@@ -6,7 +6,7 @@ enum DockerAPI {
     /// Set of published TCP host ports across running containers, or nil if the
     /// daemon isn't reachable / response couldn't be parsed.
     static func publishedTCPPorts(socketPath: String) -> Set<UInt16>? {
-        guard let body = httpGetBody(socketPath: socketPath, path: "/v1.43/containers/json"),
+        guard let body = httpGetBody(socketPath: socketPath, path: "/v1.47/containers/json"),
               let json = try? JSONSerialization.jsonObject(with: body) as? [[String: Any]]
         else { return nil }
 

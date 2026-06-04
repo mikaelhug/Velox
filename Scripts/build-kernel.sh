@@ -41,7 +41,7 @@ KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
 # moby's container-host config validator, pinned.
-CHECKCONFIG_REF="${CHECKCONFIG_REF:-v27.5.1}"
+CHECKCONFIG_REF="${CHECKCONFIG_REF:-v28.5.0}"
 CHECKCONFIG_URL="https://raw.githubusercontent.com/moby/moby/${CHECKCONFIG_REF}/contrib/check-config.sh"
 VERIFY_GPG="${VERIFY_GPG:-0}"
 

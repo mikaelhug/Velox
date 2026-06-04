@@ -1,6 +1,6 @@
 # Build a static arm64 vsock-relay and package it as a scratch image suitable
 # for use as a LinuxKit service.
-ARG GO_BUILD_IMAGE=golang:1.23-alpine
+ARG GO_BUILD_IMAGE=golang:1.26-alpine
 FROM ${GO_BUILD_IMAGE} AS build
 WORKDIR /src
 COPY go.mod ./

@@ -11,8 +11,11 @@ import Foundation
 /// a dedicated dispatch queue so it never stalls the actor or main thread.
 public actor DockerClient: DockerClientProtocol {
     private nonisolated let manager: VMManager
-    /// Docker Engine API version pinned in the request path (`/v1.43/…`).
-    static let apiVersion = "v1.43"
+    /// Docker Engine API version pinned in the request path (`/v1.47/…`).
+    /// 1.47 is within every modern daemon's supported range (Docker 27 max,
+    /// well above Docker 29's minimum), so it works without per-connection
+    /// negotiation while still exposing the current endpoints we use.
+    static let apiVersion = "v1.47"
     private static let ioQueue = DispatchQueue(label: "dev.velox.docker.io", attributes: .concurrent)
 
     public init(manager: VMManager) {

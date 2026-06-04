@@ -9,9 +9,9 @@ public enum Versions {
     public static let githubRepo = "mikaelhug/Velox"
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
-    public static let kernelVersion = "6.12.92"
+    public static let kernelVersion = "6.18.34"
     /// containerd image running in the guest.
     public static let containerdImage = "linuxkit/containerd:ba19f64efd3331a8fd0a33e00eabd14f6ee1780e"
     /// Docker Engine (dockerd) image running in the guest.
-    public static let dockerImage = "docker:27-dind"
+    public static let dockerImage = "docker:29-dind"
 }
