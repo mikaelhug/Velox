@@ -2,8 +2,9 @@
 
 Velox is a lightweight, open-source Docker Desktop alternative for macOS. The
 host supervisor is 100% Swift driving Apple's `Virtualization.framework`; the
-guest is a minimal LinuxKit image running stock `dockerd`. See `README.md` for
-the phased build status.
+guest is a minimal custom Linux image (from-source kernel + a hand-assembled
+initramfs of static binaries — **no LinuxKit**, see §7) running stock `dockerd`.
+The goal is to beat OrbStack on speed and footprint. See `README.md` for status.
 
 The following conventions are **binding** — keep them true in all future work.
 
@@ -81,8 +82,37 @@ multi-platform images, attestations/SBOM, and Wasm. Don't re-add `--storage-driv
 
 Apple VZ exposes no RTC, so the guest would boot at 1970 and break registry TLS.
 `VMConfiguration.build()` stamps `velox.epoch=<unixtime>` on the kernel cmdline; the
-`settime` onboot step (`CAP_SYS_TIME`) sets the VM clock from it before anything
-else. This is host-authoritative time injection (no NTP daemon) — keep it that way.
+init step (with `CAP_SYS_TIME`) sets the VM clock from it before anything else.
+This is host-authoritative time injection (no NTP daemon) — keep it that way.
+
+## 7. NO LinuxKit, NO dind image — the guest is a minimal custom rootfs
+
+Velox is **not** a LinuxKit appliance. Beating OrbStack (and therefore beating
+Docker Desktop by a mile) on RAM, boot time, and footprint is a primary goal, and
+LinuxKit's "every component is a baked-in OCI image" model is the opposite of lean.
+The binding architecture:
+
+- **Host supervisor: 100% Swift** driving `Virtualization.framework`. Keep it that way.
+- **Kernel:** built from kernel.org source (convention #4) — already not LinuxKit.
+- **Guest root: a read-only, compressed, demand-paged `erofs` image** (`root.img`,
+  built by `make-guest.sh` from `guest/rootfs/Dockerfile`). The kernel mounts it
+  directly (`root=/dev/vda rootfstype=erofs ro init=/sbin/vinit`, **no initramfs**);
+  the data disk is `/dev/vdb` (ext4, `/var/lib/docker`). Because the root is
+  demand-paged from disk, the big Docker binaries are NOT all held in RAM.
+- **`vinit` (`guest/vinit/`, Rust → static musl) IS PID 1**: it does every boot step
+  via direct syscalls (`nix`/`libc`) — mounts, cgroup2, clock from `velox.epoch`,
+  **native DHCP + netlink** (no udhcpc), data-disk format/mount, VirtioFS, Rosetta
+  binfmt — then forks+supervises `dockerd` (on a unix socket), runs the vsock agent
+  (ports 2375/2374/2376), and reaps zombies. All custom guest code is Rust.
+- The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
+  `versions.env`). A tiny musl userland (`iptables`-nft, `e2fsprogs`, `ca-certs` —
+  the only tools dockerd shells out to, plus busybox as a debug shell) comes from
+  Alpine packages, so there is a small `/lib`. Eliminating it (fully-static nft +
+  mke2fs from source → a pure scratch tree) is a noted follow-up.
+- **Do NOT reintroduce:** `linuxkit`, the `docker:*-dind` image, `linuxkit/*` package
+  images, an initramfs, or any OCI-image-as-guest-component. There is no
+  `guest/velox.yml`. (Buildkit gotcha: a `RUN` immediately after `COPY …/sbin/init`
+  gets exec'd as that binary — keep binary COPYs last and `init=` at `/sbin/vinit`.)
 
 ## Build / run quick reference
 

@@ -10,8 +10,6 @@ public enum Versions {
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
     public static let kernelVersion = "6.18.34"
-    /// containerd image running in the guest.
-    public static let containerdImage = "linuxkit/containerd:ba19f64efd3331a8fd0a33e00eabd14f6ee1780e"
-    /// Docker Engine (dockerd) image running in the guest.
-    public static let dockerImage = "docker:29-dind"
+    /// Docker Engine version in the guest (Docker's official static release).
+    public static let dockerVersion = "29.5.3"
 }

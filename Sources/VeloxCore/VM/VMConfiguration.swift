@@ -46,15 +46,14 @@ public enum VMConfiguration {
         config.memorySize = clampMemory(resources.memoryBytes)
 
         let bootLoader = VZLinuxBootLoader(kernelURL: image.kernelURL)
-        // Apple VZ exposes no RTC, so the guest would boot at epoch 0 (1970) and
-        // every registry TLS handshake would fail ("certificate not yet valid").
-        // Stamp the host's authoritative wall-clock onto the cmdline; the guest's
-        // `settime` onboot step reads `velox.epoch` and sets its clock first thing.
-        bootLoader.commandLine =
-            image.kernelCommandLine + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
-        if let initrd = image.initrdURL {
-            bootLoader.initialRamdiskURL = initrd
-        }
+        // The kernel mounts the read-only erofs root directly off /dev/vda (the
+        // first block device attached below) — no initramfs. Apple VZ exposes no
+        // RTC, so we also stamp the host's wall-clock as `velox.epoch` (vinit reads
+        // it and sets the guest clock first thing; otherwise the guest boots at
+        // 1970 and every registry TLS handshake fails).
+        bootLoader.commandLine = image.kernelCommandLine
+            + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
+            + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
         config.bootLoader = bootLoader
 
         config.serialPorts = [Console.makeSerialPort()]
@@ -70,11 +69,17 @@ public enum VMConfiguration {
         network.attachment = VZNATNetworkDeviceAttachment()
         config.networkDevices = [network]
 
-        // Persistent data disk for /var/lib/docker (formatted/mounted in-guest).
+        // Block devices, in order: /dev/vda = the read-only erofs root (the OS),
+        // /dev/vdb = the persistent data disk for /var/lib/docker (formatted +
+        // mounted in-guest by vinit). Order matters — it defines the device names.
+        var storage: [VZStorageDeviceConfiguration] = []
+        let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: image.rootDiskURL, readOnly: true)
+        storage.append(VZVirtioBlockDeviceConfiguration(attachment: rootAttachment))
         if let dataDisk, FileManager.default.fileExists(atPath: dataDisk.path) {
             let attachment = try VZDiskImageStorageDeviceAttachment(url: dataDisk, readOnly: false)
-            config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: attachment)]
+            storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
         }
+        config.storageDevices = storage
 
         var sharingDevices: [VZDirectorySharingDeviceConfiguration] = []
 

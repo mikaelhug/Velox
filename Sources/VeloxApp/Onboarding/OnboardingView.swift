@@ -89,6 +89,7 @@ struct OnboardingView: View {
 
     private var guestInstalled: Bool {
         FileManager.default.fileExists(atPath: Paths.kernel.path)
+            && FileManager.default.fileExists(atPath: Paths.rootDisk.path)
     }
 
     @ViewBuilder

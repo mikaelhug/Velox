@@ -12,7 +12,8 @@ public enum Paths {
     }
 
     public static var kernel: URL { root.appendingPathComponent("kernel") }
-    public static var initrd: URL { root.appendingPathComponent("initrd.img") }
+    /// Read-only erofs root filesystem (the guest OS), booted as /dev/vda.
+    public static var rootDisk: URL { root.appendingPathComponent("root.img") }
     public static var dataDisk: URL { root.appendingPathComponent("data.img") }
     public static var dockerSocket: URL { root.appendingPathComponent("docker.sock") }
     /// User preferences persisted by the GUI (resources, file shares, etc.).

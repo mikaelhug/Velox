@@ -21,10 +21,8 @@ public enum Versions {
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
     public static let kernelVersion = "${KERNEL_ORG_VERSION}"
-    /// containerd image running in the guest.
-    public static let containerdImage = "${CONTAINERD_IMAGE}"
-    /// Docker Engine (dockerd) image running in the guest.
-    public static let dockerImage = "${DIND_IMAGE}"
+    /// Docker Engine version in the guest (Docker's official static release).
+    public static let dockerVersion = "${DOCKER_VERSION}"
 }
 EOF
 

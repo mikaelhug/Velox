@@ -1,39 +1,41 @@
 import Foundation
 
-/// Locates the guest kernel/initrd and the kernel command line.
+/// Locates the guest kernel + read-only erofs root disk and the kernel command line.
 ///
 /// Defaults live under ~/.velox; each can be overridden by an environment
-/// variable so a freshly built (or downloaded) kernel can be tried without
-/// touching the install location:
-///   VELOX_KERNEL, VELOX_INITRD, VELOX_CMDLINE
+/// variable so a freshly built kernel/root can be tried without touching the
+/// install location: VELOX_KERNEL, VELOX_ROOT, VELOX_CMDLINE.
 public struct GuestImage: Sendable {
     public let kernelURL: URL
-    public let initrdURL: URL?
+    /// The erofs root filesystem image, attached read-only as /dev/vda.
+    public let rootDiskURL: URL
     public let kernelCommandLine: String
 
-    public init(kernelURL: URL, initrdURL: URL?, kernelCommandLine: String) {
+    public init(kernelURL: URL, rootDiskURL: URL, kernelCommandLine: String) {
         self.kernelURL = kernelURL
-        self.initrdURL = initrdURL
+        self.rootDiskURL = rootDiskURL
         self.kernelCommandLine = kernelCommandLine
     }
 
     /// `console=hvc0` routes the kernel console to the virtio console device
-    /// that VMConfiguration wires to this process's stdout.
+    /// that VMConfiguration wires to this process's stdout. The `root=` params
+    /// (erofs on /dev/vda) are appended by `VMConfiguration.build`, which owns
+    /// the disk ordering.
     public static let defaultCommandLine = "console=hvc0"
 
     public static func resolve(environment env: [String: String] = ProcessInfo.processInfo.environment)
         throws -> GuestImage
     {
         let kernel = env["VELOX_KERNEL"].map { URL(fileURLWithPath: $0) } ?? Paths.kernel
-        let initrdCandidate = env["VELOX_INITRD"].map { URL(fileURLWithPath: $0) } ?? Paths.initrd
+        let rootDisk = env["VELOX_ROOT"].map { URL(fileURLWithPath: $0) } ?? Paths.rootDisk
         let cmdline = env["VELOX_CMDLINE"] ?? defaultCommandLine
 
         guard FileManager.default.fileExists(atPath: kernel.path) else {
             throw VeloxError.guestArtifactMissing(kernel)
         }
-        let initrd = FileManager.default.fileExists(atPath: initrdCandidate.path)
-            ? initrdCandidate : nil
-
-        return GuestImage(kernelURL: kernel, initrdURL: initrd, kernelCommandLine: cmdline)
+        guard FileManager.default.fileExists(atPath: rootDisk.path) else {
+            throw VeloxError.guestArtifactMissing(rootDisk)
+        }
+        return GuestImage(kernelURL: kernel, rootDiskURL: rootDisk, kernelCommandLine: cmdline)
     }
 }

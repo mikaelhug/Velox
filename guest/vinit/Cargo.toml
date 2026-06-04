@@ -1,0 +1,20 @@
+[package]
+name = "vinit"
+version = "0.1.0"
+edition = "2021"
+description = "Velox guest PID1: init + supervisor + vsock agent for the minimal Docker VM"
+
+[[bin]]
+name = "vinit"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+dhcproto = "0.12"
+
+[profile.release]
+opt-level = "z"     # optimize for size — this is a lean appliance
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

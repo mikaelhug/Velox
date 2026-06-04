@@ -1,88 +1,67 @@
 #!/usr/bin/env bash
-# Build the Velox guest USERSPACE (initrd) with LinuxKit, and install it next to
-# the from-source kernel that Scripts/build-kernel.sh produced.
+# Build the Velox guest as a flat, fully-static appliance and install it.
 #
-# The kernel is no longer a LinuxKit artifact: Velox builds its own bare arm64
-# kernel from kernel.org source (Scripts/build-kernel.sh → Assets/velox-vmlinux).
-# LinuxKit is used ONLY to assemble the initrd (init + containerd + dockerd +
-# vsock-relay). The Swift host boots Assets' kernel + this initrd, both installed
-# to ~/.velox. Produces: guest/build/velox-initrd.img.
+# There is NO LinuxKit and no docker:*-dind image. The guest is a single erofs
+# root image (read-only, compressed, demand-paged) containing only the static
+# Docker server binaries, a static mkfs.ext4, the CA bundle, and the static Rust
+# /sbin/init (vinit). The kernel comes from Scripts/build-kernel.sh.
+#
+# Produces: guest/build/root.img (erofs) and installs kernel + root.img to ~/.velox.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-LINUXKIT="${LINUXKIT:-$(command -v linuxkit || echo "$(go env GOPATH)/bin/linuxkit")}"
-if [ ! -x "$LINUXKIT" ]; then
-    echo "error: linuxkit not found. Install with:" >&2
-    echo "  go install github.com/linuxkit/linuxkit/src/cmd/linuxkit@latest" >&2
-    exit 1
-fi
+set -a; . ./versions.env; set +a
 
 KERNEL_ARTIFACT="Assets/velox-vmlinux"
 OUT="guest/build"
 DEST="$HOME/.velox"
+ROOTFS_TAG="velox/rootfs:latest"
 mkdir -p "$OUT" "$DEST"
 
-# The kernel must already be built from source (it is NOT produced here).
+if ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker is required to build the guest rootfs" >&2; exit 1
+fi
 if [ ! -f "$KERNEL_ARTIFACT" ]; then
-    echo "error: $KERNEL_ARTIFACT not found — build the kernel first:" >&2
-    echo "  ./Scripts/build-kernel.sh" >&2
+    echo "error: $KERNEL_ARTIFACT not found — build the kernel first: ./Scripts/build-kernel.sh" >&2
     exit 1
 fi
 
-# Render guest/velox.yml from the template using versions.env (single source).
-# No $KERNEL_IMAGE anymore — the YAML has no kernel section (initrd-only build).
-set -a; . ./versions.env; set +a
-echo "==> render guest/velox.yml from guest/velox.yml.tmpl"
-envsubst '$INIT_IMAGE $RUNC_IMAGE $CONTAINERD_IMAGE $RNGD_IMAGE $GETTY_IMAGE $FORMAT_IMAGE $MOUNT_IMAGE $DHCPCD_IMAGE $ACPID_IMAGE $ALPINE_IMAGE $DIND_IMAGE' \
-    < guest/velox.yml.tmpl > guest/velox.yml
+echo "==> build guest rootfs image (static vinit + docker $DOCKER_VERSION + static mkfs.ext4)"
+docker build --platform linux/arm64 -t "$ROOTFS_TAG" \
+    --build-arg "RUST_BUILD_IMAGE=${RUST_BUILD_IMAGE}" \
+    --build-arg "ALPINE_IMAGE=${ALPINE_IMAGE}" \
+    --build-arg "DOCKER_VERSION=${DOCKER_VERSION}" \
+    -f guest/rootfs/Dockerfile guest
 
-# Build the guest vsock-relay image into the local Docker daemon first so
-# `linuxkit build --docker` can resolve it without a registry.
-if command -v docker >/dev/null 2>&1; then
-    ./Scripts/build-relay.sh
-else
-    echo "warning: docker not found — skipping vsock-relay image build" >&2
+echo "==> export the flat tree"
+# (the command is ignored — we only export the filesystem; scratch images need one)
+cid="$(docker create --platform linux/arm64 "$ROOTFS_TAG" /sbin/init)"
+trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+docker export "$cid" -o "$OUT/rootfs.tar"
+
+echo "==> mkfs.erofs (zstd) → $OUT/root.img"
+OUT_ABS="$(cd "$OUT" && pwd)"
+docker run --rm -i --platform linux/arm64 -v "$OUT_ABS":/out "${ALPINE_IMAGE}" sh -c '
+    set -e
+    apk add --no-cache erofs-utils >/dev/null 2>&1
+    rm -rf /r && mkdir -p /r
+    tar -C /r -xf -
+    rm -f /out/root.img
+    # lz4hc: erofs default, fast demand-paged decompress, universally supported.
+    mkfs.erofs -zlz4hc -T0 --all-root /out/root.img /r >/dev/null
+' < "$OUT/rootfs.tar"
+rm -f "$OUT/rootfs.tar"
+
+# Sanity: erofs image should be tens of MB, not near-empty.
+isize=$(wc -c < "$OUT/root.img" | tr -d ' ')
+if [ "$isize" -lt 5242880 ]; then
+    echo "error: $OUT/root.img is only ${isize}B — build failed" >&2; exit 1
 fi
 
-# The kernel comes from Assets/velox-vmlinux, not LinuxKit. LinuxKit has no plain
-# "initrd" output, and its `kernel+initrd` format would require a kernel image we
-# no longer ship — so build the root filesystem as a `tar` (needs no kernel) and
-# repack it into a cpio.gz initramfs ourselves, exactly what `kernel+initrd` does
-# internally. The repack runs in a Linux container so device nodes, permissions
-# and setuid bits survive (the host is macOS/APFS, which would mangle them).
-echo "==> linuxkit build (rootfs tar, arm64) → $OUT/velox.tar"
-"$LINUXKIT" build \
-    --docker \
-    --format tar \
-    --arch arm64 \
-    --dir "$OUT" \
-    --name velox \
-    guest/velox.yml
-
-# Reuse the kernel builder image (it has GNU tar + cpio); build it if absent.
-CONVERTER="velox-kernel-builder"
-if ! docker image inspect "$CONVERTER" >/dev/null 2>&1; then
-    echo "==> building $CONVERTER image (tar→cpio.gz helper)"
-    docker build --platform linux/arm64 -t "$CONVERTER" -f guest/kernel/Dockerfile.builder guest/kernel
-fi
-echo "==> repacking rootfs tar → cpio.gz initramfs"
-docker run --rm -i --platform linux/arm64 "$CONVERTER" \
-    bash -c 'set -o pipefail; mkdir /r && cd /r && tar --overwrite -xf - 2>/dev/null && find . | cpio -o -H newc 2>/dev/null | gzip -9' \
-    < "$OUT/velox.tar" > "$OUT/velox-initrd.img"
-rm -f "$OUT/velox.tar"
-
-# Sanity: a real initramfs is tens-to-hundreds of MB; a near-empty file means the
-# repack silently failed.
-isize=$(wc -c < "$OUT/velox-initrd.img" | tr -d ' ')
-if [ "$isize" -lt 10485760 ]; then
-    echo "error: initramfs $OUT/velox-initrd.img is only ${isize}B — repack failed" >&2
-    exit 1
-fi
-
-# Install kernel (from source build) + initrd so `velox start` finds them.
 cp "$KERNEL_ARTIFACT" "$DEST/kernel"
-cp "$OUT/velox-initrd.img" "$DEST/initrd.img"
-echo "==> Installed kernel + initrd.img → $DEST"
-
-echo "==> Output:"
-ls -la "$DEST/kernel" "$DEST/initrd.img"
+cp "$OUT/root.img" "$DEST/root.img"
+# The old initramfs is gone — remove a stale one so the boot path is unambiguous.
+rm -f "$DEST/initrd.img"
+echo "==> Installed kernel + root.img → $DEST"
+ls -lh "$DEST/kernel" "$DEST/root.img"
+echo "    root.img: $(echo "scale=1; $isize/1048576" | bc 2>/dev/null || echo $((isize/1048576)))MB erofs"

@@ -38,17 +38,16 @@ func printUsage() {
       vlcmd ps -a            vlcmd run --rm hello-world
 
     Environment overrides:
-      VELOX_KERNEL    path to guest kernel    (default ~/.velox/kernel)
-      VELOX_INITRD    path to guest initrd    (default ~/.velox/initrd.img)
-      VELOX_CMDLINE   kernel command line     (default "console=hvc0")
+      VELOX_KERNEL    path to guest kernel       (default ~/.velox/kernel)
+      VELOX_ROOT      path to erofs root image   (default ~/.velox/root.img)
+      VELOX_CMDLINE   kernel command line        (default "console=hvc0")
     """)
 }
 
 func runVersion() {
     print("Velox        v\(Versions.velox)")
     print("Kernel (OS)  \(Versions.kernelVersion)")
-    print("containerd   \(Versions.containerdImage)")
-    print("Docker       \(Versions.dockerImage)")
+    print("Docker       \(Versions.dockerVersion)")
 }
 
 func runStatus() {
@@ -70,7 +69,7 @@ func runStart(bind: BindMode) -> Never {
         let image = try GuestImage.resolve()
         let config = try VMConfiguration.build(image: image, dataDisk: Paths.dataDisk)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
-                 + "initrd=\(image.initrdURL?.lastPathComponent ?? "none") "
+                 + "root=\(image.rootDiskURL.lastPathComponent) "
                  + "cmdline=\"\(image.kernelCommandLine)\"")
 
         let manager = VMManager()

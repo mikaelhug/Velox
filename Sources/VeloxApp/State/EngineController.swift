@@ -59,6 +59,7 @@ final class EngineController {
     static var isReady: Bool {
         VZVirtualMachine.isSupported
             && FileManager.default.fileExists(atPath: Paths.kernel.path)
+            && FileManager.default.fileExists(atPath: Paths.rootDisk.path)
     }
 
     /// Re-evaluate readiness (e.g. after onboarding installs the guest image).
@@ -161,13 +162,13 @@ final class EngineController {
     private static func guestImageAdvertisingShares(_ shares: [URL]) -> GuestImage {
         // `resolve()` succeeds whenever onboarding passed; fall back defensively.
         let base = (try? GuestImage.resolve())
-            ?? GuestImage(kernelURL: Paths.kernel, initrdURL: Paths.initrd,
+            ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                           kernelCommandLine: GuestImage.defaultCommandLine)
         let adverts = VMConfiguration.shareAdvertisement(for: shares)
         guard !adverts.isEmpty else { return base }
         let payload = adverts.map { "\($0.tag)\t\($0.path)" }.joined(separator: "\n")
         let encoded = Data(payload.utf8).base64EncodedString()
-        return GuestImage(kernelURL: base.kernelURL, initrdURL: base.initrdURL,
+        return GuestImage(kernelURL: base.kernelURL, rootDiskURL: base.rootDiskURL,
                           kernelCommandLine: base.kernelCommandLine + " velox.shares=\(encoded)")
     }
 }

@@ -39,3 +39,4 @@ Icon?
 
 # ---- Velox.app bundle (built by Scripts/build-app.sh) ----
 /Velox.app/
+/guest/vinit/target/
