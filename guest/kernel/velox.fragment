@@ -23,6 +23,21 @@ CONFIG_AIO=y
 CONFIG_SHMEM=y
 CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
+# CRITICAL: flock()/fcntl() POSIX locks. tinyconfig drops FILE_LOCKING, which
+# makes every lock return ENOSYS ("Function not implemented") — that breaks
+# dhcpcd's pidfile and, fatally, containerd/dockerd's bbolt metadata store.
+CONFIG_FILE_LOCKING=y
+# Other EXPERT-gated syscalls the Go runtime + containerd/runc/dockerd expect;
+# without them they fall back noisily or fail. Enable to avoid further ENOSYS.
+CONFIG_FHANDLE=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_MEMBARRIER=y
+CONFIG_IO_URING=y
+# inotify/fanotify: dockerd's cgroup event monitor needs inotify, and countless
+# container workloads (file watchers, hot-reload dev servers) do too. tinyconfig
+# drops both → inotify_init returns ENOSYS.
+CONFIG_INOTIFY_USER=y
+CONFIG_FANOTIFY=y
 
 # --- SMP + tickless idle + throughput-tuned scheduling (VM workload) ---
 CONFIG_SMP=y
