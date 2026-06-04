@@ -120,46 +120,43 @@ CONFIG_BRIDGE=y
 CONFIG_VETH=y
 CONFIG_BRIDGE_NETFILTER=y
 
-# --- Netfilter / conntrack / NAT / iptables + nftables (docker networking) ---
+# --- Netfilter: nftables backend ONLY (no legacy iptables tables) ---
+# dockerd runs with --firewall-backend=nftables and writes nf_tables rules
+# natively. The legacy xtables table modules (iptable_nat/filter/mangle/raw and
+# their ip6 + *_LEGACY gates) are deliberately gone — leaner, faster kernel, and
+# the modern path every current distro + Docker is moving to. nft_compat is kept
+# so iptables-nft (the dind default) also works as a fallback; it and the xt
+# match/target framework are part of the modern nft stack, not legacy.
 CONFIG_NETFILTER=y
 CONFIG_NETFILTER_ADVANCED=y
 CONFIG_NF_CONNTRACK=y
 CONFIG_NF_NAT=y
 CONFIG_NF_NAT_MASQUERADE=y
+# nftables core + IPv4/IPv6/inet families + the expressions Docker's nat/filter
+# chains use (nat, masquerade, conntrack, reject).
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NF_TABLES_IPV4=y
+CONFIG_NF_TABLES_IPV6=y
+CONFIG_NFT_NAT=y
+CONFIG_NFT_MASQ=y
+CONFIG_NFT_CT=y
+CONFIG_NFT_REJECT=y
+CONFIG_NFT_REJECT_INET=y
+CONFIG_NFT_COMPAT=y
+# xt match/target framework (used via nft_compat by iptables-nft, which is the
+# dind default). dockerd programs MASQUERADE for outbound and DNAT/REDIRECT for
+# published ports + the 127.0.0.11 embedded-DNS redirect, so the xt NAT targets
+# are required — without XT_NAT the DNS rule silently fails and name resolution
+# (and port mapping) break while direct-IP traffic still works.
 CONFIG_NETFILTER_XTABLES=y
-# 6.18 master switch gating the legacy xtables backend; the per-family
-# IP{,6}_NF_IPTABLES_LEGACY (and their filter/mangle/nat/raw tables) need it.
-CONFIG_NETFILTER_XTABLES_LEGACY=y
+CONFIG_NETFILTER_XT_NAT=y
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
+CONFIG_NETFILTER_XT_TARGET_REDIRECT=y
 CONFIG_NETFILTER_XT_MARK=y
 CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
 CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
-CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y
-# xt_ipvs is on moby's "generally necessary" list; it needs the IPVS core.
-CONFIG_IP_VS=y
-CONFIG_NETFILTER_XT_MATCH_IPVS=y
-CONFIG_IP_NF_IPTABLES=y
-# Kernel 6.18 split the legacy (xtables) iptables tables behind *_LEGACY; the
-# filter/mangle/raw/nat tables below now depend on it. Docker still uses the
-# legacy tables (alongside nftables), so keep them. Same for IPv6.
-CONFIG_IP_NF_IPTABLES_LEGACY=y
-CONFIG_IP_NF_FILTER=y
-CONFIG_IP_NF_MANGLE=y
-CONFIG_IP_NF_RAW=y
-CONFIG_IP_NF_NAT=y
-CONFIG_IP_NF_TARGET_MASQUERADE=y
-# IPv6 netfilter — modern Docker (28+) requires ip6tables filter/mangle/raw/nat
-# for IPv6 container networking; moby check-config lists these as necessary.
-CONFIG_IP6_NF_IPTABLES=y
-CONFIG_IP6_NF_IPTABLES_LEGACY=y
-CONFIG_IP6_NF_FILTER=y
-CONFIG_IP6_NF_MANGLE=y
-CONFIG_IP6_NF_RAW=y
-CONFIG_IP6_NF_NAT=y
-CONFIG_IP6_NF_TARGET_MASQUERADE=y
-CONFIG_NF_TABLES=y
-CONFIG_NF_TABLES_INET=y
-CONFIG_NFT_COMPAT=y
-CONFIG_NFT_NAT=y
+CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y
 
 # --- Namespaces (all of them) ---
 CONFIG_NAMESPACES=y

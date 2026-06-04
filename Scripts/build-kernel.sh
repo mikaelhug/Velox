@@ -55,7 +55,7 @@ REQUIRED_SYMBOLS=(
     FILE_LOCKING FHANDLE INOTIFY_USER
     BLK_DEV_INITRD EXT4_FS EXT4_FS_SECURITY OVERLAY_FS TMPFS TMPFS_XATTR DEVTMPFS DEVTMPFS_MOUNT BINFMT_ELF
     NET INET BRIDGE VETH BRIDGE_NETFILTER
-    NETFILTER NF_CONNTRACK NF_NAT IP_NF_IPTABLES IP_NF_NAT
+    NETFILTER NF_CONNTRACK NF_NAT NF_TABLES NFT_NAT NFT_MASQ NFT_COMPAT
     NAMESPACES NET_NS PID_NS IPC_NS UTS_NS USER_NS
     CGROUPS MEMCG BLK_CGROUP CGROUP_PIDS CGROUP_DEVICE CFS_BANDWIDTH
     SECCOMP SECCOMP_FILTER BPF_SYSCALL
@@ -145,11 +145,18 @@ curl -fSL -o /tmp/check-config.sh "${CHECKCONFIG_URL}"
 chmod +x /tmp/check-config.sh
 report="$(CONFIG=.config bash /tmp/check-config.sh .config 2>&1 || true)"
 echo "$report"
-# Strip ANSI, isolate the "Generally Necessary" block, flag any "missing".
+# Symbols moby check-config still lists as "generally necessary" but that Velox
+# deliberately omits: the legacy iptables/ip6tables xtables TABLES (we run the
+# nftables firewall backend instead), and IPVS (single-node Docker never uses it,
+# only Swarm/kube load-balancing). Their absence must NOT fail the build.
+expected_missing="CONFIG_(IP_NF_(IPTABLES|FILTER|MANGLE|RAW|NAT|TARGET_MASQUERADE)|IP6_NF_(IPTABLES|FILTER|MANGLE|RAW|NAT|TARGET_MASQUERADE)|NETFILTER_XT_MATCH_IPVS|IP_VS)"
+# Strip ANSI, isolate the "Generally Necessary" block, flag any "missing" that
+# is not on the intentionally-omitted list above.
 necessary_missing="$(printf "%s\n" "$report" \
     | sed -E "s/\x1b\[[0-9;]*m//g" \
     | awk "/Generally Necessary/{f=1;next} /Optional Features/{f=0} f" \
-    | grep -i "missing" || true)"
+    | grep -i "missing" \
+    | grep -vE "$expected_missing" || true)"
 if [ -n "$necessary_missing" ]; then
     echo "error: check-config.sh reports Generally-Necessary items missing:" >&2
     echo "$necessary_missing" >&2
