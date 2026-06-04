@@ -50,14 +50,25 @@ pull a newer build. It is backed by `velox update`:
 - Any UI added later must wire its "Update" button to this same code path
   (`Updater` in `Sources/Velox/Support/Updater.swift`) — do not fork the logic.
 
-## 4. Custom kernel for VirtioFS / Rosetta
+## 4. Custom kernel built from kernel.org source (for VirtioFS / Rosetta)
 
-Apple's Virtualization.framework shares files only via **VirtioFS**, and the
-stock `linuxkit/kernel` is built without `CONFIG_VIRTIO_FS`. So — like Docker
-Desktop and OrbStack — Velox builds its **own** kernel with VirtioFS enabled
-(`Scripts/build-kernel.sh`, from base `KERNEL_BASE` in versions.env, retagged to
-`KERNEL_IMAGE`). Both VirtioFS `-v` mounts and Rosetta x86 depend on this kernel.
-Don't switch back to a stock kernel expecting `-v`/Rosetta to work.
+Apple's Virtualization.framework shares files only via **VirtioFS** and boots a
+raw, uncompressed `arch/arm64/boot/Image` (no EFI-zboot stub). So — like Docker
+Desktop and OrbStack — Velox builds its **own** bare, fast arm64 kernel straight
+from kernel.org source (`Scripts/build-kernel.sh`), under full config control:
+`make tinyconfig` + a curated VM fragment (`guest/kernel/velox.fragment`) +
+`olddefconfig`, with `CONFIG_VIRTIO_FS`, `CONFIG_VIRTIO_VSOCKETS`, `BINFMT_MISC`,
+all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
+
+- The build runs **Linux-to-Linux native** inside a `--platform linux/arm64`
+  container, on a Docker **named volume** — never the host APFS (case-insensitive
+  collisions + slow bind mounts). Only the final `Image` is copied back to
+  `Assets/velox-vmlinux` (and `~/.velox/kernel`).
+- The kernel version + SHA-256 are pinned in `versions.env`
+  (`KERNEL_ORG_SERIES`/`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`). No LinuxKit.
+- `Scripts/make-guest.sh` builds **only the initrd/userspace** via LinuxKit; the
+  kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v` mounts and Rosetta
+  x86 depend on this kernel — don't switch to a stock kernel expecting them to work.
 
 ## Build / run quick reference
 

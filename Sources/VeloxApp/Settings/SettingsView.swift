@@ -55,7 +55,7 @@ private struct GeneralTab: View {
 
             Section("About") {
                 LabeledContent("Velox", value: Versions.velox)
-                LabeledContent("Kernel", value: Versions.kernelImage)
+                LabeledContent("Kernel", value: Versions.kernelVersion)
                 LabeledContent("Docker", value: Versions.dockerImage)
             }
         }

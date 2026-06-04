@@ -1,10 +1,13 @@
 # Velox guest image TEMPLATE. Scripts/make-guest.sh renders this into
 # guest/velox.yml, substituting ${VAR} from versions.env. EDIT THIS FILE,
 # never the generated guest/velox.yml. See CLAUDE.md.
-kernel:
-  image: ${KERNEL_IMAGE}
-  # Apple Virtualization.framework exposes the virtio console as hvc0.
-  cmdline: "console=hvc0"
+#
+# No `kernel:` section: Velox builds its own bare arm64 kernel from kernel.org
+# source (Scripts/build-kernel.sh → Assets/velox-vmlinux), and make-guest.sh runs
+# `linuxkit build --format initrd` to assemble ONLY this userspace. The kernel is
+# monolithic (everything built-in, no modules) and the Swift host sets the kernel
+# cmdline (`console=hvc0`) via VZLinuxBootLoader — so neither a kernel image nor a
+# LinuxKit cmdline belongs here.
 init:
   - ${INIT_IMAGE}
   - ${RUNC_IMAGE}
@@ -106,6 +109,13 @@ services:
 # and ship the Rosetta binfmt registration script.
 files:
   - path: Users
+    directory: true
+    mode: "0755"
+  # Empty mountpoint for the dockerd `/lib/modules` bind. The kernel is monolithic
+  # (no loadable modules), so dockerd's modprobe attempts are no-ops on built-in
+  # features — but the bind source must exist since LinuxKit no longer supplies a
+  # kernel package to populate it.
+  - path: lib/modules
     directory: true
     mode: "0755"
   - path: etc/velox/virtiofs-extra.sh

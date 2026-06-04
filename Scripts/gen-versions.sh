@@ -19,8 +19,8 @@ public enum Versions {
     /// GitHub repo (owner/name) the updater checks for new releases.
     public static let githubRepo = "${VELOX_GITHUB_REPO}"
 
-    /// Guest kernel image (the VM "OS version").
-    public static let kernelImage = "${KERNEL_IMAGE}"
+    /// Guest kernel version (the VM "OS version") — built from kernel.org source.
+    public static let kernelVersion = "${KERNEL_ORG_VERSION}"
     /// containerd image running in the guest.
     public static let containerdImage = "${CONTAINERD_IMAGE}"
     /// Docker Engine (dockerd) image running in the guest.

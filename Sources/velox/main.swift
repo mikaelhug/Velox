@@ -46,7 +46,7 @@ func printUsage() {
 
 func runVersion() {
     print("Velox        v\(Versions.velox)")
-    print("Kernel (OS)  \(Versions.kernelImage)")
+    print("Kernel (OS)  \(Versions.kernelVersion)")
     print("containerd   \(Versions.containerdImage)")
     print("Docker       \(Versions.dockerImage)")
 }

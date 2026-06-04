@@ -10,7 +10,9 @@ DerivedData/
 *.xcuserstate
 
 # ---- Velox generated artifacts ----
-# LinuxKit guest build outputs (kernel, initrd, cmdline)
+# Kernel Image built from source by Scripts/build-kernel.sh
+Assets/velox-vmlinux
+# LinuxKit guest build outputs (initrd)
 guest/build/
 # guest/velox.yml is rendered from guest/velox.yml.tmpl by make-guest.sh
 guest/velox.yml

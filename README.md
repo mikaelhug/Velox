@@ -44,18 +44,21 @@ update` checks GitHub for a newer build.
 
 ## Guest image
 
-Build the custom kernel (once — enables VirtioFS), then the LinuxKit guest:
+Build the custom kernel (once — from kernel.org source), then the guest userspace:
 
 ```bash
-./Scripts/build-kernel.sh   # one-time: builds velox/kernel:<ver>-virtiofs (long compile)
-./Scripts/make-guest.sh     # builds guest, installs kernel+initrd to ~/.velox
+./Scripts/build-kernel.sh   # one-time: compiles Assets/velox-vmlinux from source (long)
+./Scripts/make-guest.sh     # builds initrd, installs kernel+initrd to ~/.velox
 ./Scripts/run.sh start      # boots the guest; serial console on this terminal
 ```
 
-Needs `linuxkit` + a container engine on PATH. `make-guest.sh` decompresses the
-arm64 EFI-zboot kernel into the raw `Image` that `VZLinuxBootLoader` requires.
-The custom kernel adds `CONFIG_VIRTIO_FS=y` (needed for `-v` mounts and Rosetta;
-the stock LinuxKit kernel lacks it) — see `Scripts/build-kernel.sh`.
+`build-kernel.sh` needs Docker (it compiles a bare arm64 kernel natively inside a
+`linux/arm64` container on a named volume — never on APFS — and emits the raw
+uncompressed `Image` that `VZLinuxBootLoader` requires). `make-guest.sh` needs
+`linuxkit` + a container engine and assembles only the initrd. The kernel is
+monolithic with `CONFIG_VIRTIO_FS`, `CONFIG_VIRTIO_VSOCKETS`, `BINFMT_MISC` and
+all container prereqs built-in (needed for `-v` mounts and Rosetta) — config in
+`guest/kernel/velox.fragment`, version pinned in `versions.env`.
 
 ## Status
 
