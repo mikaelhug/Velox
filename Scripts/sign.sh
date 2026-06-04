@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN="${1:-$(swift build -c release --show-bin-path)/Velox}"
+BIN="${1:-$(swift build -c release --show-bin-path)/velox}"
 codesign --force --sign - \
     --entitlements Resources/Entitlements/velox.entitlements \
     "$BIN"

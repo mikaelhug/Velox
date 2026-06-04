@@ -34,3 +34,6 @@ Icon?
 
 # ---- Logs / scratch ----
 *.log
+
+# ---- Velox.app bundle (built by Scripts/build-app.sh) ----
+/Velox.app/

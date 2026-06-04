@@ -6,5 +6,5 @@ cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-release}"
 ./Scripts/build.sh "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/Velox"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/velox"
 exec "$BIN" "$@"

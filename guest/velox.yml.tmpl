@@ -41,6 +41,17 @@ onboot:
     rootfsPropagation: shared
     # VirtioFS is built into the custom kernel (CONFIG_VIRTIO_FS=y); just mount.
     command: ["/bin/sh", "-c", "mount -t virtiofs vlxusers /Users && echo velox-virtiofs-mounted"]
+  # Extra VirtioFS shares from the GUI's File Sharing setting. The host advertises
+  # them on the kernel cmdline as `velox.shares=<base64>` (lines of "tag<TAB>path");
+  # mount each tag at its host path with shared propagation. No-op when unset.
+  - name: virtiofs-extra
+    image: ${ALPINE_IMAGE}
+    binds:
+      - /etc/velox:/etc/velox
+    capabilities:
+      - CAP_SYS_ADMIN
+    rootfsPropagation: shared
+    command: ["/bin/sh", "/etc/velox/virtiofs-extra.sh"]
   # Rosetta: mount the x86-64 translation runtime and register a binfmt_misc
   # handler (F flag preloads the interpreter so it works inside containers too).
   # No-op if the host didn't attach the rosetta share (Rosetta not installed).
@@ -97,6 +108,23 @@ files:
   - path: Users
     directory: true
     mode: "0755"
+  - path: etc/velox/virtiofs-extra.sh
+    mode: "0755"
+    contents: |
+      #!/bin/sh
+      # Mount user-configured VirtioFS shares advertised on the kernel cmdline.
+      spec=$(tr ' ' '\n' < /proc/cmdline | grep '^velox.shares=' | head -n1 | cut -d= -f2-)
+      [ -z "$spec" ] && exit 0
+      echo "$spec" | base64 -d | while IFS="$(printf '\t')" read -r tag path; do
+        [ -z "$tag" ] && continue
+        mkdir -p "$path" 2>/dev/null || true
+        if mount -t virtiofs "$tag" "$path" 2>/dev/null; then
+          mount --make-rshared "$path" 2>/dev/null || true
+          echo "velox: mounted share $tag at $path"
+        else
+          echo "velox: could not mount share $tag at $path"
+        fi
+      done
   - path: etc/velox/rosetta.sh
     mode: "0755"
     contents: |

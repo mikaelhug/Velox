@@ -10,10 +10,10 @@ ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> swift build -c $CONFIG"
-swift build -c "$CONFIG"
+echo "==> swift build -c $CONFIG (velox CLI)"
+swift build -c "$CONFIG" --product velox
 
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/Velox"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/velox"
 
 echo "==> codesign (ad-hoc) $BIN"
 codesign --force --sign - --entitlements "$ENTITLEMENTS" "$BIN"
