@@ -1,0 +1,110 @@
+# Velox guest image TEMPLATE. Scripts/make-guest.sh renders this into
+# guest/velox.yml, substituting ${VAR} from versions.env. EDIT THIS FILE,
+# never the generated guest/velox.yml. See CLAUDE.md.
+kernel:
+  image: ${KERNEL_IMAGE}
+  # Apple Virtualization.framework exposes the virtio console as hvc0.
+  cmdline: "console=hvc0"
+init:
+  - ${INIT_IMAGE}
+  - ${RUNC_IMAGE}
+  - ${CONTAINERD_IMAGE}
+onboot:
+  - name: rngd1
+    image: ${RNGD_IMAGE}
+    command: ["/sbin/rngd", "-1"]
+  # Format (first boot only) and mount the persistent virtio-block data disk at
+  # /var/lib/docker ONLY — so dockerd's data persists while LinuxKit's own
+  # service state (/var/lib/containerd, /run) stays ephemeral (tmpfs). This
+  # avoids stale service records after an unclean power-off, which otherwise
+  # break the relay/dockerd on the next boot.
+  - name: format
+    image: ${FORMAT_IMAGE}
+  - name: mkdir-dockerdir
+    image: ${ALPINE_IMAGE}
+    binds:
+      - /var:/host_var:rbind,rshared
+    rootfsPropagation: shared
+    command: ["/bin/mkdir", "-p", "/host_var/lib/docker"]
+  - name: mount
+    image: ${MOUNT_IMAGE}
+    command: ["/usr/bin/mountie", "/var/lib/docker"]
+  # VirtioFS: mount the host's /Users at the same path in the guest, with shared
+  # propagation so dockerd's bind mounts (`-v /Users/...:/...`) resolve — the
+  # Docker Desktop model. The mountpoint /Users is created via `files:` below.
+  - name: virtiofs
+    image: ${ALPINE_IMAGE}
+    binds:
+      - /Users:/Users:rbind,rshared
+    capabilities:
+      - CAP_SYS_ADMIN
+    rootfsPropagation: shared
+    # VirtioFS is built into the custom kernel (CONFIG_VIRTIO_FS=y); just mount.
+    command: ["/bin/sh", "-c", "mount -t virtiofs vlxusers /Users && echo velox-virtiofs-mounted"]
+  # Rosetta: mount the x86-64 translation runtime and register a binfmt_misc
+  # handler (F flag preloads the interpreter so it works inside containers too).
+  # No-op if the host didn't attach the rosetta share (Rosetta not installed).
+  - name: rosetta
+    image: ${ALPINE_IMAGE}
+    capabilities:
+      - CAP_SYS_ADMIN
+    binds:
+      - /etc/velox:/etc/velox
+    command: ["/bin/sh", "/etc/velox/rosetta.sh"]
+  # Acquire an IP + DNS over the Apple NAT interface so dockerd can pull images.
+  - name: dhcpcd
+    image: ${DHCPCD_IMAGE}
+    command: ["/sbin/dhcpcd", "--nobackground", "-f", "/dhcpcd.conf", "-1"]
+services:
+  # Handle ACPI power events so the host can request a graceful shutdown
+  # (flushes the data disk before poweroff).
+  - name: acpid
+    image: ${ACPID_IMAGE}
+  - name: getty
+    image: ${GETTY_IMAGE}
+    env:
+      - INSECURE=true
+  # Docker Engine. Listens on guest-localhost TCP; the relay bridges VSOCK to it.
+  # /var/lib/docker is on the persistent ext4 data disk (overlay2). /Users is
+  # bind-propagated (rshared) so VirtioFS bind mounts work inside containers.
+  - name: dockerd
+    image: ${DIND_IMAGE}
+    capabilities:
+      - all
+    net: host
+    rootfsPropagation: shared
+    mounts:
+      - type: cgroup
+        options: ["rw", "nosuid", "noexec", "nodev", "relatime"]
+    binds:
+      - /etc/resolv.conf:/etc/resolv.conf
+      - /lib/modules:/lib/modules
+      - /var/lib/docker:/var/lib/docker
+      - /Users:/Users:rbind,rshared
+    runtime:
+      mkdir: ["/var/lib/docker"]
+    command: ["/usr/local/bin/dockerd",
+              "--host=tcp://127.0.0.1:2375",
+              "--storage-driver=overlay2"]
+  # Guest side of the Docker API bridge: VSOCK 2375 -> dockerd's localhost TCP.
+  - name: vsock-relay
+    image: velox/vsock-relay:latest
+    net: host
+    command: ["/vsock-relay", "-port", "2375", "-connect", "tcp://127.0.0.1:2375"]
+# Create /Users as a mountpoint on the read-only rootfs for the VirtioFS mount,
+# and ship the Rosetta binfmt registration script.
+files:
+  - path: Users
+    directory: true
+    mode: "0755"
+  - path: etc/velox/rosetta.sh
+    mode: "0755"
+    contents: |
+      #!/bin/sh
+      mkdir -p /run/rosetta
+      if ! mount -t virtiofs rosetta /run/rosetta 2>/dev/null; then
+        echo "velox: no rosetta share — skipping x86 binfmt"; exit 0
+      fi
+      mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+      printf '%s\n' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/run/rosetta/rosetta:OCF' > /proc/sys/fs/binfmt_misc/register
+      echo velox-rosetta-registered

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      The only entitlement required for the Virtualization.framework path.
+      com.apple.security.hypervisor is NOT needed — that is for raw
+      Hypervisor.framework access. Ad-hoc signing (codesign -s -) grants this
+      restricted entitlement for local execution on this machine.
+    -->
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>

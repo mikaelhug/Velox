@@ -1,0 +1,36 @@
+# ---- Swift Package Manager ----
+.build/
+.swiftpm/
+Package.resolved
+
+# ---- Xcode (if ever opened there) ----
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# ---- Velox generated artifacts ----
+# LinuxKit guest build outputs (kernel, initrd, cmdline)
+guest/build/
+# guest/velox.yml is rendered from guest/velox.yml.tmpl by make-guest.sh
+guest/velox.yml
+# VM disk images
+*.img
+*.raw
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# ---- Editor / misc ----
+*.swp
+*~
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+
+# ---- Logs / scratch ----
+*.log
