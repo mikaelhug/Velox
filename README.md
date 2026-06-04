@@ -68,9 +68,10 @@ all container prereqs built-in (needed for `-v` mounts and Rosetta) — config i
 - [x] **Phase 2** — minimal Linux guest boot (LinuxKit → root console)
 - [x] **Phase 3** — VSOCK proxy (`~/.velox/docker.sock` ↔ guest relay)
 - [x] **Phase 4** — dockerd in guest. `vlcmd run` (pull via NAT, streamed output
-  via half-closing relay), **persistent overlay2 data disk**, graceful stop
-  (sync over a VSOCK control port), **VirtioFS `-v` host mounts**, and **Rosetta
-  x86** (`--platform linux/amd64`). Uses a custom kernel with VirtioFS
+  via half-closing relay), **persistent data disk on the containerd image store**
+  (multi-platform images, attestations, Wasm), graceful stop (sync over a VSOCK
+  control port), **VirtioFS `-v` host mounts**, and **Rosetta x86**
+  (`--platform linux/amd64`). Uses a custom kernel with VirtioFS
   (`Scripts/build-kernel.sh`).
 - [x] **Phase 5** — reverse port forwarding (`-p 8080:80` → `localhost:8080`):
   watch the Docker API for published ports, open dynamic `127.0.0.1` listeners,

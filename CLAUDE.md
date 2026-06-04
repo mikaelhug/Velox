@@ -70,6 +70,20 @@ all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
   kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v` mounts and Rosetta
   x86 depend on this kernel — don't switch to a stock kernel expecting them to work.
 
+## 5. dockerd uses the containerd image store ONLY
+
+dockerd runs with `--feature=containerd-snapshotter=true` (in `guest/velox.yml.tmpl`)
+— the containerd image store (overlayfs snapshotter) is the **only** store, no
+classic `overlay2` graph driver. This gives Docker-Desktop parity: native
+multi-platform images, attestations/SBOM, and Wasm. Don't re-add `--storage-driver`.
+
+## 6. Guest clock comes from the host (`velox.epoch`)
+
+Apple VZ exposes no RTC, so the guest would boot at 1970 and break registry TLS.
+`VMConfiguration.build()` stamps `velox.epoch=<unixtime>` on the kernel cmdline; the
+`settime` onboot step (`CAP_SYS_TIME`) sets the VM clock from it before anything
+else. This is host-authoritative time injection (no NTP daemon) — keep it that way.
+
 ## Build / run quick reference
 
 ```bash

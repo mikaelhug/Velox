@@ -92,10 +92,16 @@ CONFIG_TTY=y
 CONFIG_UNIX98_PTYS=y
 CONFIG_PRINTK=y
 
-# --- Filesystems: ext4 data disk, overlay2, pseudo-FS, devtmpfs ---
+# --- Filesystems: ext4 data disk, overlayfs (containerd snapshotter), pseudo-FS ---
 CONFIG_EXT4_FS=y
+# Container image layers carry security.capability xattrs (file caps) and POSIX
+# ACLs; without the ext4 security/ACL xattr handlers, getxattr returns ENOTSUP and
+# every `docker build` / image-diff on the containerd store fails. Required.
+CONFIG_EXT4_FS_SECURITY=y
+CONFIG_EXT4_FS_POSIX_ACL=y
 CONFIG_OVERLAY_FS=y
 CONFIG_TMPFS=y
+CONFIG_TMPFS_XATTR=y
 CONFIG_TMPFS_POSIX_ACL=y
 CONFIG_PROC_FS=y
 CONFIG_PROC_SYSCTL=y

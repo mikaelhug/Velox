@@ -13,6 +13,17 @@ init:
   - ${RUNC_IMAGE}
   - ${CONTAINERD_IMAGE}
 onboot:
+  # Set the guest clock first (Apple VZ has no RTC, so it boots at 1970, which
+  # breaks registry TLS). The host stamps `velox.epoch=<unixtime>` on the kernel
+  # cmdline; read it and set the VM-wide clock. Needs CAP_SYS_TIME. Runs first so
+  # every later step is correctly timestamped.
+  - name: settime
+    image: ${ALPINE_IMAGE}
+    capabilities:
+      - CAP_SYS_TIME
+    binds:
+      - /etc/velox:/etc/velox
+    command: ["/bin/sh", "/etc/velox/settime.sh"]
   - name: rngd1
     image: ${RNGD_IMAGE}
     command: ["/sbin/rngd", "-1"]
@@ -79,8 +90,11 @@ services:
     env:
       - INSECURE=true
   # Docker Engine. Listens on guest-localhost TCP; the relay bridges VSOCK to it.
-  # /var/lib/docker is on the persistent ext4 data disk (overlay2). /Users is
-  # bind-propagated (rshared) so VirtioFS bind mounts work inside containers.
+  # Velox uses the containerd image store (the only store — no classic graph
+  # driver) for native multi-platform images, attestations and Wasm. Its content
+  # + overlayfs snapshots live under /var/lib/docker/containerd, on the persistent
+  # ext4 data disk. /Users is bind-propagated (rshared) so VirtioFS bind mounts
+  # work inside containers.
   - name: dockerd
     image: ${DIND_IMAGE}
     capabilities:
@@ -99,7 +113,7 @@ services:
       mkdir: ["/var/lib/docker"]
     command: ["/usr/local/bin/dockerd",
               "--host=tcp://127.0.0.1:2375",
-              "--storage-driver=overlay2"]
+              "--feature=containerd-snapshotter=true"]
   # Guest side of the Docker API bridge: VSOCK 2375 -> dockerd's localhost TCP.
   - name: vsock-relay
     image: velox/vsock-relay:latest
@@ -118,6 +132,21 @@ files:
   - path: lib/modules
     directory: true
     mode: "0755"
+  - path: etc/velox/settime.sh
+    mode: "0755"
+    contents: |
+      #!/bin/sh
+      # Set the VM clock from velox.epoch on the kernel cmdline (the host's wall
+      # clock at boot). Apple VZ has no RTC, so without this the guest sits at
+      # 1970 and registry TLS fails. busybox `date -s @<epoch>` parses the epoch;
+      # CAP_SYS_TIME (declared on this onboot step) lets it actually set the clock.
+      epoch=$(tr ' ' '\n' < /proc/cmdline | grep '^velox.epoch=' | head -n1 | cut -d= -f2-)
+      [ -z "$epoch" ] && { echo "velox: no velox.epoch on cmdline"; exit 0; }
+      if date -s "@$epoch" >/dev/null 2>&1; then
+        echo "velox: clock set to $(date -u)"
+      else
+        echo "velox: failed to set clock from epoch $epoch"
+      fi
   - path: etc/velox/virtiofs-extra.sh
     mode: "0755"
     contents: |

@@ -46,7 +46,12 @@ public enum VMConfiguration {
         config.memorySize = clampMemory(resources.memoryBytes)
 
         let bootLoader = VZLinuxBootLoader(kernelURL: image.kernelURL)
-        bootLoader.commandLine = image.kernelCommandLine
+        // Apple VZ exposes no RTC, so the guest would boot at epoch 0 (1970) and
+        // every registry TLS handshake would fail ("certificate not yet valid").
+        // Stamp the host's authoritative wall-clock onto the cmdline; the guest's
+        // `settime` onboot step reads `velox.epoch` and sets its clock first thing.
+        bootLoader.commandLine =
+            image.kernelCommandLine + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
         if let initrd = image.initrdURL {
             bootLoader.initialRamdiskURL = initrd
         }
