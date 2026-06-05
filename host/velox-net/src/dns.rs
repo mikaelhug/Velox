@@ -4,34 +4,29 @@
 //! forwards everything else to the macOS system resolvers. The wire format is
 //! simple enough that hand-rolling the codec avoids a heavy dependency tree.
 
-use std::net::{Ipv4Addr, UdpSocket};
-use std::time::Duration;
+use std::net::Ipv4Addr;
 
-/// Resolve a query. Returns the raw DNS response to send back, or None if the
-/// query is malformed / forwarding failed.
-pub fn handle(query: &[u8], gateway_ip: u32, guest_ip: u32, upstreams: &[Ipv4Addr]) -> Option<Vec<u8>> {
+/// Answer Velox's internal names (host.docker.internal etc.) locally. Returns the
+/// raw DNS response, or None if the name isn't internal (the caller forwards it
+/// asynchronously to the system resolvers) or the query is malformed.
+pub fn handle_internal(query: &[u8], gateway_ip: u32, guest_ip: u32) -> Option<Vec<u8>> {
     let (name, qend) = parse_question(query)?;
     let qtype = u16::from_be_bytes([*query.get(qend)?, *query.get(qend + 1)?]);
 
-    // Internal names → answer locally.
-    let internal: Option<u32> = match name.as_str() {
-        "host.docker.internal" | "gateway.docker.internal" => Some(gateway_ip),
-        "vm.docker.internal" => Some(guest_ip),
-        _ => None,
+    let ip = match name.as_str() {
+        "host.docker.internal" | "gateway.docker.internal" => gateway_ip,
+        "vm.docker.internal" => guest_ip,
+        _ => return None, // not internal → forward upstream
     };
-    if let Some(ip) = internal {
-        let qsection_end = qend + 4; // qtype(2) + qclass(2)
-        if query.len() < qsection_end {
-            return None;
-        }
-        return Some(if qtype == 1 {
-            build_a_response(query, qsection_end, ip)
-        } else {
-            build_empty_response(query, qsection_end)
-        });
+    let qsection_end = qend + 4; // qtype(2) + qclass(2)
+    if query.len() < qsection_end {
+        return None;
     }
-
-    forward(query, upstreams)
+    Some(if qtype == 1 {
+        build_a_response(query, qsection_end, ip)
+    } else {
+        build_empty_response(query, qsection_end)
+    })
 }
 
 /// Parse the QNAME of the first question. Returns (lowercased name, offset of the
@@ -92,23 +87,6 @@ fn build_empty_response(query: &[u8], qsection_end: usize) -> Vec<u8> {
     r
 }
 
-/// Forward the query verbatim to each upstream until one answers (short timeout).
-/// The upstream's reply already carries the matching transaction id.
-fn forward(query: &[u8], upstreams: &[Ipv4Addr]) -> Option<Vec<u8>> {
-    for up in upstreams {
-        let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { continue };
-        let _ = sock.set_read_timeout(Some(Duration::from_millis(2000)));
-        if sock.send_to(query, (*up, 53)).is_err() {
-            continue;
-        }
-        let mut buf = [0u8; 1500];
-        if let Ok((n, _)) = sock.recv_from(&mut buf) {
-            return Some(buf[..n].to_vec());
-        }
-    }
-    None
-}
-
 /// Read the macOS system resolvers from /etc/resolv.conf (kept current by macOS),
 /// falling back to a public resolver if none are found.
 pub fn system_resolvers() -> Vec<Ipv4Addr> {
@@ -161,7 +139,7 @@ mod tests {
     #[test]
     fn answers_internal_a() {
         let q = query_for("host.docker.internal", 0xBEEF);
-        let resp = handle(&q, 0xC0A8_7F01, 0xC0A8_7F02, &[]).unwrap();
+        let resp = handle_internal(&q, 0xC0A8_7F01, 0xC0A8_7F02).unwrap();
         // id echoed, QR set, ancount == 1
         assert_eq!(&resp[0..2], &[0xBE, 0xEF]);
         assert_eq!(resp[2] & 0x80, 0x80);
@@ -174,8 +152,14 @@ mod tests {
     #[test]
     fn vm_name_resolves_to_guest() {
         let q = query_for("vm.docker.internal", 1);
-        let resp = handle(&q, 0xC0A8_7F01, 0xC0A8_7F02, &[]).unwrap();
+        let resp = handle_internal(&q, 0xC0A8_7F01, 0xC0A8_7F02).unwrap();
         let n = resp.len();
         assert_eq!(&resp[n - 4..], &[192, 168, 127, 2]);
+    }
+
+    #[test]
+    fn external_name_is_not_internal() {
+        let q = query_for("example.com", 7);
+        assert!(handle_internal(&q, 0xC0A8_7F01, 0xC0A8_7F02).is_none());
     }
 }

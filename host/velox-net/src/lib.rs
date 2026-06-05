@@ -86,7 +86,14 @@ pub struct VeloxNet {
     stop: Arc<AtomicBool>,
     stats: Arc<Stats>,
     cmds: Arc<Mutex<Vec<Cmd>>>,
+    wakeup_w: std::os::fd::RawFd, // write end of the reactor wakeup pipe
     thread: Option<JoinHandle<()>>,
+}
+
+/// Wake the reactor (it blocks in kevent) so it observes a new command or `stop`.
+fn poke(fd: std::os::fd::RawFd) {
+    let b: u8 = 1;
+    unsafe { libc::write(fd, &b as *const u8 as *const c_void, 1) };
 }
 
 /// Start the stack on `frame_fd` (this end of the socketpair; ownership is taken —
@@ -111,6 +118,20 @@ pub extern "C" fn velox_net_start(
         }
     }
 
+    // Wakeup pipe: the reactor blocks in kevent on the read end; expose/unexpose/stop
+    // poke the write end so the reactor wakes promptly.
+    let mut pfds = [0i32; 2];
+    if unsafe { libc::pipe(pfds.as_mut_ptr()) } != 0 {
+        return std::ptr::null_mut();
+    }
+    let (wakeup_r, wakeup_w) = (pfds[0], pfds[1]);
+    unsafe {
+        let fl = libc::fcntl(wakeup_r, libc::F_GETFL, 0);
+        if fl >= 0 {
+            libc::fcntl(wakeup_r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Stats::default());
     let cmds = Arc::new(Mutex::new(Vec::new()));
@@ -119,7 +140,7 @@ pub extern "C" fn velox_net_start(
 
     let thread = std::thread::Builder::new()
         .name("velox-net".to_string())
-        .spawn(move || stack::run(frame_fd, cfg, stop_t, stats_t, cmds_t, sink))
+        .spawn(move || stack::run(frame_fd, cfg, stop_t, stats_t, cmds_t, wakeup_r, sink))
         .ok();
 
     match thread {
@@ -127,9 +148,16 @@ pub extern "C" fn velox_net_start(
             stop,
             stats,
             cmds,
+            wakeup_w,
             thread: Some(thread),
         })),
-        None => std::ptr::null_mut(),
+        None => {
+            unsafe {
+                libc::close(wakeup_r);
+                libc::close(wakeup_w);
+            }
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -142,10 +170,12 @@ pub extern "C" fn velox_net_stop(h: *mut VeloxNet) {
     }
     let mut net = unsafe { Box::from_raw(h) };
     net.stop.store(true, Ordering::SeqCst);
+    poke(net.wakeup_w); // wake the reactor so it sees `stop`
     if let Some(t) = net.thread.take() {
         let _ = t.join();
     }
-    // Box dropped here.
+    unsafe { libc::close(net.wakeup_w) };
+    // Box dropped here (the reactor closed wakeup_r + frame_fd on exit).
 }
 
 /// Publish a host port (127.0.0.1:host_port) → guest_ip:guest_port. proto: 0=TCP, 1=UDP.
@@ -162,6 +192,7 @@ pub extern "C" fn velox_net_expose(
     let net = unsafe { &*h };
     if let Ok(mut q) = net.cmds.lock() {
         q.push(Cmd::Expose { proto, host_port, guest_port });
+        poke(net.wakeup_w);
         0
     } else {
         -1
@@ -177,6 +208,7 @@ pub extern "C" fn velox_net_unexpose(h: *mut VeloxNet, proto: c_int, host_port: 
     let net = unsafe { &*h };
     if let Ok(mut q) = net.cmds.lock() {
         q.push(Cmd::Unexpose { proto, host_port });
+        poke(net.wakeup_w);
         0
     } else {
         -1
