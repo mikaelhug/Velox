@@ -39,7 +39,7 @@ cid="$(docker create --platform linux/arm64 "$ROOTFS_TAG" /sbin/init)"
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 docker export "$cid" -o "$OUT/rootfs.tar"
 
-echo "==> mkfs.erofs (zstd) → $OUT/root.img"
+echo "==> mkfs.erofs (lz4hc) → $OUT/root.img"
 OUT_ABS="$(cd "$OUT" && pwd)"
 docker run --rm -i --platform linux/arm64 -v "$OUT_ABS":/out "${ALPINE_IMAGE}" sh -c '
     set -e

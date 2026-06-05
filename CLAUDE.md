@@ -33,16 +33,17 @@ root and no `/var/run` conflict (like Colima).
 ## 2. All version numbers live in ONE place: `versions.env`
 
 `versions.env` (repo root) is the single source of truth for **every** version:
-Velox's own version, the guest kernel ("OS version"), every LinuxKit package,
-the Docker Engine (dind) image, and the relay build toolchain. Nothing else may
-hard-code a version.
+Velox's own version, the guest kernel ("OS version"), the Docker Engine static
+release shipped in the guest, and the build-stage toolchain images (Rust/Alpine/Go).
+Nothing else may hard-code a version.
 
-- Swift reads versions via `Sources/Velox/Support/Versions.swift`, which is
+- Swift reads versions via `Sources/VeloxCore/Support/Versions.swift`, which is
   **generated** from `versions.env` by `Scripts/gen-versions.sh` (run by
   `Scripts/build.sh`). Never hand-edit `Versions.swift`.
-- The guest spec is **generated**: edit `guest/velox.yml.tmpl` (with `${VAR}`
-  placeholders); `Scripts/make-guest.sh` renders `guest/velox.yml` from it using
-  values in `versions.env`. Never hand-edit the generated `guest/velox.yml`.
+- The guest image is **built**, not templated: `Scripts/make-guest.sh` sources
+  `versions.env` and passes its values to `guest/rootfs/Dockerfile` as Docker
+  build-args (`DOCKER_VERSION`, `RUST_BUILD_IMAGE`, `ALPINE_IMAGE`). There is no
+  generated guest spec file (no `velox.yml`/`velox.yml.tmpl` — see §7).
 - Updating Velox to newer components = editing `versions.env` only.
 
 ## 3. Built-in updater pointing at GitHub releases
@@ -54,7 +55,7 @@ pull a newer build. It is backed by `velox update`:
   (repo set in `versions.env`) and reports whether a newer version exists.
 - `velox update --apply` downloads and installs the new release.
 - Any UI added later must wire its "Update" button to this same code path
-  (`Updater` in `Sources/Velox/Support/Updater.swift`) — do not fork the logic.
+  (`Updater` in `Sources/VeloxCore/Support/Updater.swift`) — do not fork the logic.
 
 ## 4. Custom kernel built from kernel.org source (for VirtioFS / Rosetta)
 
@@ -72,14 +73,16 @@ all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
   `Assets/velox-vmlinux` (and `~/.velox/kernel`).
 - The kernel version + SHA-256 are pinned in `versions.env`
   (`KERNEL_ORG_SERIES`/`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`). No LinuxKit.
-- `Scripts/make-guest.sh` builds **only the initrd/userspace** via LinuxKit; the
-  kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v` mounts and Rosetta
-  x86 depend on this kernel — don't switch to a stock kernel expecting them to work.
+- `Scripts/make-guest.sh` builds **only the erofs root userspace** (no LinuxKit,
+  no initramfs); the kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v`
+  mounts and Rosetta x86 depend on this kernel — don't switch to a stock kernel
+  expecting them to work.
 
 ## 5. dockerd uses the containerd image store ONLY
 
-dockerd runs with `--feature=containerd-snapshotter=true` (in `guest/velox.yml.tmpl`)
-— the containerd image store (overlayfs snapshotter) is the **only** store, no
+dockerd runs with `--feature=containerd-snapshotter=true` (set in vinit's dockerd
+launch, `guest/vinit/src/main.rs`) — the containerd image store (overlayfs
+snapshotter) is the **only** store, no
 classic `overlay2` graph driver. This gives Docker-Desktop parity: native
 multi-platform images, attestations/SBOM, and Wasm. Don't re-add `--storage-driver`.
 
@@ -89,6 +92,12 @@ Apple VZ exposes no RTC, so the guest would boot at 1970 and break registry TLS.
 `VMConfiguration.build()` stamps `velox.epoch=<unixtime>` on the kernel cmdline; the
 init step (with `CAP_SYS_TIME`) sets the VM clock from it before anything else.
 This is host-authoritative time injection (no NTP daemon) — keep it that way.
+
+The same channel also corrects drift: there is no RTC to advance while the Mac
+sleeps, so a resumed guest is behind by the sleep duration (enough to break TLS).
+The host (`ClockSync`) re-pushes the current epoch to the guest's clock VSOCK port
+(`VsockPort.clock`, 2377) at start, on `NSWorkspace.didWake`, and on a slow timer;
+vinit re-sets the clock only on large drift. Still host-authoritative, still no NTP.
 
 ## 7. NO LinuxKit, NO dind image — the guest is a minimal custom rootfs
 

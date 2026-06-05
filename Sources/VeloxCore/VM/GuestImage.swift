@@ -38,4 +38,19 @@ public struct GuestImage: Sendable {
         }
         return GuestImage(kernelURL: kernel, rootDiskURL: rootDisk, kernelCommandLine: cmdline)
     }
+
+    /// Return a copy whose command line advertises `shares` to the guest as
+    /// `velox.shares=<base64 of "tag\tpath\n"…>`, so vinit mounts each VirtioFS
+    /// tag at its host path. The host attaches the matching devices in
+    /// `VMConfiguration.build(extraShares:)`, which derives tags from the same
+    /// `shareAdvertisement`, so the two always agree. Both the CLI and the GUI
+    /// call this — keep the share-advertising logic here, not in either front end.
+    public func advertising(shares: [URL]) -> GuestImage {
+        let adverts = VMConfiguration.shareAdvertisement(for: shares)
+        guard !adverts.isEmpty else { return self }
+        let payload = adverts.map { "\($0.tag)\t\($0.path)" }.joined(separator: "\n")
+        let encoded = Data(payload.utf8).base64EncodedString()
+        return GuestImage(kernelURL: kernelURL, rootDiskURL: rootDiskURL,
+                          kernelCommandLine: kernelCommandLine + " velox.shares=\(encoded)")
+    }
 }

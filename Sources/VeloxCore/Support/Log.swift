@@ -24,7 +24,8 @@ public enum VeloxError: Error, CustomStringConvertible {
         switch self {
         case .guestArtifactMissing(let url):
             return "guest artifact not found: \(url.path)\n"
-                + "       build the guest image or set VELOX_KERNEL / VELOX_INITRD."
+                + "       build the guest image (./Scripts/make-guest.sh) or set "
+                + "VELOX_KERNEL / VELOX_ROOT."
         case .configurationInvalid(let message):
             return "invalid VM configuration: \(message)"
         case .vmNotRunning:

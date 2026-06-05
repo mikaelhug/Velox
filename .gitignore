@@ -12,10 +12,8 @@ DerivedData/
 # ---- Velox generated artifacts ----
 # Kernel Image built from source by Scripts/build-kernel.sh
 Assets/velox-vmlinux
-# LinuxKit guest build outputs (initrd)
+# Guest build outputs (erofs root.img + intermediate rootfs.tar), by make-guest.sh
 guest/build/
-# guest/velox.yml is rendered from guest/velox.yml.tmpl by make-guest.sh
-guest/velox.yml
 # VM disk images
 *.img
 *.raw
@@ -40,3 +38,5 @@ Icon?
 # ---- Velox.app bundle (built by Scripts/build-app.sh) ----
 /Velox.app/
 /guest/vinit/target/
+/host/velox-net/target/
+.vscode/launch.json

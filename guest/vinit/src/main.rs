@@ -25,6 +25,7 @@ const CID_ANY: u32 = 0xFFFF_FFFF;
 const DOCKER_PORT: u32 = 2375;
 const CONTROL_PORT: u32 = 2374;
 const REVERSE_PORT: u32 = 2376;
+const CLOCK_PORT: u32 = 2377;
 const DOCKER_SOCK: &str = "/run/docker.sock";
 
 fn main() {
@@ -42,11 +43,12 @@ fn main() {
         log!("network setup failed (continuing, no outbound until fixed): {e}");
     }
     setup_data_disk();
+    setup_swap();
     setup_virtiofs();
-    spawn_dockerd();
+    let dockerd_pid = spawn_dockerd();
     start_vsock_agent();
     log!("init complete — supervising");
-    reap_forever();
+    reap_forever(dockerd_pid);
 }
 
 // =================== filesystems ===================
@@ -167,6 +169,15 @@ fn sockaddr_in(ip: u32) -> libc::sockaddr_in {
 }
 
 fn setup_network() -> std::io::Result<()> {
+    // With the host userspace netstack (velox-net), the host advertises
+    // `velox.net=static`: there is no DHCP server, so configure eth0 statically
+    // (gateway 192.168.127.1, guest 192.168.127.2/24, DNS at the gateway). Without
+    // it, fall back to DHCP (the Apple-NAT path). This dual mode lets the netstack
+    // be brought up without breaking the default until it's the validated default.
+    if cmdline_value("velox.net").as_deref() == Some("static") {
+        return setup_network_static();
+    }
+
     // bring lo up + eth0 up, then DHCP, then apply lease.
     let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if s < 0 { return Err(std::io::Error::last_os_error()); }
@@ -196,6 +207,40 @@ fn setup_network() -> std::io::Result<()> {
     // DNS
     write_resolv_conf(&lease.dns);
     unsafe { libc::close(s); }
+
+    // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
+    // a long-running VM would eventually lose its address. Renew in the
+    // background at ~half the lease interval (best-effort).
+    let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
+    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs));
+    Ok(())
+}
+
+/// Static eth0 config for the velox-net host stack (no DHCP). Matches the gateway
+/// (192.168.127.1) and guest (192.168.127.2/24) the host's NetworkStack assigns.
+fn setup_network_static() -> std::io::Result<()> {
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if s < 0 { return Err(std::io::Error::last_os_error()); }
+    iface_up(s, "lo");
+    iface_up(s, IFNAME);
+
+    let ip: u32 = 0xC0A8_7F02; // 192.168.127.2
+    let mask: u32 = 0xFFFF_FF00; // /24
+    let gw: u32 = 0xC0A8_7F01; // 192.168.127.1
+
+    let mut ra = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(ip) };
+    if unsafe { libc::ioctl(s, SIOCSIFADDR as _, &mut ra) } != 0 {
+        log!("static set address failed: {}", std::io::Error::last_os_error());
+    }
+    let mut rm = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(mask) };
+    if unsafe { libc::ioctl(s, SIOCSIFNETMASK as _, &mut rm) } != 0 {
+        log!("static set netmask failed: {}", std::io::Error::last_os_error());
+    }
+    iface_up(s, IFNAME);
+    add_default_route(s, gw);
+    write_resolv_conf(&[gw]); // nameserver = the gateway's DNS responder
+    unsafe { libc::close(s); }
+    log!("network: static {}/24 gw {} (velox-net)", ipstr(ip), ipstr(gw));
     Ok(())
 }
 
@@ -264,15 +309,26 @@ mod dhcp {
     use dhcproto::{v4, Decodable, Decoder, Encodable, Encoder};
     use std::io::{Error, ErrorKind, Result};
 
-    pub struct Lease { pub ip: u32, pub mask: u32, pub router: u32, pub dns: Vec<u32> }
+    pub struct Lease {
+        pub ip: u32,
+        pub mask: u32,
+        pub router: u32,
+        pub dns: Vec<u32>,
+        /// DHCP server identifier (option 54), for renewal.
+        pub server: u32,
+        /// Lease time in seconds (option 51); 0 if the server didn't send one.
+        pub lease_secs: u32,
+    }
+
+    fn rand_xid() -> u32 {
+        let mut b = [0u8; 4];
+        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+        u32::from_ne_bytes(b)
+    }
 
     pub fn acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
         let sock = open_socket(ifname)?;
-        let xid: u32 = {
-            let mut b = [0u8; 4];
-            let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
-            u32::from_ne_bytes(b)
-        };
+        let xid = rand_xid();
         // DISCOVER
         let discover = build(&mac, xid, v4::MessageType::Discover, None, None);
         send(sock, &discover)?;
@@ -289,7 +345,37 @@ mod dhcp {
             mask: opt_addr(&ack, v4::OptionCode::SubnetMask).unwrap_or(0),
             router: opt_addr(&ack, v4::OptionCode::Router).unwrap_or(0),
             dns: opt_addrs(&ack, v4::OptionCode::DomainNameServer),
+            server: opt_addr(&ack, v4::OptionCode::ServerIdentifier).or(server).unwrap_or(0),
+            lease_secs: opt_u32(&ack, v4::OptionCode::AddressLeaseTime).unwrap_or(0),
         })
+    }
+
+    /// Renew the current lease in place (INIT-REBOOT style: broadcast REQUEST for
+    /// the IP we already hold). Returns Ok once the server ACKs. Best-effort.
+    pub fn renew(ifname: &str, mac: [u8; 6], ip: u32, server: u32) -> Result<()> {
+        let sock = open_socket(ifname)?;
+        let xid = rand_xid();
+        let req_ip = std::net::Ipv4Addr::from(ip);
+        let server_opt = if server != 0 { Some(server) } else { None };
+        let request = build(&mac, xid, v4::MessageType::Request, Some(req_ip), server_opt);
+        send(sock, &request)?;
+        let res = recv(sock, xid).map(|_| ())
+            .ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack on renew"));
+        unsafe { libc::close(sock); }
+        res
+    }
+
+    /// Background renewal loop: re-request the lease at ~half its lifetime (or
+    /// every 30 min if the server gave no lease time). Runs for the life of the VM.
+    pub fn renew_loop(ifname: &'static str, mac: [u8; 6], ip: u32, server: u32, lease_secs: u32) {
+        let interval = if lease_secs >= 120 { (lease_secs / 2) as u64 } else { 1800 };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+            match renew(ifname, mac, ip, server) {
+                Ok(()) => log!("DHCP lease renewed ({})", super::ipstr(ip)),
+                Err(e) => log!("DHCP renew failed: {e} (retrying next cycle)"),
+            }
+        }
     }
 
     fn build(mac: &[u8; 6], xid: u32, mt: v4::MessageType, req_ip: Option<std::net::Ipv4Addr>, server: Option<u32>) -> Vec<u8> {
@@ -320,6 +406,12 @@ mod dhcp {
         match m.opts().get(code) {
             Some(v4::DhcpOption::DomainNameServer(v)) => v.iter().map(|x| (*x).into()).collect(),
             _ => Vec::new(),
+        }
+    }
+    fn opt_u32(m: &v4::Message, code: v4::OptionCode) -> Option<u32> {
+        match m.opts().get(code) {
+            Some(v4::DhcpOption::AddressLeaseTime(s)) => Some(*s),
+            _ => None,
         }
     }
 
@@ -397,6 +489,71 @@ fn is_ext4(dev: &str) -> bool {
     let mut magic = [0u8; 2];
     if f.read_exact(&mut magic).is_err() { return false; }
     magic == [0x53, 0xEF] // EXT4 superblock magic 0xEF53 (LE)
+}
+
+// =================== swap ===================
+
+/// If the host requested swap (`velox.swap=<MiB>` on the cmdline), create a
+/// swapfile on the persistent data disk and enable it. No mkswap binary in the
+/// image — we write the swap v1 header ourselves and `swapon(2)` directly.
+fn setup_swap() {
+    let Some(mib) = cmdline_value("velox.swap").and_then(|v| v.parse::<u64>().ok()) else { return };
+    if mib == 0 { return; }
+    // Swap only makes sense on the persistent ext4 data disk; if it isn't mounted
+    // (no /dev/vdb), /var/lib/docker is tmpfs and swapping there is pointless.
+    if !std::path::Path::new("/dev/vdb").exists() {
+        log!("velox.swap set but no data disk — skipping swap");
+        return;
+    }
+    let path = "/var/lib/docker/.velox-swapfile";
+    match make_swapfile(path, mib * 1024 * 1024) {
+        Ok(()) => {
+            let cpath = CString::new(path).unwrap();
+            if unsafe { libc::swapon(cpath.as_ptr(), 0) } == 0 {
+                log!("swap enabled: {mib} MiB at {path}");
+            } else {
+                log!("swapon failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        Err(e) => log!("swapfile setup failed: {e}"),
+    }
+}
+
+/// Build a valid Linux v1 swapfile of (at least) `bytes`, allocated with no holes
+/// (swapon rejects sparse files) and stamped with the swap header + magic.
+fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as u64,
+        _ => 4096,
+    };
+    let pages = bytes / page;
+    if pages < 10 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "swap size too small"));
+    }
+    let size = pages * page;
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true).open(path)?;
+    // Swap must not be world/group readable.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Allocate real blocks — a sparse (ftruncate'd) file fails swapon with "has holes".
+    if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // swap_header (union, one page): info.version @1024, info.last_page @1028,
+    // info.nr_badpages @1032; magic "SWAPSPACE2" at the END of the first page.
+    f.seek(SeekFrom::Start(1024))?;
+    f.write_all(&1u32.to_ne_bytes())?;                 // version = 1
+    f.write_all(&((pages - 1) as u32).to_ne_bytes())?; // last_page
+    f.write_all(&0u32.to_ne_bytes())?;                 // nr_badpages = 0
+    f.seek(SeekFrom::Start(page - 10))?;
+    f.write_all(b"SWAPSPACE2")?;
+    f.flush()?;
+    Ok(())
 }
 
 // =================== VirtioFS + Rosetta ===================
@@ -482,7 +639,10 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 // =================== dockerd ===================
 
-fn spawn_dockerd() {
+/// Launch dockerd once and return its PID (or -1 if the spawn itself failed).
+/// The reaper (`reap_forever`) watches this PID and relaunches the daemon if it
+/// ever exits, so a dockerd crash never leaves the engine permanently dead.
+fn spawn_dockerd() -> i32 {
     // dockerd discovers containerd/runc/iptables on PATH and manages its own
     // containerd. Unix socket (not TCP) — the vsock agent bridges to it directly.
     let child = Command::new("/bin/dockerd")
@@ -494,11 +654,14 @@ fn spawn_dockerd() {
             // inherited to the console, so issues are visible here.
         ])
         .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin")
-        .env("DOCKER_RAMDISK", "1") // hint: rootfs is non-persistent (read-only erofs)
+        // NOTE: we deliberately do NOT set DOCKER_RAMDISK. The root is a real
+        // erofs block device (/dev/vda), not an initramfs, so runc can pivot_root
+        // normally — DOCKER_RAMDISK would force the weaker no-pivot_root path for
+        // every container with no benefit here.
         .spawn();
     match child {
-        Ok(c) => log!("dockerd started (pid {})", c.id()),
-        Err(e) => log!("FAILED to start dockerd: {e}"),
+        Ok(c) => { let pid = c.id() as i32; log!("dockerd started (pid {pid})"); pid }
+        Err(e) => { log!("FAILED to start dockerd: {e}"); -1 }
     }
 }
 
@@ -507,6 +670,7 @@ fn spawn_dockerd() {
 fn start_vsock_agent() {
     spawn_listener(CONTROL_PORT, handle_control);
     spawn_listener(REVERSE_PORT, handle_reverse);
+    spawn_listener(CLOCK_PORT, handle_clock);
     spawn_listener(DOCKER_PORT, handle_data);
 }
 
@@ -543,6 +707,35 @@ fn handle_control(fd: RawFd) {
     unsafe { libc::sync(); }
     let _ = nix_write(fd, b"OK\n");
     unsafe { libc::close(fd); }
+}
+
+/// Clock re-sync: the host writes "<unix-epoch>\n" (at start and whenever the Mac
+/// wakes). Apple VZ has no RTC, so a slept-then-resumed guest is behind by the
+/// sleep duration — enough to break TLS. Re-set the clock only on large drift to
+/// avoid needless jitter. Host-authoritative, no NTP daemon (see CLAUDE.md §6).
+fn handle_clock(fd: RawFd) {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut _, 1) };
+        if n <= 0 { unsafe { libc::close(fd); } return; }
+        if b[0] == b'\n' { break; }
+        line.push(b[0]);
+        if line.len() > 32 { break; }
+    }
+    unsafe { libc::close(fd); }
+    let Ok(epoch) = String::from_utf8_lossy(&line).trim().parse::<i64>() else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if (epoch - now).abs() <= 2 { return; } // already aligned
+    let tv = libc::timeval { tv_sec: epoch as libc::time_t, tv_usec: 0 };
+    if unsafe { libc::settimeofday(&tv, std::ptr::null()) } == 0 {
+        log!("clock re-synced from host: {now} -> {epoch}");
+    } else {
+        log!("clock re-sync failed: {}", std::io::Error::last_os_error());
+    }
 }
 
 fn handle_data(fd: RawFd) {
@@ -604,7 +797,7 @@ fn nix_write(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 
 // =================== PID1 reaper ===================
 
-fn reap_forever() -> ! {
+fn reap_forever(mut dockerd_pid: i32) -> ! {
     loop {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
@@ -613,6 +806,22 @@ fn reap_forever() -> ! {
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
         }
-        log!("reaped child pid {pid} (status {status:#x})");
+        if pid == dockerd_pid {
+            // The engine itself died (crash, OOM, fatal config error). Relaunch
+            // it — a single dockerd exit must never leave Velox dead. Back off
+            // first so a daemon that crashes on startup doesn't spin the CPU,
+            // and retry the spawn until we have a live PID to watch again.
+            log!("dockerd exited (status {status:#x}) — restarting");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            loop {
+                dockerd_pid = spawn_dockerd();
+                if dockerd_pid >= 0 { break; }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        } else {
+            // An orphaned grandchild (container process, containerd-shim, etc.)
+            // reparented to PID 1 — just reap it.
+            log!("reaped child pid {pid} (status {status:#x})");
+        }
     }
 }

@@ -81,11 +81,10 @@ CONFIG_VIRTIO_FS=y
 # --- Rosetta x86-64: runs IN-GUEST via binfmt_misc + the rosetta virtiofs share ---
 CONFIG_BINFMT_MISC=y
 
-# --- Boot a LinuxKit initrd (~/.velox/initrd.img is a gzip cpio) ---
-CONFIG_BLK_DEV_INITRD=y
-CONFIG_RD_GZIP=y
-CONFIG_RD_XZ=y
-CONFIG_RD_ZSTD=y
+# NOTE: there is deliberately NO initramfs support here. Velox boots the erofs
+# root directly off /dev/vda (root=/dev/vda rootfstype=erofs, init=/sbin/vinit),
+# so CONFIG_BLK_DEV_INITRD and the RD_* decompressors are intentionally omitted —
+# every byte the kernel doesn't carry is a byte of boot time and RAM saved.
 
 # --- Console usable by VZ (console=hvc0 → virtio-console) + printk ---
 CONFIG_TTY=y
@@ -102,6 +101,11 @@ CONFIG_MISC_FILESYSTEMS=y
 CONFIG_EROFS_FS=y
 CONFIG_EROFS_FS_ZIP=y
 CONFIG_EROFS_FS_ZIP_ZSTD=y
+
+# --- Swap: a disk-backed swapfile on the data disk (Resources › Swap setting) ---
+# vinit creates a swapfile under /var/lib/docker and swapon()s it when the host
+# requests swap via velox.swap=<MiB>. tinyconfig leaves SWAP off, so gate it on.
+CONFIG_SWAP=y
 
 # --- Filesystems: ext4 data disk, overlayfs (containerd snapshotter), pseudo-FS ---
 CONFIG_EXT4_FS=y

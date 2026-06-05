@@ -13,7 +13,8 @@ Targets **Apple Silicon (arm64)** first.
 
 - macOS 15+ on Apple Silicon
 - Swift 6 toolchain (Command Line Tools are sufficient — no full Xcode needed)
-- (Guest build, later phases) `linuxkit` + a container runtime to drive the build
+- Docker (any engine) to build the guest — the kernel and erofs rootfs are built
+  inside `linux/arm64` containers. No `linuxkit`, no Go, no cross-toolchain.
 
 ## Build & run
 
@@ -52,16 +53,19 @@ Build the custom kernel (once — from kernel.org source), then the guest usersp
 
 ```bash
 ./Scripts/build-kernel.sh   # one-time: compiles Assets/velox-vmlinux from source (long)
-./Scripts/make-guest.sh     # builds initrd, installs kernel+initrd to ~/.velox
+./Scripts/make-guest.sh     # builds the erofs root.img, installs kernel+root.img to ~/.velox
 ./Scripts/run.sh start      # boots the guest; serial console on this terminal
 ```
 
 `build-kernel.sh` needs Docker (it compiles a bare arm64 kernel natively inside a
 `linux/arm64` container on a named volume — never on APFS — and emits the raw
-uncompressed `Image` that `VZLinuxBootLoader` requires). `make-guest.sh` needs
-`linuxkit` + a container engine and assembles only the initrd. The kernel is
-monolithic with `CONFIG_VIRTIO_FS`, `CONFIG_VIRTIO_VSOCKETS`, `BINFMT_MISC` and
-all container prereqs built-in (needed for `-v` mounts and Rosetta) — config in
+uncompressed `Image` that `VZLinuxBootLoader` requires). `make-guest.sh` builds a
+single read-only **erofs** root image (`root.img`) from `guest/rootfs/Dockerfile`
+— the static Rust `vinit`, Docker's static server binaries, and a tiny musl
+userland — no LinuxKit, no initramfs. The kernel boots it directly
+(`root=/dev/vda rootfstype=erofs`). The kernel is monolithic with
+`CONFIG_VIRTIO_FS`, `CONFIG_VIRTIO_VSOCKETS`, `BINFMT_MISC` and all container
+prereqs built-in (needed for `-v` mounts and Rosetta) — config in
 `guest/kernel/velox.fragment`, version pinned in `versions.env`.
 
 ## Status

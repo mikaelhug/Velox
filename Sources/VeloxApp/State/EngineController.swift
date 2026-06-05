@@ -38,6 +38,11 @@ final class EngineController {
     private let manager = VMManager()
     private var bridge: VsockBridge?
     private var proxy: DockerSocketProxy?
+    private var clockSync: ClockSync?
+    private var resourceSaver: ResourceSaver?
+    /// Memory the running VM actually booted with — Resource Saver restores to
+    /// this, not to an edited-but-unapplied value in `config`.
+    private var bootedMemoryBytes: UInt64 = 0
 
     /// The Docker API client, valid only while the engine is running. Dashboards
     /// read this; it rides an in-process VSOCK connection to the guest (Phase 2).
@@ -93,7 +98,9 @@ final class EngineController {
             let shareURLs = config.shareURLs
             try Paths.ensureRoot()
             try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: resources.diskGiB)
-            let image = Self.guestImageAdvertisingShares(shareURLs)
+            let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
+                ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
+                              kernelCommandLine: GuestImage.defaultCommandLine)
             let vmConfig = try VMConfiguration.build(
                 image: image,
                 dataDisk: Paths.dataDisk,
@@ -124,6 +131,14 @@ final class EngineController {
             let docker = DockerClient(manager: manager)
             self.docker = docker
             appliedSignature = config.bootSignature
+            bootedMemoryBytes = resources.memoryBytes
+
+            // Keep the guest clock aligned with the host (survives Mac sleep), and
+            // arm Resource Saver to reclaim RAM while idle.
+            let clockSync = ClockSync(manager: manager)
+            clockSync.start()
+            self.clockSync = clockSync
+            startResourceSaver()
             // The VM has booted, but dockerd needs a few more seconds inside the
             // guest. Stay in `.starting` until it actually answers, so the
             // dashboards' first load succeeds (no transient "Connection reset by
@@ -175,6 +190,37 @@ final class EngineController {
         proxy = nil
         bridge = nil
         docker = nil
+        clockSync?.stop()
+        clockSync = nil
+        resourceSaver?.stop()
+        resourceSaver = nil
+    }
+
+    /// (Re)arm Resource Saver from the current config. Called on start and again
+    /// whenever the user toggles it or changes the idle timer in Settings, so the
+    /// change takes effect without an engine restart.
+    private func startResourceSaver() {
+        resourceSaver?.stop()
+        resourceSaver = nil
+        guard config.resourceSaverEnabled, bootedMemoryBytes > 0 else { return }
+        // Floor at ¼ of the booted RAM, clamped to [512 MiB, 1 GiB], so dockerd
+        // stays responsive enough to notice the next container start.
+        let floor = min(max(bootedMemoryBytes / 4, 512 * 1024 * 1024), 1024 * 1024 * 1024)
+        let saver = ResourceSaver(
+            manager: manager,
+            socketPath: Paths.dockerSocket.path,
+            fullMemoryBytes: bootedMemoryBytes,
+            floorBytes: floor,
+            idleMinutes: config.resourceSaverMinutes)
+        saver.start()
+        resourceSaver = saver
+    }
+
+    /// Persist preferences and apply the live-tunable ones (Resource Saver) to a
+    /// running engine. Settings calls this on change.
+    func applyRuntimeConfig() {
+        saveConfig()
+        if state.isRunning { startResourceSaver() }
     }
 
     /// Ensure the `velox` Docker context exists (so `docker --context velox` and a
@@ -223,21 +269,5 @@ final class EngineController {
             try? await Task.sleep(for: .milliseconds(250))
         }
         Log.warn("dockerd did not respond within 30s — continuing")
-    }
-
-    /// Resolve the guest image and append `velox.shares=<base64>` to the kernel
-    /// command line so the guest's on-boot mounter knows which VirtioFS tags to
-    /// mount where (the host attaches the matching devices in `VMConfiguration`).
-    private static func guestImageAdvertisingShares(_ shares: [URL]) -> GuestImage {
-        // `resolve()` succeeds whenever onboarding passed; fall back defensively.
-        let base = (try? GuestImage.resolve())
-            ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
-                          kernelCommandLine: GuestImage.defaultCommandLine)
-        let adverts = VMConfiguration.shareAdvertisement(for: shares)
-        guard !adverts.isEmpty else { return base }
-        let payload = adverts.map { "\($0.tag)\t\($0.path)" }.joined(separator: "\n")
-        let encoded = Data(payload.utf8).base64EncodedString()
-        return GuestImage(kernelURL: base.kernelURL, rootDiskURL: base.rootDiskURL,
-                          kernelCommandLine: base.kernelCommandLine + " velox.shares=\(encoded)")
     }
 }

@@ -35,4 +35,6 @@ public enum VsockPort {
     public static let control: UInt32 = 2374
     /// Reverse port-forward: host sends "<port>\n", guest dials 127.0.0.1:<port>.
     public static let reverse: UInt32 = 2376
+    /// Clock sync: host sends "<unix-epoch>\n", guest re-sets its clock on drift.
+    public static let clock: UInt32 = 2377
 }

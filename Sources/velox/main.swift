@@ -68,12 +68,30 @@ func runStatus() {
 
 func runStart(bind: BindMode) -> Never {
     do {
+        // The CLI honors the same ~/.velox/config.json the GUI writes, so
+        // resources, swap, and file shares are consistent across both front ends.
+        let prefs = VeloxConfig.load()
         try Paths.ensureRoot()
-        try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: 16)
-        let image = try GuestImage.resolve()
-        let config = try VMConfiguration.build(image: image, dataDisk: Paths.dataDisk)
+        try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: prefs.resources.diskGiB)
+
+        // Opt-in to the in-process userspace netstack (Workstream A bring-up). When
+        // off, the guest uses Apple NAT + DHCP (the validated default). When on, the
+        // guest is told `velox.net=static` and its NIC is backed by velox-net.
+        let useNetstack = ProcessInfo.processInfo.environment["VELOX_NET"] == "1"
+        let netStack: NetworkStack? = useNetstack ? try NetworkStack() : nil
+
+        let baseImage = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
+        let image = useNetstack
+            ? GuestImage(kernelURL: baseImage.kernelURL, rootDiskURL: baseImage.rootDiskURL,
+                         kernelCommandLine: baseImage.kernelCommandLine + " velox.net=static")
+            : baseImage
+        let config = try VMConfiguration.build(
+            image: image, dataDisk: Paths.dataDisk,
+            resources: prefs.resources, extraShares: prefs.shareURLs,
+            networkAttachment: netStack?.attachment)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
                  + "root=\(image.rootDiskURL.lastPathComponent) "
+                 + "net=\(useNetstack ? "velox-net" : "apple-nat") "
                  + "cmdline=\"\(image.kernelCommandLine)\"")
 
         let manager = VMManager()
@@ -86,11 +104,21 @@ func runStart(bind: BindMode) -> Never {
         let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
             forwarder.reconcile(ports)
         }
+        let clockSync = ClockSync(manager: manager)
+        let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
+            ? ResourceSaver(manager: manager, socketPath: Paths.dockerSocket.path,
+                            fullMemoryBytes: prefs.resources.memoryBytes,
+                            floorBytes: prefs.resourceSaverFloorBytes,
+                            idleMinutes: prefs.resourceSaverMinutes)
+            : nil
         let teardown = Teardown()
         manager.onStop { error in
             teardown.run()
             watcher.stop()
             forwarder.stopAll()
+            clockSync.stop()
+            resourceSaver?.stop()
+            netStack?.stop()
             proxy.stop()
             exit(error == nil ? 0 : 1)
         }
@@ -106,6 +134,9 @@ func runStart(bind: BindMode) -> Never {
                 teardown.run()
                 watcher.stop()
                 forwarder.stopAll()
+                clockSync.stop()
+                resourceSaver?.stop()
+                netStack?.stop()
                 proxy.stop()
                 manager.stopGracefully { exit(0) }
             }
@@ -121,6 +152,8 @@ func runStart(bind: BindMode) -> Never {
                     try proxy.start()
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
                     watcher.start() // dynamic -p port forwarding
+                    clockSync.start() // keep guest clock aligned across host sleep
+                    resourceSaver?.start() // reclaim RAM while idle
                 } catch {
                     Log.error("docker socket proxy failed to start: \(error)")
                 }

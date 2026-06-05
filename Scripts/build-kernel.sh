@@ -6,7 +6,8 @@
 # via VZLinuxBootLoader (it cannot run an EFI-zboot self-decompression stub). So we
 # compile our own minimal kernel: everything the VM actually uses built-in (=y),
 # nothing else. The result lands at Assets/velox-vmlinux and ~/.velox/kernel; the
-# Swift host loads it with `console=hvc0` and a LinuxKit-built initrd.
+# Swift host loads it with `console=hvc0` and boots the erofs root directly off
+# /dev/vda — no initramfs.
 #
 # The kernel source tree is NEVER written to the Mac filesystem: APFS is
 # case-insensitive (netfilter headers collide by case) and bind-mounting millions
@@ -53,7 +54,7 @@ REQUIRED_SYMBOLS=(
     VSOCKETS VIRTIO_VSOCKETS
     FUSE_FS VIRTIO_FS BINFMT_MISC
     FILE_LOCKING FHANDLE INOTIFY_USER
-    EROFS_FS EROFS_FS_ZIP EXT4_FS EXT4_FS_SECURITY OVERLAY_FS TMPFS TMPFS_XATTR DEVTMPFS DEVTMPFS_MOUNT BINFMT_ELF
+    EROFS_FS EROFS_FS_ZIP EXT4_FS EXT4_FS_SECURITY OVERLAY_FS TMPFS TMPFS_XATTR DEVTMPFS DEVTMPFS_MOUNT BINFMT_ELF SWAP
     NET INET BRIDGE VETH BRIDGE_NETFILTER
     NETFILTER NF_CONNTRACK NF_NAT NF_TABLES NFT_NAT NFT_MASQ NFT_COMPAT
     NAMESPACES NET_NS PID_NS IPC_NS UTS_NS USER_NS

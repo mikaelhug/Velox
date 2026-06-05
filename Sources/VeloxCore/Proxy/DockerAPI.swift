@@ -23,6 +23,17 @@ enum DockerAPI {
         return ports
     }
 
+    /// Number of currently running containers, or nil if the daemon isn't
+    /// reachable. `/containers/json` (without `all`) lists only running ones, so
+    /// the array length is the count. Used by Resource Saver to decide when the
+    /// engine is idle.
+    static func runningContainerCount(socketPath: String) -> Int? {
+        guard let body = httpGetBody(socketPath: socketPath, path: "/v1.47/containers/json"),
+              let json = try? JSONSerialization.jsonObject(with: body) as? [[String: Any]]
+        else { return nil }
+        return json.count
+    }
+
     /// GET over the unix socket; returns the (de-chunked) response body.
     private static func httpGetBody(socketPath: String, path: String) -> Data? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

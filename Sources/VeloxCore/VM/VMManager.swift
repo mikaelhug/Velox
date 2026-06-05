@@ -68,9 +68,41 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
         }
     }
 
+    /// Push the host's current wall-clock to the guest so it can correct drift.
+    /// Apple VZ gives the guest no RTC, so after the Mac sleeps the guest clock
+    /// lags by the sleep duration — enough to fail registry TLS. The host calls
+    /// this at start and on wake; the guest re-sets its clock if the drift is
+    /// large. Best-effort and fire-and-forget.
+    public func syncClock() {
+        let epoch = Int(Date().timeIntervalSince1970)
+        connectToGuestPort(VsockPort.clock) { result in
+            guard case .success(let fd) = result else { return }
+            DispatchQueue.global().async {
+                _ = Array("\(epoch)\n".utf8).withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+                close(fd)
+            }
+        }
+    }
+
+    /// Adjust the guest's effective memory ceiling at runtime via the virtio
+    /// memory balloon. Setting `bytes` below the configured `memorySize` inflates
+    /// the balloon, so the guest returns that many pages to the host (host RSS
+    /// drops); setting it back to the full size deflates it and returns the RAM.
+    /// Resource Saver uses this to shrink Velox's footprint while idle. No-op if
+    /// the VM isn't running or has no traditional balloon device. Runs on the VM
+    /// queue, as all Virtualization.framework access must.
+    public func setMemoryTarget(_ bytes: UInt64) {
+        queue.async {
+            guard let balloon = self.vm?.memoryBalloonDevices.first
+                    as? VZVirtioTraditionalMemoryBalloonDevice else { return }
+            balloon.targetVirtualMachineMemorySize = bytes
+        }
+    }
+
     /// Flush the guest's filesystems (via the relay's control port) so the data
-    /// disk is durable, then stop the VM. ACPI-based graceful shutdown isn't
-    /// reliable under LinuxKit, so we sync explicitly and then power off.
+    /// disk is durable, then stop the VM. The guest has no ACPI shutdown path
+    /// (vinit is a bare PID 1, not an init system), so we sync explicitly over
+    /// the VSOCK control port and then power off.
     public func stopGracefully(completion: @escaping @Sendable () -> Void) {
         Log.info("flushing guest filesystems before stop…")
         connectToGuestPort(VsockPort.control) { result in

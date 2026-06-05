@@ -12,11 +12,16 @@ public enum VMConfiguration {
         public var memoryBytes: UInt64
         /// Size of the persistent data disk backing /var/lib/docker.
         public var diskGiB: UInt64
+        /// Guest swap file size in MiB (0 = no swap). vinit creates a swapfile of
+        /// this size on the data disk and `swapon`s it; advertised via the kernel
+        /// cmdline as `velox.swap=<MiB>`.
+        public var swapMiB: UInt64
 
-        public init(cpuCount: Int, memoryBytes: UInt64, diskGiB: UInt64 = 16) {
+        public init(cpuCount: Int, memoryBytes: UInt64, diskGiB: UInt64 = 16, swapMiB: UInt64 = 1024) {
             self.cpuCount = cpuCount
             self.memoryBytes = memoryBytes
             self.diskGiB = diskGiB
+            self.swapMiB = swapMiB
         }
 
         /// Sensible defaults, clamped to the framework's allowed range.
@@ -24,7 +29,8 @@ public enum VMConfiguration {
             Resources(
                 cpuCount: max(1, min(4, ProcessInfo.processInfo.activeProcessorCount)),
                 memoryBytes: 4 * 1024 * 1024 * 1024, // 4 GiB (headroom for vfs-on-tmpfs)
-                diskGiB: 16
+                diskGiB: 16,
+                swapMiB: 1024
             )
         }
     }
@@ -34,10 +40,14 @@ public enum VMConfiguration {
     /// `extraShares` lists additional host directories to expose to the guest
     /// over VirtioFS (the File Sharing setting). The host `/Users` share is
     /// always present so `docker run -v /Users/…` keeps working.
+    /// `networkAttachment`, when provided, backs the guest's NIC — this is how the
+    /// in-process userspace netstack (`NetworkStack.attachment`) is installed. When
+    /// nil, falls back to Apple's built-in NAT (the pre-netstack default).
     public static func build(image: GuestImage,
                              dataDisk: URL? = nil,
                              resources: Resources = .default,
-                             extraShares: [URL] = [])
+                             extraShares: [URL] = [],
+                             networkAttachment: VZNetworkDeviceAttachment? = nil)
         throws -> VZVirtualMachineConfiguration
     {
         let config = VZVirtualMachineConfiguration()
@@ -53,6 +63,7 @@ public enum VMConfiguration {
         // 1970 and every registry TLS handshake fails).
         bootLoader.commandLine = image.kernelCommandLine
             + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
+            + (resources.swapMiB > 0 ? " velox.swap=\(resources.swapMiB)" : "")
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
         config.bootLoader = bootLoader
 
@@ -64,9 +75,10 @@ public enum VMConfiguration {
         // virtio socket device is allowed per VM.
         config.socketDevices = [VZVirtioSocketDeviceConfiguration()]
 
-        // NAT networking for outbound internet (image pulls).
+        // Container data network: the in-process userspace netstack when provided
+        // (file-handle attachment), else Apple's built-in NAT as a fallback.
         let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = VZNATNetworkDeviceAttachment()
+        network.attachment = networkAttachment ?? VZNATNetworkDeviceAttachment()
         config.networkDevices = [network]
 
         // Block devices, in order: /dev/vda = the read-only erofs root (the OS),
@@ -97,7 +109,8 @@ public enum VMConfiguration {
 
         // User-configured extra shares (File Sharing setting). Each host dir is
         // exposed under its own VirtioFS tag; the guest mounts each tag at its
-        // host path (advertised via the kernel cmdline — see velox.yml).
+        // host path (the tag→path map is advertised on the kernel cmdline as
+        // `velox.shares=<base64>` — assembled in EngineController, read by vinit).
         for advert in shareAdvertisement(for: extraShares) {
             let url = URL(fileURLWithPath: advert.path, isDirectory: true)
             let share = VZSingleDirectoryShare(

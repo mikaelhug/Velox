@@ -172,6 +172,57 @@ equal(adverts.count, 1, "shareAdvertisement skips /Users and missing dirs")
 equal(adverts.first?.path ?? "", "/tmp", "shareAdvertisement keeps existing dir")
 check(adverts.first?.tag.hasPrefix("vlx") ?? false, "share tag prefixed vlx")
 
+// MARK: Resources (swap + resource saver)
+
+section("Resources")
+do {
+    var cfg = VeloxConfig.default
+    cfg.swapGiB = 2
+    cfg.resourceSaverEnabled = false
+    cfg.resourceSaverMinutes = 12
+    let round = try JSONDecoder().decode(VeloxConfig.self, from: JSONEncoder().encode(cfg))
+    equal(round.swapGiB, 2, "swap round-trips")
+    equal(round.resources.swapMiB, 2048, "swapGiB → swapMiB")
+    equal(round.resourceSaverEnabled, false, "resource saver toggle round-trips")
+    equal(round.resourceSaverMinutes, 12, "resource saver minutes round-trip")
+
+    // swap=0 means no swap advertised.
+    var noSwap = VeloxConfig.default; noSwap.swapGiB = 0
+    equal(noSwap.resources.swapMiB, 0, "swap off → 0 MiB")
+
+    // Resource Saver floor: ¼ of RAM clamped to [512 MiB, 1 GiB].
+    var big = VeloxConfig.default; big.memoryGiB = 16
+    equal(big.resourceSaverFloorBytes, 1024 * 1024 * 1024, "floor clamped to 1 GiB ceiling")
+    var small = VeloxConfig.default; small.memoryGiB = 1
+    equal(small.resourceSaverFloorBytes, 512 * 1024 * 1024, "floor clamped to 512 MiB minimum")
+    var mid = VeloxConfig.default; mid.memoryGiB = 3
+    equal(mid.resourceSaverFloorBytes, 768 * 1024 * 1024, "floor is ¼ of RAM in the band")
+} catch {
+    failures += 1
+    print("FAIL  Resources threw: \(error)")
+}
+
+// MARK: GuestImage share advertising
+
+section("GuestImage.advertising")
+do {
+    let base = GuestImage(kernelURL: URL(fileURLWithPath: "/k"),
+                          rootDiskURL: URL(fileURLWithPath: "/r"),
+                          kernelCommandLine: "console=hvc0")
+    equal(base.advertising(shares: []).kernelCommandLine, "console=hvc0",
+          "no shares → cmdline unchanged")
+    let adv = base.advertising(shares: [URL(fileURLWithPath: "/tmp")])
+    check(adv.kernelCommandLine.contains(" velox.shares="), "shares → velox.shares on cmdline")
+    if let b64 = adv.kernelCommandLine.split(separator: " ")
+        .first(where: { $0.hasPrefix("velox.shares=") })?.dropFirst("velox.shares=".count),
+       let decoded = Data(base64Encoded: String(b64)),
+       let text = String(data: decoded, encoding: .utf8) {
+        check(text.hasSuffix("\t/tmp"), "advertised payload maps tag → /tmp")
+    } else {
+        failures += 1; print("FAIL  could not decode velox.shares payload")
+    }
+}
+
 // MARK: Summary
 
 print("\n----------------------------------------")
