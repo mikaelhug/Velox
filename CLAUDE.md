@@ -169,6 +169,30 @@ The binding architecture:
   `guest/velox.yml`. (Buildkit gotcha: a `RUN` immediately after `COPY …/sbin/init`
   gets exec'd as that binary — keep binary COPYs last and `init=` at `/sbin/vinit`.)
 
+## 8. Event-driven, never polling
+
+Where a push/notification exists, **use it — never poll for state.** Polling is
+slower (you wait out the interval) and, here, actively harmful: each poll opens a
+fresh API connection, and under the VSOCK contention of a `docker run` those
+connections stall and serialize on the VM queue.
+
+- The published-port watcher (`DockerEventsWatcher`) and Resource Saver
+  (`ResourceSaver`) ride the Docker **`/events` stream** via the in-process
+  `DockerClient` (one persistent VSOCK connection over `HTTPCodec`, straight to
+  dockerd — *not* the unix-socket proxy), reconciling the instant a container
+  changes. Result: a published port is reachable in ~0.4s vs 2–28s when polled.
+- The **informer rule:** the event is only the *trigger*; a full reconcile (the
+  `containers()` list) is the source of truth, re-run on every (re)connect — so a
+  missed event or a daemon restart self-heals. Never trust event deltas alone.
+- Clock sync pushes on `NSWorkspace.didWake`. The **only** timers that remain are
+  genuine *delays / corrections with no event source* — DHCP lease renewal, periodic
+  `fstrim`, the Resource-Saver idle countdown, clock drift re-push — never a status
+  poll. If you find yourself adding a repeating timer to *check* something, find the
+  event instead.
+- Do NOT hand-roll raw-socket HTTP against the docker socket for streaming; use
+  `DockerClient` (it handles persistent streams + cancellation correctly). A
+  raw-socket `/events` reader through the proxy churns connections and breaks it.
+
 ## Build / run quick reference
 
 ```bash

@@ -111,9 +111,10 @@ least on par otherwise**. The numbers below were measured on Apple Silicon, Velo
 Docker Desktop (Docker Engine 29.x both sides), 2026-06. They vary by host; each
 table has a one-line reproduction. Velox figures are CLI mode (`velox start`).
 
-**Scorecard:** Velox **wins** on network, cold-start, and RAM; is **on par** on
-disk reclaim, VirtioFS, and x86 emulation; and currently **trails** on per-container
-launch latency (see the last table — an open item).
+**Scorecard:** Velox **wins** on network, cold-start, RAM, and `docker cp`; is **on
+par** on disk reclaim, VirtioFS, x86 emulation, and published-port reachability; and
+currently **trails** only on bare per-container launch latency (see the last table —
+an open item).
 
 ### Network throughput — **win** (iperf3, container ↔ Mac, Apple VZNAT both sides)
 
@@ -184,11 +185,23 @@ Velox's lean Rust VSOCK relay beats DD's data plane ~2.5×. (`splice` doesn't ap
 Repro: `time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c pass`
 (subtract the container-start overhead below).
 
+### Published-port reachability — **on par** (`docker run -d -p` → `curl` 200)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| ~0.4–0.6 s | ~0.3–0.4 s |
+
+A published port becomes reachable almost immediately. This was a real loss (2–28 s,
+variably) until the port watcher was made **event-driven** — it consumes the Docker
+`/events` stream over the in-process VSOCK client instead of polling the API (which
+stalled under the connection contention of `docker run`). Repro:
+`docker run -d -p 18080:80 nginx`, then poll `curl -s localhost:18080` until it answers.
+
 ### Per-container launch — **trails** (open item)
 
 | Velox | Docker Desktop |
 | --- | --- |
-| ~0.77 s | ~0.30 s |
+| ~0.7 s | ~0.30 s |
 
 `docker run --rm alpine true`, averaged. Velox's ~0.45 s of extra per-container
 overhead is the one axis where it currently loses (it also inflates the small-file
