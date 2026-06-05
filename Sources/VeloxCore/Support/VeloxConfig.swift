@@ -24,23 +24,26 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// container starts again. Mirrors Docker Desktop's Resource Saver.
     public var resourceSaverEnabled: Bool
     public var resourceSaverMinutes: Int
-    /// True once the one-time "switch the active docker context to velox?" prompt
-    /// has been shown, so the GUI nudges at most once rather than every launch.
-    public var contextPromptShown: Bool
+    /// "Don't ask again" opt-out for the docker-context switch suggestion. Default
+    /// false, so the GUI re-suggests switching to `velox` on every launch while it
+    /// isn't the active context — only this opt-out silences it. (Replaces the old
+    /// `contextPromptShown`, which got stuck `true` after a single prompt and then
+    /// suppressed the suggestion forever.)
+    public var dontSuggestContext: Bool
     /// Check GitHub Releases for a newer Velox on app launch (default on).
     public var checkUpdatesOnStartup: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
                 launchAtLogin: Bool, updateBehavior: UpdateBehavior, defaultTerminal: String,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
-                contextPromptShown: Bool = false, checkUpdatesOnStartup: Bool = true) {
+                dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
         self.updateBehavior = updateBehavior; self.defaultTerminal = defaultTerminal
         self.resourceSaverEnabled = resourceSaverEnabled
         self.resourceSaverMinutes = resourceSaverMinutes
-        self.contextPromptShown = contextPromptShown
+        self.dontSuggestContext = dontSuggestContext
         self.checkUpdatesOnStartup = checkUpdatesOnStartup
     }
 
@@ -57,7 +60,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             defaultTerminal: "Terminal",
             resourceSaverEnabled: true,
             resourceSaverMinutes: 5,
-            contextPromptShown: false,
+            dontSuggestContext: false,
             checkUpdatesOnStartup: true)
     }
 
@@ -74,7 +77,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         defaultTerminal = try c.decodeIfPresent(String.self, forKey: .defaultTerminal) ?? d.defaultTerminal
         resourceSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .resourceSaverEnabled) ?? d.resourceSaverEnabled
         resourceSaverMinutes = try c.decodeIfPresent(Int.self, forKey: .resourceSaverMinutes) ?? d.resourceSaverMinutes
-        contextPromptShown = try c.decodeIfPresent(Bool.self, forKey: .contextPromptShown) ?? d.contextPromptShown
+        dontSuggestContext = try c.decodeIfPresent(Bool.self, forKey: .dontSuggestContext) ?? d.dontSuggestContext
         checkUpdatesOnStartup = try c.decodeIfPresent(Bool.self, forKey: .checkUpdatesOnStartup) ?? d.checkUpdatesOnStartup
     }
 

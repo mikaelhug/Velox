@@ -16,6 +16,10 @@ final class EngineController {
     /// Current engine lifecycle, driven onto the main actor from the VM queue.
     private(set) var state: EngineState = .stopped
 
+    /// Wall-clock time the engine reached `.running`, for the Overview uptime
+    /// readout. Cleared whenever the engine stops or fails.
+    private(set) var startedAt: Date?
+
     /// True when guest artifacts or host virtualization support are missing, so
     /// the shell should present onboarding instead of arming Start.
     private(set) var needsOnboarding: Bool
@@ -202,12 +206,12 @@ final class EngineController {
             // dashboards' first load succeeds (no transient "Connection reset by
             // peer" and no manual refresh).
             await waitForDockerReady(docker)
+            startedAt = Date()
             state = .running
             Log.info("engine started in-process (GUI)")
-            // Register the `velox` docker context and, if it isn't already
-            // active, offer (once) to switch to it. Fire-and-forget so it never
-            // delays the UI flipping to running.
-            Task { await self.maybeOfferContextSwitch() }
+            // First-run only: install terminal CLIs + the `velox` context and offer to
+            // switch if needed. Backgrounded so it never delays the UI flipping to running.
+            Task { await self.setUpTerminalAndContext() }
         } catch {
             cleanup()
             state = .failed(error.localizedDescription)
@@ -244,6 +248,7 @@ final class EngineController {
     }
 
     private func cleanup() {
+        startedAt = nil
         watcher?.stop()
         watcher = nil
         forwarder?.stopAll()
@@ -291,46 +296,54 @@ final class EngineController {
         if state.isRunning { startResourceSaver() }
     }
 
-    /// Ensure the `velox` Docker context exists (so `docker --context velox` and a
-    /// manual `docker context use velox` always work), then — if it isn't already
-    /// the active context and we haven't asked before — raise the switch prompt.
-    /// The `docker` shell-outs are blocking, so they run off the main actor.
-    private func maybeOfferContextSwitch() async {
+    /// First-run setup, on a background task (off the launch path): always (cheap)
+    /// install the terminal CLIs, and ONCE create the `velox` context + offer to switch
+    /// if it isn't active. After the first run we don't re-check every launch (that would
+    /// shell out to `docker` for nothing) — the user switches any time from Settings.
+    private func setUpTerminalAndContext() async {
         let socket = Paths.dockerSocket.path
+        let handled = config.dontSuggestContext
         let active = await Task.detached(priority: .utility) { () -> String? in
-            // Make `docker` + `velox` work from the user's terminal (rootless: symlinks
-            // into ~/.velox/bin + a marked PATH block in their zsh profile). Idempotent.
+            // Always, cheap + idempotent: make `docker` + `velox` usable from the terminal
+            // (symlinks into ~/.velox/bin + a marked PATH block in the zsh profile).
             let setup = FirstRun.installCLITools(updateShellProfile: true)
             if setup.linkedTools { Log.info("first-run: \(setup.message)") }
+            // Only on the first run: create the context + read the active one (a `docker`
+            // shell-out). Skipped forever after, so launches stay quiet.
+            guard !handled else { return nil }
             guard CLIBinding.ensureContext(socketPath: socket) else { return nil }
             return CLIBinding.activeContext()
         }.value
-        guard let active else { return }            // `docker` CLI not installed
-        if active != "velox" && !config.contextPromptShown {
+        guard !handled, let active else { return }
+        config.dontSuggestContext = true; saveConfig()      // first-run handled — never auto-check again
+        if active == "velox" {
+            Log.info("docker context: velox already active")
+        } else {
+            Log.info("docker context: active=\(active) — offering to switch to velox")
             showContextPrompt = true
         }
     }
 
-    /// User accepted: make `velox` the active Docker context.
-    func adoptVeloxContext() {
-        showContextPrompt = false
-        config.contextPromptShown = true
-        saveConfig()
+    /// Switch the active Docker context to `velox` — used by the first-run prompt and
+    /// the Settings button. Ensures the context exists first.
+    func switchToVeloxContext() {
         Task.detached(priority: .utility) {
-            if CLIBinding.useVeloxContext() {
-                Log.info("active docker context switched to velox")
-            } else {
-                Log.warn("failed to switch docker context to velox")
-            }
+            _ = CLIBinding.ensureContext(socketPath: Paths.dockerSocket.path)
+            if CLIBinding.useVeloxContext() { Log.info("active docker context → velox") }
+            else { Log.warn("failed to switch docker context to velox") }
         }
     }
 
-    /// User declined: don't switch, and don't ask again.
-    func declineVeloxContext() {
-        showContextPrompt = false
-        config.contextPromptShown = true
-        saveConfig()
+    /// The active Docker context name, for display in Settings (nil if `docker` is absent).
+    func activeDockerContext() async -> String? {
+        await Task.detached(priority: .utility) { CLIBinding.activeContext() }.value
     }
+
+    /// First-run prompt accepted → switch to the `velox` context.
+    func adoptVeloxContext() { showContextPrompt = false; switchToVeloxContext() }
+
+    /// First-run prompt dismissed. (The user can still switch later from Settings.)
+    func declineVeloxContext() { showContextPrompt = false }
 
     /// Poll dockerd until it answers (it comes up a few seconds after the VM
     /// boots). Best-effort: returns after ~30s even if it never responds, so the

@@ -43,15 +43,28 @@ final class ImagesModel {
         do { try await action(docker); await refresh() }
         catch { actionError = "\(error)" }
     }
+
+    /// Remove several images, then refresh once. Collects the first failure (e.g. an
+    /// image still referenced by a container) into `actionError`.
+    func removeImages(_ ids: Set<ImageSummary.ID>, force: Bool) async {
+        var firstError: String?
+        for id in ids {
+            do { try await docker.removeImage(id, force: force) }
+            catch { if firstError == nil { firstError = "\(error)" } }
+        }
+        if let firstError { actionError = firstError }
+        await refresh()
+    }
 }
 
 struct ImagesView: View {
     let docker: any DockerClientProtocol
     @State private var model: ImagesModel
-    @State private var selection: ImageSummary.ID?
+    @State private var selection = Set<ImageSummary.ID>()
     @State private var searchText = ""
     @State private var pullReference = ""
     @State private var pruneConfirm = false
+    @State private var removeConfirm = false
     @State private var tagTarget: ImageSummary?
 
     init(docker: any DockerClientProtocol) {
@@ -71,19 +84,19 @@ struct ImagesView: View {
         Table(filtered, selection: $selection) {
             TableColumn("Repository") { img in
                 Text(img.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-            }.width(min: 140, ideal: 220)
+            }.width(min: 110, ideal: 180)
             TableColumn("Tag") { img in
                 Text(img.tag).font(.callout).foregroundStyle(.secondary)
-            }.width(min: 70, ideal: 110)
+            }.width(min: 56, ideal: 90)
             TableColumn("Image ID") { img in
                 Text(img.shortID).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }.width(110)
+            }.width(94)
             TableColumn("Created") { img in
                 Text(Format.age(epoch: img.created)).foregroundStyle(.secondary)
-            }.width(110)
+            }.width(86)
             TableColumn("Size") { img in
                 Text(Format.bytes(img.size)).font(.callout.monospacedDigit())
-            }.width(90)
+            }.width(76)
             TableColumn("") { img in
                 HStack(spacing: 2) {
                     Button { tagTarget = img } label: { Image(systemName: "tag") }
@@ -93,7 +106,7 @@ struct ImagesView: View {
                     } label: { Image(systemName: "trash") }
                         .buttonStyle(.borderless).help("Remove image")
                 }
-            }.width(64)
+            }.width(60)
         }
         .overlay {
             if model.images.isEmpty {
@@ -105,13 +118,33 @@ struct ImagesView: View {
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter images")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button(role: .destructive) { pruneConfirm = true } label: {
-                    Label("Prune Unused", systemImage: "trash")
+                Button(role: .destructive) { removeConfirm = true } label: {
+                    Label("Remove Selected", systemImage: "trash")
                 }
-                .help("Remove all images not used by a container")
+                .disabled(selection.isEmpty)
+                .help(selection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button(role: .destructive) { pruneConfirm = true } label: {
+                        Label("Prune Unused Images…", systemImage: "sparkles")
+                    }
+                } label: { Image(systemName: "ellipsis.circle") }
+                .help("More actions")
             }
         }
         .task { await model.observe() }
+        .confirmationDialog(
+            "Remove \(selection.count) selected image\(selection.count == 1 ? "" : "s")?",
+            isPresented: $removeConfirm
+        ) {
+            Button("Remove", role: .destructive) {
+                let ids = selection
+                Task { await model.removeImages(ids, force: false); selection.removeAll() }
+            }
+        } message: {
+            Text("This removes the selected image\(selection.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
+        }
         .confirmationDialog("Prune unused images?", isPresented: $pruneConfirm) {
             Button("Prune Unused Images", role: .destructive) {
                 Task { await model.perform { _ = try await $0.pruneImages(all: true) } }

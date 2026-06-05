@@ -78,7 +78,6 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>${VELOX_VERSION}</string>
     <key>CFBundleVersion</key><string>${VELOX_VERSION}</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
-    <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 </dict>

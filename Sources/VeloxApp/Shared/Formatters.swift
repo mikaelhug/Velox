@@ -18,6 +18,14 @@ enum Format {
         return f
     }()
 
+    private static let duration: DateComponentsFormatter = {
+        let f = DateComponentsFormatter()
+        f.allowedUnits = [.day, .hour, .minute]
+        f.unitsStyle = .abbreviated
+        f.maximumUnitCount = 2
+        return f
+    }()
+
     static func bytes(_ value: Int64) -> String { byteFormatter.string(fromByteCount: value) }
     static func bytes(_ value: UInt64) -> String { byteFormatter.string(fromByteCount: Int64(clamping: value)) }
 
@@ -32,5 +40,13 @@ enum Format {
     static func age(iso: String?) -> String {
         guard let iso, let date = ISO8601DateFormatter().date(from: iso) else { return "—" }
         return relative.localizedString(for: date, relativeTo: Date())
+    }
+
+    /// Elapsed time since `date` as a compact duration (e.g. "5m", "1h 3m") —
+    /// used for engine uptime, which is a duration rather than a relative date.
+    static func uptime(since date: Date) -> String {
+        let seconds = max(0, Date().timeIntervalSince(date))
+        if seconds < 60 { return "just now" }
+        return duration.string(from: seconds) ?? "—"
     }
 }

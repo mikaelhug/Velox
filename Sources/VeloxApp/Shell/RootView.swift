@@ -5,22 +5,30 @@ import SwiftUI
 /// single "start the engine" affordance instead of an empty table.
 struct RootView: View {
     @Environment(EngineController.self) private var engine
-    @State private var selection: SidebarItem? = .containers
+    @State private var selection: SidebarItem? = .overview
 
     var body: some View {
         @Bindable var engine = engine
         return NavigationSplitView {
-            List(SidebarItem.allCases, selection: $selection) { item in
-                Label(item.title, systemImage: item.systemImage)
-                    .tag(item)
+            List(selection: $selection) {
+                row(.overview)
+                Section("Resources") {
+                    row(.containers)
+                    row(.images)
+                    row(.volumes)
+                    row(.networks)
+                }
+                Section("System") {
+                    row(.engineLogs)
+                }
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 270)
             .safeAreaInset(edge: .bottom) {
                 EngineStatusBar()
                     .padding(10)
             }
         } detail: {
-            detail(for: selection ?? .containers)
+            detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
         }
         .navigationTitle(selection?.title ?? "Velox")
@@ -28,8 +36,13 @@ struct RootView: View {
             Button("Switch") { engine.adoptVeloxContext() }
             Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
         } message: {
-            Text("Your active Docker context isn't `Velox`, switch the context to `Velox` now?")
+            Text("Your active Docker context isn't `velox`, so `docker` commands won't reach Velox. Switch now? You can also change this any time in Settings → General.")
         }
+    }
+
+    /// One selectable sidebar row.
+    private func row(_ item: SidebarItem) -> some View {
+        Label(item.title, systemImage: item.systemImage).tag(item)
     }
 
     @ViewBuilder
@@ -38,9 +51,10 @@ struct RootView: View {
         case .engineLogs:
             // Always available — also shows the boot log and why a start failed.
             EngineLogsView(store: engine.engineLog)
-        case .containers, .images, .volumes, .networks:
+        case .overview, .containers, .images, .volumes, .networks:
             if engine.state.isRunning, let docker = engine.docker {
                 switch item {
+                case .overview:   OverviewView(docker: docker)
                 case .containers: ContainersView(docker: docker)
                 case .images:     ImagesView(docker: docker)
                 case .volumes:    VolumesView(docker: docker)
@@ -61,10 +75,10 @@ struct EngineStatusBar: View {
         HStack(spacing: 8) {
             Circle()
                 .fill(engine.state.tint)
-                .frame(width: 9, height: 9)
+                .frame(width: 8, height: 8)
+                .shadow(color: engine.state.tint.opacity(0.6), radius: engine.state.isRunning ? 2.5 : 0)
             Text(engine.state.label)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+                .font(.callout.weight(.medium))
             Spacer()
             if engine.state.isBusy {
                 ProgressView().controlSize(.small)
@@ -77,6 +91,13 @@ struct EngineStatusBar: View {
                     .disabled(engine.needsOnboarding)
             }
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(.separator, lineWidth: 0.5)
+        )
     }
 }
 

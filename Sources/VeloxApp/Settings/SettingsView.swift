@@ -58,54 +58,93 @@ struct SettingsView: View {
 private struct GeneralPane: View {
     @Binding var config: VeloxConfig
     @Environment(EngineController.self) private var engine
+    @State private var activeContext: String?
 
     var body: some View {
         Form {
             Section {
                 Toggle("Launch Velox at login", isOn: $config.launchAtLogin)
                     .onChange(of: config.launchAtLogin) { _, enabled in LoginItem.set(enabled) }
-                Toggle("Check for updates on startup", isOn: $config.checkUpdatesOnStartup)
-                Picker("Software updates", selection: $config.updateBehavior) {
-                    Text("Manual").tag(VeloxConfig.UpdateBehavior.manual)
-                    Text("Notify when available").tag(VeloxConfig.UpdateBehavior.notify)
-                    Text("Download automatically").tag(VeloxConfig.UpdateBehavior.automatic)
-                }
-                TextField("Default terminal", text: $config.defaultTerminal)
+            } header: {
+                Text("Startup")
+            } footer: {
+                Text("Velox lives in the menu bar and keeps the engine available without opening the dashboard.")
             }
 
-            Section("Updates") {
-                HStack {
-                    Button(engine.checkingForUpdate ? "Checking…" : "Check for Updates") {
-                        Task { await engine.checkForUpdates() }
-                    }
-                    .disabled(engine.checkingForUpdate || engine.updateInProgress)
-
-                    if let update = engine.availableUpdate {
-                        Text(update.message).font(.callout).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if engine.availableUpdate?.isUpdateAvailable == true {
-                        Button(engine.updateInProgress ? "Updating…" : "Update Now") {
-                            engine.applyUpdate()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(engine.updateInProgress)
-                    }
+            Section {
+                Toggle("Check for updates on startup", isOn: $config.checkUpdatesOnStartup)
+                Picker("When an update is available", selection: $config.updateBehavior) {
+                    Text("Notify me").tag(VeloxConfig.UpdateBehavior.notify)
+                    Text("Download automatically").tag(VeloxConfig.UpdateBehavior.automatic)
+                    Text("Do nothing").tag(VeloxConfig.UpdateBehavior.manual)
                 }
+                LabeledContent("Status") { updateControls }
                 if engine.availableUpdate?.isUpdateAvailable == true,
                    let urlString = engine.availableUpdate?.releaseURL,
                    let url = URL(string: urlString) {
-                    Link("View release notes", destination: url).font(.callout)
+                    Link("View release notes", destination: url)
                 }
+            } header: {
+                Text("Software Updates")
+            } footer: {
+                Text("Updates are pulled from GitHub Releases and installed in place.")
+            }
+
+            Section {
+                LabeledContent("Active context", value: activeContext ?? "—")
+                Button("Use Velox context") {
+                    engine.switchToVeloxContext()
+                    activeContext = "velox"
+                }
+                .disabled(activeContext == "velox")
+            } header: {
+                Text("Docker CLI")
+            } footer: {
+                Text("Points the `docker` CLI at the Velox engine, so `docker` commands target Velox from any terminal.")
+            }
+
+            Section {
+                TextField("Terminal app", text: $config.defaultTerminal)
+            } header: {
+                Text("Terminal")
+            } footer: {
+                Text("Opened when Velox needs to drop you into a shell.")
             }
 
             Section("About") {
                 LabeledContent("Velox", value: Versions.velox)
                 LabeledContent("Kernel", value: Versions.kernelVersion)
-                LabeledContent("Docker", value: Versions.dockerVersion)
+                LabeledContent("Docker Engine", value: Versions.dockerVersion)
             }
         }
         .formStyle(.grouped)
+        .task { activeContext = await engine.activeDockerContext() }
+    }
+
+    /// The right-hand control of the "Status" row: either an up-to-date / check
+    /// affordance, or the available-update message plus an Update Now button.
+    @ViewBuilder
+    private var updateControls: some View {
+        HStack(spacing: 8) {
+            if engine.availableUpdate?.isUpdateAvailable == true {
+                Text(engine.availableUpdate?.message ?? "Update available")
+                    .foregroundStyle(.secondary)
+                Button(engine.updateInProgress ? "Updating…" : "Update Now") {
+                    engine.applyUpdate()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(engine.updateInProgress)
+            } else {
+                Text(engine.availableUpdate?.message ?? "Up to date")
+                    .foregroundStyle(.secondary)
+                Button(engine.checkingForUpdate ? "Checking…" : "Check Now") {
+                    Task { await engine.checkForUpdates() }
+                }
+                .controlSize(.small)
+                .disabled(engine.checkingForUpdate || engine.updateInProgress)
+            }
+        }
     }
 }
 
@@ -123,28 +162,36 @@ private struct ResourcesPane: View {
             if engine.needsRestart {
                 Section { RestartBanner() }
             }
-            Section("CPU") {
+            Section {
                 IntSlider(value: $config.cpuCount, range: 1...maxCores,
                           unit: config.cpuCount == 1 ? "core" : "cores")
+            } header: {
+                Text("CPU")
+            } footer: {
                 Text("Number of virtual CPUs available to the engine.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Memory") {
+            Section {
                 IntSlider(value: $config.memoryGiB, range: 1...maxMemory, unit: "GB")
+            } header: {
+                Text("Memory")
+            } footer: {
                 Text("Maximum RAM the guest may use. Resource Saver reclaims unused memory back to macOS while idle.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Swap") {
+            Section {
                 IntSlider(value: $config.swapGiB, range: 0...8,
                           unit: config.swapGiB == 0 ? "(off)" : "GB")
+            } header: {
+                Text("Swap")
+            } footer: {
                 Text("Disk-backed swap inside the guest, on the data disk. Lets memory-hungry builds spill over instead of being OOM-killed.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
-            Section("Disk") {
+            Section {
                 IntSlider(value: $config.diskGiB, range: 8...256, step: 8, unit: "GB")
                 DiskUsageRow(allocatedGiB: config.diskGiB)
-                Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — only the space actually used is allocated on your Mac (and reclaimed when you remove images).")
-                    .font(.caption).foregroundStyle(.secondary)
+            } header: {
+                Text("Disk")
+            } footer: {
+                Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — only the space actually used is allocated on your Mac, and reclaimed when you remove images.")
             }
             ResourceSaverSection(config: $config)
         }
@@ -161,22 +208,34 @@ private struct DiskUsageRow: View {
     @State private var usedBytes: Int64?
 
     var body: some View {
-        HStack {
-            Label("On disk", systemImage: "internaldrive")
-            Spacer()
-            Text(usageText)
-                .foregroundStyle(.secondary)
-            Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless)
-                .help("Refresh")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("On disk", systemImage: "internaldrive")
+                Spacer()
+                Text(usageText)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
+                    .help("Refresh")
+            }
+            ProgressView(value: fraction)
+                .tint(.purple)
         }
         .task { refresh() }
+    }
+
+    private var allocatedBytes: Double { Double(allocatedGiB) * 1024 * 1024 * 1024 }
+
+    private var fraction: Double {
+        guard let usedBytes, allocatedBytes > 0 else { return 0 }
+        return min(1, Double(usedBytes) / allocatedBytes)
     }
 
     private var usageText: String {
         guard let usedBytes else { return "—" }
         let used = ByteCountFormatter.string(fromByteCount: usedBytes, countStyle: .file)
-        return "\(used) used of \(allocatedGiB) GB allocated"
+        return "\(used) of \(allocatedGiB) GB"
     }
 
     private func refresh() {
@@ -190,20 +249,21 @@ private struct ResourceSaverSection: View {
     @Binding var config: VeloxConfig
 
     var body: some View {
-        Section("Resource Saver") {
+        Section {
             Toggle("Enable Resource Saver", isOn: $config.resourceSaverEnabled)
-            Text("Reduces CPU and memory utilization when no containers are running. Exit from Resource Saver mode happens automatically when containers are started.")
-                .font(.caption).foregroundStyle(.secondary)
             if config.resourceSaverEnabled {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Idle time before entering Resource Saver")
-                        .font(.callout)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Idle timeout").font(.callout)
                     IntSlider(value: $config.resourceSaverMinutes, range: 1...60,
                               unit: config.resourceSaverMinutes == 1 ? "minute" : "minutes")
-                    Text("Duration of time between no containers running and Velox entering Resource Saver mode.")
-                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
+        } header: {
+            Text("Resource Saver")
+        } footer: {
+            Text(config.resourceSaverEnabled
+                 ? "Reclaims CPU and memory \(config.resourceSaverMinutes) \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") after the last container stops. Exits automatically the moment a container starts."
+                 : "Reduces CPU and memory usage when no containers are running. Exits automatically when a container starts.")
         }
     }
 }
@@ -266,8 +326,11 @@ private struct FileSharingPane: View {
 
                 Section {
                     if config.fileShares.isEmpty {
-                        Text("No additional directories shared.")
-                            .foregroundStyle(.secondary)
+                        HStack {
+                            Image(systemName: "folder.badge.questionmark").foregroundStyle(.tertiary)
+                            Text("No additional directories shared.")
+                                .foregroundStyle(.secondary)
+                        }
                     } else {
                         ForEach(config.fileShares, id: \.self) { path in
                             HStack {
@@ -275,20 +338,22 @@ private struct FileSharingPane: View {
                                 Text(path).lineLimit(1).truncationMode(.middle)
                                 Spacer()
                                 Button(role: .destructive) { remove(path) } label: {
-                                    Image(systemName: "minus.circle")
-                                }.buttonStyle(.borderless)
+                                    Image(systemName: "minus.circle.fill").foregroundStyle(.red)
+                                }.buttonStyle(.borderless).help("Stop sharing")
                             }
                         }
                     }
-                } header: { Text("Additional Directories") }
+                } header: {
+                    Text("Additional Directories")
+                } footer: {
+                    Text("Containers can mount these read-write with `docker run -v`.")
+                }
             }
 
             Divider()
             HStack {
                 Button { importing = true } label: { Label("Add Directory…", systemImage: "plus") }
                 Spacer()
-                Text("Containers can mount these with `docker run -v`.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             .padding(12)
         }

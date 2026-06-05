@@ -2,6 +2,7 @@ import SwiftUI
 
 /// The resource dashboards (and the engine log) reachable from the sidebar.
 enum SidebarItem: String, Hashable, CaseIterable, Identifiable {
+    case overview
     case containers
     case images
     case volumes
@@ -12,6 +13,7 @@ enum SidebarItem: String, Hashable, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .overview:   return "Overview"
         case .containers: return "Containers"
         case .images:     return "Images"
         case .volumes:    return "Volumes"
@@ -22,6 +24,7 @@ enum SidebarItem: String, Hashable, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .overview:   return "square.grid.2x2"
         case .containers: return "shippingbox"
         case .images:     return "square.stack.3d.up"
         case .volumes:    return "externaldrive"
