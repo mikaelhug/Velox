@@ -164,6 +164,17 @@ before/after `docker pull python:3.12`, then `docker rmi python:3.12` + an `fstr
 
 Repro: `docker run --rm -v "$PWD":/mnt alpine dd if=/dev/zero of=/mnt/big bs=1M count=1024 conv=fsync`.
 
+### `docker cp` throughput — **win** (1 GiB in/out of a container, over the VSOCK data plane)
+
+| direction | Velox | Docker Desktop |
+| --- | --- | --- |
+| cp in (host → container) | **~393 MiB/s** | ~149 MiB/s |
+| cp out (container → host) | **~508 MiB/s** | ~226 MiB/s |
+
+Velox's lean Rust VSOCK relay beats DD's data plane ~2.5×. (`splice` doesn't apply —
+`AF_VSOCK` doesn't support it — and isn't needed.) Repro:
+`docker run -d --name c alpine sleep 300 && time docker cp <1GiB-file> c:/big && time docker cp c:/big /tmp/out`.
+
 ### x86 emulation — **on par** (Rosetta, amd64 workload, container-start subtracted)
 
 | Velox | Docker Desktop |
