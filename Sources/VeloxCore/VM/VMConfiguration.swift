@@ -127,6 +127,20 @@ public enum VMConfiguration {
         case .installed:
             do {
                 let rosetta = try VZLinuxRosettaDirectoryShare()
+                // Persist Rosetta's ahead-of-time translation cache across runs via a
+                // host-side cache daemon on a unix socket, so x86-64 binaries aren't
+                // re-translated every launch (Docker-Desktop parity). The caching
+                // classes/property are NS_REFINED_FOR_SWIFT with no overlay in the
+                // Command-Line-Tools SDK, so they import under their __-prefixed
+                // names — functionally identical, and the spelling is guaranteed by
+                // the refinement contract.
+                let cacheSock = Paths.root.appendingPathComponent("rosetta.sock")
+                do {
+                    rosetta.__options = try __VZLinuxRosettaUnixSocketCachingOptions(path: cacheSock.path)
+                    Log.info("Rosetta translation cache: \(cacheSock.path)")
+                } catch {
+                    Log.warn("Rosetta cache off (translations won't persist): \(error.localizedDescription)")
+                }
                 let fsRosetta = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
                 fsRosetta.share = rosetta
                 sharingDevices.append(fsRosetta)
