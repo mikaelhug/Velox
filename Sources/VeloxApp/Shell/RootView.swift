@@ -8,7 +8,8 @@ struct RootView: View {
     @State private var selection: SidebarItem? = .containers
 
     var body: some View {
-        NavigationSplitView {
+        @Bindable var engine = engine
+        return NavigationSplitView {
             List(SidebarItem.allCases, selection: $selection) { item in
                 Label(item.title, systemImage: item.systemImage)
                     .tag(item)
@@ -23,6 +24,14 @@ struct RootView: View {
                 .frame(minWidth: 560, minHeight: 360)
         }
         .navigationTitle(selection?.title ?? "Velox")
+        .alert("Switch Docker context to velox?", isPresented: $engine.showContextPrompt) {
+            Button("Switch") { engine.adoptVeloxContext() }
+            Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
+        } message: {
+            Text("Your active Docker context isn't `velox`, so a plain `docker` command "
+                 + "in the terminal won't talk to Velox. Switch the active context to "
+                 + "`velox` now? You can always change it later with `docker context use`.")
+        }
     }
 
     @ViewBuilder

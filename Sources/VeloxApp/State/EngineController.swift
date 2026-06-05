@@ -43,6 +43,11 @@ final class EngineController {
     /// read this; it rides an in-process VSOCK connection to the guest (Phase 2).
     private(set) var docker: DockerClient?
 
+    /// Set true when the engine is running and the `velox` Docker context exists
+    /// but isn't the active one — the shell shows a one-time prompt offering to
+    /// switch, so a plain `docker ps` in the terminal targets Velox.
+    var showContextPrompt = false
+
     init() {
         config = VeloxConfig.load()
         needsOnboarding = !EngineController.isReady
@@ -126,6 +131,10 @@ final class EngineController {
             await waitForDockerReady(docker)
             state = .running
             Log.info("engine started in-process (GUI)")
+            // Register the `velox` docker context and, if it isn't already
+            // active, offer (once) to switch to it. Fire-and-forget so it never
+            // delays the UI flipping to running.
+            Task { await self.maybeOfferContextSwitch() }
         } catch {
             cleanup()
             state = .failed(error.localizedDescription)
@@ -166,6 +175,43 @@ final class EngineController {
         proxy = nil
         bridge = nil
         docker = nil
+    }
+
+    /// Ensure the `velox` Docker context exists (so `docker --context velox` and a
+    /// manual `docker context use velox` always work), then — if it isn't already
+    /// the active context and we haven't asked before — raise the switch prompt.
+    /// The `docker` shell-outs are blocking, so they run off the main actor.
+    private func maybeOfferContextSwitch() async {
+        let socket = Paths.dockerSocket.path
+        let active = await Task.detached(priority: .utility) { () -> String? in
+            guard CLIBinding.ensureContext(socketPath: socket) else { return nil }
+            return CLIBinding.activeContext()
+        }.value
+        guard let active else { return }            // `docker` CLI not installed
+        if active != "velox" && !config.contextPromptShown {
+            showContextPrompt = true
+        }
+    }
+
+    /// User accepted: make `velox` the active Docker context.
+    func adoptVeloxContext() {
+        showContextPrompt = false
+        config.contextPromptShown = true
+        saveConfig()
+        Task.detached(priority: .utility) {
+            if CLIBinding.useVeloxContext() {
+                Log.info("active docker context switched to velox")
+            } else {
+                Log.warn("failed to switch docker context to velox")
+            }
+        }
+    }
+
+    /// User declined: don't switch, and don't ask again.
+    func declineVeloxContext() {
+        showContextPrompt = false
+        config.contextPromptShown = true
+        saveConfig()
     }
 
     /// Poll dockerd until it answers (it comes up a few seconds after the VM

@@ -17,12 +17,17 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     public var launchAtLogin: Bool
     public var updateBehavior: UpdateBehavior
     public var defaultTerminal: String   // app name used for "Open in Terminal"
+    /// True once the one-time "switch the active docker context to velox?" prompt
+    /// has been shown, so the GUI nudges at most once rather than every launch.
+    public var contextPromptShown: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, fileShares: [String],
-                launchAtLogin: Bool, updateBehavior: UpdateBehavior, defaultTerminal: String) {
+                launchAtLogin: Bool, updateBehavior: UpdateBehavior, defaultTerminal: String,
+                contextPromptShown: Bool = false) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
         self.updateBehavior = updateBehavior; self.defaultTerminal = defaultTerminal
+        self.contextPromptShown = contextPromptShown
     }
 
     public static var `default`: VeloxConfig {
@@ -34,7 +39,8 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             fileShares: [],
             launchAtLogin: false,
             updateBehavior: .notify,
-            defaultTerminal: "Terminal")
+            defaultTerminal: "Terminal",
+            contextPromptShown: false)
     }
 
     public init(from decoder: Decoder) throws {
@@ -47,6 +53,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
         updateBehavior = try c.decodeIfPresent(UpdateBehavior.self, forKey: .updateBehavior) ?? d.updateBehavior
         defaultTerminal = try c.decodeIfPresent(String.self, forKey: .defaultTerminal) ?? d.defaultTerminal
+        contextPromptShown = try c.decodeIfPresent(Bool.self, forKey: .contextPromptShown) ?? d.contextPromptShown
     }
 
     // MARK: - Derived

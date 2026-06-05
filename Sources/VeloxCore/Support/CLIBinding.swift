@@ -47,6 +47,38 @@ public enum CLIBinding {
         }
     }
 
+    // MARK: - GUI helpers
+    //
+    // The CLI wires the context in `apply()`; the in-process GUI engine isn't a
+    // `velox start`, so it calls these directly to register the context and offer
+    // to make it active. All three are blocking (they shell out to `docker`) —
+    // call them off the main thread.
+
+    /// True if the `docker` CLI is installed (a prerequisite for any context op).
+    public static var dockerCLIAvailable: Bool { which("docker") != nil }
+
+    /// Ensure the `velox` context exists, pointing at the engine socket. No-op
+    /// (returns false) if the `docker` CLI isn't installed.
+    @discardableResult
+    public static func ensureContext(socketPath: String) -> Bool {
+        guard which("docker") != nil else { return false }
+        ensureVeloxContext(host: "unix://\(socketPath)")
+        return true
+    }
+
+    /// The active Docker context name (`docker context show`), or nil if the
+    /// `docker` CLI isn't installed.
+    public static func activeContext() -> String? {
+        guard which("docker") != nil else { return nil }
+        return output(["docker", "context", "show"]) ?? "default"
+    }
+
+    /// Switch the active Docker context to `velox`. Returns true on success.
+    @discardableResult
+    public static func useVeloxContext() -> Bool {
+        which("docker") != nil && run(["docker", "context", "use", "velox"]) == 0
+    }
+
     // MARK: - Process helpers
 
     @discardableResult
