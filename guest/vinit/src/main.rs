@@ -411,13 +411,15 @@ mod dhcp {
         // giving up, so a transient miss self-heals instead of leaving the guest with
         // no address — and therefore no DNS — for the whole session.
         let mut last = Error::new(ErrorKind::TimedOut, "no DHCP offer");
-        for attempt in 0..6u32 {
+        for attempt in 0..12u32 {
             match try_acquire(ifname, mac) {
                 Ok(lease) => return Ok(lease),
                 Err(e) => {
                     log!("DHCP attempt {} failed: {e}", attempt + 1);
                     last = e;
-                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)));
+                    // Flat, short backoff: retransmit ~every 1.25s so we grab a lease
+                    // the moment the bridge is ready, instead of escalating into long gaps.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
             }
         }
@@ -529,7 +531,10 @@ mod dhcp {
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on as *const _ as *const _, 4);
             // bind to the device so broadcast goes out eth0 before we have an IP
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, ifname.as_ptr() as *const _, ifname.len() as u32);
-            let tv = libc::timeval { tv_sec: 5, tv_usec: 0 };
+            // Short per-try OFFER/ACK wait: the vmnet bridge often isn't ready for
+            // the very first DISCOVER, so we'd rather retransmit quickly than block
+            // 5s. Standard DHCP retransmission — costs nothing when it answers fast.
+            let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const _, std::mem::size_of::<libc::timeval>() as u32);
         }
         let bind = libc::sockaddr_in {
