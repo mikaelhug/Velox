@@ -42,6 +42,10 @@ final class EngineController {
     private var watcher: DockerEventsWatcher?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
+    /// Live ring buffer of the guest serial console (kernel + vinit + dockerd),
+    /// surfaced by the Engine Logs view. Fed from the VM's console pipe.
+    let engineLog = EngineLogStore()
+    private var consolePipe: Pipe?
     /// Memory the running VM actually booted with — Resource Saver restores to
     /// this, not to an edited-but-unapplied value in `config`.
     private var bootedMemoryBytes: UInt64 = 0
@@ -103,11 +107,18 @@ final class EngineController {
             let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
                 ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                               kernelCommandLine: GuestImage.defaultCommandLine)
+            // Capture the guest serial console (kernel + vinit + dockerd) for the
+            // Engine Logs view: hand the VM a pipe as its console write end and drain
+            // the read end into the ring buffer. (The CLI keeps stdout.)
+            let pipe = Pipe()
+            consolePipe = pipe
+            engineLog.attach(pipe.fileHandleForReading)
             let vmConfig = try VMConfiguration.build(
                 image: image,
                 dataDisk: Paths.dataDisk,
                 resources: resources,
-                extraShares: shareURLs)
+                extraShares: shareURLs,
+                consoleOutput: pipe.fileHandleForWriting)
 
             // Unexpected guest exits / crashes route here too.
             manager.onStop { [weak self] error in
@@ -210,6 +221,10 @@ final class EngineController {
         clockSync = nil
         resourceSaver?.stop()
         resourceSaver = nil
+        // Stop draining the (now-closing) console pipe; a restart attaches a fresh one.
+        // Keep the buffered lines so the user can read why the engine stopped.
+        engineLog.detach()
+        consolePipe = nil
     }
 
     /// (Re)arm Resource Saver from the current config. Called on start and again

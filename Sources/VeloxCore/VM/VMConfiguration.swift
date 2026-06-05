@@ -43,7 +43,8 @@ public enum VMConfiguration {
     public static func build(image: GuestImage,
                              dataDisk: URL? = nil,
                              resources: Resources = .default,
-                             extraShares: [URL] = [])
+                             extraShares: [URL] = [],
+                             consoleOutput: FileHandle? = nil)
         throws -> VZVirtualMachineConfiguration
     {
         let config = VZVirtualMachineConfiguration()
@@ -63,7 +64,7 @@ public enum VMConfiguration {
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
         config.bootLoader = bootLoader
 
-        config.serialPorts = [Console.makeSerialPort()]
+        config.serialPorts = [Console.makeSerialPort(write: consoleOutput ?? .standardOutput)]
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 

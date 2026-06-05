@@ -34,15 +34,21 @@ struct RootView: View {
 
     @ViewBuilder
     private func detail(for item: SidebarItem) -> some View {
-        if engine.state.isRunning, let docker = engine.docker {
-            switch item {
-            case .containers: ContainersView(docker: docker)
-            case .images:     ImagesView(docker: docker)
-            case .volumes:    VolumesView(docker: docker)
-            case .networks:   NetworksView(docker: docker)
+        switch item {
+        case .engineLogs:
+            // Always available — also shows the boot log and why a start failed.
+            EngineLogsView(store: engine.engineLog)
+        case .containers, .images, .volumes, .networks:
+            if engine.state.isRunning, let docker = engine.docker {
+                switch item {
+                case .containers: ContainersView(docker: docker)
+                case .images:     ImagesView(docker: docker)
+                case .volumes:    VolumesView(docker: docker)
+                default:          NetworksView(docker: docker)
+                }
+            } else {
+                EngineDownView(item: item)
             }
-        } else {
-            EngineDownView(item: item)
         }
     }
 }
