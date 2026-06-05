@@ -67,23 +67,23 @@ struct ContainersView: View {
                         Text(c.shortID).font(.caption2.monospaced()).foregroundStyle(.secondary)
                     }
                 }
-            }.width(min: 140, ideal: 170)
+            }.width(min: 120, ideal: 160, max: 240)
 
             TableColumn("Image") { c in
                 Text(c.image).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
-            }.width(min: 120, ideal: 200)
+            }.width(min: 110, ideal: 170, max: 300)
 
             TableColumn("Status") { c in StatusBadge(state: c.state, status: c.status) }
-                .width(min: 110, ideal: 150)
+                .width(min: 90, ideal: 130, max: 200)
 
             TableColumn("Ports") { c in
                 Text(c.ports.isEmpty ? "—" : c.ports.map(\.label).joined(separator: ", "))
                     .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 90, ideal: 130)
+            }.width(min: 70, ideal: 110, max: 180)
 
             TableColumn("CPU / MEM") { c in
                 ContainerUsageCell(docker: docker, containerID: c.id, isRunning: c.isRunning)
-            }.width(min: 110, ideal: 130)
+            }.width(min: 100, ideal: 118, max: 140)
 
             TableColumn("") { c in rowActions(c) }.width(132)
         }

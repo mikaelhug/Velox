@@ -77,9 +77,39 @@ public struct ImageSummary: Decodable, Sendable, Identifiable, Hashable {
     public let repoTags: [String]
     public let created: Int
     public let size: Int64
+    /// Platform of the image's manifest(s), e.g. "arm64" / "amd64", or "multi"
+    /// when several distinct architectures are present. Nil when the daemon
+    /// doesn't report manifest platforms. Sourced from `?manifests=true`.
+    public let architecture: String?
 
     enum CodingKeys: String, CodingKey {
         case id = "Id", repoTags = "RepoTags", created = "Created", size = "Size"
+        case manifests = "Manifests"
+    }
+
+    /// A single entry of the containerd-store `Manifests` array — just enough to
+    /// pull the platform architecture out of the OCI descriptor.
+    private struct Manifest: Decodable {
+        let kind: String?
+        let descriptor: Descriptor?
+        let imageData: ImageData?
+        enum CodingKeys: String, CodingKey {
+            case kind = "Kind", descriptor = "Descriptor", imageData = "ImageData"
+        }
+        struct Descriptor: Decodable { let platform: Platform? }
+        struct ImageData: Decodable {
+            let platform: Platform?
+            enum CodingKeys: String, CodingKey { case platform = "Platform" }
+        }
+        struct Platform: Decodable { let architecture: String? }
+
+        /// Architecture for image-kind manifests with a real platform.
+        var arch: String? {
+            guard (kind ?? "image") == "image" else { return nil }
+            let a = (descriptor?.platform ?? imageData?.platform)?.architecture
+            guard let a, !a.isEmpty, a != "unknown" else { return nil }
+            return a
+        }
     }
 
     public init(from decoder: Decoder) throws {
@@ -88,10 +118,14 @@ public struct ImageSummary: Decodable, Sendable, Identifiable, Hashable {
         repoTags = try c.decodeIfPresent([String].self, forKey: .repoTags) ?? []
         created = try c.decodeIfPresent(Int.self, forKey: .created) ?? 0
         size = try c.decodeIfPresent(Int64.self, forKey: .size) ?? 0
+        let manifests = (try? c.decodeIfPresent([Manifest].self, forKey: .manifests)) ?? nil
+        let archs = Set((manifests ?? []).compactMap(\.arch))
+        architecture = archs.count > 1 ? "multi" : archs.first
     }
 
-    public init(id: String, repoTags: [String], created: Int, size: Int64) {
+    public init(id: String, repoTags: [String], created: Int, size: Int64, architecture: String? = nil) {
         self.id = id; self.repoTags = repoTags; self.created = created; self.size = size
+        self.architecture = architecture
     }
 
     /// Image ID without the "sha256:" prefix, truncated.

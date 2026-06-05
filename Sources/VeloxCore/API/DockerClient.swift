@@ -64,7 +64,9 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     public func images() async throws -> [ImageSummary] {
-        try decode([ImageSummary].self, from: await send("GET", Self.path("/images/json")))
+        // `manifests=true` (API 1.47) attaches per-platform manifest descriptors,
+        // which is how we surface each image's architecture from the containerd store.
+        try decode([ImageSummary].self, from: await send("GET", Self.path("/images/json?manifests=true")))
     }
 
     public func volumes() async throws -> [Volume] {

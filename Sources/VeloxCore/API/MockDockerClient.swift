@@ -27,13 +27,13 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
 
     public static let sampleImages: [ImageSummary] = [
         ImageSummary(id: "sha256:aaaa111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
-                     repoTags: ["nginx:latest"], created: 1_717_000_000, size: 187_000_000),
+                     repoTags: ["nginx:latest"], created: 1_717_000_000, size: 187_000_000, architecture: "arm64"),
         ImageSummary(id: "sha256:bbbb111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
-                     repoTags: ["redis:7"], created: 1_716_000_000, size: 138_000_000),
+                     repoTags: ["redis:7"], created: 1_716_000_000, size: 138_000_000, architecture: "arm64"),
         ImageSummary(id: "sha256:cccc111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
-                     repoTags: ["ghcr.io/acme/api:2.3"], created: 1_715_000_000, size: 92_000_000),
+                     repoTags: ["ghcr.io/acme/api:2.3"], created: 1_715_000_000, size: 92_000_000, architecture: "amd64"),
         ImageSummary(id: "sha256:dddd111122223333444455556666777788889999aaaabbbbccccddddeeeeffff",
-                     repoTags: [], created: 1_714_000_000, size: 5_300_000),
+                     repoTags: [], created: 1_714_000_000, size: 5_300_000, architecture: "multi"),
     ]
 
     public static let sampleVolumes: [Volume] = [

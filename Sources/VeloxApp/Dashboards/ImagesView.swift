@@ -84,19 +84,22 @@ struct ImagesView: View {
         Table(filtered, selection: $selection) {
             TableColumn("Repository") { img in
                 Text(img.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-            }.width(min: 110, ideal: 180)
+            }.width(min: 110, ideal: 160, max: 280)
             TableColumn("Tag") { img in
-                Text(img.tag).font(.callout).foregroundStyle(.secondary)
-            }.width(min: 56, ideal: 90)
+                Text(img.tag).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }.width(min: 50, ideal: 80, max: 150)
+            TableColumn("Arch") { img in
+                ArchBadge(arch: img.architecture)
+            }.width(min: 52, ideal: 64, max: 90)
             TableColumn("Image ID") { img in
                 Text(img.shortID).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }.width(94)
+            }.width(min: 84, ideal: 96, max: 112)
             TableColumn("Created") { img in
-                Text(Format.age(epoch: img.created)).foregroundStyle(.secondary)
-            }.width(86)
+                Text(Format.age(epoch: img.created)).foregroundStyle(.secondary).lineLimit(1)
+            }.width(min: 70, ideal: 86, max: 120)
             TableColumn("Size") { img in
                 Text(Format.bytes(img.size)).font(.callout.monospacedDigit())
-            }.width(76)
+            }.width(min: 64, ideal: 76, max: 100)
             TableColumn("") { img in
                 HStack(spacing: 2) {
                     Button { tagTarget = img } label: { Image(systemName: "tag") }
@@ -183,6 +186,24 @@ struct ImagesView: View {
         let ref = pullReference
         pullReference = ""
         Task { await model.pull(ref) }
+    }
+}
+
+/// A compact capsule for an image's architecture ("arm64" / "amd64" / "multi"),
+/// or a dash when the daemon doesn't report one.
+private struct ArchBadge: View {
+    let arch: String?
+
+    var body: some View {
+        if let arch {
+            Text(arch)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(.quaternary, in: Capsule())
+        } else {
+            Text("—").foregroundStyle(.secondary)
+        }
     }
 }
 
