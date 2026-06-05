@@ -643,21 +643,27 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 /// The reaper (`reap_forever`) watches this PID and relaunches the daemon if it
 /// ever exits, so a dockerd crash never leaves the engine permanently dead.
 fn spawn_dockerd() -> i32 {
-    // dockerd discovers containerd/runc/iptables on PATH and manages its own
+    // dockerd discovers containerd/runc/nft/iptables on PATH and manages its own
     // containerd. Unix socket (not TCP) — the vsock agent bridges to it directly.
+    let mut args: Vec<String> = vec![
+        "--host=unix:///run/docker.sock".into(),
+        "--feature=containerd-snapshotter=true".into(),
+    ];
+    // In netstack (static) mode the gateway IP is fixed and is also
+    // host.docker.internal; tell dockerd so `--add-host host.docker.internal:
+    // host-gateway` (and compose extra_hosts) resolve to the Mac.
+    if cmdline_value("velox.net").as_deref() == Some("static") {
+        args.push("--host-gateway-ip=192.168.127.1".into());
+        // The netstack is IPv4-only (v1); stop dockerd from trying (and failing) to
+        // program IPv6 NAT rules. Avoids a noisy ip6tables warning at boot.
+        args.push("--ip6tables=false".into());
+    }
     let child = Command::new("/bin/dockerd")
-        .args([
-            "--host=unix:///run/docker.sock",
-            "--feature=containerd-snapshotter=true",
-            // Default firewall backend = iptables-nft (programs nf_tables); the
-            // static iptables-nft binary is in the image. dockerd's stderr is
-            // inherited to the console, so issues are visible here.
-        ])
+        .args(&args)
         .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin")
-        // NOTE: we deliberately do NOT set DOCKER_RAMDISK. The root is a real
-        // erofs block device (/dev/vda), not an initramfs, so runc can pivot_root
-        // normally — DOCKER_RAMDISK would force the weaker no-pivot_root path for
-        // every container with no benefit here.
+        // dockerd 29's default firewall backend is nftables; the `nft` binary is in
+        // the image (nftables pkg). NOTE: we deliberately do NOT set DOCKER_RAMDISK
+        // — the root is a real erofs block device, so runc can pivot_root normally.
         .spawn();
     match child {
         Ok(c) => { let pid = c.id() as i32; log!("dockerd started (pid {pid})"); pid }

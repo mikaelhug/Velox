@@ -36,10 +36,11 @@ RUN wget -qO docker.tgz "https://download.docker.com/linux/static/stable/aarch64
 # right after `COPY … /rootfs/sbin/init` gets exec'd AS that binary by this
 # buildkit/containerd-store setup — so no RUN may follow the vinit copy.)
 FROM ${ALPINE_IMAGE} AS assembly
-# apk resolves the (few) musl libs these pull in. iptables = iptables-nft → nf_tables.
+# apk resolves the (few) musl libs these pull in. iptables = iptables-nft → nf_tables;
+# nftables provides the `nft` binary dockerd 29 uses by default for its firewall.
 RUN apk add --no-cache --initdb --root /rootfs \
       --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys \
-      iptables ip6tables e2fsprogs ca-certificates \
+      iptables ip6tables nftables e2fsprogs ca-certificates \
  && rm -rf /rootfs/etc/apk /rootfs/lib/apk /rootfs/var/cache /rootfs/etc/network \
            /rootfs/etc/init.d /rootfs/etc/conf.d /rootfs/sbin/openrc* /rootfs/usr/share/man \
  && mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev/pts /rootfs/dev/shm /rootfs/run \
