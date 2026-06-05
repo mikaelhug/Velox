@@ -103,18 +103,83 @@ prereqs built-in (needed for `-v` mounts and Rosetta) — config in
 
 End-to-end: `velox start` → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.
 
-## Performance & objective
+## Performance
 
 The north star is to be **as lean, efficient, and fast as possible with the
-smallest footprint** — and to **beat Docker Desktop and OrbStack where possible,
-and be at least on par otherwise**. Concrete data point (iperf3, container ↔ Mac):
+smallest footprint** — **beat Docker Desktop and OrbStack where possible, and be at
+least on par otherwise**. The numbers below were measured on Apple Silicon, Velox vs
+Docker Desktop (Docker Engine 29.x both sides), 2026-06. They vary by host; each
+table has a one-line reproduction. Velox figures are CLI mode (`velox start`).
 
-| metric (container ↔ host) | Velox | Docker Desktop |
+**Scorecard:** Velox **wins** on network, cold-start, and RAM; is **on par** on
+disk reclaim, VirtioFS, and x86 emulation; and currently **trails** on per-container
+launch latency (see the last table — an open item).
+
+### Network throughput — **win** (iperf3, container ↔ Mac, Apple VZNAT both sides)
+
+| direction | Velox | Docker Desktop |
 | --- | --- | --- |
-| network upload (guest→host) | **~80 Gbit/s** | ~25 Gbit/s |
-| network download (host→guest) | **~14 Gbit/s** | ~12.85 Gbit/s |
+| upload (container → host) | **~87 Gbit/s** | ~25 Gbit/s |
+| download (host → container) | **~13.5 Gbit/s** | ~12.5 Gbit/s |
 
-Velox uses the same kernel datapath as Docker Desktop (Apple's VZNAT) but with a far
-leaner host (no Electron, no proxy/telemetry layers), so it matches-or-beats on
-throughput while using a fraction of the resources. Beating this further would need
-a custom hypervisor (OrbStack's approach) — deliberately out of scope.
+Same in-kernel datapath, but Velox's far leaner host gets closer to the ceiling.
+Repro: `iperf3 -s -B 0.0.0.0` on the Mac, then in a container
+`apk add iperf3 && iperf3 -c host.docker.internal` (add `-R` for download).
+
+### Cold start — **win** (launch → `docker` ready)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| **~1.5–2.8 s** | ~5.6 s |
+
+Repro: `time` from `velox start` until `docker version` succeeds; for DD, quit it,
+then time `open -a Docker` until `docker --context desktop-linux version` succeeds.
+
+### Idle RAM — **win** (host-side resident memory, no containers)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| **~28 MiB** | ~633 MiB |
+
+One VM-supervisor process vs DD's Electron UI + backend daemons + helpers. (Guest
+RAM is accounted separately by VZ for both.) Repro:
+`ps -o rss= -p "$(pgrep -f release/velox)"` vs
+`ps -axo rss=,comm= | grep -i docker | awk '{s+=$1} END{print s}'`.
+
+### Disk reclaim — **on par** (pull 1 GiB image → remove → trim)
+
+| | Velox | Docker Desktop |
+| --- | --- | --- |
+| returns freed space to macOS | yes (guest `fstrim` + ASIF hole-punch) | yes (auto-TRIM) |
+
+Velox's data disk is a sparse ASIF image that starts at tens of MiB; DD's
+`Docker.raw` grows large over time but does reclaim. Repro: `du -m ~/.velox/data.img`
+before/after `docker pull python:3.12`, then `docker rmi python:3.12` + an `fstrim`.
+
+### VirtioFS write — **on par** (`dd` 1 GiB, `conv=fsync`; same Apple VirtioFS)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| ~1.0–1.9 GB/s | ~1.0–1.8 GB/s |
+
+Repro: `docker run --rm -v "$PWD":/mnt alpine dd if=/dev/zero of=/mnt/big bs=1M count=1024 conv=fsync`.
+
+### x86 emulation — **on par** (Rosetta, amd64 workload, container-start subtracted)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| ~0.2 s | ~0.2 s |
+
+Repro: `time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c pass`
+(subtract the container-start overhead below).
+
+### Per-container launch — **trails** (open item)
+
+| Velox | Docker Desktop |
+| --- | --- |
+| ~0.77 s | ~0.30 s |
+
+`docker run --rm alpine true`, averaged. Velox's ~0.45 s of extra per-container
+overhead is the one axis where it currently loses (it inflates the small-file and
+x86 wall-times above); reducing it is a tracked follow-up. Repro:
+`time docker run --rm alpine true` (warm image, average a few runs).
