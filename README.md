@@ -24,26 +24,48 @@ The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are sha
 the kernel); published **TCP and UDP** ports map back to `localhost`; and
 `host.docker.internal` reaches the Mac.
 
-## Install
+## Installation
 
 Velox ships as a self-contained `Velox.app` — it bundles the guest kernel + rootfs, the
-engine, **and** the `docker` client, so nothing else is required on a fresh Mac.
+engine, **and** the `docker` client, so nothing else is required on a fresh Mac. Requires
+**macOS 15+ on Apple Silicon**.
+
+> Velox is code-signed but not notarized, so a downloaded copy trips macOS Gatekeeper
+> ("Apple could not verify…"). Both methods below clear the download-quarantine flag so it
+> opens normally.
+
+### Quick install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mikaelhug/Velox/main/install.sh | bash
+```
+
+This downloads the latest release, installs `Velox.app` into `/Applications`, clears the
+quarantine flag, and launches it.
+
+### Manual install
 
 1. Download `Velox-<version>-macos-arm64.zip` from the
    [Releases](https://github.com/mikaelhug/Velox/releases) page.
-2. Double-click to unzip, drag **Velox** into Applications, and open it.
-3. On first launch Velox starts the engine, installs `docker` + `velox` onto your `PATH`
-   (rootless — symlinks under `~/.velox/bin`), and registers a `velox` Docker context.
+2. Double-click to unzip and drag **Velox** into Applications.
+3. Clear the quarantine flag, then open it:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/Velox.app
+   open /Applications/Velox.app
+   ```
+   (Or open it once via **System Settings → Privacy & Security → "Open Anyway"**.)
 
-Then, in any terminal:
+On first launch Velox starts the engine, installs `docker` + `velox` onto your `PATH`
+(rootless — symlinks under `~/.velox/bin`), and registers a `velox` Docker context. Then,
+in any terminal:
 
 ```bash
 docker run --rm hello-world
 docker ps -a
 ```
 
-Requires **macOS 15+ on Apple Silicon**. The app keeps the engine running while it is
-open (quit it to stop the VM); or run it headless from the terminal with `velox start`.
+The app keeps the engine running while it is open (quit it to stop the VM); or run it
+headless from the terminal with `velox start`.
 
 ## Usage
 
