@@ -180,6 +180,12 @@ Repro: `time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c 
 | ~0.77 s | ~0.30 s |
 
 `docker run --rm alpine true`, averaged. Velox's ~0.45 s of extra per-container
-overhead is the one axis where it currently loses (it inflates the small-file and
-x86 wall-times above); reducing it is a tracked follow-up. Repro:
-`time docker run --rm alpine true` (warm image, average a few runs).
+overhead is the one axis where it currently loses (it also inflates the small-file
+and x86 wall-times above). Investigated: it is **not** the VSOCK Docker-API proxy
+(Velox's API round-trip is ~78 ms, *faster* than DD's ~91 ms), nor CPU, nor disk —
+it is the per-container **network-namespace / veth / bridge setup** (`--network
+none` is ~0.37 s faster). The iptables-nft shell-out is ~130 ms of that; Docker 29's
+native nftables backend removes it but doesn't lower total launch time and breaks
+Velox's reverse port-forwarding, so it's not adopted. Reducing the remaining veth/
+bridge cost is a tracked follow-up. Repro: `time docker run --rm alpine true`
+(warm image, average a few runs); compare `--network none`.
