@@ -1,11 +1,27 @@
 # Velox
 
-A lightweight, open-source Docker Desktop alternative for macOS. The host
-supervisor is 100% Swift and drives Apple's `Virtualization.framework` to run a
-minimal Linux guest hosting the stock `dockerd`. The Docker API socket is
-bridged from the Mac to the guest over **VSOCK**; local directories are shared
-via **VirtioFS**; outbound internet uses native **NAT**; and published container
-ports are mapped back to `localhost`.
+A lightweight, open-source Docker Desktop / OrbStack alternative for macOS, built
+to be **as lean, efficient, and fast as possible with the smallest footprint** —
+beating Docker Desktop and OrbStack on performance where possible, and at least on
+par otherwise.
+
+The design, in four pillars:
+
+- **Apple's kernel networking (VZNAT)** — the fastest container datapath on
+  `Virtualization.framework` (measured ~14 Gbit/s down / ~80 Gbit/s up, beating
+  Docker Desktop). No userspace network stack.
+- **A 100% Swift host** — VM lifecycle, the Docker-API proxy, port forwarding, and
+  the SwiftUI app are all pure Swift. **No Go, no host-side Rust.**
+- **Rust only for the tiny guest `vinit`** — a single static binary is the guest's
+  PID 1 and entire userland orchestration.
+- **A custom, minimal kernel** — built from kernel.org source, only what the VM
+  needs (`tinyconfig` + a curated fragment), with high-performance Rust added in the
+  guest where it helps.
+
+The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are shared
+via **VirtioFS**; the container network is Apple's in-kernel **VZNAT** (outbound +
+NAT in the kernel); published ports map back to `localhost`; and
+`host.docker.internal` reaches the Mac.
 
 Targets **Apple Silicon (arm64)** first.
 
@@ -27,7 +43,7 @@ The build ad-hoc signs the binary with `com.apple.security.virtualization`
 (see `Resources/Entitlements/velox.entitlements`). Verify it is embedded:
 
 ```bash
-codesign -d --entitlements - "$(swift build -c release --show-bin-path)/Velox"
+codesign -d --entitlements - "$(swift build -c release --show-bin-path)/velox"
 ```
 
 ## Usage
@@ -86,3 +102,19 @@ prereqs built-in (needed for `-v` mounts and Rosetta) — config in
   pipe over VSOCK to a guest reverse-relay (closes when the container stops).
 
 End-to-end: `velox start` → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.
+
+## Performance & objective
+
+The north star is to be **as lean, efficient, and fast as possible with the
+smallest footprint** — and to **beat Docker Desktop and OrbStack where possible,
+and be at least on par otherwise**. Concrete data point (iperf3, container ↔ Mac):
+
+| metric (container ↔ host) | Velox | Docker Desktop |
+| --- | --- | --- |
+| network upload (guest→host) | **~80 Gbit/s** | ~25 Gbit/s |
+| network download (host→guest) | **~14 Gbit/s** | ~12.85 Gbit/s |
+
+Velox uses the same kernel datapath as Docker Desktop (Apple's VZNAT) but with a far
+leaner host (no Electron, no proxy/telemetry layers), so it matches-or-beats on
+throughput while using a fraction of the resources. Beating this further would need
+a custom hypervisor (OrbStack's approach) — deliberately out of scope.

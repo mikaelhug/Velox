@@ -1,14 +1,36 @@
 # Velox — Project Conventions
 
-Velox is a lightweight, open-source Docker Desktop alternative for macOS. The
-host supervisor is 100% Swift driving Apple's `Virtualization.framework`; the
-guest is a minimal custom Linux image (from-source kernel + a compressed `erofs`
+Velox is a lightweight, open-source Docker Desktop / OrbStack alternative for macOS.
+
+## North Star — the main objective
+
+Be **as lean, efficient, fast, and small-footprint as possible**, and on every
+metric that matters — startup time, RAM, CPU, disk footprint, network throughput,
+filesystem I/O — **beat Docker Desktop and OrbStack where it's possible, and be at
+least on par otherwise.** Every decision in this repo serves that goal. The four
+pillars that deliver it:
+
+1. **Apple's kernel networking (VZNAT).** The container datapath is Apple's
+   in-kernel NAT — the fastest networking path on `Virtualization.framework`
+   (measured ~14 Gbit/s down / ~80 Gbit/s up, beating Docker Desktop). **No
+   userspace netstack:** a host-side `PortForwarder` maps published ports to
+   `localhost`, and dockerd `--host-gateway-ip` wires `host.docker.internal`.
+   (Truly *beating* VZNAT on raw throughput would need a custom hypervisor —
+   OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)
+2. **A 100% Swift host.** The whole supervisor — VM lifecycle, Docker-API VSOCK
+   proxy, port forwarding, clock sync, the SwiftUI GUI — is pure Swift on
+   `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons.**
+3. **Rust only for the tiny guest `vinit`.** One static-musl Rust binary is the
+   guest's PID 1 and entire userland orchestration. Lean and fast by design.
+4. **A custom kernel, as lean as possible.** Built from kernel.org source —
+   `tinyconfig` + a curated fragment, only what the VM needs, nothing else. Where a
+   guest component must be faster or smaller, add a focused high-performance Rust
+   piece (like `vinit`) rather than pull in heavyweight userland.
+
+Concretely: the host supervisor is 100% Swift driving `Virtualization.framework`;
+the guest is a minimal custom Linux image (from-source kernel + a compressed `erofs`
 rootfs of static binaries — **no LinuxKit, no initramfs**, see §7) running stock
-`dockerd`. Networking uses Apple's in-kernel VZNAT (the fastest datapath on VZ —
-measured >13 Gbit/s download / >80 Gbit/s upload, beating Docker Desktop) with a
-host-side `PortForwarder` for published ports and dockerd `--host-gateway-ip` for
-`host.docker.internal`; **no userspace netstack, no Go.** "Pure kernel + Swift" is
-the design. The goal is to beat OrbStack on speed and footprint. See `README.md`.
+`dockerd`. See `README.md` for status.
 
 The following conventions are **binding** — keep them true in all future work.
 
@@ -38,8 +60,8 @@ root and no `/var/run` conflict (like Colima).
 
 `versions.env` (repo root) is the single source of truth for **every** version:
 Velox's own version, the guest kernel ("OS version"), the Docker Engine static
-release shipped in the guest, and the build-stage toolchain images (Rust/Alpine/Go).
-Nothing else may hard-code a version.
+release shipped in the guest, and the build-stage toolchain images (Rust + Alpine
+only — **no Go**, per pillar #2). Nothing else may hard-code a version.
 
 - Swift reads versions via `Sources/VeloxCore/Support/Versions.swift`, which is
   **generated** from `versions.env` by `Scripts/gen-versions.sh` (run by
@@ -118,17 +140,17 @@ The binding architecture:
   the data disk is `/dev/vdb` (ext4, `/var/lib/docker`). Because the root is
   demand-paged from disk, the big Docker binaries are NOT all held in RAM.
 - **`vinit` (`guest/vinit/`, Rust → static musl) IS PID 1**: it does every boot step
-  via direct syscalls (`nix`/`libc`) — mounts, cgroup2, clock from `velox.epoch`,
-  **native DHCP + netlink** (no udhcpc), data-disk format/mount, VirtioFS, Rosetta
-  binfmt — then forks+supervises `dockerd` (on a unix socket, with
+  via direct syscalls (`libc`) — mounts, cgroup2, clock from `velox.epoch`, **native
+  DHCP via ioctl** (no udhcpc/dhcpcd), data-disk format/mount + swap, VirtioFS,
+  Rosetta binfmt — then forks+supervises `dockerd` (on a unix socket, with
   `--host-gateway-ip` for host.docker.internal), runs the vsock agent (ports 2375
   docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock), and reaps
-  zombies. All custom guest code is Rust.
+  zombies. All custom guest code is Rust (pillar #3) — keep it lean.
 - The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
-  `versions.env`). A tiny musl userland (`iptables`-nft, `e2fsprogs`, `ca-certs` —
-  the only tools dockerd shells out to, plus busybox as a debug shell) comes from
-  Alpine packages, so there is a small `/lib`. Eliminating it (fully-static nft +
-  mke2fs from source → a pure scratch tree) is a noted follow-up.
+  `versions.env`). A tiny musl userland (`iptables`-nft + `nftables`, `e2fsprogs`,
+  `ca-certificates` — the only tools dockerd shells out to) comes from Alpine
+  packages, so there is a small `/lib`. Eliminating it (fully-static nft + mke2fs
+  from source → a pure scratch tree) is a noted follow-up toward the leaner footprint.
 - **Do NOT reintroduce:** `linuxkit`, the `docker:*-dind` image, `linuxkit/*` package
   images, an initramfs, or any OCI-image-as-guest-component. There is no
   `guest/velox.yml`. (Buildkit gotcha: a `RUN` immediately after `COPY …/sbin/init`
