@@ -29,9 +29,9 @@ the kernel); published **TCP and UDP** ports map back to `localhost`; and
 Velox ships as a self-contained `Velox.app` — it bundles the guest kernel + rootfs, the
 engine, **and** the `docker` client, so nothing else is required on a fresh Mac.
 
-1. Download `Velox-<version>-macos-arm64.dmg` from the
+1. Download `Velox-<version>-macos-arm64.zip` from the
    [Releases](https://github.com/mikaelhug/Velox/releases) page.
-2. Drag **Velox** into Applications and open it.
+2. Double-click to unzip, drag **Velox** into Applications, and open it.
 3. On first launch Velox starts the engine, installs `docker` + `velox` onto your `PATH`
    (rootless — symlinks under `~/.velox/bin`), and registers a `velox` Docker context.
 

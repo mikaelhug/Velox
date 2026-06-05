@@ -102,19 +102,15 @@ sign "$APP/Contents/Resources/bin/docker"
 sign "$APP/Contents/Resources/bin/velox" "$ENTITLEMENTS"
 sign "$APP" "$ENTITLEMENTS"
 
-# --- package: .zip (updater self-replace) + .dmg (human download) -------------
+# --- package: a single .zip ---------------------------------------------------
+# One artifact serves both paths: the in-app updater unpacks it (ditto -x -k) to
+# self-replace, and a human just double-clicks it (Archive Utility extracts Velox.app)
+# and drags it into /Applications. A .dmg would only add mount/copy logic to the
+# updater for no real gain, so we don't build one.
 mkdir -p "$DIST"
 ZIP="$DIST/Velox-${VELOX_VERSION}-macos-${ARCH}.zip"
-DMG="$DIST/Velox-${VELOX_VERSION}-macos-${ARCH}.dmg"
 echo "==> package $ZIP"
 rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
-if command -v hdiutil >/dev/null 2>&1; then
-    echo "==> package $DMG"
-    STAGE="$(mktemp -d)"; cp -R "$APP" "$STAGE/"; ln -s /Applications "$STAGE/Applications"
-    rm -f "$DMG"
-    hdiutil create -volname "Velox" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-    rm -rf "$STAGE"
-fi
 
 echo "==> Built: $APP"
 du -sh "$APP" | sed 's/^/    bundle size: /'
