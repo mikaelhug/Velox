@@ -118,8 +118,12 @@ pub fn run(
     // Published ports: host_port → (127.0.0.1 listener, guest_port). TCP only (M2).
     let mut listeners: HashMap<u16, (TcpListener, u16)> = HashMap::new();
     let mut ephemeral: u16 = 49152;
+    // Outbound UDP NAT (M3): a smoltcp socket bound per (dst_ip,dst_port) the guest
+    // talks to, and a host UdpSocket per (src,dst) flow, with idle expiry.
+    let mut udp_listeners: HashMap<(u32, u16), (SocketHandle, std::time::Instant)> = HashMap::new();
+    let mut udp_flows: HashMap<ConnKey, UdpFlow> = HashMap::new();
 
-    sink.log(2, &format!("velox-net: M2 up — TCP NAT + DNS + published ports (upstreams {:?})", upstreams));
+    sink.log(2, &format!("velox-net: M3 up — TCP+UDP NAT, DNS, published ports (upstreams {:?})", upstreams));
 
     while !stop.load(Ordering::Relaxed) {
         // 1) Drain inbound frames; create a listening socket for each new outbound SYN
@@ -131,6 +135,16 @@ pub fn run(
                     let h = sockets.add(s);
                     keys.insert(key);
                     flows.insert(h, TcpFlow::outbound(key));
+                }
+            } else if let Some((_s, _sp, dst_ip, dst_port)) = parse_udp(frame) {
+                // Bind a NAT socket for any outbound UDP dst except the gateway's
+                // own DNS (handled by the responder bound to gateway:53).
+                if !(dst_ip == cfg.gateway_ip && dst_port == 53)
+                    && !udp_listeners.contains_key(&(dst_ip, dst_port))
+                {
+                    let s = make_udp_listener(dst_ip, dst_port);
+                    let h = sockets.add(s);
+                    udp_listeners.insert((dst_ip, dst_port), (h, std::time::Instant::now()));
                 }
             }
         });
@@ -150,6 +164,9 @@ pub fn run(
 
         // 6) Service TCP flows: dial newly-established outbound, pump bytes, reap dead.
         service_tcp(&mut sockets, &mut flows, &mut keys, cfg.gateway_ip);
+
+        // 7) Service outbound UDP NAT flows + expire idle ones.
+        service_udp(&mut sockets, &mut udp_listeners, &mut udp_flows, cfg.gateway_ip);
 
         // 5) Sleep until the next timer or an inbound frame (kqueue + wakeup is M5).
         let delay = iface
@@ -347,6 +364,137 @@ fn next_ephemeral(e: &mut u16) -> u16 {
     let p = *e;
     *e = if *e >= 65535 { 49152 } else { *e + 1 };
     p
+}
+
+// =================== UDP NAT (M3) ===================
+
+const UDP_IDLE: Duration = Duration::from_secs(60);
+
+struct UdpFlow {
+    host: std::net::UdpSocket, // connected to the real destination
+    last: std::time::Instant,
+}
+
+fn make_udp_listener(dst_ip: u32, dst_port: u16) -> udp::Socket<'static> {
+    let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 64 * 1024]);
+    let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 32], vec![0u8; 64 * 1024]);
+    let mut s = udp::Socket::new(rx, tx);
+    let o = dst_ip.to_be_bytes();
+    let addr = IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3]));
+    let _ = s.bind(IpListenEndpoint { addr: Some(addr), port: dst_port });
+    s
+}
+
+fn parse_udp(f: &[u8]) -> Option<ConnKey> {
+    if f.len() < 14 + 20 + 8 {
+        return None;
+    }
+    if f[12] != 0x08 || f[13] != 0x00 {
+        return None; // not IPv4
+    }
+    let ihl = (f[14] & 0x0f) as usize * 4;
+    if ihl < 20 || f.get(14 + 9) != Some(&17) {
+        return None; // not UDP
+    }
+    let src_ip = u32::from_be_bytes([f[26], f[27], f[28], f[29]]);
+    let dst_ip = u32::from_be_bytes([f[30], f[31], f[32], f[33]]);
+    let u = 14 + ihl;
+    let src_port = u16::from_be_bytes([f[u], f[u + 1]]);
+    let dst_port = u16::from_be_bytes([f[u + 2], f[u + 3]]);
+    Some((src_ip, src_port, dst_ip, dst_port))
+}
+
+fn ipv4_u32(a: IpAddress) -> u32 {
+    // IpAddress is IPv4-only in this build (no proto-ipv6 feature).
+    let IpAddress::Ipv4(v4) = a;
+    u32::from_be_bytes(v4.octets())
+}
+
+fn service_udp(
+    sockets: &mut SocketSet,
+    udp_listeners: &mut HashMap<(u32, u16), (SocketHandle, std::time::Instant)>,
+    udp_flows: &mut HashMap<ConnKey, UdpFlow>,
+    gateway_ip: u32,
+) {
+    // guest → host: drain each NAT socket, forward datagrams to the real dst.
+    for (&(dst_ip, dst_port), (handle, last)) in udp_listeners.iter_mut() {
+        let sock = sockets.get_mut::<udp::Socket>(*handle);
+        loop {
+            let pkt = match sock.recv() {
+                Ok((data, meta)) => Some((data.to_vec(), meta.endpoint)),
+                Err(_) => None,
+            };
+            let Some((data, src)) = pkt else { break };
+            *last = std::time::Instant::now();
+            let key = (ipv4_u32(src.addr), src.port, dst_ip, dst_port);
+            let flow = match udp_flows.get_mut(&key) {
+                Some(f) => Some(f),
+                None => match open_udp_host(dst_ip, dst_port, gateway_ip) {
+                    Some(host) => {
+                        udp_flows.insert(key, UdpFlow { host, last: std::time::Instant::now() });
+                        udp_flows.get_mut(&key)
+                    }
+                    None => None,
+                },
+            };
+            if let Some(flow) = flow {
+                let _ = flow.host.send(&data);
+                flow.last = std::time::Instant::now();
+            }
+        }
+    }
+
+    // host → guest: read replies and send them back through the NAT socket.
+    let mut buf = [0u8; 64 * 1024];
+    for (&(src_ip, src_port, dst_ip, dst_port), flow) in udp_flows.iter_mut() {
+        let Some((handle, _)) = udp_listeners.get(&(dst_ip, dst_port)) else { continue };
+        let sock = sockets.get_mut::<udp::Socket>(*handle);
+        loop {
+            match flow.host.recv(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    flow.last = std::time::Instant::now();
+                    let o = src_ip.to_be_bytes();
+                    let dst = IpEndpoint {
+                        addr: IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3])),
+                        port: src_port,
+                    };
+                    let _ = sock.send_slice(&buf[..n], dst);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Expire idle flows, then idle listeners with no remaining flows.
+    let now = std::time::Instant::now();
+    udp_flows.retain(|_, f| now.duration_since(f.last) < UDP_IDLE);
+    let mut drop_listeners: Vec<(u32, u16)> = Vec::new();
+    for (&(d_ip, d_port), (_h, last)) in udp_listeners.iter() {
+        let busy = udp_flows.keys().any(|k| k.2 == d_ip && k.3 == d_port);
+        if !busy && now.duration_since(*last) >= UDP_IDLE {
+            drop_listeners.push((d_ip, d_port));
+        }
+    }
+    for k in drop_listeners {
+        if let Some((h, _)) = udp_listeners.remove(&k) {
+            sockets.remove(h);
+        }
+    }
+}
+
+fn open_udp_host(dst_ip: u32, dst_port: u16, gateway_ip: u32) -> Option<std::net::UdpSocket> {
+    let ip = if dst_ip == gateway_ip {
+        Ipv4Addr::new(127, 0, 0, 1)
+    } else {
+        let o = dst_ip.to_be_bytes();
+        Ipv4Addr::new(o[0], o[1], o[2], o[3])
+    };
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect(SocketAddr::from((ip, dst_port))).ok()?;
+    sock.set_nonblocking(true).ok()?;
+    Some(sock)
 }
 
 fn dial(dst_ip: u32, dst_port: u16, gateway_ip: u32) -> std::io::Result<TcpStream> {
