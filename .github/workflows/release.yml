@@ -93,6 +93,11 @@ jobs:
   app:
     needs: guest
     runs-on: macos-15
+    # `secrets` can't be referenced in `if:` (it isn't a valid context there), so
+    # surface the two gating secrets as env and check those instead.
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      HAS_NOTARY: ${{ secrets.AC_API_KEY_ID }}
     steps:
       - uses: actions/checkout@v4
       - name: Fetch guest artifacts
@@ -103,7 +108,7 @@ jobs:
       # Developer ID signing (optional). Secrets:
       #   MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY
       - name: Import signing certificate
-        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+        if: ${{ env.HAS_SIGNING != '' }}
         env:
           P12: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           P12_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -124,7 +129,7 @@ jobs:
 
       # Notarize + staple (optional). Secrets: AC_API_KEY_ID, AC_API_ISSUER_ID, AC_API_KEY_BASE64
       - name: Notarize
-        if: ${{ secrets.AC_API_KEY_ID != '' }}
+        if: ${{ env.HAS_NOTARY != '' }}
         env:
           KEY_ID: ${{ secrets.AC_API_KEY_ID }}
           ISSUER: ${{ secrets.AC_API_ISSUER_ID }}
