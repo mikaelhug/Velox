@@ -100,10 +100,16 @@ func runStart(bind: BindMode) -> Never {
             socketPath: Paths.dockerSocket.path,
             guestPort: VsockPort.docker,
             bridge: bridge)
-        let forwarder = PortForwarder(bridge: bridge)
-        let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
-            forwarder.reconcile(ports)
+        // Inbound published ports: netstack-native reconciler when the netstack is
+        // on, else the VZNAT-era reverse-forwarder + events watcher.
+        let reconciler: PortReconciler? = netStack.map {
+            PortReconciler(socketPath: Paths.dockerSocket.path, stack: $0)
         }
+        let forwarder: PortForwarder? = useNetstack ? nil : PortForwarder(bridge: bridge)
+        let watcher: DockerEventsWatcher? = useNetstack ? nil
+            : DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
+                forwarder?.reconcile(ports)
+            }
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
             ? ResourceSaver(manager: manager, socketPath: Paths.dockerSocket.path,
@@ -114,8 +120,9 @@ func runStart(bind: BindMode) -> Never {
         let teardown = Teardown()
         manager.onStop { error in
             teardown.run()
-            watcher.stop()
-            forwarder.stopAll()
+            watcher?.stop()
+            forwarder?.stopAll()
+            reconciler?.stop()
             clockSync.stop()
             resourceSaver?.stop()
             netStack?.stop()
@@ -132,8 +139,9 @@ func runStart(bind: BindMode) -> Never {
             source.setEventHandler {
                 Log.info("signal \(sig) — flushing and stopping guest…")
                 teardown.run()
-                watcher.stop()
-                forwarder.stopAll()
+                watcher?.stop()
+                forwarder?.stopAll()
+                reconciler?.stop()
                 clockSync.stop()
                 resourceSaver?.stop()
                 netStack?.stop()
@@ -151,7 +159,8 @@ func runStart(bind: BindMode) -> Never {
                 do {
                     try proxy.start()
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
-                    watcher.start() // dynamic -p port forwarding
+                    watcher?.start() // dynamic -p port forwarding (VZNAT path)
+                    reconciler?.start() // dynamic -p port forwarding (netstack path)
                     clockSync.start() // keep guest clock aligned across host sleep
                     resourceSaver?.start() // reclaim RAM while idle
                 } catch {

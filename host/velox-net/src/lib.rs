@@ -16,8 +16,14 @@ mod stack;
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// Control commands from Swift to the stack thread (drained each poll iteration).
+pub enum Cmd {
+    Expose { proto: i32, host_port: u16, guest_port: u16 },
+    Unexpose { proto: i32, host_port: u16 },
+}
 
 /// Static configuration passed at start. Plain POD; copied internally.
 #[repr(C)]
@@ -79,6 +85,7 @@ impl LogSink {
 pub struct VeloxNet {
     stop: Arc<AtomicBool>,
     stats: Arc<Stats>,
+    cmds: Arc<Mutex<Vec<Cmd>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -106,18 +113,20 @@ pub extern "C" fn velox_net_start(
 
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Stats::default());
+    let cmds = Arc::new(Mutex::new(Vec::new()));
     let sink = LogSink { f: log, ctx: log_ctx };
-    let (stop_t, stats_t) = (stop.clone(), stats.clone());
+    let (stop_t, stats_t, cmds_t) = (stop.clone(), stats.clone(), cmds.clone());
 
     let thread = std::thread::Builder::new()
         .name("velox-net".to_string())
-        .spawn(move || stack::run(frame_fd, cfg, stop_t, stats_t, sink))
+        .spawn(move || stack::run(frame_fd, cfg, stop_t, stats_t, cmds_t, sink))
         .ok();
 
     match thread {
         Some(thread) => Box::into_raw(Box::new(VeloxNet {
             stop,
             stats,
+            cmds,
             thread: Some(thread),
         })),
         None => std::ptr::null_mut(),
@@ -139,21 +148,39 @@ pub extern "C" fn velox_net_stop(h: *mut VeloxNet) {
     // Box dropped here.
 }
 
-/// Publish a host port → guest port. M0 stub (returns 0); implemented in M2.
+/// Publish a host port (127.0.0.1:host_port) → guest_ip:guest_port. proto: 0=TCP, 1=UDP.
 #[no_mangle]
 pub extern "C" fn velox_net_expose(
-    _h: *mut VeloxNet,
-    _proto: c_int,
-    _host_port: u16,
-    _guest_port: u16,
+    h: *mut VeloxNet,
+    proto: c_int,
+    host_port: u16,
+    guest_port: u16,
 ) -> c_int {
-    0
+    if h.is_null() {
+        return -1;
+    }
+    let net = unsafe { &*h };
+    if let Ok(mut q) = net.cmds.lock() {
+        q.push(Cmd::Expose { proto, host_port, guest_port });
+        0
+    } else {
+        -1
+    }
 }
 
-/// Remove a published host port. M0 stub.
+/// Remove a published host port.
 #[no_mangle]
-pub extern "C" fn velox_net_unexpose(_h: *mut VeloxNet, _proto: c_int, _host_port: u16) -> c_int {
-    0
+pub extern "C" fn velox_net_unexpose(h: *mut VeloxNet, proto: c_int, host_port: u16) -> c_int {
+    if h.is_null() {
+        return -1;
+    }
+    let net = unsafe { &*h };
+    if let Ok(mut q) = net.cmds.lock() {
+        q.push(Cmd::Unexpose { proto, host_port });
+        0
+    } else {
+        -1
+    }
 }
 
 /// Copy current counters into `out`. Returns 0 on success, -1 on bad args.

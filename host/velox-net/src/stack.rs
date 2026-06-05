@@ -9,16 +9,16 @@
 //! and correct. Worker threads + zero-copy are the M5 throughput upgrade.
 
 use crate::device::FrameDevice;
-use crate::{dns, LogSink, Stats, VnConfig};
+use crate::{dns, Cmd, LogSink, Stats, VnConfig};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x00, 0x00, 0x00, 0x01];
@@ -33,21 +33,24 @@ struct TcpFlow {
     key: ConnKey,
     dst_ip: u32,
     dst_port: u16,
-    host: Option<TcpStream>,
-    to_host: Vec<u8>,  // guest→host bytes awaiting write to the host socket
-    to_guest: Vec<u8>, // host→guest bytes awaiting send into smoltcp
+    host: Option<TcpStream>, // None for outbound until we dial on Established
+    active: bool,            // smoltcp socket reached Established → pumping
+    to_host: Vec<u8>,        // guest→host bytes awaiting write to the host socket
+    to_guest: Vec<u8>,       // host→guest bytes awaiting send into smoltcp
     host_eof: bool,
     guest_fin: bool,      // we've shutdown(Write) the host after the guest's FIN
     closed_to_guest: bool, // we've sent a FIN to the guest after host EOF
 }
 
 impl TcpFlow {
-    fn new(key: ConnKey) -> Self {
+    /// Outbound flow (guest connecting out): host socket is dialed on Established.
+    fn outbound(key: ConnKey) -> Self {
         TcpFlow {
             key,
             dst_ip: key.2,
             dst_port: key.3,
             host: None,
+            active: false,
             to_host: Vec::new(),
             to_guest: Vec::new(),
             host_eof: false,
@@ -55,9 +58,24 @@ impl TcpFlow {
             closed_to_guest: false,
         }
     }
+
+    /// Inbound flow (host connecting into a published port): host socket is the
+    /// accepted Mac client, already in hand; we just wait for the guest connect.
+    fn inbound(key: ConnKey, host: TcpStream) -> Self {
+        let mut f = TcpFlow::outbound(key);
+        f.host = Some(host);
+        f
+    }
 }
 
-pub fn run(fd: i32, cfg: VnConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>, sink: LogSink) {
+pub fn run(
+    fd: i32,
+    cfg: VnConfig,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    cmds: Arc<Mutex<Vec<Cmd>>>,
+    sink: LogSink,
+) {
     let start = std::time::Instant::now();
     let now = || Instant::from_micros(start.elapsed().as_micros() as i64);
 
@@ -97,8 +115,11 @@ pub fn run(fd: i32, cfg: VnConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>, sin
     let upstreams = dns::system_resolvers();
     let mut flows: HashMap<SocketHandle, TcpFlow> = HashMap::new();
     let mut keys: HashSet<ConnKey> = HashSet::new();
+    // Published ports: host_port → (127.0.0.1 listener, guest_port). TCP only (M2).
+    let mut listeners: HashMap<u16, (TcpListener, u16)> = HashMap::new();
+    let mut ephemeral: u16 = 49152;
 
-    sink.log(2, &format!("velox-net: M1 up — TCP NAT + DNS (upstreams {:?})", upstreams));
+    sink.log(2, &format!("velox-net: M2 up — TCP NAT + DNS + published ports (upstreams {:?})", upstreams));
 
     while !stop.load(Ordering::Relaxed) {
         // 1) Drain inbound frames; create a listening socket for each new outbound SYN
@@ -109,18 +130,25 @@ pub fn run(fd: i32, cfg: VnConfig, stop: Arc<AtomicBool>, stats: Arc<Stats>, sin
                     let s = make_listener(key.2, key.3);
                     let h = sockets.add(s);
                     keys.insert(key);
-                    flows.insert(h, TcpFlow::new(key));
+                    flows.insert(h, TcpFlow::outbound(key));
                 }
             }
         });
 
-        // 2) Let smoltcp run its state machines (ARP/ICMP/TCP/UDP).
+        // 2) Apply expose/unexpose commands from Swift (published ports).
+        apply_commands(&cmds, &mut listeners, &sink);
+
+        // 3) Accept inbound connections on published ports and open a guest-side
+        //    smoltcp connection for each.
+        accept_inbound(&mut iface, &mut sockets, &mut flows, &listeners, cfg, &mut ephemeral);
+
+        // 4) Let smoltcp run its state machines (ARP/ICMP/TCP/UDP).
         let _ = iface.poll(now(), &mut device, &mut sockets);
 
-        // 3) Service DNS.
+        // 5) Service DNS.
         service_dns(&mut sockets, dns_handle, cfg.gateway_ip, cfg.guest_ip, &upstreams);
 
-        // 4) Service TCP flows: dial newly-established ones, pump bytes, reap dead ones.
+        // 6) Service TCP flows: dial newly-established outbound, pump bytes, reap dead.
         service_tcp(&mut sockets, &mut flows, &mut keys, cfg.gateway_ip);
 
         // 5) Sleep until the next timer or an inbound frame (kqueue + wakeup is M5).
@@ -205,24 +233,31 @@ fn service_tcp(
     let mut remove: Vec<SocketHandle> = Vec::new();
     for (&h, flow) in flows.iter_mut() {
         let sock = sockets.get_mut::<tcp::Socket>(h);
-        if flow.host.is_none() {
+        if !flow.active {
             match sock.state() {
-                tcp::State::Established => match dial(flow.dst_ip, flow.dst_port, gateway_ip) {
-                    Ok(stream) => flow.host = Some(stream),
-                    Err(_) => {
-                        sock.abort();
-                        remove.push(h);
-                        continue;
+                tcp::State::Established => {
+                    // Outbound flows dial the real host now; inbound already hold
+                    // the accepted host socket.
+                    if flow.host.is_none() {
+                        match dial(flow.dst_ip, flow.dst_port, gateway_ip) {
+                            Ok(stream) => flow.host = Some(stream),
+                            Err(_) => {
+                                sock.abort();
+                                remove.push(h);
+                                continue;
+                            }
+                        }
                     }
-                },
+                    flow.active = true;
+                }
                 tcp::State::Closed => {
-                    remove.push(h);
+                    remove.push(h); // handshake never completed
                     continue;
                 }
                 _ => continue, // still handshaking
             }
         }
-        if pump_flow(sock, flow) {
+        if flow.active && pump_flow(sock, flow) {
             remove.push(h);
         }
     }
@@ -232,6 +267,86 @@ fn service_tcp(
         }
         sockets.remove(h);
     }
+}
+
+/// Drain expose/unexpose commands from Swift, (un)binding 127.0.0.1 listeners.
+fn apply_commands(
+    cmds: &Arc<Mutex<Vec<Cmd>>>,
+    listeners: &mut HashMap<u16, (TcpListener, u16)>,
+    sink: &LogSink,
+) {
+    let drained: Vec<Cmd> = match cmds.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => return,
+    };
+    for c in drained {
+        match c {
+            Cmd::Expose { proto, host_port, guest_port } => {
+                if proto != 0 || listeners.contains_key(&host_port) {
+                    continue; // TCP only in M2; ignore dup
+                }
+                match TcpListener::bind(("127.0.0.1", host_port)) {
+                    Ok(l) => {
+                        let _ = l.set_nonblocking(true);
+                        listeners.insert(host_port, (l, guest_port));
+                        sink.log(2, &format!("expose tcp 127.0.0.1:{host_port} -> guest:{guest_port}"));
+                    }
+                    Err(e) => sink.log(1, &format!("expose tcp :{host_port} failed: {e}")),
+                }
+            }
+            Cmd::Unexpose { proto, host_port } => {
+                if proto == 0 && listeners.remove(&host_port).is_some() {
+                    sink.log(2, &format!("unexpose tcp :{host_port}"));
+                }
+            }
+        }
+    }
+}
+
+/// Accept pending connections on each published port and open a matching guest-side
+/// smoltcp connection (gateway → guest:guest_port) to bridge each one.
+fn accept_inbound(
+    iface: &mut Interface,
+    sockets: &mut SocketSet,
+    flows: &mut HashMap<SocketHandle, TcpFlow>,
+    listeners: &HashMap<u16, (TcpListener, u16)>,
+    cfg: VnConfig,
+    ephemeral: &mut u16,
+) {
+    let go = cfg.guest_ip.to_be_bytes();
+    let guest_v4 = Ipv4Address::new(go[0], go[1], go[2], go[3]);
+    let ga = cfg.gateway_ip.to_be_bytes();
+    let gw_v4 = Ipv4Address::new(ga[0], ga[1], ga[2], ga[3]);
+
+    for (listener, guest_port) in listeners.values() {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(true);
+                    let rx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+                    let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+                    let mut s = tcp::Socket::new(rx, tx);
+                    let local_port = next_ephemeral(ephemeral);
+                    let remote = IpEndpoint { addr: IpAddress::Ipv4(guest_v4), port: *guest_port };
+                    let local = IpListenEndpoint { addr: Some(IpAddress::Ipv4(gw_v4)), port: local_port };
+                    if s.connect(iface.context(), remote, local).is_err() {
+                        continue;
+                    }
+                    let h = sockets.add(s);
+                    let key = (cfg.gateway_ip, local_port, cfg.guest_ip, *guest_port);
+                    flows.insert(h, TcpFlow::inbound(key, stream));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+fn next_ephemeral(e: &mut u16) -> u16 {
+    let p = *e;
+    *e = if *e >= 65535 { 49152 } else { *e + 1 };
+    p
 }
 
 fn dial(dst_ip: u32, dst_port: u16, gateway_ip: u32) -> std::io::Result<TcpStream> {
