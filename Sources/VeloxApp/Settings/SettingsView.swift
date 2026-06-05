@@ -136,12 +136,46 @@ private struct ResourcesPane: View {
             }
             Section("Disk") {
                 IntSlider(value: $config.diskGiB, range: 8...256, step: 8, unit: "GB")
-                Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — space is used only as needed.")
+                DiskUsageRow(allocatedGiB: config.diskGiB)
+                Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — only the space actually used is allocated on your Mac (and reclaimed when you remove images).")
                     .font(.caption).foregroundStyle(.secondary)
             }
             ResourceSaverSection(config: $config)
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Shows the data disk's **actual** on-disk footprint (the ASIF image is sparse, so
+/// this is far below the allocated maximum) against the allocated size — the
+/// equivalent of Docker Desktop's disk-usage readout. Read host-side in pure Swift
+/// via the file's allocated-size resource value; refreshed on appear and on demand.
+private struct DiskUsageRow: View {
+    let allocatedGiB: Int
+    @State private var usedBytes: Int64?
+
+    var body: some View {
+        HStack {
+            Label("On disk", systemImage: "internaldrive")
+            Spacer()
+            Text(usageText)
+                .foregroundStyle(.secondary)
+            Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+                .help("Refresh")
+        }
+        .task { refresh() }
+    }
+
+    private var usageText: String {
+        guard let usedBytes else { return "—" }
+        let used = ByteCountFormatter.string(fromByteCount: usedBytes, countStyle: .file)
+        return "\(used) used of \(allocatedGiB) GB allocated"
+    }
+
+    private func refresh() {
+        let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+        usedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
     }
 }
 
