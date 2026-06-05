@@ -91,12 +91,17 @@ EOF
 # fallback covers ad-hoc (`-`), which cannot use a secure timestamp.
 sign() {  # <path> [entitlements-file]
     local path="$1" ent="${2:-}"
-    if [ -n "$ent" ]; then
-        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" --entitlements "$ent" "$path" 2>/dev/null \
-        || codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ent" "$path"
+    if [ "$SIGN_IDENTITY" = "-" ]; then
+        # Ad-hoc: PLAIN signature, never the hardened runtime. An ad-hoc, non-notarized
+        # app signed with --options runtime is SIGTRAP-killed on launch once downloaded
+        # (the CI runner's codesign accepts --options runtime where a local one may not,
+        # which is why a downloaded build crashed while a local build ran). Hardened
+        # runtime + secure timestamp belong only to a real Developer ID, for notarization.
+        if [ -n "$ent" ]; then codesign --force --sign - --entitlements "$ent" "$path"
+        else                   codesign --force --sign - "$path"; fi
     else
-        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$path" 2>/dev/null \
-        || codesign --force --sign "$SIGN_IDENTITY" "$path"
+        if [ -n "$ent" ]; then codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" --entitlements "$ent" "$path"
+        else                   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$path"; fi
     fi
 }
 echo "==> codesign ($SIGN_IDENTITY)"

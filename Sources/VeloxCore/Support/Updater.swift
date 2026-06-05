@@ -165,6 +165,11 @@ public enum Updater {
         do {
             _ = try fm.replaceItemAt(target, withItemAt: newApp)
             try? fm.removeItem(at: staging)
+            // Re-register the new bundle with LaunchServices so its icon + Info.plist
+            // changes take effect immediately, rather than from a stale icon cache.
+            let lsregister = "/System/Library/Frameworks/CoreServices.framework"
+                + "/Frameworks/LaunchServices.framework/Support/lsregister"
+            _ = run([lsregister, "-f", target.path])
             print("Updated \(target.lastPathComponent) → \(release.tag). Relaunching…")
             let open = Process(); open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             open.arguments = ["-n", target.path]; try? open.run()
