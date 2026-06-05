@@ -15,9 +15,6 @@ set -a; . ./versions.env; set +a
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> build velox-net host staticlib (linked into VeloxCore)"
-./Scripts/build-net.sh
-
 echo "==> swift build -c $CONFIG (VeloxApp)"
 swift build -c "$CONFIG" --product VeloxApp
 

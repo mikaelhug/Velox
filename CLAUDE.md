@@ -2,9 +2,13 @@
 
 Velox is a lightweight, open-source Docker Desktop alternative for macOS. The
 host supervisor is 100% Swift driving Apple's `Virtualization.framework`; the
-guest is a minimal custom Linux image (from-source kernel + a hand-assembled
-initramfs of static binaries — **no LinuxKit**, see §7) running stock `dockerd`.
-The goal is to beat OrbStack on speed and footprint. See `README.md` for status.
+guest is a minimal custom Linux image (from-source kernel + a compressed `erofs`
+rootfs of static binaries — **no LinuxKit, no initramfs**, see §7) running stock
+`dockerd`. Networking uses Apple's in-kernel VZNAT (the fastest datapath on VZ —
+measured >13 Gbit/s download / >80 Gbit/s upload, beating Docker Desktop) with a
+host-side `PortForwarder` for published ports and dockerd `--host-gateway-ip` for
+`host.docker.internal`; **no userspace netstack, no Go.** "Pure kernel + Swift" is
+the design. The goal is to beat OrbStack on speed and footprint. See `README.md`.
 
 The following conventions are **binding** — keep them true in all future work.
 
@@ -116,8 +120,10 @@ The binding architecture:
 - **`vinit` (`guest/vinit/`, Rust → static musl) IS PID 1**: it does every boot step
   via direct syscalls (`nix`/`libc`) — mounts, cgroup2, clock from `velox.epoch`,
   **native DHCP + netlink** (no udhcpc), data-disk format/mount, VirtioFS, Rosetta
-  binfmt — then forks+supervises `dockerd` (on a unix socket), runs the vsock agent
-  (ports 2375/2374/2376), and reaps zombies. All custom guest code is Rust.
+  binfmt — then forks+supervises `dockerd` (on a unix socket, with
+  `--host-gateway-ip` for host.docker.internal), runs the vsock agent (ports 2375
+  docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock), and reaps
+  zombies. All custom guest code is Rust.
 - The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
   `versions.env`). A tiny musl userland (`iptables`-nft, `e2fsprogs`, `ca-certs` —
   the only tools dockerd shells out to, plus busybox as a debug shell) comes from

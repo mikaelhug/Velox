@@ -38,6 +38,8 @@ final class EngineController {
     private let manager = VMManager()
     private var bridge: VsockBridge?
     private var proxy: DockerSocketProxy?
+    private var forwarder: PortForwarder?
+    private var watcher: DockerEventsWatcher?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
     /// Memory the running VM actually booted with — Resource Saver restores to
@@ -133,6 +135,16 @@ final class EngineController {
             appliedSignature = config.bootSignature
             bootedMemoryBytes = resources.memoryBytes
 
+            // Reverse-forward published container ports to localhost (watch the
+            // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
+            let forwarder = PortForwarder(bridge: bridge)
+            let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
+                forwarder.reconcile(ports)
+            }
+            watcher.start()
+            self.forwarder = forwarder
+            self.watcher = watcher
+
             // Keep the guest clock aligned with the host (survives Mac sleep), and
             // arm Resource Saver to reclaim RAM while idle.
             let clockSync = ClockSync(manager: manager)
@@ -186,6 +198,10 @@ final class EngineController {
     }
 
     private func cleanup() {
+        watcher?.stop()
+        watcher = nil
+        forwarder?.stopAll()
+        forwarder = nil
         proxy?.stop()
         proxy = nil
         bridge = nil

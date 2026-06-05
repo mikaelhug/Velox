@@ -127,6 +127,9 @@ const SIOCSIFNETMASK: libc::c_ulong = 0x891C;
 const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
 const SIOCADDRT: libc::c_ulong = 0x890B;
 const IFNAME: &str = "eth0";
+/// The VZNAT gateway (the Mac on the vmnet bridge), learned from DHCP and read by
+/// spawn_dockerd to wire `host.docker.internal` → the host.
+static GATEWAY_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[repr(C)]
 struct IfReqAddr { name: [u8; 16], addr: libc::sockaddr_in }
@@ -169,16 +172,9 @@ fn sockaddr_in(ip: u32) -> libc::sockaddr_in {
 }
 
 fn setup_network() -> std::io::Result<()> {
-    // With the host userspace netstack (velox-net), the host advertises
-    // `velox.net=static`: there is no DHCP server, so configure eth0 statically
-    // (gateway 192.168.127.1, guest 192.168.127.2/24, DNS at the gateway). Without
-    // it, fall back to DHCP (the Apple-NAT path). This dual mode lets the netstack
-    // be brought up without breaking the default until it's the validated default.
-    if cmdline_value("velox.net").as_deref() == Some("static") {
-        return setup_network_static();
-    }
-
-    // bring lo up + eth0 up, then DHCP, then apply lease.
+    // Apple's in-kernel VZNAT runs a DHCP server on the vmnet bridge. Bring lo +
+    // eth0 up, take the lease, apply it, and remember the gateway (= the Mac on the
+    // bridge) so dockerd can wire host.docker.internal to it.
     let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if s < 0 { return Err(std::io::Error::last_os_error()); }
     iface_up(s, "lo");
@@ -206,6 +202,8 @@ fn setup_network() -> std::io::Result<()> {
     }
     // DNS
     write_resolv_conf(&lease.dns);
+    // Remember the gateway (the Mac on the vmnet bridge) for host.docker.internal.
+    GATEWAY_IP.store(lease.router, std::sync::atomic::Ordering::Relaxed);
     unsafe { libc::close(s); }
 
     // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
@@ -213,34 +211,6 @@ fn setup_network() -> std::io::Result<()> {
     // background at ~half the lease interval (best-effort).
     let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
     std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs));
-    Ok(())
-}
-
-/// Static eth0 config for the velox-net host stack (no DHCP). Matches the gateway
-/// (192.168.127.1) and guest (192.168.127.2/24) the host's NetworkStack assigns.
-fn setup_network_static() -> std::io::Result<()> {
-    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if s < 0 { return Err(std::io::Error::last_os_error()); }
-    iface_up(s, "lo");
-    iface_up(s, IFNAME);
-
-    let ip: u32 = 0xC0A8_7F02; // 192.168.127.2
-    let mask: u32 = 0xFFFF_FF00; // /24
-    let gw: u32 = 0xC0A8_7F01; // 192.168.127.1
-
-    let mut ra = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(ip) };
-    if unsafe { libc::ioctl(s, SIOCSIFADDR as _, &mut ra) } != 0 {
-        log!("static set address failed: {}", std::io::Error::last_os_error());
-    }
-    let mut rm = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(mask) };
-    if unsafe { libc::ioctl(s, SIOCSIFNETMASK as _, &mut rm) } != 0 {
-        log!("static set netmask failed: {}", std::io::Error::last_os_error());
-    }
-    iface_up(s, IFNAME);
-    add_default_route(s, gw);
-    write_resolv_conf(&[gw]); // nameserver = the gateway's DNS responder
-    unsafe { libc::close(s); }
-    log!("network: static {}/24 gw {} (velox-net)", ipstr(ip), ipstr(gw));
     Ok(())
 }
 
@@ -652,11 +622,12 @@ fn spawn_dockerd() -> i32 {
     // In netstack (static) mode the gateway IP is fixed and is also
     // host.docker.internal; tell dockerd so `--add-host host.docker.internal:
     // host-gateway` (and compose extra_hosts) resolve to the Mac.
-    if cmdline_value("velox.net").as_deref() == Some("static") {
-        args.push("--host-gateway-ip=192.168.127.1".into());
-        // The netstack is IPv4-only (v1); stop dockerd from trying (and failing) to
-        // program IPv6 NAT rules. Avoids a noisy ip6tables warning at boot.
-        args.push("--ip6tables=false".into());
+    // host.docker.internal → the vmnet gateway (the Mac), so containers can reach
+    // host services. Containers add it via `--add-host host.docker.internal:host-gateway`
+    // (Docker Desktop sets the same hostname automatically too).
+    let gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
+    if gw != 0 {
+        args.push(format!("--host-gateway-ip={}", ipstr(gw)));
     }
     let child = Command::new("/bin/dockerd")
         .args(&args)

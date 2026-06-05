@@ -38,5 +38,4 @@ Icon?
 # ---- Velox.app bundle (built by Scripts/build-app.sh) ----
 /Velox.app/
 /guest/vinit/target/
-/host/velox-net/target/
 .vscode/launch.json

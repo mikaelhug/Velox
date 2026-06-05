@@ -10,9 +10,6 @@ ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> build velox-net host staticlib (linked into VeloxCore)"
-./Scripts/build-net.sh
-
 echo "==> swift build -c $CONFIG (velox CLI)"
 swift build -c "$CONFIG" --product velox
 

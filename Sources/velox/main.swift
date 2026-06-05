@@ -74,24 +74,12 @@ func runStart(bind: BindMode) -> Never {
         try Paths.ensureRoot()
         try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: prefs.resources.diskGiB)
 
-        // Opt-in to the in-process userspace netstack (Workstream A bring-up). When
-        // off, the guest uses Apple NAT + DHCP (the validated default). When on, the
-        // guest is told `velox.net=static` and its NIC is backed by velox-net.
-        let useNetstack = ProcessInfo.processInfo.environment["VELOX_NET"] == "1"
-        let netStack: NetworkStack? = useNetstack ? try NetworkStack() : nil
-
-        let baseImage = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
-        let image = useNetstack
-            ? GuestImage(kernelURL: baseImage.kernelURL, rootDiskURL: baseImage.rootDiskURL,
-                         kernelCommandLine: baseImage.kernelCommandLine + " velox.net=static")
-            : baseImage
+        let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
         let config = try VMConfiguration.build(
             image: image, dataDisk: Paths.dataDisk,
-            resources: prefs.resources, extraShares: prefs.shareURLs,
-            networkAttachment: netStack?.attachment)
+            resources: prefs.resources, extraShares: prefs.shareURLs)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
                  + "root=\(image.rootDiskURL.lastPathComponent) "
-                 + "net=\(useNetstack ? "velox-net" : "apple-nat") "
                  + "cmdline=\"\(image.kernelCommandLine)\"")
 
         let manager = VMManager()
@@ -100,16 +88,12 @@ func runStart(bind: BindMode) -> Never {
             socketPath: Paths.dockerSocket.path,
             guestPort: VsockPort.docker,
             bridge: bridge)
-        // Inbound published ports: netstack-native reconciler when the netstack is
-        // on, else the VZNAT-era reverse-forwarder + events watcher.
-        let reconciler: PortReconciler? = netStack.map {
-            PortReconciler(socketPath: Paths.dockerSocket.path, stack: $0)
+        // Inbound published ports: watch the Docker API and reverse-forward each
+        // published port over VSOCK to the guest (which dials 127.0.0.1:<port>).
+        let forwarder = PortForwarder(bridge: bridge)
+        let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
+            forwarder.reconcile(ports)
         }
-        let forwarder: PortForwarder? = useNetstack ? nil : PortForwarder(bridge: bridge)
-        let watcher: DockerEventsWatcher? = useNetstack ? nil
-            : DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
-                forwarder?.reconcile(ports)
-            }
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
             ? ResourceSaver(manager: manager, socketPath: Paths.dockerSocket.path,
@@ -120,12 +104,10 @@ func runStart(bind: BindMode) -> Never {
         let teardown = Teardown()
         manager.onStop { error in
             teardown.run()
-            watcher?.stop()
-            forwarder?.stopAll()
-            reconciler?.stop()
+            watcher.stop()
+            forwarder.stopAll()
             clockSync.stop()
             resourceSaver?.stop()
-            netStack?.stop()
             proxy.stop()
             exit(error == nil ? 0 : 1)
         }
@@ -139,12 +121,10 @@ func runStart(bind: BindMode) -> Never {
             source.setEventHandler {
                 Log.info("signal \(sig) — flushing and stopping guest…")
                 teardown.run()
-                watcher?.stop()
-                forwarder?.stopAll()
-                reconciler?.stop()
+                watcher.stop()
+                forwarder.stopAll()
                 clockSync.stop()
                 resourceSaver?.stop()
-                netStack?.stop()
                 proxy.stop()
                 manager.stopGracefully { exit(0) }
             }
@@ -159,8 +139,7 @@ func runStart(bind: BindMode) -> Never {
                 do {
                     try proxy.start()
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
-                    watcher?.start() // dynamic -p port forwarding (VZNAT path)
-                    reconciler?.start() // dynamic -p port forwarding (netstack path)
+                    watcher.start() // dynamic -p port forwarding
                     clockSync.start() // keep guest clock aligned across host sleep
                     resourceSaver?.start() // reclaim RAM while idle
                 } catch {
