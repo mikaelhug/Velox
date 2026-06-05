@@ -19,7 +19,7 @@ public enum CLIBinding {
     /// Apply the binding and return a teardown closure to run on stop.
     public static func apply(_ mode: BindMode, socketPath: String) -> () -> Void {
         let host = "unix://\(socketPath)"
-        guard which("docker") != nil else {
+        guard let docker = dockerPath() else {
             Log.warn("`docker` CLI not found — install it (e.g. `brew install docker`) to use Velox from the terminal.")
             return {}
         }
@@ -30,20 +30,21 @@ public enum CLIBinding {
             Log.info("engine ready — run `docker context use velox` (or `export DOCKER_HOST=\(host)`) to point docker at Velox.")
             return {}
         case .docker:
-            let previous = output(["docker", "context", "show"]) ?? "default"
-            _ = run(["docker", "context", "use", "velox"])
+            let previous = output([docker, "context", "show"]) ?? "default"
+            _ = run([docker, "context", "use", "velox"])
             Log.info("`docker` now targets Velox (context 'velox'); restoring '\(previous)' on stop.")
             return {
-                if previous != "velox" { _ = run(["docker", "context", "use", previous]) }
+                if previous != "velox" { _ = run([docker, "context", "use", previous]) }
             }
         }
     }
 
     /// Create (or update) the `velox` context pointing at the engine socket.
     private static func ensureVeloxContext(host: String) {
-        if run(["docker", "context", "create", "velox",
+        guard let docker = dockerPath() else { return }
+        if run([docker, "context", "create", "velox",
                 "--docker", "host=\(host)", "--description", "Velox engine"]) != 0 {
-            _ = run(["docker", "context", "update", "velox", "--docker", "host=\(host)"])
+            _ = run([docker, "context", "update", "velox", "--docker", "host=\(host)"])
         }
     }
 
@@ -55,13 +56,13 @@ public enum CLIBinding {
     // call them off the main thread.
 
     /// True if the `docker` CLI is installed (a prerequisite for any context op).
-    public static var dockerCLIAvailable: Bool { which("docker") != nil }
+    public static var dockerCLIAvailable: Bool { dockerPath() != nil }
 
     /// Ensure the `velox` context exists, pointing at the engine socket. No-op
     /// (returns false) if the `docker` CLI isn't installed.
     @discardableResult
     public static func ensureContext(socketPath: String) -> Bool {
-        guard which("docker") != nil else { return false }
+        guard dockerPath() != nil else { return false }
         ensureVeloxContext(host: "unix://\(socketPath)")
         return true
     }
@@ -69,14 +70,15 @@ public enum CLIBinding {
     /// The active Docker context name (`docker context show`), or nil if the
     /// `docker` CLI isn't installed.
     public static func activeContext() -> String? {
-        guard which("docker") != nil else { return nil }
-        return output(["docker", "context", "show"]) ?? "default"
+        guard let docker = dockerPath() else { return nil }
+        return output([docker, "context", "show"]) ?? "default"
     }
 
     /// Switch the active Docker context to `velox`. Returns true on success.
     @discardableResult
     public static func useVeloxContext() -> Bool {
-        which("docker") != nil && run(["docker", "context", "use", "velox"]) == 0
+        guard let docker = dockerPath() else { return false }
+        return run([docker, "context", "use", "velox"]) == 0
     }
 
     // MARK: - Process helpers
@@ -107,4 +109,20 @@ public enum CLIBinding {
     }
 
     private static func which(_ cmd: String) -> String? { output(["which", cmd]) }
+
+    /// Resolve a usable `docker` client even before the user's shell PATH is set up:
+    /// the PATH first, then the rootless install (`~/.velox/bin/docker`), then the
+    /// copy bundled inside `Velox.app`. This is what lets context registration work
+    /// on a brand-new Mac (FirstRun symlinks the bundled client into ~/.velox/bin).
+    public static func dockerPath() -> String? {
+        if let p = which("docker") { return p }
+        let fm = FileManager.default
+        let installed = Paths.root.appendingPathComponent("bin/docker").path
+        if fm.isExecutableFile(atPath: installed) { return installed }
+        if let res = Bundle.main.resourceURL?.appendingPathComponent("bin/docker").path,
+           fm.isExecutableFile(atPath: res) { return res }
+        if let exec = Bundle.main.executableURL?.deletingLastPathComponent()
+            .appendingPathComponent("docker").path, fm.isExecutableFile(atPath: exec) { return exec }
+        return nil
+    }
 }

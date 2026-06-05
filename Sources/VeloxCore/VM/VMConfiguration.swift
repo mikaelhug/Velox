@@ -58,10 +58,18 @@ public enum VMConfiguration {
         // RTC, so we also stamp the host's wall-clock as `velox.epoch` (vinit reads
         // it and sets the guest clock first thing; otherwise the guest boots at
         // 1970 and every registry TLS handshake fails).
-        bootLoader.commandLine = image.kernelCommandLine
+        var cmdline = image.kernelCommandLine
             + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
             + (resources.swapMiB > 0 ? " velox.swap=\(resources.swapMiB)" : "")
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
+        // Optional host-supplied extra kernel parameters, appended LAST so a
+        // duplicated key overrides the defaults (kernel takes the last value).
+        // Used for scheduler A/B tuning, e.g. VELOX_KCMDLINE_EXTRA="preempt=full".
+        if let extra = ProcessInfo.processInfo.environment["VELOX_KCMDLINE_EXTRA"]?
+            .trimmingCharacters(in: .whitespaces), !extra.isEmpty {
+            cmdline += " " + extra
+        }
+        bootLoader.commandLine = cmdline
         config.bootLoader = bootLoader
 
         config.serialPorts = [Console.makeSerialPort(write: consoleOutput ?? .standardOutput)]
@@ -90,7 +98,16 @@ public enum VMConfiguration {
         let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: image.rootDiskURL, readOnly: true)
         storage.append(VZVirtioBlockDeviceConfiguration(attachment: rootAttachment))
         if let dataDisk, FileManager.default.fileExists(atPath: dataDisk.path) {
-            let attachment = try VZDiskImageStorageDeviceAttachment(url: dataDisk, readOnly: false)
+            // /var/lib/docker is the hot path for `docker run`: every container
+            // create/start/remove mounts + tears down an overlay snapshot, a storm
+            // of small metadata I/O. `.cached` routes that through the host page
+            // cache (vs the default uncached path), and `.fsync` honours the guest's
+            // fsync barriers without syncing *every* write through to disk — the
+            // same speed/durability trade Docker Desktop & OrbStack make for the
+            // engine disk. Measured to cut container create/remove latency.
+            let attachment = try VZDiskImageStorageDeviceAttachment(
+                url: dataDisk, readOnly: false,
+                cachingMode: .cached, synchronizationMode: .fsync)
             storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
         }
         config.storageDevices = storage

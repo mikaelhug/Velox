@@ -57,14 +57,14 @@ struct SettingsView: View {
 
 private struct GeneralPane: View {
     @Binding var config: VeloxConfig
-    @State private var updateMessage: String?
-    @State private var checking = false
+    @Environment(EngineController.self) private var engine
 
     var body: some View {
         Form {
             Section {
                 Toggle("Launch Velox at login", isOn: $config.launchAtLogin)
                     .onChange(of: config.launchAtLogin) { _, enabled in LoginItem.set(enabled) }
+                Toggle("Check for updates on startup", isOn: $config.checkUpdatesOnStartup)
                 Picker("Software updates", selection: $config.updateBehavior) {
                     Text("Manual").tag(VeloxConfig.UpdateBehavior.manual)
                     Text("Notify when available").tag(VeloxConfig.UpdateBehavior.notify)
@@ -75,11 +75,27 @@ private struct GeneralPane: View {
 
             Section("Updates") {
                 HStack {
-                    Button(checking ? "Checking…" : "Check for Updates", action: checkForUpdates)
-                        .disabled(checking)
-                    if let updateMessage {
-                        Text(updateMessage).font(.callout).foregroundStyle(.secondary)
+                    Button(engine.checkingForUpdate ? "Checking…" : "Check for Updates") {
+                        Task { await engine.checkForUpdates() }
                     }
+                    .disabled(engine.checkingForUpdate || engine.updateInProgress)
+
+                    if let update = engine.availableUpdate {
+                        Text(update.message).font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if engine.availableUpdate?.isUpdateAvailable == true {
+                        Button(engine.updateInProgress ? "Updating…" : "Update Now") {
+                            engine.applyUpdate()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(engine.updateInProgress)
+                    }
+                }
+                if engine.availableUpdate?.isUpdateAvailable == true,
+                   let urlString = engine.availableUpdate?.releaseURL,
+                   let url = URL(string: urlString) {
+                    Link("View release notes", destination: url).font(.callout)
                 }
             }
 
@@ -90,16 +106,6 @@ private struct GeneralPane: View {
             }
         }
         .formStyle(.grouped)
-    }
-
-    private func checkForUpdates() {
-        checking = true
-        updateMessage = nil
-        Task {
-            let result = await Updater.checkForUpdate()
-            updateMessage = result.message
-            checking = false
-        }
     }
 }
 

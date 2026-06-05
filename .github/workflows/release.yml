@@ -1,0 +1,152 @@
+name: Release
+
+# Build + publish a Velox release when a v* tag is pushed.
+#   1. bump VELOX_VERSION in versions.env   (the single source of truth, CLAUDE.md §2)
+#   2. git commit -am "release vX.Y.Z"
+#   3. git tag vX.Y.Z && git push origin vX.Y.Z
+# CI verifies the tag matches VELOX_VERSION, builds a self-contained Velox.app (guest
+# VM + velox + docker CLIs bundled), and attaches Velox-*.dmg / Velox-*.zip to a
+# GitHub Release. The updater reads /releases/latest, so the tag MUST equal the
+# VELOX_VERSION you ship — the verify step below fails the build otherwise.
+#
+# The guest kernel + rootfs are CACHED on their own inputs: a GUI-only change rebuilds
+# neither (both restored from cache); a velox.fragment change rebuilds only the kernel;
+# a vinit/Dockerfile change rebuilds only the rootfs. VELOX_VERSION is deliberately NOT
+# in the cache keys, so bumping it every release doesn't force a kernel recompile.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}      # manual runs build + package but don't publish a Release
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Guest (custom kernel + erofs rootfs) on a NATIVE arm64 Linux runner —
+  #    Docker is preinstalled and linux/arm64 runs without qemu. Cached per-input.
+  # ---------------------------------------------------------------------------
+  guest:
+    runs-on: ubuntu-24.04-arm      # GitHub-hosted Linux arm64 (native — no qemu). NB: label is
+                                    # `-arm`, not `-arm64`; ubuntu-26.04 has no hosted runner yet.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches VELOX_VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -a; . ./versions.env; set +a
+          if [ "${GITHUB_REF_NAME}" != "v${VELOX_VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} != v${VELOX_VERSION} (versions.env). \
+            versions.env is the single source of truth — bump VELOX_VERSION to match the tag."
+            exit 1
+          fi
+
+      - name: Compute cache keys (kernel + rootfs inputs, NOT VELOX_VERSION)
+        id: keys
+        run: |
+          set -a; . ./versions.env; set +a
+          KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF"; \
+                     cat guest/kernel/velox.fragment guest/kernel/Dockerfile.builder Scripts/build-kernel.sh; \
+                   } | sha256sum | cut -c1-16 )
+          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
+                     cat guest/rootfs/Dockerfile guest/vinit/src/main.rs guest/vinit/Cargo.toml \
+                         guest/vinit/Cargo.lock Scripts/make-guest.sh; \
+                   } | sha256sum | cut -c1-16 )
+          echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"
+          echo "rootfs=rootfs-${DOCKER_VERSION}-${RHASH}"     >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached kernel
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: Assets/velox-vmlinux
+          key: ${{ steps.keys.outputs.kernel }}
+      - name: Build kernel (only when its inputs changed)
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: ./Scripts/build-kernel.sh
+
+      - name: Restore cached rootfs
+        id: rcache
+        uses: actions/cache@v4
+        with:
+          path: guest/build/root.img
+          key: ${{ steps.keys.outputs.rootfs }}
+      - name: Build guest rootfs (only when its inputs changed)
+        if: steps.rcache.outputs.cache-hit != 'true'
+        run: ./Scripts/make-guest.sh
+
+      - name: Upload guest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest
+          path: |
+            Assets/velox-vmlinux
+            guest/build/root.img
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 2) Build + package the macOS app (always — it's fast). Bundles the guest from
+  #    job 1, signs ad-hoc by default (Developer ID + notarize when secrets exist).
+  # ---------------------------------------------------------------------------
+  app:
+    needs: guest
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch guest artifacts
+        uses: actions/download-artifact@v4
+        with: { name: guest, path: . }
+      - run: swift --version && xcode-select -p
+
+      # Developer ID signing (optional). Secrets:
+      #   MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY
+      - name: Import signing certificate
+        if: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          P12_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/velox-signing.keychain-db"
+          security create-keychain -p actions "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$P12_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+      - name: Build + package (Velox.app, .dmg, .zip)
+        env:
+          VELOX_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}   # empty → ad-hoc
+        run: ./Scripts/build-app.sh release
+
+      # Notarize + staple (optional). Secrets: AC_API_KEY_ID, AC_API_ISSUER_ID, AC_API_KEY_BASE64
+      - name: Notarize
+        if: ${{ secrets.AC_API_KEY_ID != '' }}
+        env:
+          KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          ISSUER: ${{ secrets.AC_API_ISSUER_ID }}
+          KEY_B64: ${{ secrets.AC_API_KEY_BASE64 }}
+        run: |
+          echo "$KEY_B64" | base64 --decode > "$RUNNER_TEMP/ac.p8"
+          for f in dist/Velox-*.dmg dist/Velox-*.zip; do
+            [ -f "$f" ] && xcrun notarytool submit "$f" --key "$RUNNER_TEMP/ac.p8" \
+              --key-id "$KEY_ID" --issuer "$ISSUER" --wait || true
+          done
+          for d in dist/Velox-*.dmg; do [ -f "$d" ] && xcrun stapler staple "$d" || true; done
+
+      - name: Upload build artifacts (every run, for inspection)
+        uses: actions/upload-artifact@v4
+        with: { name: velox-app, path: dist/Velox-*, retention-days: 7 }
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')      # tags publish; manual runs don't
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Velox-*.dmg
+            dist/Velox-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

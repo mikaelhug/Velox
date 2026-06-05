@@ -72,7 +72,7 @@ public enum Updater {
         print("Update available: v\(latest)  (you have v\(Versions.velox))")
         print("  \(release.htmlURL)")
         if apply {
-            download(release)
+            applyUpdate(release)
         } else {
             print("Run `velox update --apply` to download and install it.")
         }
@@ -105,41 +105,96 @@ public enum Updater {
         return release
     }
 
-    /// Download the macOS/arm64 asset to ~/.velox/updates/<tag>/ for the
-    /// bundled installer to apply. (Self-replacement lands with the first real
-    /// release; the download path here is ready for it.)
-    private static func download(_ release: Release) {
-        guard let asset = release.assets.first(where: {
-            $0.name.contains("arm64") || $0.name.contains("macos") || $0.name.hasSuffix(".tar.gz")
-        }), let assetURL = URL(string: asset.url) else {
-            Log.error("update: release \(release.tag) has no macOS arm64 asset")
-            return
+    /// GUI "Update" entry point: check the configured repo and, if a newer release
+    /// exists, download + self-replace. Same code path as `velox update --apply`
+    /// (CLAUDE.md §3). Blocking — call off the main thread.
+    public static func applyLatestUpdate() {
+        let repo = Versions.githubRepo
+        guard repo.contains("/"),
+              let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest"),
+              let release = fetchLatest(url) else {
+            Log.error("update: no release found or repo unreachable"); return
+        }
+        let latest = release.tag.hasPrefix("v") ? String(release.tag.dropFirst()) : release.tag
+        guard compareSemver(latest, Versions.velox) > 0 else {
+            print("Velox is up to date (v\(Versions.velox))."); return
+        }
+        applyUpdate(release)
+    }
+
+    /// Download the new release's macOS `.zip`, replace the installed `Velox.app` in
+    /// place, and relaunch. Falls back to revealing the download in Finder if the app
+    /// can't be replaced automatically (e.g. it lives somewhere read-only).
+    private static func applyUpdate(_ release: Release) {
+        // The .zip is programmatically unpackable; the .dmg is the human download.
+        guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") })
+                ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") }),
+              let assetURL = URL(string: asset.url) else {
+            Log.error("update: release \(release.tag) has no macOS asset"); return
+        }
+        let fm = FileManager.default
+        let dir = Paths.root.appendingPathComponent("updates/\(release.tag)", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(asset.name)
+
+        print("Downloading \(asset.name)…")
+        let sem = DispatchSemaphore(value: 0); var saved = false
+        URLSession.shared.downloadTask(with: assetURL) { tmp, _, _ in
+            defer { sem.signal() }
+            guard let tmp else { return }
+            try? fm.removeItem(at: dest)
+            saved = (try? fm.moveItem(at: tmp, to: dest)) != nil
+        }.resume()
+        _ = sem.wait(timeout: .now() + 600)
+        guard saved else { Log.error("update: download failed"); return }
+        print("Saved \(dest.lastPathComponent).")
+
+        // Only a .zip can be applied in place; a .dmg is revealed for manual install.
+        guard asset.name.hasSuffix(".zip") else { reveal(dest); return }
+        guard let target = runningAppBundle() else {
+            print("Could not locate the installed Velox.app — open \(dest.path) to install."); reveal(dest); return
+        }
+        // Unpack beside the target (same volume → atomic replace works), then swap.
+        let staging = target.deletingLastPathComponent().appendingPathComponent(".velox-update-\(release.tag)")
+        try? fm.removeItem(at: staging)
+        guard run(["/usr/bin/ditto", "-x", "-k", dest.path, staging.path]) == 0,
+              let newApp = (try? fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil))?
+                .first(where: { $0.pathExtension == "app" }) else {
+            Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return
         }
         do {
-            let dir = Paths.root.appendingPathComponent("updates/\(release.tag)", isDirectory: true)
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dest = dir.appendingPathComponent(asset.name)
-            print("Downloading \(asset.name)…")
-
-            let sem = DispatchSemaphore(value: 0)
-            var saved = false
-            URLSession.shared.downloadTask(with: assetURL) { tmp, _, _ in
-                defer { sem.signal() }
-                guard let tmp else { return }
-                try? FileManager.default.removeItem(at: dest)
-                saved = (try? FileManager.default.moveItem(at: tmp, to: dest)) != nil
-            }.resume()
-            _ = sem.wait(timeout: .now() + 600)
-
-            if saved {
-                print("Saved: \(dest.path)")
-                print("Extract and replace the running binary to finish the update.")
-            } else {
-                Log.error("update: download failed")
-            }
+            _ = try fm.replaceItemAt(target, withItemAt: newApp)
+            try? fm.removeItem(at: staging)
+            print("Updated \(target.lastPathComponent) → \(release.tag). Relaunching…")
+            let open = Process(); open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            open.arguments = ["-n", target.path]; try? open.run()
+            exit(0)
         } catch {
-            Log.error("update: \(error.localizedDescription)")
+            Log.error("update: could not replace \(target.path): \(error.localizedDescription)")
+            print("Open \(dest.path) to install the update manually.")
+            try? fm.removeItem(at: staging); reveal(dest)
         }
+    }
+
+    /// The enclosing `.app` of the running executable (GUI: Velox.app; a CLI shipped
+    /// inside the bundle: walk up to the `.app`). nil if not running from a bundle.
+    private static func runningAppBundle() -> URL? {
+        if Bundle.main.bundleURL.pathExtension == "app" { return Bundle.main.bundleURL }
+        var url = Bundle.main.executableURL ?? Bundle.main.bundleURL
+        while url.pathComponents.count > 1 {
+            if url.pathExtension == "app" { return url }
+            url = url.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    private static func reveal(_ url: URL) { _ = run(["/usr/bin/open", "-R", url.path]) }
+
+    @discardableResult
+    private static func run(_ argv: [String]) -> Int32 {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: argv[0])
+        p.arguments = Array(argv.dropFirst())
+        do { try p.run(); p.waitUntilExit(); return p.terminationStatus } catch { return -1 }
     }
 
     /// Returns >0 if a>b, <0 if a<b, 0 if equal (dotted-integer semver).

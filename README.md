@@ -1,216 +1,215 @@
 # Velox
 
-A lightweight, open-source Docker Desktop / OrbStack alternative for macOS, built
-to be **as lean, efficient, and fast as possible with the smallest footprint** —
-beating Docker Desktop and OrbStack on performance where possible, and at least on
-par otherwise.
+A lightweight, open-source way to run Docker on macOS — built to be **as lean,
+efficient, and fast as possible, with the smallest footprint.** The whole supervisor
+is pure Swift on `Virtualization.framework`; the guest is a minimal custom Linux image
+(a from-source kernel + a compressed `erofs` rootfs of static binaries) running stock
+`dockerd`. You drive it with the **stock `docker` CLI** — Velox ships no wrapper
+command. Apple Silicon (arm64) first.
 
-The design, in four pillars:
+## Design — four pillars
 
 - **Apple's kernel networking (VZNAT)** — the fastest container datapath on
-  `Virtualization.framework` (measured ~14 Gbit/s down / ~80 Gbit/s up, beating
-  Docker Desktop). No userspace network stack.
-- **A 100% Swift host** — VM lifecycle, the Docker-API proxy, port forwarding, and
-  the SwiftUI app are all pure Swift. **No Go, no host-side Rust.**
-- **Rust only for the tiny guest `vinit`** — a single static binary is the guest's
-  PID 1 and entire userland orchestration.
-- **A custom, minimal kernel** — built from kernel.org source, only what the VM
-  needs (`tinyconfig` + a curated fragment), with high-performance Rust added in the
-  guest where it helps.
+  `Virtualization.framework` (measured ~14 Gbit/s down / ~80 Gbit/s up). No userspace
+  network stack.
+- **A 100% Swift host** — VM lifecycle, the Docker-API proxy, port forwarding, and the
+  SwiftUI app are all pure Swift. **No Go, no host-side Rust, no helper daemons.**
+- **Rust only for the tiny guest `vinit`** — a single static binary is the guest's PID 1
+  and entire userland orchestration.
+- **A custom, minimal kernel** — built from kernel.org source, only what the VM needs
+  (`tinyconfig` + a curated fragment), tuned for fast container launch.
 
-The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are shared
-via **VirtioFS**; the container network is Apple's in-kernel **VZNAT** (outbound +
-NAT in the kernel); published ports map back to `localhost`; and
+The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are shared via
+**VirtioFS**; the container network is Apple's in-kernel **VZNAT** (outbound + NAT in
+the kernel); published **TCP and UDP** ports map back to `localhost`; and
 `host.docker.internal` reaches the Mac.
 
-Targets **Apple Silicon (arm64)** first.
+## Install
 
-## Requirements
+Velox ships as a self-contained `Velox.app` — it bundles the guest kernel + rootfs, the
+engine, **and** the `docker` client, so nothing else is required on a fresh Mac.
 
-- macOS 15+ on Apple Silicon
-- Swift 6 toolchain (Command Line Tools are sufficient — no full Xcode needed)
-- Docker (any engine) to build the guest — the kernel and erofs rootfs are built
-  inside `linux/arm64` containers. No `linuxkit`, no Go, no cross-toolchain.
+1. Download `Velox-<version>-macos-arm64.dmg` from the
+   [Releases](https://github.com/mikaelhug/Velox/releases) page.
+2. Drag **Velox** into Applications and open it.
+3. On first launch Velox starts the engine, installs `docker` + `velox` onto your `PATH`
+   (rootless — symlinks under `~/.velox/bin`), and registers a `velox` Docker context.
 
-## Build & run
+Then, in any terminal:
 
 ```bash
-./Scripts/build.sh          # swift build -c release + ad-hoc codesign w/ entitlement
-./Scripts/run.sh            # build, sign, and run
+docker run --rm hello-world
+docker ps -a
 ```
 
-The build ad-hoc signs the binary with `com.apple.security.virtualization`
-(see `Resources/Entitlements/velox.entitlements`). Verify it is embedded:
+Requires **macOS 15+ on Apple Silicon**. The app keeps the engine running while it is
+open (quit it to stop the VM); or run it headless from the terminal with `velox start`.
+
+## Usage
+
+Velox registers a Docker **context** named `velox` (pointing at `~/.velox/docker.sock`)
+and you use the stock `docker` CLI, so it coexists with any existing Docker install:
+
+```bash
+docker context use velox          # make velox the active context (persistent)
+docker --context velox ps         # …or target it per-command
+export DOCKER_HOST=unix://~/.velox/docker.sock   # …or via an env var
+```
+
+Prefer your own command? Alias it: `alias vdocker='docker --context velox'`.
+`velox version` shows component versions.
+
+## Updating
+
+`velox update` (CLI), or the **Update** button in **Settings → General**, checks GitHub
+Releases for a newer build and installs it in place (downloads the release, swaps the
+app, relaunches). **Check for updates on startup** is on by default, and the menu bar
+shows a notice when a new version is available.
+
+## Build from source (developers)
+
+Building the guest needs **Docker** (the kernel and erofs rootfs are compiled inside
+`linux/arm64` containers — no LinuxKit, no Go, no cross-toolchain) and a **Swift 6**
+toolchain (Command Line Tools are enough — no full Xcode).
+
+```bash
+./Scripts/build-kernel.sh   # one-time: compile Assets/velox-vmlinux from kernel.org source (long)
+./Scripts/make-guest.sh     # build the erofs root.img; install kernel+root.img to ~/.velox
+./Scripts/build.sh          # swift build -c release + ad-hoc codesign with the VZ entitlement
+./Scripts/run.sh start      # boot the guest; serial console on this terminal
+./Scripts/build-app.sh      # package a self-contained Velox.app (+ .dmg, .zip)
+```
+
+`build-kernel.sh` compiles a bare arm64 kernel natively inside a `linux/arm64` container
+on a named volume (never on APFS), emitting the raw uncompressed `Image` that
+`VZLinuxBootLoader` requires. `make-guest.sh` builds a single read-only **erofs** root
+image (`root.img`) from `guest/rootfs/Dockerfile` — the static Rust `vinit`, Docker's
+static server binaries, and a tiny musl userland — no LinuxKit, no initramfs. The kernel
+boots it directly (`root=/dev/vda rootfstype=erofs`). Everything is version-pinned in
+`versions.env` (the single source of truth); the kernel config lives in
+`guest/kernel/velox.fragment`.
+
+The signing entitlement is `com.apple.security.virtualization`
+(`Resources/Entitlements/velox.entitlements`). Verify it is embedded:
 
 ```bash
 codesign -d --entitlements - "$(swift build -c release --show-bin-path)/velox"
 ```
 
-## Usage
+Releases are built by CI on every `v*` tag (`.github/workflows/release.yml`): the guest
+is built on a native arm64 Linux runner, the app + package on macOS, and the `.dmg`/`.zip`
+are attached to a GitHub Release.
 
-```bash
-velox start                      # boot the engine (serial console on this terminal)
-docker context use velox         # point the stock docker CLI at Velox (one time)
-docker run --rm hello-world      # talk to the Velox engine — plain docker
-docker ps -a
-```
+## What works
 
-Velox ships no wrapper command: it registers a Docker **context** named `velox`
-(pointing at `~/.velox/docker.sock`) and you use the stock `docker` CLI — the
-same mechanism Docker Desktop uses for its `desktop-linux` context. This
-coexists with any existing Docker install. Prefer a one-off? `docker --context
-velox ps`. Prefer your own command? Alias it: `alias vdocker='docker --context
-velox'`. `velox version` shows component versions; `velox update` checks GitHub
-for a newer build.
+A full, daily-driver Docker engine plus a native menu-bar app:
 
-## Guest image
+- **Engine** — `docker run/build/compose`, the **containerd image store** (multi-platform
+  images, attestations, Wasm), a persistent data disk, **VirtioFS `-v` host mounts**, and
+  **Rosetta x86** (`--platform linux/amd64`). Stock `dockerd`, native nftables firewall.
+- **Networking** — Apple VZNAT, `host.docker.internal`, and reverse port forwarding for
+  published **TCP and UDP** ports (`-p 8080:80`, `-p 53:53/udp`) → `localhost`.
+- **Lifecycle** — host-authoritative clock (survives sleep), a Resource Saver that
+  reclaims idle guest RAM, graceful stop that flushes the data disk, and event-driven
+  reconciliation (no polling — ports come up the instant a container publishes them).
+- **App** — containers, images, volumes, and networks dashboards with live CPU/memory
+  sparklines and log streaming; an engine-console log view; resource settings
+  (CPU/RAM/disk/swap/file-sharing); a self-contained, self-updating bundle.
 
-Build the custom kernel (once — from kernel.org source), then the guest userspace:
-
-```bash
-./Scripts/build-kernel.sh   # one-time: compiles Assets/velox-vmlinux from source (long)
-./Scripts/make-guest.sh     # builds the erofs root.img, installs kernel+root.img to ~/.velox
-./Scripts/run.sh start      # boots the guest; serial console on this terminal
-```
-
-`build-kernel.sh` needs Docker (it compiles a bare arm64 kernel natively inside a
-`linux/arm64` container on a named volume — never on APFS — and emits the raw
-uncompressed `Image` that `VZLinuxBootLoader` requires). `make-guest.sh` builds a
-single read-only **erofs** root image (`root.img`) from `guest/rootfs/Dockerfile`
-— the static Rust `vinit`, Docker's static server binaries, and a tiny musl
-userland — no LinuxKit, no initramfs. The kernel boots it directly
-(`root=/dev/vda rootfstype=erofs`). The kernel is monolithic with
-`CONFIG_VIRTIO_FS`, `CONFIG_VIRTIO_VSOCKETS`, `BINFMT_MISC` and all container
-prereqs built-in (needed for `-v` mounts and Rosetta) — config in
-`guest/kernel/velox.fragment`, version pinned in `versions.env`.
-
-## Status
-
-**MVP complete** — all five phases working and verified end-to-end.
-
-- [x] **Phase 1** — bootstrap & code-signing
-- [x] **Phase 2** — minimal Linux guest boot (erofs root + Rust `vinit` PID1)
-- [x] **Phase 3** — VSOCK proxy (`~/.velox/docker.sock` ↔ guest relay)
-- [x] **Phase 4** — dockerd in guest. `docker run` (pull via NAT, streamed output
-  via half-closing relay), **persistent data disk on the containerd image store**
-  (multi-platform images, attestations, Wasm), graceful stop (sync over a VSOCK
-  control port), **VirtioFS `-v` host mounts**, and **Rosetta x86**
-  (`--platform linux/amd64`). Uses a custom kernel with VirtioFS
-  (`Scripts/build-kernel.sh`).
-- [x] **Phase 5** — reverse port forwarding (`-p 8080:80` → `localhost:8080`):
-  watch the Docker API for published ports, open dynamic `127.0.0.1` listeners,
-  pipe over VSOCK to a guest reverse-relay (closes when the container stops).
-
-End-to-end: `velox start` → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.
+End-to-end: open Velox → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.
 
 ## Performance
 
-The north star is to be **as lean, efficient, and fast as possible with the
-smallest footprint** — **beat Docker Desktop and OrbStack where possible, and be at
-least on par otherwise**. The numbers below were measured on Apple Silicon, Velox vs
-Docker Desktop (Docker Engine 29.x both sides), 2026-06. They vary by host; each
-table has a one-line reproduction. Velox figures are CLI mode (`velox start`).
+The north star is to be **as lean, efficient, and fast as possible with the smallest
+footprint** — beating the leading VM-based Docker engines where possible, and at least on
+par otherwise. Numbers below were measured on Apple Silicon, same Docker Engine version
+(29.x) on both sides, 10 vCPU / 16 GB both, 2026-06. They vary by host; each table has a
+one-line reproduction. The comparison column is the leading VM-based alternative for
+macOS, measured the same way.¹
 
-**Scorecard:** Velox **wins** on network, cold-start, RAM, and `docker cp`; is **on
-par** on disk reclaim, VirtioFS, x86 emulation, and published-port reachability; and
-currently **trails** only on bare per-container launch latency (see the last table —
-an open item).
+**Scorecard:** Velox **wins** on container launch, cold start, idle RAM, network
+throughput, and `docker cp`; and is **on par** on disk reclaim, VirtioFS, x86 emulation,
+and published-port reachability.
+
+### Container launch — **win** (`docker run --rm alpine true`, warm)
+
+| | Velox | Leading alternative |
+| --- | --- | --- |
+| full network | **~0.17 s** | ~0.19 s |
+| `--network none` | **~0.12 s** | ~0.15 s |
+
+Both engines do the same per-container veth/bridge work; Velox does the rest faster. The
+win comes from a finer scheduler tick (`HZ=1000` + lazy preemption) — per-container
+network setup is full of short kernel waits that round up to the tick — and a
+**host-cached engine disk** (the VZ block device runs `cachingMode: .cached`), which
+routes overlay-snapshot metadata I/O through the page cache. Repro:
+`time docker run --rm alpine true` (warm image, average a few runs); compare `--network none`.
+
+### Cold start — **win** (launch → `docker` ready, warm caches)
+
+| Velox | Leading alternative |
+| --- | --- |
+| **~0.8–1.3 s** | ~5.6 s |
+
+Repro: `time` from `velox start` until `docker version` succeeds.
+
+### Idle RAM — **win** (host-side resident memory, no containers)
+
+| Velox | Leading alternative |
+| --- | --- |
+| **~13 MiB** | ~630 MiB |
+
+One lean VM-supervisor process vs a UI + backend daemons + helpers. (Guest RAM is
+accounted separately by VZ for both.) Repro:
+`ps -o rss= -p "$(pgrep -f release/velox)"`.
 
 ### Network throughput — **win** (iperf3, container ↔ Mac, Apple VZNAT both sides)
 
-| direction | Velox | Docker Desktop |
+| direction | Velox | Leading alternative |
 | --- | --- | --- |
 | upload (container → host) | **~87 Gbit/s** | ~25 Gbit/s |
 | download (host → container) | **~13.5 Gbit/s** | ~12.5 Gbit/s |
 
-Same in-kernel datapath, but Velox's far leaner host gets closer to the ceiling.
-Repro: `iperf3 -s -B 0.0.0.0` on the Mac, then in a container
+Same in-kernel datapath, but Velox's far leaner host gets closer to the ceiling. Repro:
+`iperf3 -s -B 0.0.0.0` on the Mac, then in a container
 `apk add iperf3 && iperf3 -c host.docker.internal` (add `-R` for download).
-
-### Cold start — **win** (launch → `docker` ready)
-
-| Velox | Docker Desktop |
-| --- | --- |
-| **~1.5–2.8 s** | ~5.6 s |
-
-Repro: `time` from `velox start` until `docker version` succeeds; for DD, quit it,
-then time `open -a Docker` until `docker --context desktop-linux version` succeeds.
-
-### Idle RAM — **win** (host-side resident memory, no containers)
-
-| Velox | Docker Desktop |
-| --- | --- |
-| **~28 MiB** | ~633 MiB |
-
-One VM-supervisor process vs DD's Electron UI + backend daemons + helpers. (Guest
-RAM is accounted separately by VZ for both.) Repro:
-`ps -o rss= -p "$(pgrep -f release/velox)"` vs
-`ps -axo rss=,comm= | grep -i docker | awk '{s+=$1} END{print s}'`.
-
-### Disk reclaim — **on par** (pull 1 GiB image → remove → trim)
-
-| | Velox | Docker Desktop |
-| --- | --- | --- |
-| returns freed space to macOS | yes (guest `fstrim` + ASIF hole-punch) | yes (auto-TRIM) |
-
-Velox's data disk is a sparse ASIF image that starts at tens of MiB; DD's
-`Docker.raw` grows large over time but does reclaim. Repro: `du -m ~/.velox/data.img`
-before/after `docker pull python:3.12`, then `docker rmi python:3.12` + an `fstrim`.
-
-### VirtioFS write — **on par** (`dd` 1 GiB, `conv=fsync`; same Apple VirtioFS)
-
-| Velox | Docker Desktop |
-| --- | --- |
-| ~1.0–1.9 GB/s | ~1.0–1.8 GB/s |
-
-Repro: `docker run --rm -v "$PWD":/mnt alpine dd if=/dev/zero of=/mnt/big bs=1M count=1024 conv=fsync`.
 
 ### `docker cp` throughput — **win** (1 GiB in/out of a container, over the VSOCK data plane)
 
-| direction | Velox | Docker Desktop |
+| direction | Velox | Leading alternative |
 | --- | --- | --- |
 | cp in (host → container) | **~393 MiB/s** | ~149 MiB/s |
 | cp out (container → host) | **~508 MiB/s** | ~226 MiB/s |
 
-Velox's lean Rust VSOCK relay beats DD's data plane ~2.5×. (`splice` doesn't apply —
-`AF_VSOCK` doesn't support it — and isn't needed.) Repro:
+Velox's lean Rust VSOCK relay is ~2.5× faster. Repro:
 `docker run -d --name c alpine sleep 300 && time docker cp <1GiB-file> c:/big && time docker cp c:/big /tmp/out`.
 
-### x86 emulation — **on par** (Rosetta, amd64 workload, container-start subtracted)
+### Disk reclaim — **on par** (pull 1 GiB image → remove → trim)
 
-| Velox | Docker Desktop |
-| --- | --- |
-| ~0.2 s | ~0.2 s |
+Velox's data disk is a sparse ASIF image that starts at tens of MiB and returns freed
+space to macOS (guest `fstrim` + ASIF hole-punch). Repro: `du -m ~/.velox/data.img`
+before/after `docker pull python:3.12`, then `docker rmi python:3.12` + an `fstrim`.
 
-Repro: `time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c pass`
-(subtract the container-start overhead below).
+### VirtioFS write — **on par** (`dd` 1 GiB, `conv=fsync`; same Apple VirtioFS)
+
+~1.0–1.9 GB/s — bounded by Apple's VirtioFS, which both engines use. Repro:
+`docker run --rm -v "$PWD":/mnt alpine dd if=/dev/zero of=/mnt/big bs=1M count=1024 conv=fsync`.
+
+### x86 emulation — **on par** (Rosetta, amd64 workload)
+
+~0.2 s for a small amd64 workload (container-start subtracted) — native Apple Rosetta
+both sides. Repro:
+`time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c pass`.
 
 ### Published-port reachability — **on par** (`docker run -d -p` → `curl` 200)
 
-| Velox | Docker Desktop |
-| --- | --- |
-| ~0.4–0.6 s | ~0.3–0.4 s |
+~0.4–0.6 s — a published port becomes reachable almost immediately, because the watcher
+is **event-driven** (it rides the Docker `/events` stream over the in-process VSOCK client
+rather than polling). Repro: `docker run -d -p 18080:80 nginx`, then poll
+`curl -s localhost:18080` until it answers.
 
-A published port becomes reachable almost immediately. This was a real loss (2–28 s,
-variably) until the port watcher was made **event-driven** — it consumes the Docker
-`/events` stream over the in-process VSOCK client instead of polling the API (which
-stalled under the connection contention of `docker run`). Repro:
-`docker run -d -p 18080:80 nginx`, then poll `curl -s localhost:18080` until it answers.
+---
 
-### Per-container launch — **trails** (open item)
-
-| Velox | Docker Desktop |
-| --- | --- |
-| ~0.7 s | ~0.30 s |
-
-`docker run --rm alpine true`, averaged. Velox's ~0.45 s of extra per-container
-overhead is the one axis where it currently loses (it also inflates the small-file
-and x86 wall-times above). Investigated: it is **not** the VSOCK Docker-API proxy
-(Velox's API round-trip is ~78 ms, *faster* than DD's ~91 ms), nor CPU, nor disk —
-it is the per-container **network-namespace / veth / bridge setup** (`--network
-none` is ~0.37 s faster). The iptables-nft shell-out was ~130 ms of that; Velox now
-runs dockerd's **native nftables firewall backend** (which removes that shell-out and
-let us drop the `iptables` binary, per pillar #5), but it doesn't change total launch
-time — the remaining cost is the veth/bridge work both engines do, and reducing it is
-a tracked follow-up. Repro: `time docker run --rm alpine true` (warm image, average a
-few runs); compare `--network none`.
+¹ Comparisons are against the leading VM-based Docker engine for macOS, on the same Docker
+Engine version and resource allocation, measured on the same Mac. Absolute figures vary by
+hardware; the reproduction commands above let you measure your own.

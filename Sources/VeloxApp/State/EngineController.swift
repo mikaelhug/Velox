@@ -39,6 +39,7 @@ final class EngineController {
     private var bridge: VsockBridge?
     private var proxy: DockerSocketProxy?
     private var forwarder: PortForwarder?
+    private var udpForwarder: UDPForwarder?
     private var watcher: DockerEventsWatcher?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
@@ -59,6 +60,12 @@ final class EngineController {
     /// switch, so a plain `docker ps` in the terminal targets Velox.
     var showContextPrompt = false
 
+    /// Result of the most recent update check (startup or manual), surfaced in
+    /// Settings → General and the menu bar.
+    var availableUpdate: Updater.UpdateCheckResult?
+    var checkingForUpdate = false
+    var updateInProgress = false
+
     init() {
         config = VeloxConfig.load()
         needsOnboarding = !EngineController.isReady
@@ -67,6 +74,31 @@ final class EngineController {
         let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
         if !needsOnboarding && !isPreview {
             Task { await self.start() }
+        }
+        if config.checkUpdatesOnStartup && !isPreview {
+            Task { await self.checkForUpdates() }
+        }
+    }
+
+    // MARK: - Updates
+
+    /// Check GitHub Releases (VELOX_GITHUB_REPO) for a newer Velox; the result lands
+    /// in `availableUpdate`, which Settings → General and the menu bar observe.
+    func checkForUpdates() async {
+        checkingForUpdate = true
+        defer { checkingForUpdate = false }
+        availableUpdate = await Updater.checkForUpdate()
+    }
+
+    /// Download the latest release and replace the running app in place, then
+    /// relaunch. Runs off the main actor (it blocks on the download and exits the
+    /// process on success); `updateInProgress` only clears if it falls back.
+    func applyUpdate() {
+        guard !updateInProgress else { return }
+        updateInProgress = true
+        Task.detached(priority: .userInitiated) {
+            Updater.applyLatestUpdate()
+            await MainActor.run { [weak self] in self?.updateInProgress = false }
         }
     }
 
@@ -149,11 +181,14 @@ final class EngineController {
             // Reverse-forward published container ports to localhost (watch the
             // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
             let forwarder = PortForwarder(bridge: bridge)
-            let watcher = DockerEventsWatcher(docker: docker) { ports in
-                forwarder.reconcile(ports)
+            let udpForwarder = UDPForwarder(manager: manager)
+            let watcher = DockerEventsWatcher(docker: docker) { tcp, udp in
+                forwarder.reconcile(tcp)
+                udpForwarder.reconcile(udp)
             }
             watcher.start()
             self.forwarder = forwarder
+            self.udpForwarder = udpForwarder
             self.watcher = watcher
 
             // Keep the guest clock aligned with the host (survives Mac sleep), and
@@ -213,6 +248,8 @@ final class EngineController {
         watcher = nil
         forwarder?.stopAll()
         forwarder = nil
+        udpForwarder?.stopAll()
+        udpForwarder = nil
         proxy?.stop()
         proxy = nil
         bridge = nil
@@ -261,6 +298,10 @@ final class EngineController {
     private func maybeOfferContextSwitch() async {
         let socket = Paths.dockerSocket.path
         let active = await Task.detached(priority: .utility) { () -> String? in
+            // Make `docker` + `velox` work from the user's terminal (rootless: symlinks
+            // into ~/.velox/bin + a marked PATH block in their zsh profile). Idempotent.
+            let setup = FirstRun.installCLITools(updateShellProfile: true)
+            if setup.linkedTools { Log.info("first-run: \(setup.message)") }
             guard CLIBinding.ensureContext(socketPath: socket) else { return nil }
             return CLIBinding.activeContext()
         }.value

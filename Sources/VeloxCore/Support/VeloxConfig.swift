@@ -27,11 +27,13 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// True once the one-time "switch the active docker context to velox?" prompt
     /// has been shown, so the GUI nudges at most once rather than every launch.
     public var contextPromptShown: Bool
+    /// Check GitHub Releases for a newer Velox on app launch (default on).
+    public var checkUpdatesOnStartup: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
                 launchAtLogin: Bool, updateBehavior: UpdateBehavior, defaultTerminal: String,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
-                contextPromptShown: Bool = false) {
+                contextPromptShown: Bool = false, checkUpdatesOnStartup: Bool = true) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
@@ -39,6 +41,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         self.resourceSaverEnabled = resourceSaverEnabled
         self.resourceSaverMinutes = resourceSaverMinutes
         self.contextPromptShown = contextPromptShown
+        self.checkUpdatesOnStartup = checkUpdatesOnStartup
     }
 
     public static var `default`: VeloxConfig {
@@ -54,7 +57,8 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             defaultTerminal: "Terminal",
             resourceSaverEnabled: true,
             resourceSaverMinutes: 5,
-            contextPromptShown: false)
+            contextPromptShown: false,
+            checkUpdatesOnStartup: true)
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +75,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         resourceSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .resourceSaverEnabled) ?? d.resourceSaverEnabled
         resourceSaverMinutes = try c.decodeIfPresent(Int.self, forKey: .resourceSaverMinutes) ?? d.resourceSaverMinutes
         contextPromptShown = try c.decodeIfPresent(Bool.self, forKey: .contextPromptShown) ?? d.contextPromptShown
+        checkUpdatesOnStartup = try c.decodeIfPresent(Bool.self, forKey: .checkUpdatesOnStartup) ?? d.checkUpdatesOnStartup
     }
 
     // MARK: - Derived

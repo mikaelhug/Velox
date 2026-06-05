@@ -20,6 +20,14 @@ struct MenuBarContentView: View {
                     .font(.caption)
             }
 
+            if engine.availableUpdate?.isUpdateAvailable == true,
+               let latest = engine.availableUpdate?.latestVersion {
+                Button(engine.updateInProgress ? "Updating…" : "Update to v\(latest)…") {
+                    engine.applyUpdate()
+                }
+                .disabled(engine.updateInProgress)
+            }
+
             Divider()
 
             engineControl

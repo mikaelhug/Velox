@@ -598,10 +598,19 @@ fn setup_data_disk() {
     if std::path::Path::new(dev).exists() {
         if !is_ext4(dev) {
             log!("formatting {dev} ext4 (first boot)");
-            let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", dev]).status();
+            // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd
+            // runs as root anyway) — reclaim it for image/container storage. Applies to
+            // the first-boot format only; existing disks keep whatever they were made with.
+            let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
             match st { Ok(s) if s.success() => {}, other => log!("mkfs.ext4 failed: {other:?}") }
         }
-        do_mount(dev, "/var/lib/docker", "ext4", 0, None);
+        // /var/lib/docker is overlay-snapshot churn central — every `docker run`
+        // mounts/unmounts a snapshot. noatime drops read-driven atime writes; lazytime
+        // keeps inode mtime/ctime in memory and flushes them lazily (on fsync / sync /
+        // 24h) instead of journalling every metadata touch — less write amplification on
+        // the container hot path, and nothing under here needs atime/precise timestamps.
+        do_mount(dev, "/var/lib/docker", "ext4",
+                 libc::MS_NOATIME | libc::MS_LAZYTIME, None);
         start_fstrim_timer();
     } else {
         log!("no {dev} — /var/lib/docker stays on tmpfs (non-persistent)");
@@ -923,13 +932,96 @@ fn handle_reverse(fd: RawFd) {
         line.push(b[0]);
         if line.len() > 64 { break; }
     }
-    let mut target = String::from_utf8_lossy(&line).trim().to_string();
-    if target.is_empty() { unsafe { libc::close(fd); } return; }
+    let header = String::from_utf8_lossy(&line).trim().to_string();
+    if header.is_empty() { unsafe { libc::close(fd); } return; }
+    // "udp <port>" → datagram relay; otherwise the original TCP stream relay.
+    if let Some(port) = header.strip_prefix("udp ") {
+        return handle_reverse_udp(fd, port.trim());
+    }
+    let mut target = header;
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
     match std::net::TcpStream::connect(&target) {
         Ok(up) => bridge(fd, up.into_raw_fd()),
         Err(e) => { log!("reverse dial {target}: {e}"); unsafe { libc::close(fd); } }
     }
+}
+
+/// UDP reverse relay. The host tunnels each datagram length-prefixed
+/// (`[u16 BE len][payload]`) over the vsock stream; we dial the published UDP
+/// port inside the guest (docker-proxy on 127.0.0.1:port, same as the TCP path)
+/// and shuttle datagrams both ways until the host closes the flow (idle) or errors.
+fn handle_reverse_udp(vsock: RawFd, port: &str) {
+    use std::os::unix::io::AsRawFd;
+    let target = format!("127.0.0.1:{port}");
+    let sock = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s, Err(e) => { log!("udp reverse bind: {e}"); unsafe { libc::close(vsock); } return; }
+    };
+    if let Err(e) = sock.connect(&target) {
+        log!("udp reverse connect {target}: {e}"); unsafe { libc::close(vsock); } return;
+    }
+    let udp = sock.as_raw_fd();
+    // vsock(framed) → udp(datagrams), and udp → vsock, until one side ends.
+    let t = std::thread::spawn(move || udp_frames_to_dgrams(vsock, udp));
+    udp_dgrams_to_frames(udp, vsock);
+    // unblock the peer thread, then tear down (sock drop closes `udp`).
+    unsafe { libc::shutdown(vsock, libc::SHUT_RDWR); libc::shutdown(udp, libc::SHUT_RDWR); }
+    let _ = t.join();
+    unsafe { libc::close(vsock); }
+    drop(sock);
+}
+
+/// Read `[u16 len][payload]` frames off the vsock stream, send each as one datagram.
+fn udp_frames_to_dgrams(vsock: RawFd, udp: RawFd) {
+    let mut hdr = [0u8; 2];
+    let mut buf = vec![0u8; 65535];
+    loop {
+        if !read_exact_fd(vsock, &mut hdr) { break; }
+        let len = u16::from_be_bytes(hdr) as usize;
+        if len == 0 { continue; }
+        if !read_exact_fd(vsock, &mut buf[..len]) { break; }
+        let _ = unsafe { libc::send(udp, buf.as_ptr() as *const _, len, 0) };
+    }
+}
+
+/// Receive datagrams, frame each as `[u16 len][payload]` onto the vsock stream.
+fn udp_dgrams_to_frames(udp: RawFd, vsock: RawFd) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let n = unsafe { libc::recv(udp, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+        if n <= 0 { break; }
+        let len = n as usize;
+        if !write_all_fd(vsock, &(len as u16).to_be_bytes()) { break; }
+        if !write_all_fd(vsock, &buf[..len]) { break; }
+    }
+}
+
+/// Read exactly `buf.len()` bytes (retrying EINTR/partial); false on EOF/error.
+fn read_exact_fd(fd: RawFd, buf: &mut [u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut _, buf.len() - off) };
+        if n == 0 { return false; }
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+            return false;
+        }
+        off += n as usize;
+    }
+    true
+}
+
+/// Write all of `buf` (retrying EINTR/partial); false on error.
+fn write_all_fd(fd: RawFd, buf: &[u8]) -> bool {
+    let mut off = 0;
+    while off < buf.len() {
+        let n = unsafe { libc::write(fd, buf[off..].as_ptr() as *const _, buf.len() - off) };
+        if n <= 0 {
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted { continue; }
+            return false;
+        }
+        off += n as usize;
+    }
+    true
 }
 
 /// Bidirectional copy with independent half-close (so Docker's hijacked

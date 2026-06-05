@@ -14,11 +14,13 @@ import Foundation
 /// source of truth (the informer pattern).
 public final class DockerEventsWatcher: @unchecked Sendable {
     private let docker: any DockerClientProtocol
-    private let onPorts: @Sendable (Set<UInt16>) -> Void
+    private let onPorts: @Sendable (Set<UInt16>, Set<UInt16>) -> Void
     private var task: Task<Void, Never>?
-    private var last: Set<UInt16> = []
+    private var lastTCP: Set<UInt16> = []
+    private var lastUDP: Set<UInt16> = []
 
-    public init(docker: any DockerClientProtocol, onPorts: @escaping @Sendable (Set<UInt16>) -> Void) {
+    /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
+    public init(docker: any DockerClientProtocol, onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void) {
         self.docker = docker
         self.onPorts = onPorts
     }
@@ -52,15 +54,22 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// serially inside the single watcher Task, so `last` needs no extra locking.
     private func reconcile() async {
         guard let containers = try? await docker.containers() else { return }
-        var ports: Set<UInt16> = []
+        var tcp: Set<UInt16> = []
+        var udp: Set<UInt16> = []
         for c in containers where c.state == "running" {
-            for p in c.ports where p.type == "tcp" {
-                if let pub = p.publicPort, pub > 0, pub <= 65_535 { ports.insert(UInt16(pub)) }
+            for p in c.ports {
+                guard let pub = p.publicPort, pub > 0, pub <= 65_535 else { continue }
+                switch p.type {
+                case "tcp": tcp.insert(UInt16(pub))
+                case "udp": udp.insert(UInt16(pub))
+                default: break
+                }
             }
         }
-        if ports != last {
-            last = ports
-            onPorts(ports)
+        if tcp != lastTCP || udp != lastUDP {
+            lastTCP = tcp
+            lastUDP = udp
+            onPorts(tcp, udp)
         }
     }
 }

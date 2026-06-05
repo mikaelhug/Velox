@@ -1,29 +1,67 @@
 #!/usr/bin/env bash
-# Build the VeloxApp executable and wrap it into a signed Velox.app bundle.
-# SwiftPM emits a bare Mach-O; a menu-bar SwiftUI app needs a real .app bundle
-# with an Info.plist, so we assemble one here and ad-hoc sign it with the same
-# virtualization entitlement the CLI uses.
+# Build a SELF-CONTAINED, distributable Velox.app (+ .dmg and .zip).
+#
+# A downloaded Velox.app must run on a brand-new Mac with nothing else installed:
+# so the bundle carries everything the engine and the user need —
+#   Contents/MacOS/VeloxApp           the SwiftUI menu-bar app (runs the engine in-process)
+#   Contents/Resources/kernel         the custom guest kernel  (Assets/velox-vmlinux)
+#   Contents/Resources/root.img       the erofs guest rootfs   (guest/build/root.img)
+#   Contents/Resources/bin/velox      the CLI (start/update/status) — installed onto PATH
+#   Contents/Resources/bin/docker     the stock Docker client for macOS — installed onto PATH
+#
+# GuestImage.resolve() reads kernel/root.img from the bundle when ~/.velox is empty,
+# so no `make-guest.sh` is required on the user's machine. First-run install of the
+# two CLIs onto PATH + the `velox` docker context is done by the app (FirstRun).
+#
+# Signing: ad-hoc by default (fine locally; Gatekeeper warns on a *downloaded* app).
+# Set VELOX_SIGN_IDENTITY="Developer ID Application: …" to sign for distribution; the
+# release workflow notarizes when notarytool credentials are present.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+set -a; . ./versions.env; set +a
 
 CONFIG="${1:-release}"
 ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 APP="Velox.app"
+KERNEL_SRC="${KERNEL_SRC:-Assets/velox-vmlinux}"
+ROOT_SRC="${ROOT_SRC:-guest/build/root.img}"
+[ -f "$ROOT_SRC" ] || ROOT_SRC="$HOME/.velox/root.img"     # fall back to the installed copy
+SIGN_IDENTITY="${VELOX_SIGN_IDENTITY:--}"                   # "-" = ad-hoc
+DIST="${DIST:-dist}"
 
-set -a; . ./versions.env; set +a
+# --- preflight: the guest artifacts must already be built ---------------------
+[ -f "$KERNEL_SRC" ] || { echo "error: $KERNEL_SRC missing — run ./Scripts/build-kernel.sh" >&2; exit 1; }
+[ -f "$ROOT_SRC" ]   || { echo "error: guest root.img missing — run ./Scripts/make-guest.sh" >&2; exit 1; }
 
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> swift build -c $CONFIG (VeloxApp)"
+echo "==> swift build -c $CONFIG (VeloxApp + velox CLI)"
 swift build -c "$CONFIG" --product VeloxApp
+swift build -c "$CONFIG" --product velox
+BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/VeloxApp"
+# --- fetch the stock Docker client for macOS (pinned DOCKER_VERSION) ----------
+ARCH="$(uname -m)"; case "$ARCH" in arm64) DARCH=aarch64;; x86_64) DARCH=x86_64;; *) DARCH=aarch64;; esac
+DOCKER_CLI="$DIST/docker-cli/docker"
+if [ ! -x "$DOCKER_CLI" ]; then
+    echo "==> download stock docker client $DOCKER_VERSION ($DARCH) for macOS"
+    mkdir -p "$DIST/docker-cli"
+    curl -fSL "https://download.docker.com/mac/static/stable/${DARCH}/docker-${DOCKER_VERSION}.tgz" \
+        -o "$DIST/docker-cli.tgz"
+    tar -xzf "$DIST/docker-cli.tgz" -C "$DIST/docker-cli" --strip-components=1 docker/docker
+fi
 
+# --- assemble the bundle ------------------------------------------------------
 echo "==> assemble $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/VeloxApp"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
+cp "$BIN_DIR/VeloxApp" "$APP/Contents/MacOS/VeloxApp"
+cp "$BIN_DIR/velox"    "$APP/Contents/Resources/bin/velox"
+cp "$DOCKER_CLI"       "$APP/Contents/Resources/bin/docker"
+cp "$KERNEL_SRC"       "$APP/Contents/Resources/kernel"
+cp "$ROOT_SRC"         "$APP/Contents/Resources/root.img"
+chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -38,14 +76,47 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>${VELOX_VERSION}</string>
     <key>CFBundleVersion</key><string>${VELOX_VERSION}</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 </dict>
 </plist>
 EOF
 
-echo "==> codesign (ad-hoc) $APP"
-codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP"
+# --- sign (nested executables first, then the app last so the seal stays valid).
+# `velox` runs the VM, so it needs the virtualization entitlement; the stock
+# `docker` client does not. Hardened runtime + timestamp for Developer ID; the
+# fallback covers ad-hoc (`-`), which cannot use a secure timestamp.
+sign() {  # <path> [entitlements-file]
+    local path="$1" ent="${2:-}"
+    if [ -n "$ent" ]; then
+        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" --entitlements "$ent" "$path" 2>/dev/null \
+        || codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ent" "$path"
+    else
+        codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$path" 2>/dev/null \
+        || codesign --force --sign "$SIGN_IDENTITY" "$path"
+    fi
+}
+echo "==> codesign ($SIGN_IDENTITY)"
+sign "$APP/Contents/Resources/bin/docker"
+sign "$APP/Contents/Resources/bin/velox" "$ENTITLEMENTS"
+sign "$APP" "$ENTITLEMENTS"
+
+# --- package: .zip (updater self-replace) + .dmg (human download) -------------
+mkdir -p "$DIST"
+ZIP="$DIST/Velox-${VELOX_VERSION}-macos-${ARCH}.zip"
+DMG="$DIST/Velox-${VELOX_VERSION}-macos-${ARCH}.dmg"
+echo "==> package $ZIP"
+rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
+if command -v hdiutil >/dev/null 2>&1; then
+    echo "==> package $DMG"
+    STAGE="$(mktemp -d)"; cp -R "$APP" "$STAGE/"; ln -s /Applications "$STAGE/Applications"
+    rm -f "$DMG"
+    hdiutil create -volname "Velox" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+    rm -rf "$STAGE"
+fi
 
 echo "==> Built: $APP"
-echo "    Run with: open $APP   (or $APP/Contents/MacOS/VeloxApp for logs)"
+du -sh "$APP" | sed 's/^/    bundle size: /'
+ls -1 "$DIST"/Velox-*."${VELOX_VERSION}"* 2>/dev/null | sed 's/^/    artifact: /' || ls -1 "$DIST"/Velox-* | sed 's/^/    artifact: /'
+echo "    Run with: open $APP"

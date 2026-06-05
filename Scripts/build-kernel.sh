@@ -34,6 +34,7 @@ INSTALL_DEST="${INSTALL_DEST:-$HOME/.velox/kernel}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
 VOLUME="${VOLUME:-velox-kernel-build}"
 BUILDER_TAG="${BUILDER_TAG:-velox-kernel-builder}"
+KERNEL_BUILDER_IMAGE="${KERNEL_BUILDER_IMAGE:?set KERNEL_BUILDER_IMAGE in versions.env}"
 FRAGMENT="guest/kernel/velox.fragment"
 DOCKERFILE="guest/kernel/Dockerfile.builder"
 PLATFORM="linux/arm64"
@@ -42,7 +43,7 @@ KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
 # moby's container-host config validator, pinned.
-CHECKCONFIG_REF="${CHECKCONFIG_REF:-v28.5.0}"
+CHECKCONFIG_REF="${CHECKCONFIG_REF:-${MOBY_CHECKCONFIG_REF:?set MOBY_CHECKCONFIG_REF in versions.env}}"
 CHECKCONFIG_URL="https://raw.githubusercontent.com/moby/moby/${CHECKCONFIG_REF}/contrib/check-config.sh"
 VERIFY_GPG="${VERIFY_GPG:-0}"
 
@@ -82,7 +83,8 @@ docker volume inspect "$VOLUME" >/dev/null 2>&1 || {
 }
 
 echo "==> building builder image $BUILDER_TAG ($PLATFORM)"
-docker build --platform "$PLATFORM" -t "$BUILDER_TAG" -f "$DOCKERFILE" guest/kernel
+docker build --platform "$PLATFORM" --build-arg KERNEL_BUILDER_IMAGE="$KERNEL_BUILDER_IMAGE" \
+    -t "$BUILDER_TAG" -f "$DOCKERFILE" guest/kernel
 
 # Output dir on the Mac receives ONLY the final Image (one file — APFS-safe).
 mkdir -p "$(dirname "$OUTPUT")"

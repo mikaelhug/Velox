@@ -39,13 +39,37 @@ CONFIG_IO_URING=y
 CONFIG_INOTIFY_USER=y
 CONFIG_FANOTIFY=y
 
-# --- SMP + tickless idle + throughput-tuned scheduling (VM workload) ---
+# --- SMP + tickless idle + low-latency scheduling (fast container launch) ---
+# `docker run` is a latency-bound pipeline: per container the kernel/libnetwork
+# create a net namespace + veth pair + bridge attach + nft DNS-redirect rules, then
+# fork containerd-shim → runc → runc-init → exec. Much of that is *short* kernel and
+# libnetwork waits that round UP to the scheduler tick. MEASURED on 6.18 (warm, A/B/A
+# kernel swap): HZ_100 → HZ_1000 nearly halves launch — full-net `run --rm alpine
+# true` 0.46s → 0.24s, the veth/bridge component 0.225s → 0.053s (≈ Docker Desktop's
+# 0.041s). A finer tick lets those sub-tick waits resolve in ~1ms instead of ~10ms;
+# NO_HZ_IDLE keeps idle CPUs interrupt-free so the extra ticks are paid only while
+# busy, and HIGH_RES_TIMERS keeps absolute timeouts exact regardless of HZ.
+# Preemption model was MEASURED neutral for launch (none/voluntary/full/lazy within
+# noise), but we keep PREEMPT_LAZY — the modern 6.18 best-of-both (NONE-class
+# throughput, yet prompt wakeups) — plus PREEMPT_DYNAMIC so `preempt=` stays
+# boot-tunable from the host cmdline (see VELOX_KCMDLINE_EXTRA).
 CONFIG_SMP=y
 CONFIG_NO_HZ_IDLE=y
 CONFIG_HIGH_RES_TIMERS=y
-CONFIG_HZ_100=y
-CONFIG_PREEMPT_NONE=y
+CONFIG_HZ_1000=y
+CONFIG_PREEMPT_LAZY=y
+CONFIG_PREEMPT_DYNAMIC=y
 # Leave CONFIG_MODULES off → fully monolithic, no /lib/modules, no depmod.
+
+# --- arm64 fast paths (tinyconfig strips both; pure wins on Apple silicon) ---
+# JUMP_LABEL = static-key branch patching: hot kernel predicates (sched features,
+# tracepoint gates, PREEMPT_DYNAMIC) compile to a nop instead of a load+test. It also
+# UNLOCKS LSE atomics — ARM64_USE_LSE_ATOMICS *depends on* JUMP_LABEL. Apple M-series
+# implements ARMv8.1 LSE, so CAS/LDADD/SWP become single instructions instead of LL/SC
+# retry loops: materially less atomic overhead under the lock contention of dockerd/
+# containerd across many vCPUs (runtime-patched via alternatives, so safe if absent).
+CONFIG_JUMP_LABEL=y
+CONFIG_ARM64_USE_LSE_ATOMICS=y
 
 # --- PCIe root complex Apple VZ presents (generic ECAM) + virtio-over-PCI ---
 CONFIG_PCI=y
@@ -61,7 +85,14 @@ CONFIG_VIRTIO_MMIO=y
 # would silently drop virtio-blk/net, ext4 and veth — turn the gates back on.
 CONFIG_BLOCK=y
 CONFIG_BLK_DEV=y
+# virtio-blk sits on a host file the Mac already schedules; an in-guest I/O scheduler
+# only adds merge/reorder overhead. Compile none-only (drop mq-deadline + kyber; bfq
+# is already off) so blk-mq hands requests straight through to the host.
+# CONFIG_MQ_IOSCHED_DEADLINE is not set
+# CONFIG_MQ_IOSCHED_KYBER is not set
 CONFIG_NETDEVICES=y
+# No wireless exists in a headless VZ guest — drop the (otherwise empty) WLAN menu.
+# CONFIG_WLAN is not set
 CONFIG_VIRTIO_BLK=y
 CONFIG_VIRTIO_NET=y
 CONFIG_VIRTIO_CONSOLE=y
@@ -106,6 +137,20 @@ CONFIG_EROFS_FS_ZIP_ZSTD=y
 # vinit creates a swapfile under /var/lib/docker and swapon()s it when the host
 # requests swap via velox.swap=<MiB>. tinyconfig leaves SWAP off, so gate it on.
 CONFIG_SWAP=y
+
+# --- Memory management: modern reclaim + anti-fragmentation for a churn-heavy host ---
+# MGLRU (LRU_GEN) replaces the classic active/inactive lists with multi-generation
+# reclaim — cheaper, and far better under pressure (image pulls, parallel builds, many
+# containers); pairs with the balloon + PAGE_REPORTING return path. COMPACTION keeps
+# higher-order allocations succeeding as memory fragments over a long-running daemon's
+# lifetime (without it, order-N allocs stall or fail under churn).
+CONFIG_LRU_GEN=y
+CONFIG_LRU_GEN_ENABLED=y
+CONFIG_COMPACTION=y
+# Parallelize struct-page init across cores at boot instead of one-threaded. The
+# Resources pane can allocate 16 GB+; single-threaded memmap init is otherwise a
+# visible chunk of cold start, and it scales linearly with RAM. Near-zero downside.
+CONFIG_DEFERRED_STRUCT_PAGE_INIT=y
 
 # --- Filesystems: ext4 data disk, overlayfs (containerd snapshotter), pseudo-FS ---
 CONFIG_EXT4_FS=y
@@ -211,6 +256,11 @@ CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
+# JIT-compile BPF instead of interpreting it — every container applies a seccomp cBPF
+# filter, so JIT = faster syscall filtering; ALWAYS_ON drops the interpreter entirely
+# (smaller attack surface). arm64 has a mature eBPF JIT.
+CONFIG_BPF_JIT=y
+CONFIG_BPF_JIT_ALWAYS_ON=y
 
 # --- Hardening (near-zero-cost, expert-expected; defense-in-depth for a container
 # escape that reaches the guest kernel) ---

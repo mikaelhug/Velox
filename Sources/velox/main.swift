@@ -93,9 +93,11 @@ func runStart(bind: BindMode) -> Never {
         // The watcher rides the same in-process VSOCK Docker client the GUI uses and
         // is push-based (the /events stream), so ports come up near-instantly.
         let forwarder = PortForwarder(bridge: bridge)
+        let udpForwarder = UDPForwarder(manager: manager)
         let docker = DockerClient(manager: manager)
-        let watcher = DockerEventsWatcher(docker: docker) { ports in
-            forwarder.reconcile(ports)
+        let watcher = DockerEventsWatcher(docker: docker) { tcp, udp in
+            forwarder.reconcile(tcp)
+            udpForwarder.reconcile(udp)
         }
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
@@ -109,6 +111,7 @@ func runStart(bind: BindMode) -> Never {
             teardown.run()
             watcher.stop()
             forwarder.stopAll()
+            udpForwarder.stopAll()
             clockSync.stop()
             resourceSaver?.stop()
             proxy.stop()

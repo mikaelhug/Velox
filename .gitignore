@@ -35,7 +35,8 @@ Icon?
 # ---- Logs / scratch ----
 *.log
 
-# ---- Velox.app bundle (built by Scripts/build-app.sh) ----
+# ---- Velox.app bundle + release artifacts (built by Scripts/build-app.sh) ----
 /Velox.app/
+/dist/
 /guest/vinit/target/
 .vscode/launch.json
