@@ -46,6 +46,12 @@ final class EngineController {
     init() {
         config = VeloxConfig.load()
         needsOnboarding = !EngineController.isReady
+        // Autostart the engine on app launch (unless onboarding is needed). Skipped
+        // under SwiftUI previews so the canvas doesn't try to boot a VM.
+        let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
+        if !needsOnboarding && !isPreview {
+            Task { await self.start() }
+        }
     }
 
     /// Persist preferences to disk.
@@ -100,8 +106,8 @@ final class EngineController {
                 }
             }
 
-            // Engine is up: expose the legacy unix socket for `vlcmd`, and open
-            // the in-process Docker client for the dashboards.
+            // Engine is up: expose the unix socket for the `docker` CLI (via the
+            // `velox` context), and open the in-process Docker client for the dashboards.
             let bridge = VsockBridge(manager: manager)
             let proxy = DockerSocketProxy(
                 socketPath: Paths.dockerSocket.path,
@@ -110,8 +116,14 @@ final class EngineController {
             try proxy.start()
             self.bridge = bridge
             self.proxy = proxy
-            self.docker = DockerClient(manager: manager)
+            let docker = DockerClient(manager: manager)
+            self.docker = docker
             appliedSignature = config.bootSignature
+            // The VM has booted, but dockerd needs a few more seconds inside the
+            // guest. Stay in `.starting` until it actually answers, so the
+            // dashboards' first load succeeds (no transient "Connection reset by
+            // peer" and no manual refresh).
+            await waitForDockerReady(docker)
             state = .running
             Log.info("engine started in-process (GUI)")
         } catch {
@@ -154,6 +166,17 @@ final class EngineController {
         proxy = nil
         bridge = nil
         docker = nil
+    }
+
+    /// Poll dockerd until it answers (it comes up a few seconds after the VM
+    /// boots). Best-effort: returns after ~30s even if it never responds, so the
+    /// UI doesn't hang on a broken guest.
+    private func waitForDockerReady(_ docker: DockerClient) async {
+        for _ in 0..<120 {
+            if await docker.ping() { return }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        Log.warn("dockerd did not respond within 30s — continuing")
     }
 
     /// Resolve the guest image and append `velox.shares=<base64>` to the kernel

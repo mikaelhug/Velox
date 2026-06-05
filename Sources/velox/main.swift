@@ -23,19 +23,23 @@ func printUsage() {
     Velox \(Versions.velox) — lightweight Docker engine host for macOS
 
     Usage:
-      velox start [--bind vlcmd|docker|both]
+      velox start [--bind none|docker]
                       Boot the Linux guest engine (serial console on this terminal)
       velox status    Show host/environment info
       velox version   Show Velox and component versions
       velox update    Check GitHub for a newer Velox (--apply to install)
       velox help      Show this help
 
-    --bind chooses which client CLIs target Velox (default: vlcmd):
-      vlcmd   use the `vlcmd` wrapper          docker  bind the `docker` CLI (context)
-      both    either `vlcmd` or `docker` works
+    Velox is a standard Docker engine on a unix socket. Reach it with the plain
+    `docker` CLI via the `velox` Docker context (created on start):
+      docker context use velox     # then: docker ps / docker run …
+      docker --context velox ps    # one-off, without switching
+    Or set an env var:  export DOCKER_HOST=unix://~/.velox/docker.sock
+    Prefer your own command? Alias it:  alias vdocker='docker --context velox'
 
-    Talk to the engine with `vlcmd` (the Docker CLI for Velox):
-      vlcmd ps -a            vlcmd run --rm hello-world
+    --bind controls the active Docker context on start (default: none):
+      none    just create/update the `velox` context; don't change the active one
+      docker  switch the active context to `velox` (restored when the engine stops)
 
     Environment overrides:
       VELOX_KERNEL    path to guest kernel       (default ~/.velox/kernel)
@@ -150,7 +154,7 @@ func parseBind(_ args: [String]) -> BindMode {
        let mode = BindMode(rawValue: args[i + 1].lowercased()) {
         return mode
     }
-    return .vlcmd
+    return .none
 }
 
 // Ignore SIGPIPE: writing to a socket whose peer has closed must surface as an

@@ -179,7 +179,7 @@ private struct FileSharingTab: View {
             HStack {
                 Button { importing = true } label: { Label("Add Directory…", systemImage: "plus") }
                 Spacer()
-                Text("Containers can mount these with `vlcmd run -v`.")
+                Text("Containers can mount these with `docker run -v`.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .padding(12)

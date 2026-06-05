@@ -33,7 +33,7 @@ public enum VMConfiguration {
     ///
     /// `extraShares` lists additional host directories to expose to the guest
     /// over VirtioFS (the File Sharing setting). The host `/Users` share is
-    /// always present so `vlcmd run -v /Users/…` keeps working.
+    /// always present so `docker run -v /Users/…` keeps working.
     public static func build(image: GuestImage,
                              dataDisk: URL? = nil,
                              resources: Resources = .default,
@@ -84,8 +84,8 @@ public enum VMConfiguration {
         var sharingDevices: [VZDirectorySharingDeviceConfiguration] = []
 
         // VirtioFS: share the host's /Users at the same path in the guest, so
-        // `vlcmd run -v /Users/...:/...` resolves transparently (Docker Desktop
-        // model). Tag must match the guest mount command in velox.yml.
+        // `docker run -v /Users/...:/...` resolves transparently (Docker Desktop
+        // model). Tag must match the guest VirtioFS mount in vinit.
         let usersURL = URL(fileURLWithPath: "/Users", isDirectory: true)
         if FileManager.default.fileExists(atPath: usersURL.path) {
             let share = VZSingleDirectoryShare(

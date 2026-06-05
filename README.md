@@ -32,15 +32,19 @@ codesign -d --entitlements - "$(swift build -c release --show-bin-path)/Velox"
 ## Usage
 
 ```bash
-velox start                 # boot the engine (serial console on this terminal)
-./Scripts/install-vlcmd.sh  # put `vlcmd` on PATH (one time)
-vlcmd run --rm hello-world  # talk to the Velox engine, just like docker
-vlcmd ps -a
+velox start                      # boot the engine (serial console on this terminal)
+docker context use velox         # point the stock docker CLI at Velox (one time)
+docker run --rm hello-world      # talk to the Velox engine — plain docker
+docker ps -a
 ```
 
-`vlcmd` is the Docker CLI pointed at Velox's socket, so Velox coexists with any
-existing Docker install. `velox version` shows component versions; `velox
-update` checks GitHub for a newer build.
+Velox ships no wrapper command: it registers a Docker **context** named `velox`
+(pointing at `~/.velox/docker.sock`) and you use the stock `docker` CLI — the
+same mechanism Docker Desktop uses for its `desktop-linux` context. This
+coexists with any existing Docker install. Prefer a one-off? `docker --context
+velox ps`. Prefer your own command? Alias it: `alias vdocker='docker --context
+velox'`. `velox version` shows component versions; `velox update` checks GitHub
+for a newer build.
 
 ## Guest image
 
@@ -65,9 +69,9 @@ all container prereqs built-in (needed for `-v` mounts and Rosetta) — config i
 **MVP complete** — all five phases working and verified end-to-end.
 
 - [x] **Phase 1** — bootstrap & code-signing
-- [x] **Phase 2** — minimal Linux guest boot (LinuxKit → root console)
+- [x] **Phase 2** — minimal Linux guest boot (erofs root + Rust `vinit` PID1)
 - [x] **Phase 3** — VSOCK proxy (`~/.velox/docker.sock` ↔ guest relay)
-- [x] **Phase 4** — dockerd in guest. `vlcmd run` (pull via NAT, streamed output
+- [x] **Phase 4** — dockerd in guest. `docker run` (pull via NAT, streamed output
   via half-closing relay), **persistent data disk on the containerd image store**
   (multi-platform images, attestations, Wasm), graceful stop (sync over a VSOCK
   control port), **VirtioFS `-v` host mounts**, and **Rosetta x86**
@@ -77,4 +81,4 @@ all container prereqs built-in (needed for `-v` mounts and Rosetta) — config i
   watch the Docker API for published ports, open dynamic `127.0.0.1` listeners,
   pipe over VSOCK to a guest reverse-relay (closes when the container stops).
 
-End-to-end: `velox start` → `vlcmd run -d -p 8080:80 nginx` → `curl localhost:8080`.
+End-to-end: `velox start` → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.

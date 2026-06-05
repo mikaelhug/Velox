@@ -104,7 +104,7 @@ struct ContainersView: View {
         .overlay {
             if model.containers.isEmpty {
                 ContentUnavailableView("No Containers", systemImage: SidebarItem.containers.systemImage,
-                                       description: Text(model.loadError ?? "Run one with `vlcmd run`."))
+                                       description: Text(model.loadError ?? "Run one with `docker run`."))
             }
         }
         .task { await model.observe() }

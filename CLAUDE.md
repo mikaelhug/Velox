@@ -8,22 +8,27 @@ The goal is to beat OrbStack on speed and footprint. See `README.md` for status.
 
 The following conventions are **binding** — keep them true in all future work.
 
-## 1. User-facing CLI is `vlcmd`, never `docker`
+## 1. User-facing CLI is the stock `docker`, via a Docker **context**
 
-Velox must coexist with an existing Docker install, so it never takes over the
-`docker` command. The Docker-CLI-equivalent for Velox is **`vlcmd`**
-(`Scripts/vlcmd`), a thin wrapper that runs `docker -H unix://~/.velox/docker.sock`.
+Velox is "as original as possible": it ships **no wrapper command**. Users drive
+it with the plain `docker` CLI, pointed at Velox's socket through a Docker
+**context** named `velox` — exactly how Docker Desktop binds its own CLI (the
+`desktop-linux` context). This coexists with any other Docker install with no
+root and no `/var/run` conflict (like Colima).
 
-- Examples shown to users: `vlcmd ps -a`, `vlcmd run …`, `vlcmd network create …`.
-- Docs, `velox` CLI hints, and messages reference `vlcmd`, not `DOCKER_HOST`.
+- `velox start` creates/updates the `velox` context (`docker context create velox
+  --docker host=unix://~/.velox/docker.sock`). Users then run:
+  `docker context use velox` (persistent) or `docker --context velox ps` (one-off).
+- Examples shown to users use plain `docker`: `docker ps -a`, `docker run …`.
+  An env var works too: `export DOCKER_HOST=unix://~/.velox/docker.sock`.
+- Want a distinct command? That's a user-side **alias**, not something Velox
+  ships: `alias vdocker='docker --context velox'` in `~/.zshrc`.
+- Velox never *auto*-hijacks the active `docker` context, but the user may opt in
+  at launch: `velox start --bind none|docker`. `--bind docker` switches the active
+  context to `velox` and restores the previous one on stop. Default is `none`
+  (just create the context; don't change the active one). See `CLIBinding.swift`.
 - Internal API/socket naming stays "docker" (it *is* the Docker API):
-  `~/.velox/docker.sock`, `DockerSocketProxy`, etc. `vlcmd` is only the
-  user-facing front door (chosen to be easy to find/replace later).
-- Velox never *auto*-hijacks `docker`, but the user may opt in at launch:
-  `velox start --bind vlcmd|docker|both`. `docker`/`both` bind the standard
-  `docker` CLI via a Docker **context** named `velox` (no root, no /var/run
-  conflict — like Colima) and restore the previous context on stop. See
-  `CLIBinding.swift`. Default is `vlcmd`.
+  `~/.velox/docker.sock`, `DockerSocketProxy`, etc.
 
 ## 2. All version numbers live in ONE place: `versions.env`
 
@@ -118,10 +123,10 @@ The binding architecture:
 
 ```bash
 ./Scripts/build.sh          # gen versions + swift build + ad-hoc codesign
-./Scripts/make-guest.sh     # build/render + build LinuxKit guest, install to ~/.velox
-./Scripts/install-vlcmd.sh  # put vlcmd on PATH
-velox start                 # boot the engine
-vlcmd ps                    # talk to it
+./Scripts/make-guest.sh     # build kernel + erofs rootfs guest, install to ~/.velox
+velox start                 # boot the engine (creates the `velox` docker context)
+docker context use velox    # point the stock docker CLI at Velox
+docker ps                   # talk to it
 ```
 
 Only `com.apple.security.virtualization` is required for signing (NOT

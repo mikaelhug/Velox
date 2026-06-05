@@ -50,6 +50,13 @@ public actor DockerClient: DockerClientProtocol {
         catch { throw DockerError.decoding("\(error)") }
     }
 
+    /// Lightweight readiness probe (`GET /_ping`). Returns true once dockerd is up
+    /// and answering — used to wait out the boot gap between the VM starting and
+    /// dockerd being reachable, so the UI doesn't connect too early.
+    public func ping() async -> Bool {
+        (try? await send("GET", "/_ping")) != nil
+    }
+
     // MARK: - Lists
 
     public func containers() async throws -> [ContainerSummary] {

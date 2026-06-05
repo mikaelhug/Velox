@@ -1,50 +1,49 @@
 import Foundation
 
-/// Which client CLIs to wire up to the Velox engine on `velox start`.
+/// How `velox start` wires the standard `docker` CLI to the engine.
 public enum BindMode: String, Sendable {
-    case vlcmd   // user socket only; talk to it via the `vlcmd` wrapper
-    case docker  // bind the standard `docker` CLI via a Docker context
-    case both    // both of the above
+    /// Default: ensure the `velox` Docker *context* exists, but leave the active
+    /// context untouched. Use it with `docker context use velox` or `--context velox`.
+    case none
+    /// Also switch the active Docker context to `velox` (restored when the engine
+    /// stops), so a plain `docker ps` targets Velox while it's running.
+    case docker
 }
 
-/// Wires client CLIs to the engine socket. `docker` binding uses a Docker
-/// *context* (no root, no /var/run conflict with Docker Desktop) — the same
-/// approach Colima takes — and is reverted when the engine stops.
+/// Velox is just a standard Docker engine on a unix socket, so the native way to
+/// reach it is a Docker **context** — exactly how Docker Desktop binds its own CLI
+/// (the `desktop-linux` context). We create/maintain a `velox` context pointing at
+/// the engine socket; switching to it is opt-in (`--bind docker`) so we never
+/// hijack an existing Docker Desktop session.
 public enum CLIBinding {
     /// Apply the binding and return a teardown closure to run on stop.
     public static func apply(_ mode: BindMode, socketPath: String) -> () -> Void {
-        switch mode {
-        case .vlcmd:
-            Log.info("engine ready — use `vlcmd` (e.g. `vlcmd ps`).  [bind: vlcmd]")
+        let host = "unix://\(socketPath)"
+        guard which("docker") != nil else {
+            Log.warn("`docker` CLI not found — install it (e.g. `brew install docker`) to use Velox from the terminal.")
             return {}
-        case .docker, .both:
-            let teardown = bindDockerContext(socketPath: socketPath)
-            if mode == .both {
-                Log.info("engine ready — use `vlcmd` OR `docker` (both target Velox).  [bind: both]")
+        }
+        ensureVeloxContext(host: host)
+
+        switch mode {
+        case .none:
+            Log.info("engine ready — run `docker context use velox` (or `export DOCKER_HOST=\(host)`) to point docker at Velox.")
+            return {}
+        case .docker:
+            let previous = output(["docker", "context", "show"]) ?? "default"
+            _ = run(["docker", "context", "use", "velox"])
+            Log.info("`docker` now targets Velox (context 'velox'); restoring '\(previous)' on stop.")
+            return {
+                if previous != "velox" { _ = run(["docker", "context", "use", previous]) }
             }
-            return teardown
         }
     }
 
-    private static func bindDockerContext(socketPath: String) -> () -> Void {
-        guard which("docker") != nil else {
-            Log.warn("`docker` CLI not found — falling back to `vlcmd` only.")
-            return {}
-        }
-        let host = "unix://\(socketPath)"
-        let previous = output(["docker", "context", "show"]) ?? "default"
-
+    /// Create (or update) the `velox` context pointing at the engine socket.
+    private static func ensureVeloxContext(host: String) {
         if run(["docker", "context", "create", "velox",
                 "--docker", "host=\(host)", "--description", "Velox engine"]) != 0 {
             _ = run(["docker", "context", "update", "velox", "--docker", "host=\(host)"])
-        }
-        _ = run(["docker", "context", "use", "velox"])
-        Log.info("`docker` bound to Velox (context 'velox'); will restore '\(previous)' on stop.")
-
-        return {
-            if previous != "velox" {
-                _ = run(["docker", "context", "use", previous])
-            }
         }
     }
 
