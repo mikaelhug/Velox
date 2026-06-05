@@ -90,13 +90,16 @@ func runStart(bind: BindMode) -> Never {
             bridge: bridge)
         // Inbound published ports: watch the Docker API and reverse-forward each
         // published port over VSOCK to the guest (which dials 127.0.0.1:<port>).
+        // The watcher rides the same in-process VSOCK Docker client the GUI uses and
+        // is push-based (the /events stream), so ports come up near-instantly.
         let forwarder = PortForwarder(bridge: bridge)
-        let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
+        let docker = DockerClient(manager: manager)
+        let watcher = DockerEventsWatcher(docker: docker) { ports in
             forwarder.reconcile(ports)
         }
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
-            ? ResourceSaver(manager: manager, socketPath: Paths.dockerSocket.path,
+            ? ResourceSaver(manager: manager, docker: docker,
                             fullMemoryBytes: prefs.resources.memoryBytes,
                             floorBytes: prefs.resourceSaverFloorBytes,
                             idleMinutes: prefs.resourceSaverMinutes)

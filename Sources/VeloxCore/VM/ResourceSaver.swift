@@ -2,75 +2,98 @@ import Foundation
 
 /// Docker Desktop-style **Resource Saver**: when no containers have been running
 /// for a configured idle period, reclaim guest RAM by inflating the virtio memory
-/// balloon down to a floor; restore full memory as soon as a container starts
-/// again. The VM keeps running throughout (an idle guest already uses ~no CPU),
-/// so dockerd stays responsive and exit is automatic.
+/// balloon down to a floor; restore full memory the instant a container starts
+/// again. The VM keeps running throughout (an idle guest already uses ~no CPU), so
+/// dockerd stays responsive and recovery is automatic.
 ///
-/// Polls the Docker API for the running-container count. Polling (rather than the
-/// event stream) matches `DockerEventsWatcher` and is robust to the daemon coming
-/// and going; the poll interval is short relative to the minutes-scale threshold.
+/// **Event-driven**, not polled: it rides the Docker `/events` stream (the same
+/// in-process VSOCK client the GUI uses) to learn the running-container count the
+/// moment it changes. The only timer is the idle *countdown* — an inherent delay
+/// (you must wait the threshold), armed when the count hits zero and cancelled the
+/// instant a container starts — not a status poll.
 public final class ResourceSaver: @unchecked Sendable {
     private let manager: VMManager
-    private let socketPath: String
+    private let docker: any DockerClientProtocol
     private let fullMemoryBytes: UInt64
     private let floorBytes: UInt64
     private let idleThreshold: TimeInterval
     private let queue = DispatchQueue(label: "dev.velox.resourcesaver")
-    private static let pollInterval: TimeInterval = 10
 
-    private var timer: DispatchSourceTimer?
-    private var zeroRunningSince: Date?
+    private var task: Task<Void, Never>?
+    private var idleTimer: DispatchSourceTimer?
     private var saving = false
 
     /// - Parameters:
     ///   - fullMemoryBytes: the configured (boot) memory size to restore on exit.
     ///   - floorBytes: the memory ceiling to hold while saving.
     ///   - idleMinutes: minutes with zero running containers before saving kicks in.
-    public init(manager: VMManager, socketPath: String,
+    public init(manager: VMManager, docker: any DockerClientProtocol,
                 fullMemoryBytes: UInt64, floorBytes: UInt64, idleMinutes: Int) {
         self.manager = manager
-        self.socketPath = socketPath
+        self.docker = docker
         self.fullMemoryBytes = fullMemoryBytes
         self.floorBytes = min(floorBytes, fullMemoryBytes)
         self.idleThreshold = TimeInterval(max(0, idleMinutes) * 60)
     }
 
     public func start() {
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + Self.pollInterval, repeating: Self.pollInterval)
-        t.setEventHandler { [weak self] in self?.poll() }
-        t.resume()
-        timer = t
+        task = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.evaluate()                       // current state on (re)connect
+                for await event in self.docker.events() {
+                    if Task.isCancelled { return }
+                    if event.type == nil || event.type == "container" { await self.evaluate() }
+                }
+                if Task.isCancelled { return }
+                try? await Task.sleep(for: .seconds(1))      // back off, reconnect
+            }
+        }
     }
 
-    /// Stop polling and, if currently saving, restore full memory so a later
+    /// Stop watching and, if currently saving, restore full memory so a later
     /// engine restart (or a different saver config) starts from a clean ceiling.
     public func stop() {
+        task?.cancel()
+        task = nil
         queue.async {
-            self.timer?.cancel()
-            self.timer = nil
+            self.idleTimer?.cancel()
+            self.idleTimer = nil
             if self.saving { self.exitSaver() }
         }
     }
 
+    /// Read the running-container count, then apply on `queue`.
+    private func evaluate() async {
+        // nil = daemon not reachable; leave the current mode untouched.
+        guard let containers = try? await docker.containers() else { return }
+        let running = containers.lazy.filter { $0.state == "running" }.count
+        queue.async { [weak self] in self?.apply(running: running) }
+    }
+
     // MARK: - private (all on `queue`)
 
-    private func poll() {
-        // nil = daemon not reachable; leave the current mode untouched.
-        guard let running = DockerAPI.runningContainerCount(socketPath: socketPath) else { return }
+    private func apply(running: Int) {
         if running > 0 {
-            zeroRunningSince = nil
+            idleTimer?.cancel(); idleTimer = nil
             if saving { exitSaver() }
             return
         }
-        if zeroRunningSince == nil { zeroRunningSince = Date() }
-        if !saving, let since = zeroRunningSince,
-           Date().timeIntervalSince(since) >= idleThreshold {
-            enterSaver()
+        // Zero running: arm the idle countdown (a one-shot delay) if not already.
+        guard !saving, idleTimer == nil else { return }
+        if idleThreshold <= 0 { enterSaver(); return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + idleThreshold)
+        t.setEventHandler { [weak self] in
+            self?.idleTimer = nil
+            self?.enterSaver()
         }
+        t.resume()
+        idleTimer = t
     }
 
     private func enterSaver() {
+        guard !saving else { return }
         saving = true
         manager.setMemoryTarget(floorBytes)
         Log.info("resource saver: idle — reclaiming memory to \(floorBytes / (1024 * 1024)) MiB")

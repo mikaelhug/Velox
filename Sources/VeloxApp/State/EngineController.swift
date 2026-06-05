@@ -138,7 +138,7 @@ final class EngineController {
             // Reverse-forward published container ports to localhost (watch the
             // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
             let forwarder = PortForwarder(bridge: bridge)
-            let watcher = DockerEventsWatcher(socketPath: Paths.dockerSocket.path) { ports in
+            let watcher = DockerEventsWatcher(docker: docker) { ports in
                 forwarder.reconcile(ports)
             }
             watcher.start()
@@ -218,13 +218,13 @@ final class EngineController {
     private func startResourceSaver() {
         resourceSaver?.stop()
         resourceSaver = nil
-        guard config.resourceSaverEnabled, bootedMemoryBytes > 0 else { return }
+        guard config.resourceSaverEnabled, bootedMemoryBytes > 0, let docker else { return }
         // Floor at ¼ of the booted RAM, clamped to [512 MiB, 1 GiB], so dockerd
         // stays responsive enough to notice the next container start.
         let floor = min(max(bootedMemoryBytes / 4, 512 * 1024 * 1024), 1024 * 1024 * 1024)
         let saver = ResourceSaver(
             manager: manager,
-            socketPath: Paths.dockerSocket.path,
+            docker: docker,
             fullMemoryBytes: bootedMemoryBytes,
             floorBytes: floor,
             idleMinutes: config.resourceSaverMinutes)
