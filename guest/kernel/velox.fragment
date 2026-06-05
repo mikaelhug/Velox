@@ -211,3 +211,21 @@ CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
+
+# --- Hardening (near-zero-cost, expert-expected; defense-in-depth for a container
+# escape that reaches the guest kernel) ---
+# Deliberately the *cheap* set only — KASLR, stack canaries, _FORTIFY compile-time
+# bounds checks, and SLUB freelist hardening. We do NOT enable INIT_ON_ALLOC/FREE:
+# it zeroes every allocation (~1-3% throughput) and the VM boundary is the real
+# isolation, so it loses more on the speed north star than it buys here.
+CONFIG_RANDOMIZE_BASE=y
+CONFIG_STACKPROTECTOR=y
+CONFIG_STACKPROTECTOR_STRONG=y
+CONFIG_FORTIFY_SOURCE=y
+# tinyconfig defaults to the size-optimized SLUB_TINY allocator, which trades
+# throughput for footprint — the wrong call for a container host doing heavy
+# allocation (and it blocks the freelist hardening below). Use the full SLUB: faster
+# AND hardenable. The size cost is tens of KB; the speed win is the point.
+# CONFIG_SLUB_TINY is not set
+CONFIG_SLAB_FREELIST_HARDENED=y
+CONFIG_SLAB_FREELIST_RANDOM=y
