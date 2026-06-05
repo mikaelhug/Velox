@@ -16,10 +16,12 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public let status: String         // "Up 3 minutes", "Exited (0) 2 hours ago"
     public let created: Int
     public let ports: [PortMapping]
+    public let labels: [String: String]
 
     enum CodingKeys: String, CodingKey {
         case id = "Id", names = "Names", image = "Image", imageID = "ImageID"
         case state = "State", status = "Status", created = "Created", ports = "Ports"
+        case labels = "Labels"
     }
 
     public init(from decoder: Decoder) throws {
@@ -34,19 +36,31 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
         created = try c.decodeIfPresent(Int.self, forKey: .created) ?? 0
         ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+        labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
     }
 
     /// Memberwise init for mock fixtures and tests.
     public init(id: String, names: [String], image: String, imageID: String = "",
-                state: String, status: String, created: Int = 0, ports: [PortMapping] = []) {
+                state: String, status: String, created: Int = 0, ports: [PortMapping] = [],
+                labels: [String: String] = [:]) {
         self.id = id; self.names = names; self.image = image; self.imageID = imageID
         self.state = state; self.status = status; self.created = created; self.ports = ports
+        self.labels = labels
     }
 
     public var displayName: String { names.first ?? String(id.prefix(12)) }
     public var shortID: String { String(id.prefix(12)) }
     public var isRunning: Bool { state == "running" }
     public var isPaused: Bool { state == "paused" }
+
+    /// Compose project this container belongs to, if any (the standard
+    /// `com.docker.compose.project` label set by `docker compose`).
+    public var composeProject: String? {
+        let p = labels["com.docker.compose.project"]
+        return (p?.isEmpty == false) ? p : nil
+    }
+    /// The Compose service name within its project, when present.
+    public var composeService: String? { labels["com.docker.compose.service"] }
 }
 
 public struct PortMapping: Codable, Sendable, Hashable {
