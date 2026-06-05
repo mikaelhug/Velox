@@ -578,13 +578,42 @@ fn setup_data_disk() {
     if std::path::Path::new(dev).exists() {
         if !is_ext4(dev) {
             log!("formatting {dev} ext4 (first boot)");
-            let st = Command::new("/bin/mkfs.ext4").args(["-F", "-q", dev]).status();
+            let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", dev]).status();
             match st { Ok(s) if s.success() => {}, other => log!("mkfs.ext4 failed: {other:?}") }
         }
         do_mount(dev, "/var/lib/docker", "ext4", 0, None);
+        start_fstrim_timer();
     } else {
         log!("no {dev} — /var/lib/docker stays on tmpfs (non-persistent)");
     }
+}
+
+/// Periodically TRIM the data disk so blocks freed by deleted image layers /
+/// containers are released back to the host. Paired with the host's ASIF data disk,
+/// the discard hole-punches the backing file — so the disk shrinks instead of
+/// growing forever like Docker Desktop's `Docker.raw`. Periodic (not `-o discard`)
+/// to keep delete latency off the hot path, exactly like OrbStack/Docker Desktop.
+fn start_fstrim_timer() {
+    // FITRIM: _IOWR('X', 121, struct fstrim_range) — trims the whole filesystem.
+    const FITRIM: libc::c_ulong = 0xC018_5879;
+    #[repr(C)]
+    struct FstrimRange { start: u64, len: u64, minlen: u64 }
+    std::thread::spawn(|| {
+        // One pass shortly after boot (reclaims anything freed last session), then hourly.
+        let mut delay = std::time::Duration::from_secs(60);
+        loop {
+            std::thread::sleep(delay);
+            delay = std::time::Duration::from_secs(3600);
+            let path = match CString::new("/var/lib/docker") { Ok(p) => p, Err(_) => continue };
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            if fd < 0 { continue; }
+            let mut range = FstrimRange { start: 0, len: u64::MAX, minlen: 0 };
+            if unsafe { libc::ioctl(fd, FITRIM as _, &mut range) } < 0 {
+                log!("fstrim failed: {}", std::io::Error::last_os_error());
+            }
+            unsafe { libc::close(fd); }
+        }
+    });
 }
 
 fn is_ext4(dev: &str) -> bool {
