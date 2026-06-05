@@ -155,12 +155,15 @@ echo "$report"
 # nftables firewall backend instead), and IPVS (single-node Docker never uses it,
 # only Swarm/kube load-balancing). Their absence must NOT fail the build.
 expected_missing="CONFIG_(IP_NF_(IPTABLES|FILTER|MANGLE|RAW|NAT|TARGET_MASQUERADE)|IP6_NF_(IPTABLES|FILTER|MANGLE|RAW|NAT|TARGET_MASQUERADE)|NETFILTER_XT_MATCH_IPVS|IP_VS)"
-# Strip ANSI, isolate the "Generally Necessary" block, flag any "missing" that
-# is not on the intentionally-omitted list above.
+# Strip ANSI, isolate the "Generally Necessary" block, and flag only missing
+# *CONFIG_ symbols* (the actual kernel-config gaps) — never host-tooling lines like
+# "apparmor: enabled, but apparmor_parser missing", which depend on the build host's
+# AppArmor + a userland tool we don't ship (the guest is seccomp-only, no AppArmor),
+# not on our kernel. Then drop the intentionally-omitted symbols above.
 necessary_missing="$(printf "%s\n" "$report" \
     | sed -E "s/\x1b\[[0-9;]*m//g" \
     | awk "/Generally Necessary/{f=1;next} /Optional Features/{f=0} f" \
-    | grep -i "missing" \
+    | grep -iE "CONFIG_[A-Z0-9_]+.*missing" \
     | grep -vE "$expected_missing" || true)"
 if [ -n "$necessary_missing" ]; then
     echo "error: check-config.sh reports Generally-Necessary items missing:" >&2
