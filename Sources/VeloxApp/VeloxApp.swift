@@ -13,6 +13,15 @@ enum WindowID {
 struct VeloxApp: App {
     @State private var engine = EngineController()
 
+    init() {
+        // Ignore SIGPIPE: writing to a socket whose peer has closed must surface as
+        // an EPIPE error, not terminate the process. Essential for the proxy/relay/
+        // watcher — the same disposition the `velox` CLI sets at startup. Without it
+        // a BuildKit build (devcontainers `up`) half-closes its hijacked `/session`
+        // stream and the next proxy write kills the whole GUI app.
+        signal(SIGPIPE, SIG_IGN)
+    }
+
     var body: some Scene {
         Window("Velox", id: WindowID.dashboard) {
             RootView()
