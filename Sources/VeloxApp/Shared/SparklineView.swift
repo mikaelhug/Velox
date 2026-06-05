@@ -1,26 +1,14 @@
 import SwiftUI
 import VeloxCore
 
-/// A fixed-capacity ring of recent stats samples backing a container's
-/// CPU/memory sparklines. `@Observable` so appends redraw the cells.
+/// Holds the most recent stats sample for a container row. `@Observable` so a new
+/// sample redraws the cell's CPU/memory numbers.
 @MainActor
 @Observable
 final class StatsBuffer {
-    private(set) var cpu: [Double] = []
-    private(set) var memPercent: [Double] = []
     private(set) var latest: ContainerStatsSample?
-    private let capacity = 60
 
-    func append(_ sample: ContainerStatsSample) {
-        latest = sample
-        push(&cpu, sample.cpuPercent)
-        push(&memPercent, sample.memoryPercent)
-    }
-
-    private func push(_ array: inout [Double], _ value: Double) {
-        array.append(value)
-        if array.count > capacity { array.removeFirst(array.count - capacity) }
-    }
+    func append(_ sample: ContainerStatsSample) { latest = sample }
 }
 
 /// A compact line chart drawn with `Canvas` — cheap enough to live in every
@@ -61,8 +49,8 @@ struct SparklineView: View {
     }
 }
 
-/// One cell that subscribes to a container's stats stream and renders a live CPU
-/// sparkline plus a memory bar. A single stream feeds both metrics.
+/// One cell that subscribes to a container's stats stream and shows its live CPU
+/// and memory as plain numbers (no per-row chart — the numbers are enough).
 struct ContainerUsageCell: View {
     let docker: any DockerClientProtocol
     let containerID: String
@@ -70,13 +58,9 @@ struct ContainerUsageCell: View {
     @State private var buffer = StatsBuffer()
 
     var body: some View {
-        HStack(spacing: 10) {
-            metric(title: "CPU", value: buffer.latest.map { String(format: "%.0f%%", $0.cpuPercent) } ?? "—") {
-                SparklineView(values: buffer.cpu, tint: .green)
-            }
-            metric(title: "MEM", value: buffer.latest.map { Format.bytes($0.memoryBytes) } ?? "—") {
-                SparklineView(values: buffer.memPercent, maxValue: 100, tint: .blue)
-            }
+        HStack(spacing: 14) {
+            metric(title: "CPU", value: buffer.latest.map { String(format: "%.0f%%", $0.cpuPercent) } ?? "—")
+            metric(title: "MEM", value: buffer.latest.map { Format.bytes($0.memoryBytes) } ?? "—")
         }
         .task(id: containerID) {
             guard isRunning else { return }
@@ -86,14 +70,10 @@ struct ContainerUsageCell: View {
         }
     }
 
-    @ViewBuilder
-    private func metric(title: String, value: String, @ViewBuilder chart: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(spacing: 4) {
-                Text(title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
-                Text(value).font(.system(size: 10).monospacedDigit())
-            }
-            chart().frame(width: 64, height: 16)
+    private func metric(title: String, value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value).font(.callout.monospacedDigit())
         }
     }
 }

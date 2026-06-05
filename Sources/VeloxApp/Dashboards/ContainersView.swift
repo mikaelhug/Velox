@@ -83,7 +83,7 @@ struct ContainersView: View {
 
             TableColumn("CPU / MEM") { c in
                 ContainerUsageCell(docker: docker, containerID: c.id, isRunning: c.isRunning)
-            }.width(160)
+            }.width(min: 110, ideal: 130)
 
             TableColumn("") { c in rowActions(c) }.width(132)
         }

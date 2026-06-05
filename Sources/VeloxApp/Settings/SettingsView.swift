@@ -47,7 +47,10 @@ struct SettingsView: View {
             .navigationTitle(selection.title)
             .frame(minWidth: 420, maxWidth: .infinity, minHeight: 460, maxHeight: .infinity)
         }
-        .frame(width: 720, height: 520)
+        // Use a min/ideal frame (not an exact width/height) so the window lays out
+        // within the title-bar safe area — pinning an exact size pushes the content
+        // up under the traffic lights and crowds them against the window edge.
+        .frame(minWidth: 700, idealWidth: 720, minHeight: 520, idealHeight: 560)
         // Persist every edit and re-apply the live-tunable ones (Resource Saver).
         .onChange(of: engine.config) { engine.applyRuntimeConfig() }
     }

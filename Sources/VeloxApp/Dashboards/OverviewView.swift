@@ -191,12 +191,10 @@ struct OverviewView: View {
             HStack(spacing: Theme.gridSpacing) {
                 LiveMetricCard(title: "CPU", tint: .green,
                                value: String(format: "%.0f%%", model.totalCPU),
-                               history: model.cpuHistory,
-                               maxValue: Double(max(engine.config.cpuCount, 1)) * 100)
+                               history: model.cpuHistory)
                 LiveMetricCard(title: "Memory", tint: .blue,
                                value: Format.bytes(model.totalMemBytes),
-                               history: model.memHistory,
-                               maxValue: Double(max(engine.config.memoryGiB, 1)) * 1024 * 1024 * 1024)
+                               history: model.memHistory)
             }
         }
     }
@@ -211,14 +209,21 @@ struct OverviewView: View {
     }
 }
 
-/// A live metric tile: a headline value over a wide sparkline. Reuses the same
-/// `SparklineView` the container rows draw, scaled to the engine's allocation.
+/// A live metric tile: a headline value over a wide sparkline. The chart
+/// auto-scales to its own recent peak (with headroom) so real usage fills the
+/// plot instead of flat-lining against the full VM allocation.
 private struct LiveMetricCard: View {
     let title: String
     let tint: Color
     let value: String
     let history: [Double]
-    let maxValue: Double
+
+    /// 30% headroom above the window's peak, so the line never pegs the top and
+    /// a rising trend still has room to climb. Falls back to 1 when idle (all-zero).
+    private var ceiling: Double {
+        let peak = history.max() ?? 0
+        return peak > 0 ? peak * 1.3 : 1
+    }
 
     var body: some View {
         DashboardCard {
@@ -231,7 +236,7 @@ private struct LiveMetricCard: View {
                         .monospacedDigit()
                         .contentTransition(.numericText())
                 }
-                SparklineView(values: history, maxValue: maxValue, tint: tint)
+                SparklineView(values: history, maxValue: ceiling, tint: tint)
                     .frame(height: 46)
             }
         }
