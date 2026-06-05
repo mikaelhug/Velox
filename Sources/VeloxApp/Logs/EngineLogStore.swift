@@ -37,13 +37,19 @@ final class EngineLogStore {
         let fd = handle.fileDescriptor
         let src = DispatchSource.makeReadSource(
             fileDescriptor: fd, queue: DispatchQueue(label: "dev.velox.enginelog"))
-        src.setEventHandler { [weak self] in
+        // The handler runs on the background queue above, so it MUST be non-isolated.
+        // Declaring it `@Sendable` stops the compiler inferring `@MainActor` from this
+        // `@MainActor` method (the SDK's @convention(block) param would silently accept
+        // an isolated closure, then trap at runtime via swift_task_isCurrentExecutor).
+        // It reads off-main and hops to the main actor only to ingest.
+        let handler: @Sendable () -> Void = { [weak self] in
             var buf = [UInt8](repeating: 0, count: 16 * 1024)
             let n = read(fd, &buf, buf.count)
             guard n > 0 else { return }
             let chunk = String(decoding: buf[0 ..< n], as: UTF8.self)
             Task { @MainActor in self?.ingest(chunk) }
         }
+        src.setEventHandler(handler: handler)
         src.resume()
         source = src
     }
