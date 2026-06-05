@@ -61,6 +61,7 @@ cp "$BIN_DIR/velox"    "$APP/Contents/Resources/bin/velox"
 cp "$DOCKER_CLI"       "$APP/Contents/Resources/bin/docker"
 cp "$KERNEL_SRC"       "$APP/Contents/Resources/kernel"
 cp "$ROOT_SRC"         "$APP/Contents/Resources/root.img"
+[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker"
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -72,6 +73,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleDisplayName</key><string>Velox</string>
     <key>CFBundleIdentifier</key><string>dev.velox.VeloxApp</string>
     <key>CFBundleExecutable</key><string>VeloxApp</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${VELOX_VERSION}</string>
     <key>CFBundleVersion</key><string>${VELOX_VERSION}</string>
