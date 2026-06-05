@@ -184,8 +184,9 @@ overhead is the one axis where it currently loses (it also inflates the small-fi
 and x86 wall-times above). Investigated: it is **not** the VSOCK Docker-API proxy
 (Velox's API round-trip is ~78 ms, *faster* than DD's ~91 ms), nor CPU, nor disk —
 it is the per-container **network-namespace / veth / bridge setup** (`--network
-none` is ~0.37 s faster). The iptables-nft shell-out is ~130 ms of that; Docker 29's
-native nftables backend removes it but doesn't lower total launch time and breaks
-Velox's reverse port-forwarding, so it's not adopted. Reducing the remaining veth/
-bridge cost is a tracked follow-up. Repro: `time docker run --rm alpine true`
-(warm image, average a few runs); compare `--network none`.
+none` is ~0.37 s faster). The iptables-nft shell-out was ~130 ms of that; Velox now
+runs dockerd's **native nftables firewall backend** (which removes that shell-out and
+let us drop the `iptables` binary, per pillar #5), but it doesn't change total launch
+time — the remaining cost is the veth/bridge work both engines do, and reducing it is
+a tracked follow-up. Repro: `time docker run --rm alpine true` (warm image, average a
+few runs); compare `--network none`.

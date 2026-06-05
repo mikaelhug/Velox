@@ -159,11 +159,20 @@ CONFIG_NFT_CT=y
 CONFIG_NFT_REJECT=y
 CONFIG_NFT_REJECT_INET=y
 CONFIG_NFT_COMPAT=y
-# xt match/target framework (used via nft_compat by iptables-nft, which is the
-# dind default). dockerd programs MASQUERADE for outbound and DNAT/REDIRECT for
-# published ports + the 127.0.0.11 embedded-DNS redirect, so the xt NAT targets
-# are required — without XT_NAT the DNS rule silently fails and name resolution
-# (and port mapping) break while direct-IP traffic still works.
+# Expressions Docker 29's NATIVE nftables firewall backend emits directly
+# (--firewall-backend=nftables): `fib daddr type local` (route/local-address match)
+# and `redir` (for the 127.0.0.11 embedded-DNS redirect). Required — without fib the
+# bridge driver fails to register. (Inline `counter` is part of nf_tables core.)
+CONFIG_NFT_FIB_IPV4=y
+CONFIG_NFT_FIB_IPV6=y
+CONFIG_NFT_FIB_INET=y
+CONFIG_NFT_REDIR=y
+# xt match/target framework + nft_compat. The GUEST firewall no longer needs this
+# (dockerd uses the native nftables backend above, and the iptables binary is gone
+# from the rootfs), but it's kept for CONTAINER workloads: images that run their own
+# `iptables`/`ip6tables` (kube-proxy, network tools, …) rely on the shared kernel's
+# xt/compat support, which lives here even though their userspace binary ships in
+# the image, not the guest.
 CONFIG_NETFILTER_XTABLES=y
 CONFIG_NETFILTER_XT_NAT=y
 CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y

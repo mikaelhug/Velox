@@ -45,6 +45,7 @@ fn main() {
     setup_data_disk();
     setup_swap();
     setup_virtiofs();
+    enable_ip_forwarding();
     let dockerd_pid = spawn_dockerd();
     start_vsock_agent();
     log!("init complete — supervising");
@@ -224,6 +225,20 @@ fn setup_network() -> std::io::Result<()> {
     let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
     std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs));
     Ok(())
+}
+
+/// Enable IPv4/IPv6 packet forwarding before dockerd starts. Docker 29's native
+/// nftables firewall backend *checks* `net.ipv4.ip_forward=1` and refuses to
+/// initialize the bridge network if it isn't (the legacy iptables path set it
+/// itself). Containers can't route out without this anyway.
+fn enable_ip_forwarding() {
+    for (path, val) in [
+        ("/proc/sys/net/ipv4/ip_forward", "1"),
+        ("/proc/sys/net/ipv4/conf/all/forwarding", "1"),
+        ("/proc/sys/net/ipv6/conf/all/forwarding", "1"),
+    ] {
+        if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
+    }
 }
 
 fn iface_up(s: RawFd, name: &str) {
@@ -787,6 +802,12 @@ fn spawn_dockerd() -> i32 {
     let mut args: Vec<String> = vec![
         "--host=unix:///run/docker.sock".into(),
         "--feature=containerd-snapshotter=true".into(),
+        // Docker 29's native in-kernel nftables firewall (drives `nft` directly via a
+        // batched ruleset) instead of shelling out to the iptables-nft compat binary
+        // per rule. Native dockerd capability over an extra package: the
+        // iptables/ip6tables binaries are dropped from the rootfs. Requires the nft
+        // `fib` expression (kernel fragment) and ip_forward preset (below).
+        "--firewall-backend=nftables".into(),
     ];
     // In netstack (static) mode the gateway IP is fixed and is also
     // host.docker.internal; tell dockerd so `--add-host host.docker.internal:

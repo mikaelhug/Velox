@@ -26,6 +26,15 @@ pillars that deliver it:
    `tinyconfig` + a curated fragment, only what the VM needs, nothing else. Where a
    guest component must be faster or smaller, add a focused high-performance Rust
    piece (like `vinit`) rather than pull in heavyweight userland.
+5. **Native-first; if we must build our own, it's Rust.** Prefer a capability that
+   `dockerd` (or the kernel) already provides natively over adding another userland
+   package — and over rolling our own. Example: dockerd 29's **native nftables
+   firewall backend** (`--firewall-backend=nftables`, drives `nft` in-kernel)
+   replaces shelling out to the `iptables-nft` compat binary, so the
+   `iptables`/`ip6tables` packages are **dropped** from the guest. Only when no
+   native option exists and we genuinely must build one do we write it — and then in
+   **Rust** (like `vinit`), never Go, never a heavyweight dependency. Fewer packages
+   and fewer bespoke components = leaner, faster, smaller.
 
 Concretely: the host supervisor is 100% Swift driving `Virtualization.framework`;
 the guest is a minimal custom Linux image (from-source kernel + a compressed `erofs`
@@ -147,10 +156,14 @@ The binding architecture:
   docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock), and reaps
   zombies. All custom guest code is Rust (pillar #3) — keep it lean.
 - The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
-  `versions.env`). A tiny musl userland (`iptables`-nft + `nftables`, `e2fsprogs`,
-  `ca-certificates` — the only tools dockerd shells out to) comes from Alpine
-  packages, so there is a small `/lib`. Eliminating it (fully-static nft + mke2fs
-  from source → a pure scratch tree) is a noted follow-up toward the leaner footprint.
+  `versions.env`). A tiny musl userland (`nftables`, `e2fsprogs`, `ca-certificates`
+  — the only tools dockerd shells out to) comes from Alpine packages, so there is a
+  small `/lib`. dockerd runs its **native nftables firewall backend** (pillar #5), so
+  it drives the `nft` binary directly and the legacy `iptables`/`ip6tables` (iptables-nft)
+  packages are **not** shipped. The kernel still carries full nft/xt support (fragment)
+  for container workloads that run their own `iptables`. Eliminating the musl `/lib`
+  entirely (fully-static nft + mke2fs from source → a pure scratch tree) is a noted
+  follow-up toward the leaner footprint.
 - **Do NOT reintroduce:** `linuxkit`, the `docker:*-dind` image, `linuxkit/*` package
   images, an initramfs, or any OCI-image-as-guest-component. There is no
   `guest/velox.yml`. (Buildkit gotcha: a `RUN` immediately after `COPY …/sbin/init`

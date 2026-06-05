@@ -2,12 +2,12 @@
 # NO LinuxKit, NO docker:*-dind, NO per-container rootfs duplication. The guest is:
 #   - the static Rust /sbin/init (vinit): PID1 + supervisor + vsock agent
 #   - Docker's official STATIC server binaries (dockerd/containerd/runc/…)
-#   - a tiny musl userland (iptables-nft, e2fsprogs, ca-certificates) — the only
-#     tools dockerd shells out to (firewall rules + one-time data-disk mkfs)
+#   - a tiny musl userland (nftables, e2fsprogs, ca-certificates) — the only tools
+#     dockerd shells out to (native nftables firewall via `nft` + one-time data-disk mkfs)
 # Scripts/make-guest.sh exports this and runs mkfs.erofs over it → root.img.
 #
-# (Eliminating the musl /lib entirely would require building a static nft/iptables
-#  + mke2fs from source — a follow-up polish; everything else is already static.)
+# (Eliminating the musl /lib entirely would require building a static nft + mke2fs
+#  from source — a follow-up polish; everything else is already static.)
 
 ARG RUST_BUILD_IMAGE=rust:1-alpine
 ARG ALPINE_IMAGE=alpine:3.23
@@ -36,11 +36,13 @@ RUN wget -qO docker.tgz "https://download.docker.com/linux/static/stable/aarch64
 # right after `COPY … /rootfs/sbin/init` gets exec'd AS that binary by this
 # buildkit/containerd-store setup — so no RUN may follow the vinit copy.)
 FROM ${ALPINE_IMAGE} AS assembly
-# apk resolves the (few) musl libs these pull in. iptables = iptables-nft → nf_tables;
-# nftables provides the `nft` binary dockerd 29 uses by default for its firewall.
+# apk resolves the (few) musl libs these pull in. dockerd runs with its NATIVE
+# nftables firewall backend (--firewall-backend=nftables), which drives the `nft`
+# binary directly — so we ship only `nftables`, NOT the legacy iptables/ip6tables
+# (iptables-nft) compat shim. Native dockerd capability > extra packages.
 RUN apk add --no-cache --initdb --root /rootfs \
       --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys \
-      iptables ip6tables nftables e2fsprogs ca-certificates \
+      nftables e2fsprogs ca-certificates \
  && rm -rf /rootfs/etc/apk /rootfs/lib/apk /rootfs/var/cache /rootfs/etc/network \
            /rootfs/etc/init.d /rootfs/etc/conf.d /rootfs/sbin/openrc* /rootfs/usr/share/man \
  && mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev/pts /rootfs/dev/shm /rootfs/run \
