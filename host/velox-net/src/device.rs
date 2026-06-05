@@ -28,7 +28,9 @@ impl FrameDevice {
     /// Drain all currently-available frames from the fd into the rx queue,
     /// invoking `on_frame` for each so the caller can pre-process (e.g. create a
     /// per-destination listener for an outbound SYN) before smoltcp polls.
-    pub fn pump_in<F: FnMut(&[u8])>(&mut self, mut on_frame: F) {
+    /// Returns the number of frames ingested (0 = the fd was drained / idle).
+    pub fn pump_in<F: FnMut(&[u8])>(&mut self, mut on_frame: F) -> usize {
+        let mut count = 0;
         loop {
             let mut buf = vec![0u8; self.mtu + 18];
             let n = unsafe {
@@ -42,7 +44,9 @@ impl FrameDevice {
             self.stats.rx_bytes.fetch_add(n as u64, Ordering::Relaxed);
             on_frame(&buf);
             self.rx.push_back(buf);
+            count += 1;
         }
+        count
     }
 }
 
