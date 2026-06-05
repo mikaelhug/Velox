@@ -200,11 +200,23 @@ fn setup_network() -> std::io::Result<()> {
     if lease.router != 0 {
         add_default_route(s, lease.router);
     }
-    // DNS
-    write_resolv_conf(&lease.dns);
     // Remember the gateway (the Mac on the vmnet bridge) for host.docker.internal.
     GATEWAY_IP.store(lease.router, std::sync::atomic::Ordering::Relaxed);
     unsafe { libc::close(s); }
+
+    // DNS: run an in-guest responder so every container gets `host.docker.internal`
+    // (Docker-Desktop parity — vanilla dockerd never injects it, on any network).
+    // Bind :53 first, then point resolv.conf at our own eth0 IP: the responder
+    // becomes the primary nameserver for the guest and — because dockerd copies this
+    // file to default-bridge containers and uses it as the embedded resolver's
+    // ExtServer on user-defined nets — for every container too. The real upstream(s)
+    // follow as a fallback. dockerd strips loopback from the copied file, so we must
+    // advertise eth0's address here, never 127.0.0.1.
+    let upstream = lease.dns.first().copied().unwrap_or(lease.router);
+    start_dns_proxy(lease.ip, lease.router, upstream);
+    let mut nameservers = vec![lease.ip];
+    nameservers.extend_from_slice(&lease.dns);
+    write_resolv_conf(&nameservers);
 
     // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
     // a long-running VM would eventually lose its address. Renew in the
@@ -275,6 +287,103 @@ fn ipstr(ip: u32) -> String {
     format!("{}.{}.{}.{}", (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff)
 }
 
+// =================== DNS responder (host.docker.internal parity) ===================
+//
+// Docker Desktop auto-resolves `host.docker.internal` on every container network;
+// vanilla dockerd never does. We match it with no host code: a tiny UDP resolver on
+// :53 answers the two `*.docker.internal` names with the vmnet gateway (the Mac) and
+// forwards everything else to the real upstream. resolv.conf points all consumers
+// here (see setup_network), so the name resolves on default-bridge and user-defined
+// networks alike — exactly like Docker Desktop.
+const DOCKER_INTERNAL_NAMES: [&str; 2] = ["host.docker.internal", "gateway.docker.internal"];
+
+fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
+    // Bind to eth0's *specific* address, not 0.0.0.0: a wildcard socket sources its
+    // reply from the route-chosen IP (docker0's gateway), but a default-bridge
+    // container queried us at eth0's IP and rejects the mismatched reply. Binding the
+    // exact address makes every reply originate from the address that was queried.
+    let listen = std::net::SocketAddr::from((std::net::Ipv4Addr::from(bind_ip), 53));
+    let sock = match std::net::UdpSocket::bind(listen) {
+        Ok(s) => s,
+        Err(e) => { log!("dns: bind {listen} failed ({e}); host.docker.internal unavailable"); return; }
+    };
+    log!("dns: responder on {} (*.docker.internal -> {}, upstream {})", listen, ipstr(gateway), ipstr(upstream));
+    std::thread::spawn(move || {
+        let sock = std::sync::Arc::new(sock);
+        let mut buf = [0u8; 1500];
+        loop {
+            let (n, src) = match sock.recv_from(&mut buf) { Ok(v) => v, Err(_) => continue };
+            let query = buf[..n].to_vec();
+            let s = sock.clone();
+            std::thread::spawn(move || answer_dns(&s, &query, src, gateway, upstream));
+        }
+    });
+}
+
+fn answer_dns(sock: &std::net::UdpSocket, query: &[u8], src: std::net::SocketAddr, gateway: u32, upstream: u32) {
+    if let Some((name, qtype, qend)) = parse_qname(query) {
+        if DOCKER_INTERNAL_NAMES.contains(&name.as_str()) {
+            // A -> gateway; anything else (e.g. AAAA) -> empty NOERROR so the client
+            // falls back to the A record instead of chasing a bogus NXDOMAIN.
+            let reply = if qtype == 1 { build_a_reply(query, qend, gateway) }
+                        else { build_empty_reply(query, qend) };
+            let _ = sock.send_to(&reply, src);
+            return;
+        }
+    }
+    if let Some(reply) = forward_dns(query, upstream) {
+        let _ = sock.send_to(&reply, src);
+    }
+}
+
+/// Extract the (lowercased) query name, qtype, and the offset just past the question.
+fn parse_qname(q: &[u8]) -> Option<(String, u16, usize)> {
+    if q.len() < 12 { return None; }
+    let mut pos = 12usize;
+    let mut name = String::new();
+    loop {
+        let len = *q.get(pos)? as usize; pos += 1;
+        if len == 0 { break; }
+        if len & 0xC0 != 0 { return None; } // compression isn't valid in a question
+        if pos + len > q.len() { return None; }
+        if !name.is_empty() { name.push('.'); }
+        for &b in &q[pos..pos + len] { name.push((b as char).to_ascii_lowercase()); }
+        pos += len;
+    }
+    let qtype = u16::from_be_bytes([*q.get(pos)?, *q.get(pos + 1)?]);
+    Some((name, qtype, pos + 4))
+}
+
+fn build_a_reply(query: &[u8], qend: usize, addr: u32) -> Vec<u8> {
+    let mut r = query[..qend].to_vec();
+    r[2] = 0x84 | (query[2] & 0x01); // QR=1, AA=1, RD copied
+    r[3] = 0x80;                     // RA=1, RCODE=0
+    r[6] = 0; r[7] = 1;              // ANCOUNT=1
+    r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0; // NSCOUNT=ARCOUNT=0
+    // Answer: name pointer to the question, type A, class IN, TTL 30s, 4-byte addr.
+    r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x04]);
+    r.extend_from_slice(&addr.to_be_bytes());
+    r
+}
+
+fn build_empty_reply(query: &[u8], qend: usize) -> Vec<u8> {
+    let mut r = query[..qend].to_vec();
+    r[2] = 0x84 | (query[2] & 0x01);
+    r[3] = 0x80;
+    r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0; // ANCOUNT=NS=AR=0
+    r
+}
+
+fn forward_dns(query: &[u8], upstream: u32) -> Option<Vec<u8>> {
+    let up = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    up.set_read_timeout(Some(std::time::Duration::from_secs(4))).ok()?;
+    let dst = std::net::SocketAddr::from((std::net::Ipv4Addr::from(upstream), 53));
+    up.send_to(query, dst).ok()?;
+    let mut buf = [0u8; 4096];
+    let (n, _) = up.recv_from(&mut buf).ok()?;
+    Some(buf[..n].to_vec())
+}
+
 mod dhcp {
     use dhcproto::{v4, Decodable, Decoder, Encodable, Encoder};
     use std::io::{Error, ErrorKind, Result};
@@ -297,19 +406,45 @@ mod dhcp {
     }
 
     pub fn acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
+        // Apple's vmnet DHCP server can drop the first DISCOVER (notably right after
+        // the bridge comes up). Retransmit a few times with linear backoff before
+        // giving up, so a transient miss self-heals instead of leaving the guest with
+        // no address — and therefore no DNS — for the whole session.
+        let mut last = Error::new(ErrorKind::TimedOut, "no DHCP offer");
+        for attempt in 0..6u32 {
+            match try_acquire(ifname, mac) {
+                Ok(lease) => return Ok(lease),
+                Err(e) => {
+                    log!("DHCP attempt {} failed: {e}", attempt + 1);
+                    last = e;
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        Err(last)
+    }
+
+    fn try_acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
+        // Open the socket here and close it on every path (including the `?` errors
+        // in the handshake) so a retried acquire doesn't leak a descriptor per miss.
         let sock = open_socket(ifname)?;
+        let res = handshake(sock, &mac);
+        unsafe { libc::close(sock); }
+        res
+    }
+
+    fn handshake(sock: i32, mac: &[u8; 6]) -> Result<Lease> {
         let xid = rand_xid();
         // DISCOVER
-        let discover = build(&mac, xid, v4::MessageType::Discover, None, None);
+        let discover = build(mac, xid, v4::MessageType::Discover, None, None);
         send(sock, &discover)?;
         let offer = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP offer"))?;
         let offered_ip = offer.yiaddr();
         let server = opt_addr(&offer, v4::OptionCode::ServerIdentifier);
         // REQUEST
-        let request = build(&mac, xid, v4::MessageType::Request, Some(offered_ip), server);
+        let request = build(mac, xid, v4::MessageType::Request, Some(offered_ip), server);
         send(sock, &request)?;
         let ack = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack"))?;
-        unsafe { libc::close(sock); }
         Ok(Lease {
             ip: u32::from(ack.yiaddr()),
             mask: opt_addr(&ack, v4::OptionCode::SubnetMask).unwrap_or(0),
