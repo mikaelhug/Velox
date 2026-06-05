@@ -96,7 +96,7 @@ private enum TopLevelEntry: Identifiable {
 struct ContainersView: View {
     let docker: any DockerClientProtocol
     @State private var model: ContainersModel
-    @State private var selection: ContainerRow.ID?
+    @State private var selection: Set<ContainerRow.ID> = []
     @State private var searchText = ""
     /// Project names the user has collapsed. Absence ⇒ expanded, so groups open
     /// by default (matching Docker Desktop).
@@ -195,11 +195,23 @@ struct ContainersView: View {
         }
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter containers")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { Task { await model.refresh() } } label: {
-                    Image(systemName: "arrow.clockwise")
+            ToolbarItemGroup(placement: .primaryAction) {
+                if !selectedContainers.isEmpty {
+                    Text("\(selectedContainers.count) selected")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
-                .help("Refresh")
+                Button { start(selectedContainers) } label: { Image(systemName: "play.fill") }
+                    .help("Start selected")
+                    .disabled(!selectedContainers.contains { !$0.isRunning })
+                Button { stop(selectedContainers) } label: { Image(systemName: "stop.fill") }
+                    .help("Stop selected")
+                    .disabled(!selectedContainers.contains { $0.isRunning || $0.isPaused })
+                Button { restart(selectedContainers) } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+                    .help("Restart selected")
+                    .disabled(selectedContainers.isEmpty)
+                Divider()
+                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                    .help("Refresh")
             }
         }
         .overlay {
@@ -294,33 +306,62 @@ struct ContainersView: View {
     private func projectActions(_ g: ProjectGroup) -> some View {
         HStack(spacing: 2) {
             if g.runningCount < g.containers.count {
-                iconButton("play.fill", "Start project") {
-                    await model.performAll(g.containers.filter { !$0.isRunning }.map(\.id)) {
-                        try await $0.startContainer($1)
-                    }
-                }
+                iconButton("play.fill", "Start project") { start(g.containers) }
             }
             if g.runningCount > 0 {
-                iconButton("stop.fill", "Stop project") {
-                    await model.performAll(g.containers.filter(\.isRunning).map(\.id)) {
-                        try await $0.stopContainer($1)
-                    }
-                }
+                iconButton("stop.fill", "Stop project") { stop(g.containers) }
             }
         }
+    }
+
+    // MARK: Bulk actions
+
+    /// Resolve selected row IDs to the underlying containers — a selected project
+    /// row expands to all its members — de-duplicated by container id.
+    private func containers(for ids: Set<ContainerRow.ID>) -> [ContainerSummary] {
+        var byID: [String: ContainerSummary] = [:]
+        for id in ids {
+            if let c = model.containers.first(where: { $0.id == id }) {
+                byID[c.id] = c
+            } else if let g = group(forRowID: id) {
+                for c in g.containers { byID[c.id] = c }
+            }
+        }
+        return Array(byID.values)
+    }
+
+    private var selectedContainers: [ContainerSummary] { containers(for: selection) }
+
+    private func start(_ cs: [ContainerSummary]) {
+        Task { await model.performAll(cs.filter { !$0.isRunning }.map(\.id)) { try await $0.startContainer($1) } }
+    }
+    private func stop(_ cs: [ContainerSummary]) {
+        Task { await model.performAll(cs.filter { $0.isRunning || $0.isPaused }.map(\.id)) { try await $0.stopContainer($1) } }
+    }
+    private func restart(_ cs: [ContainerSummary]) {
+        Task { await model.performAll(cs.map(\.id)) { try await $0.restartContainer($1) } }
     }
 
     // MARK: Context menus
 
     @ViewBuilder
     private func contextMenu(for ids: Set<ContainerRow.ID>) -> some View {
-        if let id = ids.first {
+        if ids.count <= 1, let id = ids.first {
             if let c = model.containers.first(where: { $0.id == id }) {
                 containerContext(c)
             } else if let g = group(forRowID: id) {
                 projectContext(g)
             }
+        } else if !containers(for: ids).isEmpty {
+            bulkContext(containers(for: ids))
         }
+    }
+
+    @ViewBuilder
+    private func bulkContext(_ cs: [ContainerSummary]) -> some View {
+        Button("Start \(cs.count) Containers") { start(cs) }
+        Button("Stop \(cs.count) Containers") { stop(cs) }
+        Button("Restart \(cs.count) Containers") { restart(cs) }
     }
 
     @ViewBuilder
@@ -338,15 +379,9 @@ struct ContainersView: View {
 
     @ViewBuilder
     private func projectContext(_ g: ProjectGroup) -> some View {
-        Button("Start Project") {
-            Task { await model.performAll(g.containers.filter { !$0.isRunning }.map(\.id)) { try await $0.startContainer($1) } }
-        }
-        Button("Stop Project") {
-            Task { await model.performAll(g.containers.filter(\.isRunning).map(\.id)) { try await $0.stopContainer($1) } }
-        }
-        Button("Restart Project") {
-            Task { await model.performAll(g.containers.map(\.id)) { try await $0.restartContainer($1) } }
-        }
+        Button("Start Project") { start(g.containers) }
+        Button("Stop Project") { stop(g.containers) }
+        Button("Restart Project") { restart(g.containers) }
     }
 
     private func group(forRowID id: String) -> ProjectGroup? {
