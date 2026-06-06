@@ -11,7 +11,6 @@ final class OverviewModel {
     private(set) var containers: [ContainerSummary] = []
     private(set) var images: [ImageSummary] = []
     private(set) var volumes: [Volume] = []
-    private(set) var networks: [NetworkSummary] = []
     private(set) var diskUsedBytes: Int64?
     private(set) var loadError: String?
 
@@ -28,7 +27,6 @@ final class OverviewModel {
     var runningCount: Int { containers.lazy.filter(\.isRunning).count }
     var totalImageBytes: Int64 { images.reduce(0) { $0 + $1.size } }
     var totalVolumeBytes: Int64 { volumes.reduce(0) { $0 + ($1.size ?? 0) } }
-    var attachedCount: Int { networks.reduce(0) { $0 + $1.attachedContainers.count } }
 
     /// Identifies the current running set so the view restarts the stats fan-out
     /// (via `.task(id:)`) only when a container actually starts or stops.
@@ -44,11 +42,9 @@ final class OverviewModel {
             async let c = docker.containers()
             async let i = docker.images()
             async let v = docker.volumes()
-            async let n = docker.networks()
             containers = try await c
             images = try await i
             volumes = try await v
-            networks = try await n
             loadError = nil
         } catch {
             loadError = "\(error)"
@@ -171,8 +167,6 @@ struct OverviewView: View {
                      caption: "\(Format.bytes(model.totalImageBytes)) total", tint: .blue)
             StatCard(title: "Volumes", systemImage: "externaldrive", value: "\(model.volumes.count)",
                      caption: "\(Format.bytes(model.totalVolumeBytes)) stored", tint: .orange)
-            StatCard(title: "Networks", systemImage: "network", value: "\(model.networks.count)",
-                     caption: "\(model.attachedCount) attached", tint: .teal)
             StatCard(title: "Disk", systemImage: "internaldrive",
                      value: model.diskUsedBytes.map(Format.bytes) ?? "—",
                      caption: "of \(engine.config.diskGiB) GB allocated", tint: .purple)

@@ -80,26 +80,49 @@ struct ImagesView: View {
         }
     }
 
+    // Content-fit widths for the bounded columns (measured over all images so the
+    // layout doesn't jump while filtering).
+    private var tagWidth: CGFloat {
+        ColumnWidth.fit(header: "Tag", model.images.map(\.tag), font: ColumnWidth.callout, min: 48, max: 220)
+    }
+    private var archWidth: CGFloat {
+        ColumnWidth.fit(header: "Arch", model.images.map { $0.architecture ?? "—" },
+                        font: ColumnWidth.captionMono, min: 52, max: 120, padding: 30)
+    }
+    private var idWidth: CGFloat {
+        ColumnWidth.fit(header: "Image ID", model.images.map(\.shortID), font: ColumnWidth.captionMono, min: 84, max: 130)
+    }
+    private var createdWidth: CGFloat {
+        ColumnWidth.fit(header: "Created", model.images.map { Format.age(epoch: $0.created) },
+                        font: ColumnWidth.callout, min: 64, max: 150)
+    }
+    private var sizeWidth: CGFloat {
+        ColumnWidth.fit(header: "Size", model.images.map { Format.bytes($0.size) },
+                        font: ColumnWidth.calloutMono, min: 60, max: 120)
+    }
+
     var body: some View {
         Table(filtered, selection: $selection) {
+            // Repository is the one flexible column — it absorbs the leftover width
+            // so the others can stay sized to their content.
             TableColumn("Repository") { img in
                 Text(img.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-            }.width(min: 110, ideal: 160, max: 280)
+            }.width(min: 140, ideal: 240)
             TableColumn("Tag") { img in
                 Text(img.tag).font(.callout).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 50, ideal: 80, max: 150)
+            }.width(tagWidth)
             TableColumn("Arch") { img in
                 ArchBadge(arch: img.architecture)
-            }.width(min: 52, ideal: 64, max: 90)
+            }.width(archWidth)
             TableColumn("Image ID") { img in
                 Text(img.shortID).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }.width(min: 84, ideal: 96, max: 112)
+            }.width(idWidth)
             TableColumn("Created") { img in
                 Text(Format.age(epoch: img.created)).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 70, ideal: 86, max: 120)
+            }.width(createdWidth)
             TableColumn("Size") { img in
                 Text(Format.bytes(img.size)).font(.callout.monospacedDigit())
-            }.width(min: 64, ideal: 76, max: 100)
+            }.width(sizeWidth)
             TableColumn("") { img in
                 HStack(spacing: 2) {
                     Button { tagTarget = img } label: { Image(systemName: "tag") }

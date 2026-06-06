@@ -46,5 +46,6 @@ struct VeloxApp: App {
             SettingsView()
                 .environment(engine)
         }
+        .windowToolbarStyle(.unified)
     }
 }

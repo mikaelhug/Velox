@@ -118,6 +118,28 @@ struct ContainersView: View {
         }
     }
 
+    // Content-fit widths for the bounded columns (measured over all containers so
+    // the layout is stable while filtering); the Image column stays flexible.
+    private var nameWidth: CGFloat {
+        let primary = model.containers.map(\.displayName) + model.containers.compactMap(\.composeProject)
+        let ids = model.containers.map(\.shortID)
+        let widest = max(
+            ColumnWidth.fit(header: "Name", primary, font: ColumnWidth.callout, min: 0, max: .infinity, padding: 0),
+            ColumnWidth.fit(header: "", ids, font: ColumnWidth.captionMono, min: 0, max: .infinity, padding: 0)
+        )
+        return min(max(widest + 44, 150), 320)   // + status dot / disclosure indent / padding
+    }
+    private var statusWidth: CGFloat {
+        ColumnWidth.fit(header: "Status",
+                        model.containers.map { $0.status.isEmpty ? $0.state.capitalized : $0.status },
+                        font: ColumnWidth.caption, min: 84, max: 240, padding: 30)
+    }
+    private var portsWidth: CGFloat {
+        ColumnWidth.fit(header: "Ports",
+                        model.containers.map { $0.ports.isEmpty ? "—" : $0.ports.map(\.label).joined(separator: ", ") },
+                        font: ColumnWidth.captionMono, min: 64, max: 240)
+    }
+
     /// Standalone containers and Compose project groups, interleaved alphabetically.
     private var topLevel: [TopLevelEntry] {
         var groups: [String: [ContainerSummary]] = [:]
@@ -151,29 +173,30 @@ struct ContainersView: View {
     var body: some View {
         Table(of: ContainerRow.self, selection: $selection) {
             TableColumn("Name") { row in nameCell(row) }
-                .width(min: 150, ideal: 200, max: 320)
+                .width(nameWidth)
 
+            // Image is the one flexible column — it absorbs the leftover width.
             TableColumn("Image") { row in
                 if case .container(let c) = row {
                     Text(c.image).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
                 }
-            }.width(min: 110, ideal: 170, max: 300)
+            }.width(min: 120, ideal: 200)
 
             TableColumn("Status") { row in statusCell(row) }
-                .width(min: 90, ideal: 130, max: 200)
+                .width(statusWidth)
 
             TableColumn("Ports") { row in
                 if case .container(let c) = row {
                     Text(c.ports.isEmpty ? "—" : c.ports.map(\.label).joined(separator: ", "))
                         .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                 }
-            }.width(min: 70, ideal: 110, max: 180)
+            }.width(portsWidth)
 
             TableColumn("CPU / MEM") { row in
                 if case .container(let c) = row {
                     ContainerUsageCell(docker: docker, containerID: c.id, isRunning: c.isRunning)
                 }
-            }.width(min: 100, ideal: 118, max: 140)
+            }.width(124)
 
             TableColumn("") { row in actionsCell(row) }.width(132)
         } rows: {

@@ -35,7 +35,16 @@ struct SettingsView: View {
             List(Pane.allCases, selection: $selection) { pane in
                 Label(pane.title, systemImage: pane.icon).tag(pane)
             }
-            .navigationSplitViewColumnWidth(180)
+            .navigationSplitViewColumnWidth(min: 190, ideal: 200, max: 240)
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 6) {
+                    Image(systemName: "shippingbox.fill").foregroundStyle(.tint)
+                    Text("Velox \(Versions.velox)").foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .font(.callout)
+                .padding(.horizontal, 12).padding(.vertical, 10)
+            }
         } detail: {
             Group {
                 switch selection {
@@ -47,6 +56,9 @@ struct SettingsView: View {
             .navigationTitle(selection.title)
             .frame(minWidth: 420, maxWidth: .infinity, minHeight: 460, maxHeight: .infinity)
         }
+        // A Settings window shouldn't let you hide its category list, so drop the
+        // automatic sidebar toggle that was crowding the traffic-light buttons.
+        .toolbar(removing: .sidebarToggle)
         // Use a min/ideal frame (not an exact width/height) so the window lays out
         // within the title-bar safe area — pinning an exact size pushes the content
         // up under the traffic lights and crowds them against the window edge.
