@@ -19,6 +19,12 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     private var lastTCP: Set<UInt16> = []
     private var lastUDP: Set<UInt16> = []
 
+    // Readiness: fired once, the first time a reconcile actually reaches dockerd.
+    // The GUI awaits this to leave `.starting`, so it never has to poll `/_ping`.
+    private let readyLock = NSLock()
+    private var isReady = false
+    private var readyWaiters: [ReadyWaiter] = []
+
     /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
     public init(docker: any DockerClientProtocol, onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void) {
         self.docker = docker
@@ -50,10 +56,62 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         task = nil
     }
 
+    /// Suspends until dockerd first answers — signaled by the first successful
+    /// reconcile — or until `timeout` elapses. Returns true if ready, false on
+    /// timeout. Rides the watcher's existing connection, so readiness costs no extra
+    /// polling (CLAUDE.md §8); returns immediately if dockerd already answered.
+    public func waitUntilReady(timeout: Duration) async -> Bool {
+        await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let waiter = ReadyWaiter(cont)
+            // Register, or fire immediately if dockerd already answered (decided
+            // atomically under the lock — see registerWaiter).
+            if registerWaiter(waiter) {
+                waiter.fire(true)
+                return
+            }
+            // Bound the wait so a broken guest never hangs the caller forever.
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.removeWaiter(waiter)
+                waiter.fire(false)
+            }
+        }
+    }
+
+    /// Register `waiter` to be released when dockerd becomes ready, or return true
+    /// if it is *already* ready (the caller fires immediately and skips registering).
+    /// Synchronous so the lock is never held across an `await`.
+    private func registerWaiter(_ waiter: ReadyWaiter) -> Bool {
+        readyLock.lock(); defer { readyLock.unlock() }
+        if isReady { return true }
+        readyWaiters.append(waiter)
+        return false
+    }
+
+    /// Mark dockerd reachable and release every pending `waitUntilReady`. Idempotent.
+    private func signalReady() {
+        readyLock.lock()
+        if isReady { readyLock.unlock(); return }
+        isReady = true
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        readyLock.unlock()
+        for w in waiters { w.fire(true) }
+    }
+
+    private func removeWaiter(_ waiter: ReadyWaiter) {
+        readyLock.lock()
+        readyWaiters.removeAll { $0 === waiter }
+        readyLock.unlock()
+    }
+
     /// Re-read the authoritative published-port set; report only on change. Runs
     /// serially inside the single watcher Task, so `last` needs no extra locking.
     private func reconcile() async {
         guard let containers = try? await docker.containers() else { return }
+        // A successful list means dockerd is up and answering — release any
+        // startup waiter (the source of truth for readiness, not a `/_ping` poll).
+        signalReady()
         var tcp: Set<UInt16> = []
         var udp: Set<UInt16> = []
         for c in containers where c.state == "running" {
@@ -71,5 +129,17 @@ public final class DockerEventsWatcher: @unchecked Sendable {
             lastUDP = udp
             onPorts(tcp, udp)
         }
+    }
+}
+
+/// One pending `waitUntilReady` caller. Resumes its continuation exactly once,
+/// whichever of readiness or timeout fires first.
+private final class ReadyWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<Bool, Never>?
+    init(_ cont: CheckedContinuation<Bool, Never>) { self.cont = cont }
+    func fire(_ value: Bool) {
+        lock.lock(); let c = cont; cont = nil; lock.unlock()
+        c?.resume(returning: value)
     }
 }

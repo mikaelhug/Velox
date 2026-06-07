@@ -9,6 +9,8 @@ FROM ${KERNEL_BUILDER_IMAGE}
 
 # Exactly the toolchain a modern arm64 kernel needs to build `Image`, plus
 # curl/xz/gpg for fetching+verifying the kernel.org tarball inside the volume.
+# (No cpio/kmod/gzip: the guest has no initramfs, the kernel is monolithic — no
+# modules — and the tarball is .tar.xz with an uncompressed arm64 `Image`.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         bc \
@@ -16,10 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         flex \
         libelf-dev \
         libssl-dev \
-        cpio \
-        kmod \
         xz-utils \
-        gzip \
         zstd \
         ca-certificates \
         curl \

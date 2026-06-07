@@ -107,7 +107,8 @@ all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
   collisions + slow bind mounts). Only the final `Image` is copied back to
   `Assets/velox-vmlinux` (and `~/.velox/kernel`).
 - The kernel version + SHA-256 are pinned in `versions.env`
-  (`KERNEL_ORG_SERIES`/`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`). No LinuxKit.
+  (`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`; the kernel.org `v6.x` dir is derived
+  from the version). No LinuxKit.
 - `Scripts/make-guest.sh` builds **only the erofs root userspace** (no LinuxKit,
   no initramfs); the kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v`
   mounts and Rosetta x86 depend on this kernel — don't switch to a stock kernel

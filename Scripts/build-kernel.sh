@@ -26,7 +26,6 @@ cd "$(dirname "$0")/.."
 set -a; . ./versions.env; set +a
 
 # --- Modular knobs ---------------------------------------------------------
-KERNEL_SERIES="${KERNEL_ORG_SERIES:?set KERNEL_ORG_SERIES in versions.env}"
 KERNEL_VERSION="${KERNEL_ORG_VERSION:?set KERNEL_ORG_VERSION in versions.env}"
 KERNEL_SHA256="${KERNEL_ORG_SHA256:?set KERNEL_ORG_SHA256 in versions.env}"
 OUTPUT="${OUTPUT:-Assets/velox-vmlinux}"

@@ -24,9 +24,16 @@ public final class VsockBridge: @unchecked Sendable {
             case .success(let vsockFd):
                 if let header {
                     // Write the header (names the target) off the VM queue, then pump.
+                    // If it can't be fully written, the guest never learns the target
+                    // port, so tear the connection down instead of pumping a stream the
+                    // peer can't frame.
                     DispatchQueue.global().async {
-                        let bytes = Array(header.utf8)
-                        _ = bytes.withUnsafeBytes { write(vsockFd, $0.baseAddress, $0.count) }
+                        guard Self.writeAll(vsockFd, Array(header.utf8)) else {
+                            Log.error("vsock header write to port \(port) failed; dropping connection")
+                            close(vsockFd)
+                            close(localFd)
+                            return
+                        }
                         self.startPump(localFd, vsockFd)
                     }
                 } else {
@@ -43,6 +50,20 @@ public final class VsockBridge: @unchecked Sendable {
         }
         store(id, pump)
         pump.start()
+    }
+
+    /// Write all of `buf` to `fd`, retrying short writes and `EINTR`. Returns false
+    /// if the descriptor errors before the whole buffer is written.
+    private static func writeAll(_ fd: Int32, _ buf: [UInt8]) -> Bool {
+        var off = 0
+        return buf.withUnsafeBytes { raw in
+            while off < buf.count {
+                let n = write(fd, raw.baseAddress!.advanced(by: off), buf.count - off)
+                if n <= 0 { if n < 0 && errno == EINTR { continue }; return false }
+                off += n
+            }
+            return true
+        }
     }
 
     private func store(_ id: UUID, _ pump: SocketPump) {

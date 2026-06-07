@@ -400,8 +400,67 @@ fn forward_dns(query: &[u8], upstream: u32) -> Option<Vec<u8>> {
 }
 
 mod dhcp {
-    use dhcproto::{v4, Decodable, Decoder, Encodable, Encoder};
     use std::io::{Error, ErrorKind, Result};
+
+    // BOOTP/DHCP wire format (RFC 2131/2132). Apple's vmnet server only needs the
+    // classic DISCOVER→OFFER→REQUEST→ACK exchange (plus a renewing REQUEST), so a
+    // small hand-rolled codec replaces a full DHCP crate — zero dependencies in PID 1.
+    const OP_BOOTREQUEST: u8 = 1;
+    const OP_BOOTREPLY: u8 = 2;
+    const HTYPE_ETHERNET: u8 = 1;
+    const HLEN_ETHERNET: u8 = 6;
+    const FLAG_BROADCAST: u16 = 0x8000;
+    const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
+    /// Length of the fixed BOOTP header up to and including the magic cookie;
+    /// option TLVs follow from here.
+    const COOKIE_END: usize = 240;
+
+    // DHCP message types (option 53).
+    const DISCOVER: u8 = 1;
+    const REQUEST: u8 = 3;
+
+    // Option codes we read or write.
+    const OPT_SUBNET_MASK: u8 = 1;
+    const OPT_ROUTER: u8 = 3;
+    const OPT_DNS: u8 = 6;
+    const OPT_REQUESTED_IP: u8 = 50;
+    const OPT_LEASE_TIME: u8 = 51;
+    const OPT_MESSAGE_TYPE: u8 = 53;
+    const OPT_SERVER_ID: u8 = 54;
+    const OPT_PARAM_REQUEST: u8 = 55;
+    const OPT_PAD: u8 = 0;
+    const OPT_END: u8 = 255;
+
+    /// A decoded BOOTP reply — the two header fields we need plus the raw option
+    /// TLVs, read through the typed helpers below.
+    struct Reply {
+        xid: u32,
+        yiaddr: u32,
+        opts: Vec<(u8, Vec<u8>)>,
+    }
+
+    impl Reply {
+        fn option(&self, code: u8) -> Option<&[u8]> {
+            self.opts.iter().find(|(c, _)| *c == code).map(|(_, v)| v.as_slice())
+        }
+        /// First IPv4 address in an option (single-value options, or the first
+        /// entry of a list such as Router).
+        fn addr(&self, code: u8) -> Option<u32> {
+            let v = self.option(code)?;
+            (v.len() >= 4).then(|| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+        }
+        /// Every IPv4 address packed into an option (e.g. the DNS server list).
+        fn addrs(&self, code: u8) -> Vec<u32> {
+            self.option(code)
+                .map(|v| v.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .unwrap_or_default()
+        }
+        /// A 4-byte option read as a big-endian u32 (e.g. the lease time).
+        fn read_u32(&self, code: u8) -> Option<u32> {
+            let v = self.option(code)?;
+            (v.len() >= 4).then(|| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+        }
+    }
 
     pub struct Lease {
         pub ip: u32,
@@ -453,22 +512,22 @@ mod dhcp {
     fn handshake(sock: i32, mac: &[u8; 6]) -> Result<Lease> {
         let xid = rand_xid();
         // DISCOVER
-        let discover = build(mac, xid, v4::MessageType::Discover, None, None);
+        let discover = build(mac, xid, DISCOVER, None, None);
         send(sock, &discover)?;
         let offer = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP offer"))?;
-        let offered_ip = offer.yiaddr();
-        let server = opt_addr(&offer, v4::OptionCode::ServerIdentifier);
+        let offered_ip = offer.yiaddr;
+        let server = offer.addr(OPT_SERVER_ID);
         // REQUEST
-        let request = build(mac, xid, v4::MessageType::Request, Some(offered_ip), server);
+        let request = build(mac, xid, REQUEST, Some(offered_ip), server);
         send(sock, &request)?;
         let ack = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack"))?;
         Ok(Lease {
-            ip: u32::from(ack.yiaddr()),
-            mask: opt_addr(&ack, v4::OptionCode::SubnetMask).unwrap_or(0),
-            router: opt_addr(&ack, v4::OptionCode::Router).unwrap_or(0),
-            dns: opt_addrs(&ack, v4::OptionCode::DomainNameServer),
-            server: opt_addr(&ack, v4::OptionCode::ServerIdentifier).or(server).unwrap_or(0),
-            lease_secs: opt_u32(&ack, v4::OptionCode::AddressLeaseTime).unwrap_or(0),
+            ip: ack.yiaddr,
+            mask: ack.addr(OPT_SUBNET_MASK).unwrap_or(0),
+            router: ack.addr(OPT_ROUTER).unwrap_or(0),
+            dns: ack.addrs(OPT_DNS),
+            server: ack.addr(OPT_SERVER_ID).or(server).unwrap_or(0),
+            lease_secs: ack.read_u32(OPT_LEASE_TIME).unwrap_or(0),
         })
     }
 
@@ -477,9 +536,8 @@ mod dhcp {
     pub fn renew(ifname: &str, mac: [u8; 6], ip: u32, server: u32) -> Result<()> {
         let sock = open_socket(ifname)?;
         let xid = rand_xid();
-        let req_ip = std::net::Ipv4Addr::from(ip);
         let server_opt = if server != 0 { Some(server) } else { None };
-        let request = build(&mac, xid, v4::MessageType::Request, Some(req_ip), server_opt);
+        let request = build(&mac, xid, REQUEST, Some(ip), server_opt);
         send(sock, &request)?;
         let res = recv(sock, xid).map(|_| ())
             .ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack on renew"));
@@ -500,41 +558,72 @@ mod dhcp {
         }
     }
 
-    fn build(mac: &[u8; 6], xid: u32, mt: v4::MessageType, req_ip: Option<std::net::Ipv4Addr>, server: Option<u32>) -> Vec<u8> {
-        let mut msg = v4::Message::default();
-        msg.set_flags(v4::Flags::default().set_broadcast())
-            .set_xid(xid)
-            .set_chaddr(mac);
-        msg.opts_mut().insert(v4::DhcpOption::MessageType(mt));
-        msg.opts_mut().insert(v4::DhcpOption::ParameterRequestList(vec![
-            v4::OptionCode::SubnetMask, v4::OptionCode::Router, v4::OptionCode::DomainNameServer,
-        ]));
-        if let Some(ip) = req_ip { msg.opts_mut().insert(v4::DhcpOption::RequestedIpAddress(ip)); }
-        if let Some(s) = server { msg.opts_mut().insert(v4::DhcpOption::ServerIdentifier(s.into())); }
-        let mut buf = Vec::new();
-        msg.encode(&mut Encoder::new(&mut buf)).ok();
-        buf
+    /// Encode a BOOTREQUEST (DISCOVER or REQUEST) carrying the options Apple's
+    /// vmnet server expects. `req_ip`/`server` are host-order IPv4 and are emitted
+    /// only when present (REQUEST sets them; DISCOVER omits them).
+    fn build(mac: &[u8; 6], xid: u32, msg_type: u8, req_ip: Option<u32>, server: Option<u32>) -> Vec<u8> {
+        let mut p = Vec::with_capacity(300);
+        p.push(OP_BOOTREQUEST);
+        p.push(HTYPE_ETHERNET);
+        p.push(HLEN_ETHERNET);
+        p.push(0); // hops
+        p.extend_from_slice(&xid.to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes()); // secs
+        p.extend_from_slice(&FLAG_BROADCAST.to_be_bytes()); // broadcast: replies come back before we have an IP
+        p.extend_from_slice(&[0u8; 4]); // ciaddr
+        p.extend_from_slice(&[0u8; 4]); // yiaddr
+        p.extend_from_slice(&[0u8; 4]); // siaddr
+        p.extend_from_slice(&[0u8; 4]); // giaddr
+        p.extend_from_slice(mac); // chaddr: 6-byte MAC ...
+        p.extend_from_slice(&[0u8; 10]); // ... padded out to the 16-byte chaddr field
+        p.extend_from_slice(&[0u8; 64]); // sname
+        p.extend_from_slice(&[0u8; 128]); // file
+        p.extend_from_slice(&MAGIC_COOKIE);
+        // Options: message type, the parameter request list, then the optional
+        // requested-IP / server-id, terminated by END.
+        p.extend_from_slice(&[OPT_MESSAGE_TYPE, 1, msg_type]);
+        p.extend_from_slice(&[OPT_PARAM_REQUEST, 3, OPT_SUBNET_MASK, OPT_ROUTER, OPT_DNS]);
+        if let Some(ip) = req_ip {
+            p.push(OPT_REQUESTED_IP);
+            p.push(4);
+            p.extend_from_slice(&ip.to_be_bytes());
+        }
+        if let Some(s) = server {
+            p.push(OPT_SERVER_ID);
+            p.push(4);
+            p.extend_from_slice(&s.to_be_bytes());
+        }
+        p.push(OPT_END);
+        p
     }
 
-    fn opt_addr(m: &v4::Message, code: v4::OptionCode) -> Option<u32> {
-        match m.opts().get(code) {
-            Some(v4::DhcpOption::SubnetMask(a)) | Some(v4::DhcpOption::ServerIdentifier(a)) => Some((*a).into()),
-            Some(v4::DhcpOption::Router(a)) => a.first().map(|x| (*x).into()),
-            Some(v4::DhcpOption::RequestedIpAddress(a)) => Some((*a).into()),
-            _ => None,
+    /// Decode a BOOTREPLY, or None if it isn't a well-formed reply (wrong op,
+    /// missing cookie, or a truncated option).
+    fn parse_reply(buf: &[u8]) -> Option<Reply> {
+        if buf.len() < COOKIE_END || buf[0] != OP_BOOTREPLY || buf[236..240] != MAGIC_COOKIE {
+            return None;
         }
-    }
-    fn opt_addrs(m: &v4::Message, code: v4::OptionCode) -> Vec<u32> {
-        match m.opts().get(code) {
-            Some(v4::DhcpOption::DomainNameServer(v)) => v.iter().map(|x| (*x).into()).collect(),
-            _ => Vec::new(),
+        let xid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let yiaddr = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let mut opts: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut i = COOKIE_END;
+        while i < buf.len() {
+            match buf[i] {
+                OPT_END => break,
+                OPT_PAD => i += 1,
+                code => {
+                    let len = *buf.get(i + 1)? as usize;
+                    let start = i + 2;
+                    let end = start + len;
+                    if end > buf.len() {
+                        break;
+                    }
+                    opts.push((code, buf[start..end].to_vec()));
+                    i = end;
+                }
+            }
         }
-    }
-    fn opt_u32(m: &v4::Message, code: v4::OptionCode) -> Option<u32> {
-        match m.opts().get(code) {
-            Some(v4::DhcpOption::AddressLeaseTime(s)) => Some(*s),
-            _ => None,
-        }
+        Some(Reply { xid, yiaddr, opts })
     }
 
     fn open_socket(ifname: &str) -> Result<i32> {
@@ -576,14 +665,14 @@ mod dhcp {
         Ok(())
     }
 
-    fn recv(s: i32, xid: u32) -> Option<v4::Message> {
+    fn recv(s: i32, xid: u32) -> Option<Reply> {
         // retry a few times within the socket timeout for a matching xid
         for _ in 0..4 {
             let mut buf = [0u8; 1024];
             let n = unsafe { libc::recv(s, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
             if n <= 0 { return None; }
-            if let Ok(m) = v4::Message::decode(&mut Decoder::new(&buf[..n as usize])) {
-                if m.xid() == xid { return Some(m); }
+            if let Some(m) = parse_reply(&buf[..n as usize]) {
+                if m.xid == xid { return Some(m); }
             }
         }
         log!("DHCP: no matching reply");
