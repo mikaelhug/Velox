@@ -94,10 +94,6 @@ public actor DockerClient: DockerClientProtocol {
 
     // MARK: - Image actions
 
-    public func tagImage(_ id: String, repository: String, tag: String) async throws {
-        let q = "repo=\(repository.urlEncoded)&tag=\(tag.urlEncoded)"
-        _ = try await send("POST", Self.path("/images/\(id)/tag?\(q)"))
-    }
     public func removeImage(_ id: String, force: Bool) async throws {
         _ = try await send("DELETE", Self.path("/images/\(id)?force=\(force ? 1 : 0)"))
     }

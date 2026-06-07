@@ -102,11 +102,14 @@ struct ContainersView: View {
     /// by default (matching Docker Desktop).
     @State private var collapsed: Set<String> = []
     @State private var pendingDelete: ContainerSummary?
+    @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var logsTarget: ContainerSummary?
+    @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
     init(docker: any DockerClientProtocol) {
         self.docker = docker
         _model = State(initialValue: ContainersModel(docker: docker))
+        _tableLayout = State(initialValue: TableLayout.load("containers"))
     }
 
     private var filtered: [ContainerSummary] {
@@ -116,28 +119,6 @@ struct ContainersView: View {
                 || $0.image.localizedCaseInsensitiveContains(searchText)
                 || ($0.composeProject?.localizedCaseInsensitiveContains(searchText) ?? false)
         }
-    }
-
-    // Content-fit widths for the bounded columns (measured over all containers so
-    // the layout is stable while filtering); the Image column stays flexible.
-    private var nameWidth: CGFloat {
-        let primary = model.containers.map(\.displayName) + model.containers.compactMap(\.composeProject)
-        let ids = model.containers.map(\.shortID)
-        let widest = max(
-            ColumnWidth.fit(header: "Name", primary, font: ColumnWidth.callout, min: 0, max: .infinity, padding: 0),
-            ColumnWidth.fit(header: "", ids, font: ColumnWidth.captionMono, min: 0, max: .infinity, padding: 0)
-        )
-        return min(max(widest + 44, 150), 320)   // + status dot / disclosure indent / padding
-    }
-    private var statusWidth: CGFloat {
-        ColumnWidth.fit(header: "Status",
-                        model.containers.map { $0.status.isEmpty ? $0.state.capitalized : $0.status },
-                        font: ColumnWidth.caption, min: 84, max: 240, padding: 30)
-    }
-    private var portsWidth: CGFloat {
-        ColumnWidth.fit(header: "Ports",
-                        model.containers.map { $0.ports.isEmpty ? "—" : $0.ports.map(\.label).joined(separator: ", ") },
-                        font: ColumnWidth.captionMono, min: 64, max: 240)
     }
 
     /// Standalone containers and Compose project groups, interleaved alphabetically.
@@ -171,34 +152,34 @@ struct ContainersView: View {
     }
 
     var body: some View {
-        Table(of: ContainerRow.self, selection: $selection) {
+        Table(of: ContainerRow.self, selection: $selection, columnCustomization: $tableLayout) {
             TableColumn("Name") { row in nameCell(row) }
-                .width(nameWidth)
+                .customizationID("name")
 
-            // Image is the one flexible column — it absorbs the leftover width.
             TableColumn("Image") { row in
                 if case .container(let c) = row {
                     Text(c.image).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
                 }
-            }.width(min: 120, ideal: 200)
+            }
+                .customizationID("image")
 
             TableColumn("Status") { row in statusCell(row) }
-                .width(statusWidth)
+                .customizationID("status")
 
             TableColumn("Ports") { row in
                 if case .container(let c) = row {
                     Text(c.ports.isEmpty ? "—" : c.ports.map(\.label).joined(separator: ", "))
                         .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                 }
-            }.width(portsWidth)
+            }
+                .customizationID("ports")
 
             TableColumn("CPU / MEM") { row in
                 if case .container(let c) = row {
                     ContainerUsageCell(docker: docker, containerID: c.id, isRunning: c.isRunning)
                 }
-            }.width(124)
-
-            TableColumn("") { row in actionsCell(row) }.width(132)
+            }
+                .customizationID("usage")
         } rows: {
             ForEach(topLevel) { entry in
                 switch entry {
@@ -218,23 +199,39 @@ struct ContainersView: View {
         }
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter containers")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                if !selectedContainers.isEmpty {
-                    Text("\(selectedContainers.count) selected")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                Button { start(selectedContainers) } label: { Image(systemName: "play.fill") }
+            ToolbarItem(placement: .primaryAction) {
+                ControlGroup {
+                    Button { start(selectedContainers) } label: {
+                        Label("Start selected", systemImage: "play.fill")
+                    }
                     .help("Start selected")
                     .disabled(!selectedContainers.contains { !$0.isRunning })
-                Button { stop(selectedContainers) } label: { Image(systemName: "stop.fill") }
+
+                    Button { stop(selectedContainers) } label: {
+                        Label("Stop selected", systemImage: "stop.fill")
+                    }
                     .help("Stop selected")
                     .disabled(!selectedContainers.contains { $0.isRunning || $0.isPaused })
-                Button { restart(selectedContainers) } label: { Image(systemName: "arrow.triangle.2.circlepath") }
+
+                    Button { restart(selectedContainers) } label: {
+                        Label("Restart selected", systemImage: "arrow.triangle.2.circlepath")
+                    }
                     .help("Restart selected")
                     .disabled(selectedContainers.isEmpty)
-                Divider()
-                Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Refresh")
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button { Task { await model.refresh() } } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .help("Refresh")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button(role: .destructive) { pendingBulkDelete = selectedContainers } label: {
+                    Label("Delete selected", systemImage: "trash")
+                }
+                .help("Delete selected")
+                .disabled(selectedContainers.isEmpty)
             }
         }
         .overlay {
@@ -244,6 +241,7 @@ struct ContainersView: View {
             }
         }
         .task { await model.observe() }
+        .persistTableLayout(tableLayout, "containers")
         .confirmationDialog(
             "Delete container \(pendingDelete?.displayName ?? "")?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -254,6 +252,21 @@ struct ContainersView: View {
             }
         } message: { c in
             Text("This permanently removes “\(c.displayName)” and its writable layer.")
+        }
+        .confirmationDialog(
+            "Delete \(pendingBulkDelete.count) selected container\(pendingBulkDelete.count == 1 ? "" : "s")?",
+            isPresented: Binding(get: { !pendingBulkDelete.isEmpty }, set: { if !$0 { pendingBulkDelete = [] } })
+        ) {
+            Button("Delete", role: .destructive) {
+                let ids = pendingBulkDelete.map(\.id)
+                pendingBulkDelete = []
+                Task {
+                    await model.performAll(ids) { try await $0.removeContainer($1, force: true) }
+                    selection.removeAll()
+                }
+            }
+        } message: {
+            Text("This permanently removes the selected container\(pendingBulkDelete.count == 1 ? "" : "s") and their writable layers.")
         }
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
@@ -299,42 +312,6 @@ struct ContainersView: View {
         if running == 0 { return "Stopped · \(total)" }
         if running == total { return "Running · \(total)" }
         return "\(running)/\(total) running"
-    }
-
-    @ViewBuilder
-    private func actionsCell(_ row: ContainerRow) -> some View {
-        switch row {
-        case .container(let c): rowActions(c)
-        case .project(let g):   projectActions(g)
-        }
-    }
-
-    // MARK: Row actions
-
-    @ViewBuilder
-    private func rowActions(_ c: ContainerSummary) -> some View {
-        HStack(spacing: 2) {
-            if c.isRunning || c.isPaused {
-                iconButton("stop.fill", "Stop") { await model.perform { try await $0.stopContainer(c.id) } }
-                iconButton("arrow.clockwise", "Restart") { await model.perform { try await $0.restartContainer(c.id) } }
-            } else {
-                iconButton("play.fill", "Start") { await model.perform { try await $0.startContainer(c.id) } }
-            }
-            iconButton("text.alignleft", "Logs") { logsTarget = c }
-            iconButton("trash", "Delete", role: .destructive) { pendingDelete = c }
-        }
-    }
-
-    @ViewBuilder
-    private func projectActions(_ g: ProjectGroup) -> some View {
-        HStack(spacing: 2) {
-            if g.runningCount < g.containers.count {
-                iconButton("play.fill", "Start project") { start(g.containers) }
-            }
-            if g.runningCount > 0 {
-                iconButton("stop.fill", "Stop project") { stop(g.containers) }
-            }
-        }
     }
 
     // MARK: Bulk actions
@@ -412,16 +389,6 @@ struct ContainersView: View {
         let name = String(id.dropFirst("project:".count))
         for entry in topLevel { if case .group(let g) = entry, g.name == name { return g } }
         return nil
-    }
-
-    @ViewBuilder
-    private func iconButton(_ symbol: String, _ help: String, role: ButtonRole? = nil,
-                            _ action: @escaping () async -> Void) -> some View {
-        Button(role: role) { Task { await action() } } label: {
-            Image(systemName: symbol).frame(width: 22, height: 20)
-        }
-        .buttonStyle(.borderless)
-        .help(help)
     }
 
     private func color(for state: String) -> Color {

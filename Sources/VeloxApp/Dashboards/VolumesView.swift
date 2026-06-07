@@ -27,40 +27,49 @@ final class VolumesModel {
         do { try await action(docker); await refresh() }
         catch { actionError = "\(error)" }
     }
+
+    func removeVolumes(_ ids: Set<Volume.ID>, force: Bool) async {
+        var firstError: String?
+        for id in ids {
+            do { try await docker.removeVolume(id, force: force) }
+            catch { if firstError == nil { firstError = "\(error)" } }
+        }
+        if let firstError { actionError = firstError }
+        await refresh()
+    }
 }
 
 struct VolumesView: View {
     let docker: any DockerClientProtocol
     @State private var model: VolumesModel
-    @State private var selection: Volume.ID?
+    @State private var selection = Set<Volume.ID>()
     @State private var showInspector = true
     @State private var pruneConfirm = false
+    @State private var removeConfirm = false
+    @State private var tableLayout: TableColumnCustomization<Volume>
 
     init(docker: any DockerClientProtocol) {
         self.docker = docker
         _model = State(initialValue: VolumesModel(docker: docker))
+        _tableLayout = State(initialValue: TableLayout.load("volumes"))
     }
 
-    private var selected: Volume? { model.volumes.first { $0.id == selection } }
+    private var selected: Volume? { model.volumes.first { selection.contains($0.id) } }
 
     var body: some View {
-        Table(model.volumes, selection: $selection) {
+        Table(model.volumes, selection: $selection, columnCustomization: $tableLayout) {
             TableColumn("Name") { v in Text(v.name).fontWeight(.medium).lineLimit(1) }
-                .width(min: 140, ideal: 200)
+                .customizationID("name")
             TableColumn("Driver") { v in Text(v.driver).foregroundStyle(.secondary) }
-                .width(80)
+                .customizationID("driver")
             TableColumn("Size") { v in
                 Text(v.size.map(Format.bytes) ?? "—").font(.callout.monospacedDigit())
-            }.width(90)
+            }
+                .customizationID("size")
             TableColumn("Created") { v in
                 Text(Format.age(iso: v.createdAt)).foregroundStyle(.secondary)
-            }.width(110)
-            TableColumn("") { v in
-                Button(role: .destructive) {
-                    Task { await model.perform { try await $0.removeVolume(v.name, force: false) } }
-                } label: { Image(systemName: "trash") }
-                    .buttonStyle(.borderless).help("Remove volume")
-            }.width(40)
+            }
+                .customizationID("created")
         }
         .overlay {
             if model.volumes.isEmpty {
@@ -68,28 +77,51 @@ struct VolumesView: View {
                                        description: Text(model.loadError ?? "Named volumes appear here."))
             }
         }
-        .inspector(isPresented: $showInspector) {
-            VolumeInspector(volume: selected)
-                .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
-        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { pruneConfirm = true } label: {
-                    Label("Prune", systemImage: "trash")
-                }.help("Remove all unused volumes")
+                    Label("Prune Unused Volumes", systemImage: "sparkles")
+                }
+                .help("Prune unused volumes")
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button(role: .destructive) { removeConfirm = true } label: {
+                    Label("Remove Selected", systemImage: "trash")
+                }
+                .disabled(selection.isEmpty)
+                .help(selection.isEmpty ? "Select volumes to remove" : "Remove the selected volume(s)")
             }
             ToolbarItem(placement: .automatic) {
                 Button { showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
                     .help("Toggle inspector")
             }
         }
+        .inspector(isPresented: $showInspector) {
+            VolumeInspector(volume: selected)
+                .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
+        }
         .task { await model.observe() }
+        .persistTableLayout(tableLayout, "volumes")
         .confirmationDialog("Prune unused volumes?", isPresented: $pruneConfirm) {
             Button("Prune Volumes", role: .destructive) {
                 Task { await model.perform { _ = try await $0.pruneVolumes() } }
             }
         } message: {
             Text("Removes every volume not used by at least one container. Data is deleted permanently.")
+        }
+        .confirmationDialog(
+            "Remove \(selection.count) selected volume\(selection.count == 1 ? "" : "s")?",
+            isPresented: $removeConfirm
+        ) {
+            Button("Remove", role: .destructive) {
+                let ids = selection
+                Task {
+                    await model.removeVolumes(ids, force: false)
+                    selection.removeAll()
+                }
+            }
+        } message: {
+            Text("This removes the selected volume\(selection.count == 1 ? "" : "s"). A volume still used by a container can't be removed.")
         }
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })

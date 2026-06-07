@@ -75,7 +75,6 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
     public func stopContainer(_ id: String) async throws {}
     public func restartContainer(_ id: String) async throws {}
     public func removeContainer(_ id: String, force: Bool) async throws {}
-    public func tagImage(_ id: String, repository: String, tag: String) async throws {}
     public func removeImage(_ id: String, force: Bool) async throws {}
     public func pruneImages(all: Bool) async throws -> UInt64 { 5_300_000 }
     public func removeVolume(_ name: String, force: Bool) async throws {}

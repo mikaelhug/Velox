@@ -14,31 +14,27 @@ enum Theme {
     static var hairline: Color { Color(nsColor: .separatorColor) }
 }
 
-/// Measures the width a table column needs to show its widest value without
-/// truncation. SwiftUI's `Table` can't size columns to content on its own, so we
-/// measure the strings ourselves and pin each bounded column to a fixed width —
-/// that way short columns (a "Tag" of "3.0.1") stay tight instead of stretching
-/// to fill the table, and a single flexible column absorbs the leftover space.
 @MainActor
-enum ColumnWidth {
-    static var caption: NSFont { .preferredFont(forTextStyle: .caption1) }
-    static var callout: NSFont { .preferredFont(forTextStyle: .callout) }
-    static var captionMono: NSFont { .monospacedSystemFont(ofSize: caption.pointSize, weight: .regular) }
-    static var calloutMono: NSFont { .monospacedSystemFont(ofSize: callout.pointSize, weight: .regular) }
+enum TableLayout {
+    private static func key(_ name: String) -> String { "velox.tableLayout.v2.\(name)" }
 
-    private static var headerFont: NSFont { .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold) }
+    static func load<R: Identifiable>(_ name: String) -> TableColumnCustomization<R> {
+        guard let data = UserDefaults.standard.data(forKey: key(name)),
+              let value = try? JSONDecoder().decode(TableColumnCustomization<R>.self, from: data)
+        else { return TableColumnCustomization<R>() }
+        return value
+    }
 
-    /// Width that fits the column `header` and the widest of `values` in `font`,
-    /// plus cell `padding`, clamped to `[lo, hi]`.
-    static func fit(header: String, _ values: [String], font: NSFont,
-                    min lo: CGFloat, max hi: CGFloat, padding: CGFloat = 22) -> CGFloat {
-        var widest = (header as NSString).size(withAttributes: [.font: headerFont]).width
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        for value in values {
-            let w = (value as NSString).size(withAttributes: attrs).width
-            if w > widest { widest = w }
-        }
-        return Swift.min(Swift.max(widest + padding, lo), hi)
+    static func save<R: Identifiable>(_ name: String, _ value: TableColumnCustomization<R>) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        UserDefaults.standard.set(data, forKey: key(name))
+    }
+}
+
+extension View {
+    func persistTableLayout<R: Identifiable>(_ layout: TableColumnCustomization<R>,
+                                             _ name: String) -> some View {
+        onChange(of: layout) { _, newValue in TableLayout.save(name, newValue) }
     }
 }
 

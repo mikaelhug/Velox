@@ -18,7 +18,6 @@ public protocol DockerClientProtocol: Sendable {
 
     // Image actions
     func pullImage(_ reference: String) -> AsyncThrowingStream<String, Error>
-    func tagImage(_ id: String, repository: String, tag: String) async throws
     func removeImage(_ id: String, force: Bool) async throws
     func pruneImages(all: Bool) async throws -> UInt64
 
