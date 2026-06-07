@@ -103,7 +103,8 @@ struct OverviewView: View {
         _model = State(initialValue: OverviewModel(docker: docker))
     }
 
-    private let columns = [GridItem(.adaptive(minimum: 176), spacing: Theme.gridSpacing)]
+    private let columns = Array(repeating: GridItem(.flexible(minimum: 136), spacing: Theme.gridSpacing),
+                                count: 4)
 
     var body: some View {
         ScrollView {

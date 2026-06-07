@@ -31,6 +31,7 @@ struct RootView: View {
             detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
         }
+        .toolbar(removing: .sidebarToggle)
         .navigationTitle(selection?.title ?? "Velox")
         .alert("Switch Docker context to Velox?", isPresented: $engine.showContextPrompt) {
             Button("Switch") { engine.adoptVeloxContext() }

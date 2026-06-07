@@ -65,11 +65,12 @@ struct ImagesView: View {
     @State private var pullReference = ""
     @State private var pruneConfirm = false
     @State private var removeConfirm = false
-    @State private var tagTarget: ImageSummary?
+    @State private var tableLayout: TableColumnCustomization<ImageSummary>
 
     init(docker: any DockerClientProtocol) {
         self.docker = docker
         _model = State(initialValue: ImagesModel(docker: docker))
+        _tableLayout = State(initialValue: TableLayout.load("images"))
     }
 
     private var filtered: [ImageSummary] {
@@ -80,59 +81,32 @@ struct ImagesView: View {
         }
     }
 
-    // Content-fit widths for the bounded columns (measured over all images so the
-    // layout doesn't jump while filtering).
-    private var tagWidth: CGFloat {
-        ColumnWidth.fit(header: "Tag", model.images.map(\.tag), font: ColumnWidth.callout, min: 48, max: 220)
-    }
-    private var archWidth: CGFloat {
-        ColumnWidth.fit(header: "Arch", model.images.map { $0.architecture ?? "—" },
-                        font: ColumnWidth.captionMono, min: 52, max: 120, padding: 30)
-    }
-    private var idWidth: CGFloat {
-        ColumnWidth.fit(header: "Image ID", model.images.map(\.shortID), font: ColumnWidth.captionMono, min: 84, max: 130)
-    }
-    private var createdWidth: CGFloat {
-        ColumnWidth.fit(header: "Created", model.images.map { Format.age(epoch: $0.created) },
-                        font: ColumnWidth.callout, min: 64, max: 150)
-    }
-    private var sizeWidth: CGFloat {
-        ColumnWidth.fit(header: "Size", model.images.map { Format.bytes($0.size) },
-                        font: ColumnWidth.calloutMono, min: 60, max: 120)
-    }
-
     var body: some View {
-        Table(filtered, selection: $selection) {
-            // Repository is the one flexible column — it absorbs the leftover width
-            // so the others can stay sized to their content.
+        Table(filtered, selection: $selection, columnCustomization: $tableLayout) {
             TableColumn("Repository") { img in
                 Text(img.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-            }.width(min: 140, ideal: 240)
+            }
+                .customizationID("repository")
             TableColumn("Tag") { img in
                 Text(img.tag).font(.callout).foregroundStyle(.secondary).lineLimit(1)
-            }.width(tagWidth)
+            }
+                .customizationID("tag")
             TableColumn("Arch") { img in
                 ArchBadge(arch: img.architecture)
-            }.width(archWidth)
+            }
+                .customizationID("arch")
             TableColumn("Image ID") { img in
                 Text(img.shortID).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }.width(idWidth)
+            }
+                .customizationID("imageID")
             TableColumn("Created") { img in
                 Text(Format.age(epoch: img.created)).foregroundStyle(.secondary).lineLimit(1)
-            }.width(createdWidth)
+            }
+                .customizationID("created")
             TableColumn("Size") { img in
                 Text(Format.bytes(img.size)).font(.callout.monospacedDigit())
-            }.width(sizeWidth)
-            TableColumn("") { img in
-                HStack(spacing: 2) {
-                    Button { tagTarget = img } label: { Image(systemName: "tag") }
-                        .buttonStyle(.borderless).help("Tag image")
-                    Button(role: .destructive) {
-                        Task { await model.perform { try await $0.removeImage(img.id, force: false) } }
-                    } label: { Image(systemName: "trash") }
-                        .buttonStyle(.borderless).help("Remove image")
-                }
-            }.width(60)
+            }
+                .customizationID("size")
         }
         .overlay {
             if model.images.isEmpty {
@@ -144,22 +118,21 @@ struct ImagesView: View {
         .searchable(text: $searchText, placement: .toolbar, prompt: "Filter images")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
+                Button(role: .destructive) { pruneConfirm = true } label: {
+                    Label("Prune Unused Images", systemImage: "sparkles")
+                }
+                .help("Prune unused images")
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { removeConfirm = true } label: {
                     Label("Remove Selected", systemImage: "trash")
                 }
                 .disabled(selection.isEmpty)
                 .help(selection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
             }
-            ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button(role: .destructive) { pruneConfirm = true } label: {
-                        Label("Prune Unused Images…", systemImage: "sparkles")
-                    }
-                } label: { Image(systemName: "ellipsis.circle") }
-                .help("More actions")
-            }
         }
         .task { await model.observe() }
+        .persistTableLayout(tableLayout, "images")
         .confirmationDialog(
             "Remove \(selection.count) selected image\(selection.count == 1 ? "" : "s")?",
             isPresented: $removeConfirm
@@ -181,7 +154,6 @@ struct ImagesView: View {
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
         ) { Button("OK", role: .cancel) {} } message: { Text(model.actionError ?? "") }
-        .sheet(item: $tagTarget) { img in TagSheet(image: img, model: model) }
     }
 
     private var pullBar: some View {
@@ -227,41 +199,6 @@ private struct ArchBadge: View {
         } else {
             Text("—").foregroundStyle(.secondary)
         }
-    }
-}
-
-/// Sheet for tagging an image with a new repository:tag.
-private struct TagSheet: View {
-    let image: ImageSummary
-    let model: ImagesModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var repository = ""
-    @State private var tag = "latest"
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Tag Image").font(.headline)
-            Text(image.repository + ":" + image.tag)
-                .font(.caption.monospaced()).foregroundStyle(.secondary)
-            Form {
-                TextField("Repository", text: $repository, prompt: Text("acme/web"))
-                TextField("Tag", text: $tag)
-            }
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }
-                Button("Tag") {
-                    Task {
-                        await model.perform { try await $0.tagImage(image.id, repository: repository, tag: tag) }
-                        dismiss()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(repository.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
-        }
-        .padding(20)
-        .frame(width: 360)
     }
 }
 

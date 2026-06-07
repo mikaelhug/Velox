@@ -11,26 +11,14 @@ struct MenuBarContentView: View {
 
     var body: some View {
         Group {
-            Label("Velox \(Versions.velox) — \(engine.state.label)",
-                  systemImage: engine.state.menuBarSymbol)
-                .labelStyle(.titleAndIcon)
-
-            if let failure = engine.state.failureMessage {
-                Text(failure)
-                    .font(.caption)
+            Label {
+                Text("Velox is \(engine.state.label.lowercased())")
+            } icon: {
+                Image(nsImage: statusIcon)
             }
-
-            if engine.availableUpdate?.isUpdateAvailable == true,
-               let latest = engine.availableUpdate?.latestVersion {
-                Button(engine.updateInProgress ? "Updating…" : "Update to v\(latest)…") {
-                    engine.applyUpdate()
-                }
-                .disabled(engine.updateInProgress)
-            }
+            .labelStyle(.titleAndIcon)
 
             Divider()
-
-            engineControl
 
             Button("Open Dashboard") {
                 NSApp.activate(ignoringOtherApps: true)
@@ -38,12 +26,15 @@ struct MenuBarContentView: View {
             }
             .keyboardShortcut("d")
 
-            SettingsLink {
-                Text("Settings…")
+            Button("Settings") {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: WindowID.settings)
             }
             .keyboardShortcut(",")
 
             Divider()
+
+            engineControl
 
             Button("Quit Velox") {
                 Task {
@@ -69,5 +60,34 @@ struct MenuBarContentView: View {
         } else {
             Button("Start Engine") { Task { await engine.start() } }
         }
+    }
+
+    private var statusIcon: NSImage {
+        Self.tintedSymbol(engine.state.menuBarSymbol, color: statusColor)
+    }
+
+    private var statusColor: NSColor {
+        switch engine.state {
+        case .running: return .systemGreen
+        case .starting, .stopping: return .systemYellow
+        case .failed: return .systemRed
+        case .stopped: return .systemRed
+        }
+    }
+
+    private static func tintedSymbol(_ name: String, color: NSColor) -> NSImage {
+        let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil) ?? NSImage()
+        let configured = symbol.withSymbolConfiguration(.init(pointSize: 13, weight: .regular)) ?? symbol
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+
+        image.lockFocus()
+        let rect = NSRect(origin: .zero, size: image.size)
+        configured.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+        color.setFill()
+        rect.fill(using: .sourceAtop)
+        image.unlockFocus()
+
+        image.isTemplate = false
+        return image
     }
 }
