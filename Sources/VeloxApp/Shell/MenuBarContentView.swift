@@ -26,8 +26,9 @@ struct MenuBarContentView: View {
             }
             .keyboardShortcut("d")
 
-            SettingsLink {
-                Text("Settings")
+            Button("Settings") {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: WindowID.settings)
             }
             .keyboardShortcut(",")
 

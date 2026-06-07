@@ -70,11 +70,45 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     public func volumes() async throws -> [Volume] {
-        try decode(VolumeListResponse.self, from: await send("GET", Self.path("/volumes"))).volumes
+        let volumes = try decode(VolumeListResponse.self, from: await send("GET", Self.path("/volumes"))).volumes
+        guard !volumes.isEmpty else { return [] }
+
+        guard let usage = try? decode(VolumeListResponse.self,
+                                      from: await send("GET", Self.path("/system/df?type=volume")))
+        else { return volumes }
+
+        let sizesByName = Dictionary(uniqueKeysWithValues: usage.volumes.compactMap { volume -> (String, Int64)? in
+            guard let size = volume.size else { return nil }
+            return (volume.name, size)
+        })
+
+        return volumes.map { volume in
+            guard let size = sizesByName[volume.name] else { return volume }
+            return Volume(name: volume.name,
+                          driver: volume.driver,
+                          mountpoint: volume.mountpoint,
+                          createdAt: volume.createdAt,
+                          size: size)
+        }
     }
 
     public func networks() async throws -> [NetworkSummary] {
-        try decode([NetworkSummary].self, from: await send("GET", Self.path("/networks")))
+        let summaries = try decode([NetworkSummary].self, from: await send("GET", Self.path("/networks")))
+        var detailed: [NetworkSummary] = []
+        detailed.reserveCapacity(summaries.count)
+
+        for network in summaries {
+            do {
+                let data = try await send("GET", Self.path("/networks/\(network.id.urlEncoded)"))
+                detailed.append(try decode(NetworkSummary.self, from: data))
+            } catch DockerError.http(status: 404, message: _) {
+                // Network disappeared between list and inspect; the next event-triggered
+                // reconcile will see the settled state.
+                continue
+            }
+        }
+
+        return detailed
     }
 
     // MARK: - Container actions

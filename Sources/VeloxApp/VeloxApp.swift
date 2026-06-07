@@ -4,6 +4,7 @@ import VeloxCore
 /// Stable window identifiers used with `openWindow`.
 enum WindowID {
     static let dashboard = "dashboard"
+    static let settings = "settings"
 }
 
 /// The Velox desktop app: a menu-bar engine controller plus a dashboard window
@@ -42,10 +43,13 @@ struct VeloxApp: App {
                 .environment(engine)
         }
 
-        Settings {
+        Window("Settings", id: WindowID.settings) {
             SettingsView()
                 .environment(engine)
         }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 720, height: 560)
+        .defaultLaunchBehavior(.suppressed)
         .windowToolbarStyle(.unified)
     }
 }

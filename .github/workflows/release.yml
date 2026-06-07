@@ -92,7 +92,7 @@ jobs:
   # ---------------------------------------------------------------------------
   app:
     needs: guest
-    runs-on: macos-15
+    runs-on: macos-26
     # `secrets` can't be referenced in `if:` (it isn't a valid context there), so
     # surface the two gating secrets as env and check those instead.
     env:
@@ -103,7 +103,7 @@ jobs:
       - name: Fetch guest artifacts
         uses: actions/download-artifact@v4
         with: { name: guest, path: . }
-      - run: swift --version && xcode-select -p
+      - run: swift --version && xcode-select -p && xcrun --sdk macosx --show-sdk-version
 
       # Developer ID signing (optional). Secrets:
       #   MACOS_CERT_P12_BASE64, MACOS_CERT_PASSWORD, MACOS_SIGN_IDENTITY
