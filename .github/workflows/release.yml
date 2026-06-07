@@ -5,7 +5,7 @@ name: Release
 #   2. git commit -am "release vX.Y.Z"
 #   3. git tag vX.Y.Z && git push origin vX.Y.Z
 # CI verifies the tag matches VELOX_VERSION, builds a self-contained Velox.app (guest
-# VM + velox + docker CLIs bundled), and attaches Velox-*.dmg / Velox-*.zip to a
+# VM + velox + docker CLIs bundled), and attaches Velox-*.zip to a
 # GitHub Release. The updater reads /releases/latest, so the tag MUST equal the
 # VELOX_VERSION you ship — the verify step below fails the build otherwise.
 #

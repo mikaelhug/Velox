@@ -88,9 +88,10 @@ func frame(_ stream: UInt8, _ text: String) -> Data {
     return d
 }
 do {
+    let parser = LogFrameParser()
     var acc = frame(1, "out\n") + frame(2, "err\n")
     var frames: [LogFrame] = []
-    LogFrameParser.parse(&acc) { frames.append($0) }
+    parser.parse(&acc) { frames.append($0) }
     equal(frames.count, 2, "two multiplexed frames")
     check(frames.first?.stream == .stdout && frames.first?.text == "out\n", "stdout frame")
     check(frames.last?.stream == .stderr && frames.last?.text == "err\n", "stderr frame")
@@ -98,7 +99,7 @@ do {
 
     var partial = Data(frame(1, "hello").prefix(10)) // header + 2 of 5 payload bytes
     var none: [LogFrame] = []
-    LogFrameParser.parse(&partial) { none.append($0) }
+    parser.parse(&partial) { none.append($0) }
     check(none.isEmpty, "partial frame yields nothing")
     equal(partial.count, 10, "partial frame preserved")
 }

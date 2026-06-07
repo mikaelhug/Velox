@@ -214,9 +214,10 @@ public actor DockerClient: DockerClientProtocol {
     public nonisolated func logs(container id: String, tail: Int) -> AsyncStream<LogFrame> {
         let tailParam = tail > 0 ? "\(tail)" : "all"
         let path = Self.path("/containers/\(id)/logs?follow=1&stdout=1&stderr=1&tail=\(tailParam)")
+        let parser = LogFrameParser()
         return makeStream(method: "GET", path: path) { bytes, acc, yield in
             acc.append(bytes)
-            LogFrameParser.parse(&acc, yield: yield)
+            parser.parse(&acc, yield: yield)
         }
     }
 
@@ -272,15 +273,31 @@ final class CancelFlag: @unchecked Sendable {
 }
 
 /// Parses Docker's multiplexed log stream (8-byte frame header + payload) into
-/// `LogFrame`s, with a fallback to raw text when the stream is un-multiplexed
-/// (TTY containers).
-public enum LogFrameParser {
-    public static func parse(_ acc: inout Data, yield: (LogFrame) -> Void) {
+/// `LogFrame`s, with a fallback to raw text for un-multiplexed (TTY) containers.
+///
+/// Stateful — one instance per log stream (the caller serializes `parse` calls). A
+/// TTY stream has no frame headers, so once a non-multiplexed chunk is seen the
+/// parser stays in raw mode for the rest of the stream; otherwise a later TTY chunk
+/// that happened to start with byte 0/1/2 would be misread as a frame header.
+public final class LogFrameParser: @unchecked Sendable {
+    private var isTTY = false
+    public init() {}
+
+    public func parse(_ acc: inout Data, yield: (LogFrame) -> Void) {
+        if isTTY {
+            if !acc.isEmpty {
+                yield(LogFrame(stream: .stdout, text: String(decoding: acc, as: UTF8.self)))
+                acc.removeAll(keepingCapacity: true)
+            }
+            return
+        }
         while acc.count >= 8 {
             let header = [UInt8](acc.prefix(8))
             let streamByte = header[0]
-            // Non-multiplexed (TTY) stream: stream byte isn't 0/1/2 → emit as raw.
+            // Non-multiplexed (TTY) stream: stream byte isn't 0/1/2 → switch to raw
+            // mode for the rest of the stream and emit the buffer as text.
             guard streamByte <= 2 else {
+                isTTY = true
                 let text = String(decoding: acc, as: UTF8.self)
                 acc.removeAll(keepingCapacity: true)
                 if !text.isEmpty { yield(LogFrame(stream: .stdout, text: text)) }
@@ -298,8 +315,14 @@ public enum LogFrameParser {
 }
 
 private extension String {
+    /// Percent-encode a query-parameter *value*: encode the characters that delimit a
+    /// URL query (`& = + ;`) and anything not URL-safe, but leave registry/tag/filter
+    /// punctuation (`. / : - _ ~` …) intact — so `ghcr.io/org/img:tag` and filter JSON
+    /// aren't needlessly mangled (Docker decodes either way, but this is readable).
     var urlEncoded: String {
-        addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? self
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+;")
+        return addingPercentEncoding(withAllowedCharacters: allowed) ?? self
     }
 }
 

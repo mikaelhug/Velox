@@ -27,7 +27,8 @@ public enum Paths {
     }
 }
 
-/// Well-known guest VSOCK ports.
+/// Well-known guest VSOCK ports. MUST stay in sync with the guest-side constants in
+/// `guest/vinit/src/main.rs` (`DOCKER_PORT`/`CONTROL_PORT`/`REVERSE_PORT`/`CLOCK_PORT`).
 public enum VsockPort {
     /// Guest relay forwarding to dockerd.
     public static let docker: UInt32 = 2375

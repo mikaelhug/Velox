@@ -2,14 +2,12 @@ import Foundation
 
 /// Errors from the in-process Docker HTTP exchange.
 public enum DockerError: Error, CustomStringConvertible, Sendable {
-    case notConnected
     case transport(String)
     case http(status: Int, message: String)
     case decoding(String)
 
     public var description: String {
         switch self {
-        case .notConnected: return "engine is not running"
         case .transport(let m): return "connection error: \(m)"
         case .http(let s, let m): return "docker API error \(s): \(m)"
         case .decoding(let m): return "could not decode docker response: \(m)"

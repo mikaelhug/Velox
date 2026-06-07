@@ -7,7 +7,7 @@ Velox is a lightweight, open-source Docker Desktop / OrbStack alternative for ma
 Be **as lean, efficient, fast, and small-footprint as possible**, and on every
 metric that matters — startup time, RAM, CPU, disk footprint, network throughput,
 filesystem I/O — **beat Docker Desktop and OrbStack where it's possible, and be at
-least on par otherwise.** Every decision in this repo serves that goal. The four
+least on par otherwise.** Every decision in this repo serves that goal. The five
 pillars that deliver it:
 
 1. **Apple's kernel networking (VZNAT).** The container datapath is Apple's

@@ -48,7 +48,7 @@ public final class UDPForwarder: @unchecked Sendable {
             let current = Set(self.listeners.keys)
             for port in wanted.subtracting(current) { self.open(port) }
             for port in current.subtracting(wanted) { self.closeListener(port) }
-            self.ensureReaper()
+            self.updateReaper()
         }
     }
 
@@ -197,10 +197,17 @@ public final class UDPForwarder: @unchecked Sendable {
         flow.ready = false
     }
 
-    /// Periodically reclaim flows idle beyond `idleSeconds`. The only timer here is a
-    /// genuine inactivity sweep — UDP has no connection close to ride.
-    private func ensureReaper() {
-        guard reaper == nil, !listeners.isEmpty else { return }
+    /// Keep the idle-flow reaper in sync with the listener set: run a 30s inactivity
+    /// sweep while any UDP port is published, and stop it once none are (so the timer
+    /// doesn't keep firing on an empty listener set after the last port closes). UDP
+    /// has no connection close to ride, so this sweep is the only timer — never a poll.
+    private func updateReaper() {
+        if listeners.isEmpty {
+            reaper?.cancel()
+            reaper = nil
+            return
+        }
+        guard reaper == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 30, repeating: 30)
         timer.setEventHandler { [weak self] in self?.sweep() }

@@ -125,8 +125,9 @@ CONFIG_PRINTK=y
 # --- Read-only root: erofs (compressed, demand-paged from /dev/vda) ---
 # Velox's root filesystem is a compressed read-only erofs image on a virtio-blk
 # disk, mounted directly by the kernel (root=/dev/vda rootfstype=erofs, no
-# initramfs). Built-in (=y) so the kernel can mount root with no modules. lz4 is
-# the fast default; zstd gives a smaller image — both enabled, picked at mkfs time.
+# initramfs). Built-in (=y) so the kernel can mount root with no modules. lz4 is the
+# fast default (its decompressor ships with EROFS_FS_ZIP); zstd (the explicit option
+# below) gives a smaller image — both available, picked at mkfs time (make-guest uses lz4hc).
 # erofs lives under the MISC_FILESYSTEMS menu, which tinyconfig turns off — gate it on.
 CONFIG_MISC_FILESYSTEMS=y
 CONFIG_EROFS_FS=y

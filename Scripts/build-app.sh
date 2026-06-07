@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a SELF-CONTAINED, distributable Velox.app (+ .dmg and .zip).
+# Build a SELF-CONTAINED, distributable Velox.app (packaged as a .zip).
 #
 # A downloaded Velox.app must run on a brand-new Mac with nothing else installed:
 # so the bundle carries everything the engine and the user need —
@@ -120,5 +120,5 @@ rm -f "$ZIP"; /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
 
 echo "==> Built: $APP"
 du -sh "$APP" | sed 's/^/    bundle size: /'
-ls -1 "$DIST"/Velox-*."${VELOX_VERSION}"* 2>/dev/null | sed 's/^/    artifact: /' || ls -1 "$DIST"/Velox-* | sed 's/^/    artifact: /'
+ls -1 "$DIST"/Velox-"${VELOX_VERSION}"-* 2>/dev/null | sed 's/^/    artifact: /'
 echo "    Run with: open $APP"

@@ -22,6 +22,7 @@ macro_rules! log {
 }
 
 const CID_ANY: u32 = 0xFFFF_FFFF;
+// VSOCK ports — keep in sync with the host's `VsockPort` enum (Sources/VeloxCore/Support/Paths.swift).
 const DOCKER_PORT: u32 = 2375;
 const CONTROL_PORT: u32 = 2374;
 const REVERSE_PORT: u32 = 2376;
