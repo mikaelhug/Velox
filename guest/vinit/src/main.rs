@@ -415,9 +415,13 @@ mod dhcp {
     /// option TLVs follow from here.
     const COOKIE_END: usize = 240;
 
-    // DHCP message types (option 53).
+    // DHCP message types (option 53): the two we send (DISCOVER/REQUEST) and the
+    // two replies we accept (OFFER/ACK). Validating the reply type means a DHCPNAK
+    // (6) can never be mistaken for a lease — it fails the check and we retry.
     const DISCOVER: u8 = 1;
+    const OFFER: u8 = 2;
     const REQUEST: u8 = 3;
+    const ACK: u8 = 5;
 
     // Option codes we read or write.
     const OPT_SUBNET_MASK: u8 = 1;
@@ -436,6 +440,8 @@ mod dhcp {
     struct Reply {
         xid: u32,
         yiaddr: u32,
+        /// DHCP message type (option 53) — OFFER / ACK / NAK / …
+        msg_type: u8,
         opts: Vec<(u8, Vec<u8>)>,
     }
 
@@ -514,13 +520,13 @@ mod dhcp {
         // DISCOVER
         let discover = build(mac, xid, DISCOVER, None, None);
         send(sock, &discover)?;
-        let offer = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP offer"))?;
+        let offer = recv(sock, xid, OFFER).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP offer"))?;
         let offered_ip = offer.yiaddr;
         let server = offer.addr(OPT_SERVER_ID);
         // REQUEST
         let request = build(mac, xid, REQUEST, Some(offered_ip), server);
         send(sock, &request)?;
-        let ack = recv(sock, xid).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack"))?;
+        let ack = recv(sock, xid, ACK).ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack"))?;
         Ok(Lease {
             ip: ack.yiaddr,
             mask: ack.addr(OPT_SUBNET_MASK).unwrap_or(0),
@@ -539,7 +545,7 @@ mod dhcp {
         let server_opt = if server != 0 { Some(server) } else { None };
         let request = build(&mac, xid, REQUEST, Some(ip), server_opt);
         send(sock, &request)?;
-        let res = recv(sock, xid).map(|_| ())
+        let res = recv(sock, xid, ACK).map(|_| ())
             .ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack on renew"));
         unsafe { libc::close(sock); }
         res
@@ -623,7 +629,11 @@ mod dhcp {
                 }
             }
         }
-        Some(Reply { xid, yiaddr, opts })
+        let msg_type = opts.iter()
+            .find(|(c, _)| *c == OPT_MESSAGE_TYPE)
+            .and_then(|(_, v)| v.first().copied())
+            .unwrap_or(0);
+        Some(Reply { xid, yiaddr, msg_type, opts })
     }
 
     fn open_socket(ifname: &str) -> Result<i32> {
@@ -665,14 +675,16 @@ mod dhcp {
         Ok(())
     }
 
-    fn recv(s: i32, xid: u32) -> Option<Reply> {
-        // retry a few times within the socket timeout for a matching xid
+    fn recv(s: i32, xid: u32, expect: u8) -> Option<Reply> {
+        // Retry within the socket timeout for a reply that matches both our xid and
+        // the expected message type (OFFER or ACK) — so a stray/duplicate packet or a
+        // NAK is skipped rather than taken for the lease.
         for _ in 0..4 {
             let mut buf = [0u8; 1024];
             let n = unsafe { libc::recv(s, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
             if n <= 0 { return None; }
             if let Some(m) = parse_reply(&buf[..n as usize]) {
-                if m.xid == xid { return Some(m); }
+                if m.xid == xid && m.msg_type == expect { return Some(m); }
             }
         }
         log!("DHCP: no matching reply");
