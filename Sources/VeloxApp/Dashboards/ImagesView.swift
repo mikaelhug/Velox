@@ -40,13 +40,12 @@ final class ImagesModel {
         catch { actionError = "\(error)" }
     }
 
-    /// Remove several images, then refresh once. Collects the first failure (e.g. an
-    /// image still referenced by a container) into `actionError`.
+    /// Remove several images (capped-parallel), then refresh once. Collects the first
+    /// failure (e.g. an image still referenced by a container) into `actionError`.
     func removeImages(_ ids: Set<ImageSummary.ID>, force: Bool) async {
-        var firstError: String?
-        for id in ids {
-            do { try await docker.removeImage(id, force: force) }
-            catch { if firstError == nil { firstError = "\(error)" } }
+        let docker = self.docker
+        let firstError = await runBounded(over: ids) { id in
+            try await docker.removeImage(id, force: force)
         }
         if let firstError { actionError = firstError }
         await store.refreshImages()

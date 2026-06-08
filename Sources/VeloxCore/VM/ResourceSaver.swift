@@ -20,6 +20,7 @@ public final class ResourceSaver: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.velox.resourcesaver")
 
     private var task: Task<Void, Never>?
+    private var coalescer: Coalescer?
     private var idleTimer: DispatchSourceTimer?
     private var saving = false
 
@@ -43,13 +44,17 @@ public final class ResourceSaver: @unchecked Sendable {
     }
 
     public func start() {
+        // Coalesce so a healthcheck / compose storm collapses to one container-count
+        // read instead of a full `containers()` fetch per event (CLAUDE.md §8).
+        let coalescer = Coalescer { [weak self] in await self?.evaluate() }
+        self.coalescer = coalescer
         task = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.evaluate()                       // current state on (re)connect
                 for await event in self.docker.events() {
                     if Task.isCancelled { return }
-                    if event.type == nil || event.type == "container" { await self.evaluate() }
+                    if event.type == nil || event.type == "container" { coalescer.trigger() }
                 }
                 if Task.isCancelled { return }
                 try? await Task.sleep(for: .seconds(1))      // back off, reconnect
@@ -60,6 +65,8 @@ public final class ResourceSaver: @unchecked Sendable {
     /// Stop watching and, if currently saving, restore full memory so a later
     /// engine restart (or a different saver config) starts from a clean ceiling.
     public func stop() {
+        coalescer?.cancel()
+        coalescer = nil
         task?.cancel()
         task = nil
         queue.async {

@@ -34,8 +34,16 @@ public actor DockerClient: DockerClientProtocol {
         }
     }
 
-    private func send(_ method: String, _ path: String, body: Data? = nil) async throws -> Data {
+    private func send(_ method: String, _ path: String, body: Data? = nil, readTimeout: Int32? = nil) async throws -> Data {
         let fd = try await openConnection()
+        if let readTimeout {
+            // Bound the wait so a wedged dockerd (accepts the VSOCK connection but never
+            // replies) can't park this ioQueue thread + the awaiting Task forever. Only
+            // the read-only reconcile calls pass this — never actions like `stop`, which
+            // legitimately block until the container actually stops.
+            var tv = timeval(tv_sec: Int(readTimeout), tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        }
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
             DockerClient.ioQueue.async {
                 defer { close(fd) }
@@ -45,7 +53,7 @@ public actor DockerClient: DockerClientProtocol {
         }
     }
 
-    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+    private nonisolated func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw DockerError.decoding("\(error)") }
     }
@@ -53,21 +61,21 @@ public actor DockerClient: DockerClientProtocol {
     // MARK: - Lists
 
     public func containers() async throws -> [ContainerSummary] {
-        try decode([ContainerSummary].self, from: await send("GET", Self.path("/containers/json?all=1")))
+        try decode([ContainerSummary].self, from: await send("GET", Self.path("/containers/json?all=1"), readTimeout: 30))
     }
 
     public func images() async throws -> [ImageSummary] {
         // `manifests=true` (API 1.47) attaches per-platform manifest descriptors,
         // which is how we surface each image's architecture from the containerd store.
-        try decode([ImageSummary].self, from: await send("GET", Self.path("/images/json?manifests=true")))
+        try decode([ImageSummary].self, from: await send("GET", Self.path("/images/json?manifests=true"), readTimeout: 30))
     }
 
     public func volumes() async throws -> [Volume] {
-        let volumes = try decode(VolumeListResponse.self, from: await send("GET", Self.path("/volumes"))).volumes
+        let volumes = try decode(VolumeListResponse.self, from: await send("GET", Self.path("/volumes"), readTimeout: 30)).volumes
         guard !volumes.isEmpty else { return [] }
 
         guard let usage = try? decode(VolumeListResponse.self,
-                                      from: await send("GET", Self.path("/system/df?type=volume")))
+                                      from: await send("GET", Self.path("/system/df?type=volume"), readTimeout: 30))
         else { return volumes }
 
         let sizesByName = Dictionary(uniqueKeysWithValues: usage.volumes.compactMap { volume -> (String, Int64)? in
@@ -86,22 +94,38 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     public func networks() async throws -> [NetworkSummary] {
-        let summaries = try decode([NetworkSummary].self, from: await send("GET", Self.path("/networks")))
-        var detailed: [NetworkSummary] = []
-        detailed.reserveCapacity(summaries.count)
-
-        for network in summaries {
-            do {
-                let data = try await send("GET", Self.path("/networks/\(network.id.urlEncoded)"))
-                detailed.append(try decode(NetworkSummary.self, from: data))
-            } catch DockerError.http(status: 404, message: _) {
-                // Network disappeared between list and inspect; the next event-triggered
-                // reconcile will see the settled state.
-                continue
+        let summaries = try decode([NetworkSummary].self, from: await send("GET", Self.path("/networks"), readTimeout: 30))
+        guard !summaries.isEmpty else { return [] }
+        // The summary list omits each network's attached-container list, so inspect each.
+        // Do it **bounded-parallel** rather than 1+N serial: the per-network round-trips
+        // overlap on the VSOCK path (the actor releases at each `await`), so a host with
+        // many compose-project networks reconciles in a few batches, not N deep. Results
+        // are slotted by index so the list order stays stable across refreshes.
+        let maxConcurrent = min(summaries.count, 6)
+        var results = [NetworkSummary?](repeating: nil, count: summaries.count)
+        try await withThrowingTaskGroup(of: (Int, NetworkSummary?).self) { group in
+            var next = 0
+            func submit() {
+                guard next < summaries.count else { return }
+                let idx = next
+                let id = summaries[idx].id
+                next += 1
+                group.addTask {
+                    do {
+                        let data = try await self.send("GET", Self.path("/networks/\(id.urlEncoded)"), readTimeout: 30)
+                        return (idx, try self.decode(NetworkSummary.self, from: data))
+                    } catch DockerError.http(status: 404, message: _) {
+                        return (idx, nil) // disappeared between list and inspect
+                    }
+                }
+            }
+            for _ in 0..<maxConcurrent { submit() }
+            while let (idx, ns) = try await group.next() {
+                results[idx] = ns
+                submit()
             }
         }
-
-        return detailed
+        return results.compactMap { $0 }
     }
 
     // MARK: - Container actions
@@ -152,19 +176,20 @@ public actor DockerClient: DockerClientProtocol {
         let path = Self.path("/images/create?fromImage=\(image.urlEncoded)&tag=\(tag.urlEncoded)")
         let manager = self.manager
         return AsyncThrowingStream { continuation in
-            let cancelled = CancelFlag()
-            continuation.onTermination = { _ in cancelled.cancel() }
+            let conn = StreamConnection()
+            continuation.onTermination = { _ in conn.cancel() }
             manager.connectToGuestPort(VsockPort.docker) { result in
                 switch result {
                 case .failure(let error):
                     continuation.finish(throwing: error)
                 case .success(let fd):
+                    conn.attach(fd)
                     DockerClient.ioQueue.async {
-                        defer { close(fd) }
+                        defer { conn.closeFD() }
                         var acc = Data()
                         do {
                             try HTTPCodec.performStreaming(fd: fd, method: "POST", path: path,
-                                                           isCancelled: { cancelled.isCancelled }) { bytes in
+                                                           isCancelled: { conn.isCancelled }) { bytes in
                                 acc.append(bytes)
                                 for line in acc.takeLines() {
                                     if let status = Self.progressLine(line) { continuation.yield(status) }
@@ -203,7 +228,10 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     public nonisolated func stats(container id: String) -> AsyncStream<ContainerStatsSample> {
-        makeStream(method: "GET", path: Self.path("/containers/\(id)/stats?stream=1")) { bytes, acc, yield in
+        // Only the freshest sample matters, so drop backlog if a consumer (a paused
+        // table) falls behind — a slow UI can't grow an unbounded queue of stale samples.
+        makeStream(method: "GET", path: Self.path("/containers/\(id)/stats?stream=1"),
+                   bufferingPolicy: .bufferingNewest(2)) { bytes, acc, yield in
             acc.append(bytes)
             for line in acc.takeLines() {
                 if let raw = try? JSONDecoder().decode(RawStats.self, from: line) { yield(raw.sample()) }
@@ -223,26 +251,29 @@ public actor DockerClient: DockerClientProtocol {
 
     /// Generic streaming helper: open a VSOCK connection, run the blocking HTTP
     /// stream on `ioQueue`, and feed body bytes through `parse`, which yields
-    /// decoded items into the AsyncStream. Cancellation propagates via `CancelFlag`.
+    /// decoded items into the AsyncStream. Cancellation shuts the fd down via
+    /// `StreamConnection` so a reader blocked in `read()` unwinds promptly.
     private nonisolated func makeStream<T: Sendable>(
         method: String,
         path: String,
+        bufferingPolicy: AsyncStream<T>.Continuation.BufferingPolicy = .unbounded,
         parse: @escaping @Sendable (Data, inout Data, (T) -> Void) -> Void
     ) -> AsyncStream<T> {
         let manager = self.manager
-        return AsyncStream { continuation in
-            let cancelled = CancelFlag()
-            continuation.onTermination = { _ in cancelled.cancel() }
+        return AsyncStream(bufferingPolicy: bufferingPolicy) { continuation in
+            let conn = StreamConnection()
+            continuation.onTermination = { _ in conn.cancel() }
             manager.connectToGuestPort(VsockPort.docker) { result in
                 switch result {
                 case .failure:
                     continuation.finish()
                 case .success(let fd):
+                    conn.attach(fd)
                     DockerClient.ioQueue.async {
-                        defer { close(fd); continuation.finish() }
+                        defer { conn.closeFD(); continuation.finish() }
                         var acc = Data()
                         try? HTTPCodec.performStreaming(fd: fd, method: method, path: path,
-                                                        isCancelled: { cancelled.isCancelled }) { bytes in
+                                                        isCancelled: { conn.isCancelled }) { bytes in
                             parse(bytes, &acc) { item in continuation.yield(item) }
                         }
                     }
@@ -263,13 +294,44 @@ public actor DockerClient: DockerClientProtocol {
     }
 }
 
-/// Thread-safe cancellation flag shared between an AsyncStream and its blocking
-/// reader task.
-final class CancelFlag: @unchecked Sendable {
+/// Owns the fd of a streaming vsock connection and makes cancellation *interrupt* a
+/// blocked read instead of only flipping a flag the reader checks between reads.
+///
+/// The streaming readers (`HTTPCodec.streamChunked`/`streamRaw`) block in `read()`
+/// inside `SocketChannel.fill()`; they only re-check `isCancelled` *between* reads. So
+/// on an idle stream (a quiet `logs -f`, an `events()` stream with no Docker activity)
+/// a parked reader would never notice a flag flip — leaking the dup'd vsock fd and its
+/// `ioQueue` thread until bytes arrive. `cancel()` therefore `shutdown()`s the fd,
+/// which forces the blocked `read()` to return so the reader unwinds through its
+/// `defer { conn.close() }`. `close()` closes exactly once and nulls the fd, so a
+/// cancel racing with normal teardown is a harmless no-op (no double-close / fd reuse).
+final class StreamConnection: @unchecked Sendable {
     private let lock = NSLock()
+    private var fd: Int32?
     private var cancelled = false
+
+    /// Cheap between-reads check passed to `performStreaming` (fast path).
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
-    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+
+    /// Register the fd once connected; if cancellation already fired, shut it down now.
+    func attach(_ newFd: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        fd = newFd
+        if cancelled { shutdown(newFd, SHUT_RDWR) }
+    }
+
+    /// Interrupt a blocked read by shutting the connection down.
+    func cancel() {
+        lock.lock(); defer { lock.unlock() }
+        cancelled = true
+        if let fd { shutdown(fd, SHUT_RDWR) }
+    }
+
+    /// Close the fd exactly once; a later `cancel()` then sees no fd and does nothing.
+    func closeFD() {
+        lock.lock(); defer { lock.unlock() }
+        if let fd { Darwin.close(fd); self.fd = nil }
+    }
 }
 
 /// Parses Docker's multiplexed log stream (8-byte frame header + payload) into

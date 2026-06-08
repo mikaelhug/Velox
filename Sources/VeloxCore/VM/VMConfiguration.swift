@@ -108,7 +108,13 @@ public enum VMConfiguration {
         // /dev/vdb = the persistent data disk for /var/lib/docker (formatted +
         // mounted in-guest by vinit). Order matters — it defines the device names.
         var storage: [VZStorageDeviceConfiguration] = []
-        let rootAttachment = try VZDiskImageStorageDeviceAttachment(url: image.rootDiskURL, readOnly: true)
+        // Cache the read-only erofs root in the host page cache: dockerd / containerd /
+        // runc / containerd-shim are demand-paged from here and re-read on every single
+        // container spawn, so keeping their hot pages in host RAM avoids re-reading (and
+        // re-decompressing) the image each time. `.none` sync — there are no writes.
+        let rootAttachment = try VZDiskImageStorageDeviceAttachment(
+            url: image.rootDiskURL, readOnly: true,
+            cachingMode: .cached, synchronizationMode: .none)
         storage.append(VZVirtioBlockDeviceConfiguration(attachment: rootAttachment))
         if let dataDisk, FileManager.default.fileExists(atPath: dataDisk.path) {
             // /var/lib/docker is the hot path for `docker run`: every container

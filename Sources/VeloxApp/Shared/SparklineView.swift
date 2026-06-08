@@ -1,16 +1,6 @@
 import SwiftUI
 import VeloxCore
 
-/// Holds the most recent stats sample for a container row. `@Observable` so a new
-/// sample redraws the cell's CPU/memory numbers.
-@MainActor
-@Observable
-final class StatsBuffer {
-    private(set) var latest: ContainerStatsSample?
-
-    func append(_ sample: ContainerStatsSample) { latest = sample }
-}
-
 /// A compact line chart drawn with `Canvas` — cheap enough to live in every
 /// table row and update several times a second.
 struct SparklineView: View {
@@ -49,24 +39,18 @@ struct SparklineView: View {
     }
 }
 
-/// One cell that subscribes to a container's stats stream and shows its live CPU
-/// and memory as plain numbers (no per-row chart — the numbers are enough).
+/// One cell showing a container's live CPU and memory, read from the shared
+/// `StatsStore` (which owns a single stats stream per running container). No per-row
+/// stream — that fan-out lived here before and didn't scale.
 struct ContainerUsageCell: View {
-    let docker: any DockerClientProtocol
+    let stats: StatsStore
     let containerID: String
-    let isRunning: Bool
-    @State private var buffer = StatsBuffer()
 
     var body: some View {
-        HStack(spacing: 14) {
-            metric(title: "CPU", value: buffer.latest.map { String(format: "%.0f%%", $0.cpuPercent) } ?? "—")
-            metric(title: "MEM", value: buffer.latest.map { Format.bytes($0.memoryBytes) } ?? "—")
-        }
-        .task(id: containerID) {
-            guard isRunning else { return }
-            for await sample in docker.stats(container: containerID) {
-                buffer.append(sample)
-            }
+        let sample = stats.latest[containerID]
+        return HStack(spacing: 14) {
+            metric(title: "CPU", value: sample.map { String(format: "%.0f%%", $0.cpuPercent) } ?? "—")
+            metric(title: "MEM", value: sample.map { Format.bytes($0.memoryBytes) } ?? "—")
         }
     }
 
@@ -74,6 +58,19 @@ struct ContainerUsageCell: View {
         HStack(spacing: 4) {
             Text(title).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
             Text(value).font(.callout.monospacedDigit())
+        }
+    }
+}
+
+extension View {
+    /// Keep `stats` retained — its streams running — while this view is on screen. The
+    /// keep-alive task holds until the view disappears (the `.task` is cancelled), then
+    /// releases; the store stops streaming after the last release (with a short grace).
+    func retainingStats(_ stats: StatsStore) -> some View {
+        task {
+            stats.retain()
+            defer { stats.release() }
+            while !Task.isCancelled { try? await Task.sleep(for: .seconds(3600)) }
         }
     }
 }

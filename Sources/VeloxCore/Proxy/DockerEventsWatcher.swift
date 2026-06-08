@@ -18,6 +18,12 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     private var task: Task<Void, Never>?
     private var lastTCP: Set<UInt16> = []
     private var lastUDP: Set<UInt16> = []
+    /// Coalesces event-driven reconciles so a healthcheck / `compose up` storm collapses
+    /// to one `containers()` fetch instead of one per event (CLAUDE.md §8).
+    private var coalescer: Coalescer?
+    /// Guards `lastTCP`/`lastUDP` — a coalesced reconcile can overlap the immediate one
+    /// done on (re)connect.
+    private let stateLock = NSLock()
 
     // Readiness: fired once, the first time a reconcile actually reaches dockerd.
     // The GUI awaits this to leave `.starting`, so it never has to poll `/_ping`.
@@ -32,16 +38,21 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     }
 
     public func start() {
+        let coalescer = Coalescer { [weak self] in await self?.reconcile() }
+        self.coalescer = coalescer
         task = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 // Catch the current state on (re)connect (also picks up restart-policy
-                // containers that were already running).
+                // containers that were already running) — immediate, not coalesced, so
+                // published ports come up fast and readiness fires promptly.
                 await self.reconcile()
                 for await event in self.docker.events() {
                     if Task.isCancelled { return }
+                    // Coalesce: a burst of container events fans into a single
+                    // reconcile rather than one full `containers()` fetch each.
                     if event.type == nil || event.type == "container" {
-                        await self.reconcile()
+                        coalescer.trigger()
                     }
                 }
                 // Stream ended (daemon not up yet, or restarted). Back off, reconnect.
@@ -52,6 +63,8 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     }
 
     public func stop() {
+        coalescer?.cancel()
+        coalescer = nil
         task?.cancel()
         task = nil
     }
@@ -124,11 +137,16 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                 }
             }
         }
-        if tcp != lastTCP || udp != lastUDP {
-            lastTCP = tcp
-            lastUDP = udp
-            onPorts(tcp, udp)
-        }
+        if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
+    }
+
+    /// Atomically diff + store the published-port sets; returns whether they changed.
+    /// Synchronous so the lock is never held across an `await`.
+    private func commit(_ tcp: Set<UInt16>, _ udp: Set<UInt16>) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard tcp != lastTCP || udp != lastUDP else { return false }
+        lastTCP = tcp; lastUDP = udp
+        return true
     }
 }
 

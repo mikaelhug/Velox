@@ -28,6 +28,10 @@ const CONTROL_PORT: u32 = 2374;
 const REVERSE_PORT: u32 = 2376;
 const CLOCK_PORT: u32 = 2377;
 const DOCKER_SOCK: &str = "/run/docker.sock";
+/// PID of the currently-supervised dockerd. The reaper compares each reaped child
+/// against this (atomic) value and signals the supervisor thread to respawn when it
+/// dies; -1 means "no dockerd" (e.g. a data-disk failure refused startup).
+static DOCKERD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 fn main() {
     // vinit IS the init — it must be PID 1. If it's ever exec'd otherwise (e.g.
@@ -43,25 +47,48 @@ fn main() {
     if let Err(e) = setup_network() {
         log!("network setup failed (continuing, no outbound until fixed): {e}");
     }
-    setup_data_disk();
-    setup_swap();
+    let data_ok = setup_data_disk();
+    if data_ok { setup_swap(); }
     setup_virtiofs();
     enable_ip_forwarding();
-    let dockerd_pid = spawn_dockerd();
+    // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
+    // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
+    let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
+    if data_ok {
+        let pid = spawn_dockerd();
+        DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+        std::thread::spawn(move || dockerd_supervisor(deaths_rx));
+    } else {
+        // Persistence was expected (/dev/vdb present) but the data fs didn't mount.
+        // Running dockerd now would silently use the tmpfs /var and lose every image
+        // and volume on the next boot — refuse, and let the host surface this log.
+        log!("FATAL: data disk mount failed — refusing to start dockerd (it would run on \
+              non-persistent tmpfs and lose all images/volumes). Fix /dev/vdb and restart.");
+    }
     start_vsock_agent();
     log!("init complete — supervising");
-    reap_forever(dockerd_pid);
+    reap_forever(deaths_tx);
 }
 
 // =================== filesystems ===================
 
-fn do_mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: Option<&str>) {
+/// Returns true on success. Most callers ignore the result (best-effort pseudo-fs
+/// mounts); the data-disk mount checks it so a failure can refuse to start dockerd.
+fn do_mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: Option<&str>) -> bool {
     // Create the mountpoint if missing (only works on tmpfs/writable parents).
     let _ = std::fs::create_dir_all(target);
-    let csrc = CString::new(src).unwrap();
-    let ctgt = CString::new(target).unwrap();
-    let cfs = CString::new(fstype).unwrap();
-    let cdata = data.map(|d| CString::new(d).unwrap());
+    // Don't `.unwrap()` CString::new — a NUL byte in a host-supplied `velox.shares`
+    // path/tag would panic, and with `panic = "abort"` a panic in PID 1 is a kernel
+    // panic. Skip the mount instead of taking down the whole guest.
+    let (Ok(csrc), Ok(ctgt), Ok(cfs)) = (CString::new(src), CString::new(target), CString::new(fstype)) else {
+        log!("mount {target}: NUL in path/fstype — skipping");
+        return false;
+    };
+    let cdata = match data.map(CString::new) {
+        Some(Ok(c)) => Some(c),
+        Some(Err(_)) => { log!("mount {target}: NUL in mount data — skipping"); return false; }
+        None => None,
+    };
     let dptr = cdata.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
     let r = unsafe {
         libc::mount(csrc.as_ptr(), ctgt.as_ptr(),
@@ -70,7 +97,9 @@ fn do_mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: O
     };
     if r != 0 {
         log!("mount {target} ({fstype}) failed: {}", std::io::Error::last_os_error());
+        return false;
     }
+    true
 }
 
 fn mount_all() {
@@ -313,6 +342,13 @@ fn ipstr(ip: u32) -> String {
 // networks alike — exactly like Docker Desktop.
 const DOCKER_INTERNAL_NAMES: [&str; 2] = ["host.docker.internal", "gateway.docker.internal"];
 
+/// Cap on concurrent DNS handler threads. `:53` is reachable by every container, and a
+/// query whose upstream is dead parks a thread for the recv timeout — so an unbounded
+/// thread-per-datagram model lets a flood exhaust PID 1. Over the cap, queries are
+/// dropped (the resolver retries). 64 is far above any real per-VM query concurrency.
+static DNS_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const DNS_MAX_INFLIGHT: usize = 64;
+
 fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
     // Bind to eth0's *specific* address, not 0.0.0.0: a wildcard socket sources its
     // reply from the route-chosen IP (docker0's gateway), but a default-bridge
@@ -329,9 +365,18 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
         let mut buf = [0u8; 1500];
         loop {
             let (n, src) = match sock.recv_from(&mut buf) { Ok(v) => v, Err(_) => continue };
+            // Bound concurrent handlers so a query flood (or a dead upstream parking
+            // threads on the forward recv) can't exhaust PID 1's threads/fds.
+            if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
+                DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                continue; // drop; the stub resolver retries
+            }
             let query = buf[..n].to_vec();
             let s = sock.clone();
-            std::thread::spawn(move || answer_dns(&s, &query, src, gateway, upstream));
+            std::thread::spawn(move || {
+                answer_dns(&s, &query, src, gateway, upstream);
+                DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
         }
     });
 }
@@ -392,7 +437,7 @@ fn build_empty_reply(query: &[u8], qend: usize) -> Vec<u8> {
 
 fn forward_dns(query: &[u8], upstream: u32) -> Option<Vec<u8>> {
     let up = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    up.set_read_timeout(Some(std::time::Duration::from_secs(4))).ok()?;
+    up.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
     let dst = std::net::SocketAddr::from((std::net::Ipv4Addr::from(upstream), 53));
     up.send_to(query, dst).ok()?;
     let mut buf = [0u8; 4096];
@@ -739,47 +784,56 @@ fn planned_resize(dev: &str) -> Option<(ResizeDir, u64)> {
     }
 }
 
-fn setup_data_disk() {
+/// Returns true if `/var/lib/docker` is on durable storage (or intentionally on tmpfs
+/// because no data disk was attached). Returns **false** only when a data disk *was*
+/// attached (`/dev/vdb` present) but couldn't be formatted/mounted — in which case the
+/// caller refuses to start dockerd rather than silently run on non-persistent tmpfs.
+fn setup_data_disk() -> bool {
     let dev = "/dev/vdb";
-    if std::path::Path::new(dev).exists() {
-        if !is_ext4(dev) {
-            log!("formatting {dev} ext4 (first boot)");
-            // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd
-            // runs as root anyway) — reclaim it for image/container storage. Applies to
-            // the first-boot format only; existing disks keep whatever they were made with.
-            let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
-            match st { Ok(s) if s.success() => {}, other => log!("mkfs.ext4 failed: {other:?}") }
-        }
-        // Resize the data fs to the configured size (velox.disk on the cmdline). ext4
-        // can only SHRINK while unmounted (and needs a prior e2fsck), so do a shrink
-        // here, before the mount; a GROW is done online right after it. One-shot —
-        // planned_resize returns None once the fs already matches the target, so a
-        // normal boot pays nothing. resize2fs ships in e2fsprogs-extra; e2fsck is base.
-        let resize = planned_resize(dev);
-        if let Some((ResizeDir::Shrink, blocks)) = resize {
-            log!("data disk: shrinking ext4 → {blocks} blocks (velox.disk)");
-            let _ = Command::new("/sbin/e2fsck").args(["-f", "-y", dev]).status();
-            match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
-                Ok(s) if s.success() => {}, other => log!("resize2fs shrink failed: {other:?}"),
-            }
-        }
-        // /var/lib/docker is overlay-snapshot churn central — every `docker run`
-        // mounts/unmounts a snapshot. noatime drops read-driven atime writes; lazytime
-        // keeps inode mtime/ctime in memory and flushes them lazily (on fsync / sync /
-        // 24h) instead of journalling every metadata touch — less write amplification on
-        // the container hot path, and nothing under here needs atime/precise timestamps.
-        do_mount(dev, "/var/lib/docker", "ext4",
-                 libc::MS_NOATIME | libc::MS_LAZYTIME, None);
-        if let Some((ResizeDir::Grow, blocks)) = resize {
-            log!("data disk: growing ext4 → {blocks} blocks (velox.disk)");
-            match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
-                Ok(s) if s.success() => {}, other => log!("resize2fs grow failed: {other:?}"),
-            }
-        }
-        start_fstrim_timer();
-    } else {
+    if !std::path::Path::new(dev).exists() {
         log!("no {dev} — /var/lib/docker stays on tmpfs (non-persistent)");
+        return true; // intentional (dev/test) — not a failure
     }
+    if !is_ext4(dev) {
+        log!("formatting {dev} ext4 (first boot)");
+        // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd
+        // runs as root anyway) — reclaim it for image/container storage. Applies to
+        // the first-boot format only; existing disks keep whatever they were made with.
+        let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
+        if !st.as_ref().map(|s| s.success()).unwrap_or(false) {
+            log!("mkfs.ext4 failed: {st:?}");
+            return false;
+        }
+    }
+    // Resize the data fs to the configured size (velox.disk on the cmdline). ext4
+    // can only SHRINK while unmounted (and needs a prior e2fsck), so do a shrink
+    // here, before the mount; a GROW is done online right after it. One-shot —
+    // planned_resize returns None once the fs already matches the target, so a
+    // normal boot pays nothing. resize2fs ships in e2fsprogs-extra; e2fsck is base.
+    let resize = planned_resize(dev);
+    if let Some((ResizeDir::Shrink, blocks)) = resize {
+        log!("data disk: shrinking ext4 → {blocks} blocks (velox.disk)");
+        let _ = Command::new("/sbin/e2fsck").args(["-f", "-y", dev]).status();
+        match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
+            Ok(s) if s.success() => {}, other => log!("resize2fs shrink failed: {other:?}"),
+        }
+    }
+    // /var/lib/docker is overlay-snapshot churn central — every `docker run`
+    // mounts/unmounts a snapshot. noatime drops read-driven atime writes; lazytime
+    // keeps inode mtime/ctime in memory and flushes them lazily (on fsync / sync /
+    // 24h) instead of journalling every metadata touch — less write amplification on
+    // the container hot path, and nothing under here needs atime/precise timestamps.
+    if !do_mount(dev, "/var/lib/docker", "ext4", libc::MS_NOATIME | libc::MS_LAZYTIME, None) {
+        return false; // mount failed — caller refuses dockerd (don't run on tmpfs)
+    }
+    if let Some((ResizeDir::Grow, blocks)) = resize {
+        log!("data disk: growing ext4 → {blocks} blocks (velox.disk)");
+        match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
+            Ok(s) if s.success() => {}, other => log!("resize2fs grow failed: {other:?}"),
+        }
+    }
+    start_fstrim_timer();
+    true
 }
 
 /// Periodically TRIM the data disk so blocks freed by deleted image layers /
@@ -1029,6 +1083,14 @@ fn vsock_listen(port: u32) -> std::io::Result<RawFd> {
     Ok(fd)
 }
 
+/// Cap on concurrent vsock handler threads across all agent ports. Each accepted
+/// connection spawns a handler (and the data/reverse bridges spawn 2 more pump threads
+/// each), so without a ceiling a host-side connection storm could exhaust PID 1's
+/// threads/fds. Over the cap, the connection is closed (the host retries). 256 is far
+/// above the ~25-30 persistent streams Velox actually opens.
+static VSOCK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const VSOCK_MAX_INFLIGHT: usize = 256;
+
 fn spawn_listener(port: u32, handler: fn(RawFd)) {
     std::thread::spawn(move || {
         let lfd = match vsock_listen(port) {
@@ -1038,8 +1100,32 @@ fn spawn_listener(port: u32, handler: fn(RawFd)) {
         log!("vsock listening on {port}");
         loop {
             let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if cfd < 0 { continue; }
-            std::thread::spawn(move || handler(cfd));
+            if cfd < 0 {
+                // Don't busy-spin on a persistent error. Transient → retry; resource
+                // exhaustion → back off (so the spin doesn't starve the threads that
+                // would free fds); fatal → the listener is dead, stop it.
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) | Some(libc::ECONNABORTED) => {}
+                    Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM) => {
+                        log!("vsock accept on {port}: {err} — backing off");
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    _ => { log!("vsock accept on {port} fatal: {err} — listener stopping"); return; }
+                }
+                continue;
+            }
+            // Bound concurrent handlers so a connection storm can't exhaust PID 1.
+            if VSOCK_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= VSOCK_MAX_INFLIGHT {
+                VSOCK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                log!("vsock {port}: too many in-flight connections — rejecting");
+                unsafe { libc::close(cfd); }
+                continue;
+            }
+            std::thread::spawn(move || {
+                handler(cfd);
+                VSOCK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
         }
     });
 }
@@ -1221,31 +1307,41 @@ fn nix_write(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 
 // =================== PID1 reaper ===================
 
-fn reap_forever(mut dockerd_pid: i32) -> ! {
+/// Respawn dockerd whenever the reaper signals it died. Runs on its own thread so the
+/// reaper itself stays a tight `waitpid` loop. Backs off before each (re)spawn so a
+/// daemon that crashes on startup doesn't spin the CPU.
+fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>) {
+    while deaths.recv().is_ok() {
+        log!("dockerd exited — restarting");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        loop {
+            let pid = spawn_dockerd();
+            if pid >= 0 {
+                DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+/// PID-1 reaper: a tight blocking `waitpid` loop that reaps every child immediately and
+/// never sleeps on the dockerd-restart path (that's the supervisor thread's job) — so a
+/// crash-looping dockerd can't leave orphaned shims/containers piling up as zombies.
+fn reap_forever(deaths: std::sync::mpsc::Sender<()>) -> ! {
     loop {
         let mut status = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
         if pid < 0 {
-            // ECHILD or EINTR — nothing to reap right now; brief sleep.
+            // ECHILD (no children yet) or EINTR — nothing to reap; brief sleep.
             std::thread::sleep(std::time::Duration::from_millis(200));
             continue;
         }
-        if pid == dockerd_pid {
-            // The engine itself died (crash, OOM, fatal config error). Relaunch
-            // it — a single dockerd exit must never leave Velox dead. Back off
-            // first so a daemon that crashes on startup doesn't spin the CPU,
-            // and retry the spawn until we have a live PID to watch again.
-            log!("dockerd exited (status {status:#x}) — restarting");
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            loop {
-                dockerd_pid = spawn_dockerd();
-                if dockerd_pid >= 0 { break; }
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-        } else {
-            // An orphaned grandchild (container process, containerd-shim, etc.)
-            // reparented to PID 1 — just reap it.
-            log!("reaped child pid {pid} (status {status:#x})");
+        if pid == DOCKERD_PID.load(std::sync::atomic::Ordering::SeqCst) {
+            // dockerd died — hand the restart to the supervisor and keep reaping now.
+            log!("dockerd exited (status {status:#x}) — signalling restart");
+            let _ = deaths.send(());
         }
+        // Any other pid is an orphaned grandchild (container proc, shim) — already reaped.
     }
 }

@@ -62,27 +62,57 @@ final class ContainersModel {
     /// once. Collects the first failure into `actionError`.
     func performAll(_ ids: [String],
                     _ action: @Sendable @escaping (any DockerClientProtocol, String) async throws -> Void) async {
-        guard !ids.isEmpty else { return }
         let docker = self.docker
-        let maxConcurrent = min(ids.count, 16)
-        let firstError = await withTaskGroup(of: String?.self) { group -> String? in
-            func add(_ id: String) {
-                group.addTask {
-                    do { try await action(docker, id); return nil }
-                    catch { return "\(error)" }
-                }
-            }
-            var iterator = ids.makeIterator()
-            for _ in 0..<maxConcurrent { if let id = iterator.next() { add(id) } }
-            var err: String?
-            while let result = await group.next() {
-                if let result, err == nil { err = result }
-                if let id = iterator.next() { add(id) }
-            }
-            return err
-        }
+        let firstError = await runBounded(over: ids) { id in try await action(docker, id) }
         if let firstError { actionError = firstError }
         await store.refreshContainers()
+    }
+
+    // Memoized grouping/sort. The interleave does an O(N log N) ICU-collation sort, and
+    // the Containers `body` re-evaluates on selection/badge changes (not just data
+    // changes), so cache the result and recompute only when the container set or the
+    // search text actually changes. The signature hashes only the fields grouping/sort
+    // depend on (id, name, project) — a status flip doesn't reshuffle rows. Ignored by
+    // Observation so updating the cache during `body` doesn't invalidate the view.
+    @ObservationIgnored private var topLevelSig: Int?
+    @ObservationIgnored private var topLevelCache: [TopLevelEntry] = []
+
+    fileprivate func topLevel(searchText: String) -> [TopLevelEntry] {
+        let cs = store.containers
+        var hasher = Hasher()
+        for c in cs { hasher.combine(c.id); hasher.combine(c.displayName); hasher.combine(c.composeProject) }
+        hasher.combine(searchText)
+        let sig = hasher.finalize()
+        if topLevelSig == sig { return topLevelCache }
+        let result = Self.computeTopLevel(cs, searchText: searchText)
+        topLevelSig = sig
+        topLevelCache = result
+        return result
+    }
+
+    /// Standalone containers and Compose project groups, interleaved alphabetically.
+    private static func computeTopLevel(_ containers: [ContainerSummary], searchText: String) -> [TopLevelEntry] {
+        let filtered = searchText.isEmpty ? containers : containers.filter {
+            $0.displayName.localizedCaseInsensitiveContains(searchText)
+                || $0.image.localizedCaseInsensitiveContains(searchText)
+                || ($0.composeProject?.localizedCaseInsensitiveContains(searchText) ?? false)
+        }
+        var groups: [String: [ContainerSummary]] = [:]
+        var standalone: [ContainerSummary] = []
+        for c in filtered {
+            if let project = c.composeProject { groups[project, default: []].append(c) }
+            else { standalone.append(c) }
+        }
+        var entries = standalone.map(TopLevelEntry.standalone)
+        for (name, members) in groups {
+            let sorted = members.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+            entries.append(.group(ProjectGroup(name: name, containers: sorted)))
+        }
+        return entries.sorted {
+            $0.sortKey.localizedCaseInsensitiveCompare($1.sortKey) == .orderedAscending
+        }
     }
 }
 
@@ -131,6 +161,7 @@ private enum TopLevelEntry: Identifiable {
 
 struct ContainersView: View {
     let docker: any DockerClientProtocol
+    let stats: StatsStore
     @Environment(\.openWindow) private var openWindow
     @State private var model: ContainersModel
     @State private var selection: Set<ContainerRow.ID> = []
@@ -142,43 +173,16 @@ struct ContainersView: View {
     @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
-    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore, stats: StatsStore) {
         self.docker = docker
+        self.stats = stats
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("containers"))
     }
 
-    private var filtered: [ContainerSummary] {
-        guard !searchText.isEmpty else { return model.containers }
-        return model.containers.filter {
-            $0.displayName.localizedCaseInsensitiveContains(searchText)
-                || $0.image.localizedCaseInsensitiveContains(searchText)
-                || ($0.composeProject?.localizedCaseInsensitiveContains(searchText) ?? false)
-        }
-    }
-
-    /// Standalone containers and Compose project groups, interleaved alphabetically.
-    private var topLevel: [TopLevelEntry] {
-        var groups: [String: [ContainerSummary]] = [:]
-        var standalone: [ContainerSummary] = []
-        for c in filtered {
-            if let project = c.composeProject {
-                groups[project, default: []].append(c)
-            } else {
-                standalone.append(c)
-            }
-        }
-        var entries = standalone.map(TopLevelEntry.standalone)
-        for (name, members) in groups {
-            let sorted = members.sorted {
-                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
-            }
-            entries.append(.group(ProjectGroup(name: name, containers: sorted)))
-        }
-        return entries.sorted {
-            $0.sortKey.localizedCaseInsensitiveCompare($1.sortKey) == .orderedAscending
-        }
-    }
+    /// Standalone containers and Compose project groups, interleaved alphabetically —
+    /// memoized in the model (recomputed only when the set or search text changes).
+    private var topLevel: [TopLevelEntry] { model.topLevel(searchText: searchText) }
 
     private func expansion(_ name: String) -> Binding<Bool> {
         Binding(get: { !collapsed.contains(name) },
@@ -215,7 +219,7 @@ struct ContainersView: View {
 
             TableColumn("CPU / MEM") { row in
                 if case .container(let c) = row {
-                    ContainerUsageCell(docker: docker, containerID: c.id, isRunning: c.isRunning)
+                    ContainerUsageCell(stats: stats, containerID: c.id)
                 }
             }
                 .customizationID("usage")
@@ -280,6 +284,7 @@ struct ContainersView: View {
             }
         }
         .persistTableLayout(tableLayout, "containers")
+        .retainingStats(stats)
         .confirmationDialog(
             "Delete container \(pendingDelete?.displayName ?? "")?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -515,7 +520,10 @@ struct PendingBadge: View {
 #if DEBUG
 struct ContainersView_Previews: PreviewProvider {
     static var previews: some View {
-        ContainersView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
+        ContainersView(docker: MockDockerClient(),
+                       store: DockerResourceStore(docker: MockDockerClient()),
+                       stats: StatsStore(docker: MockDockerClient(),
+                                         resources: DockerResourceStore(docker: MockDockerClient())))
             .frame(width: 860, height: 420)
     }
 }

@@ -25,10 +25,9 @@ final class VolumesModel {
     }
 
     func removeVolumes(_ ids: Set<Volume.ID>, force: Bool) async {
-        var firstError: String?
-        for id in ids {
-            do { try await docker.removeVolume(id, force: force) }
-            catch { if firstError == nil { firstError = "\(error)" } }
+        let docker = self.docker
+        let firstError = await runBounded(over: ids) { id in
+            try await docker.removeVolume(id, force: force)
         }
         if let firstError { actionError = firstError }
         await store.refreshVolumes()

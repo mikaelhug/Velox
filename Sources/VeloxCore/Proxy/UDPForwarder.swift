@@ -40,6 +40,11 @@ public final class UDPForwarder: @unchecked Sendable {
     private let idleSeconds: TimeInterval
     private var reaper: DispatchSourceTimer?
     private let maxPending = 32
+    /// Cap on concurrent client flows per published UDP port. Each flow holds a reader
+    /// thread + a VSOCK connection, so without a ceiling a source-port flood to a
+    /// published UDP port could grow threads unbounded. UDP is lossy — over the cap, new
+    /// flows are dropped. 256 distinct live clients per port is well beyond real use.
+    private let maxFlows = 256
 
     public init(manager: VMManager, idleSeconds: TimeInterval = 60, privilegedBinder: PrivilegedPortBinder? = nil) {
         self.manager = manager
@@ -136,6 +141,8 @@ public final class UDPForwarder: @unchecked Sendable {
                 flow.lastActive = Date()
                 if flow.ready { _ = Self.writeFrame(flow.vsockFd, datagram) }
                 else if flow.pending.count < maxPending { flow.pending.append(datagram) }
+            } else if listener.flows.count >= maxFlows {
+                continue // over the per-port flow cap — drop (UDP is lossy); bounds threads
             } else {
                 let flow = Flow()
                 flow.client = from

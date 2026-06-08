@@ -26,6 +26,10 @@ enum Format {
         return f
     }()
 
+    // Cache like the formatters above — `ISO8601DateFormatter` is expensive to build and
+    // `age(iso:)` was allocating one per call (it runs per volume table row).
+    private static let iso8601 = ISO8601DateFormatter()
+
     static func bytes(_ value: Int64) -> String { byteFormatter.string(fromByteCount: value) }
     static func bytes(_ value: UInt64) -> String { byteFormatter.string(fromByteCount: Int64(clamping: value)) }
 
@@ -38,7 +42,7 @@ enum Format {
 
     /// Relative age from an ISO-8601 string.
     static func age(iso: String?) -> String {
-        guard let iso, let date = ISO8601DateFormatter().date(from: iso) else { return "—" }
+        guard let iso, let date = iso8601.date(from: iso) else { return "—" }
         return relative.localizedString(for: date, relativeTo: Date())
     }
 

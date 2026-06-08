@@ -59,6 +59,12 @@ CONFIG_HIGH_RES_TIMERS=y
 CONFIG_HZ_1000=y
 CONFIG_PREEMPT_LAZY=y
 CONFIG_PREEMPT_DYNAMIC=y
+# tinyconfig builds the kernel with CONFIG_CC_OPTIMIZE_FOR_SIZE (-Os) — the wrong
+# default for a throughput-first container host (exactly the SLUB_TINY reasoning
+# below). Compile for speed (-O2): the size cost is a few hundred KB, the win — fewer
+# cycles in the kernel paths every container's syscalls/network/io traverse — is the point.
+# CONFIG_CC_OPTIMIZE_FOR_SIZE is not set
+CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
 # Leave CONFIG_MODULES off → fully monolithic, no /lib/modules, no depmod.
 
 # --- arm64 fast paths (tinyconfig strips both; pure wins on Apple silicon) ---
@@ -148,6 +154,16 @@ CONFIG_SWAP=y
 CONFIG_LRU_GEN=y
 CONFIG_LRU_GEN_ENABLED=y
 CONFIG_COMPACTION=y
+# Transparent huge pages in MADVISE mode (deliberately NOT `always`): memory that opts
+# in via madvise(MADV_HUGEPAGE) — e.g. a JVM/jemalloc/DB container workload — gets 2 MiB
+# pages (less TLB pressure, fewer faults), but nothing is collapsed implicitly. `always`
+# would round ALL anon memory up to 2 MiB (RAM bloat) and resist the balloon +
+# PAGE_REPORTING reclaim path this image is built around — wrong for a lean, actively-
+# ballooned host. (The Go engine itself won't auto-benefit — Go doesn't madvise its heap
+# — so this is opt-in upside for workloads, zero downside to the memory story.) THP
+# needs COMPACTION (above) for its higher-order allocations.
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_TRANSPARENT_HUGEPAGE_MADVISE=y
 # Parallelize struct-page init across cores at boot instead of one-threaded. The
 # Resources pane can allocate 16 GB+; single-threaded memmap init is otherwise a
 # visible chunk of cold start, and it scales linearly with RAM. Near-zero downside.

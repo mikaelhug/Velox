@@ -111,9 +111,28 @@ public enum HTTPCodec {
 final class SocketChannel {
     private let fd: Int32
     private var buffer = [UInt8]()
-    private var eof = false
+    private var head = 0          // first unconsumed byte; consuming advances this index
+    private var eof = false       // (instead of front-shifting the whole buffer per read)
 
     init(fd: Int32) { self.fd = fd }
+
+    /// Unconsumed bytes available.
+    private var available: Int { buffer.count - head }
+
+    /// Drop the already-consumed prefix — amortized: only shift when the dead prefix is
+    /// sizeable, so steady streaming doesn't memmove the tail on every consume (the old
+    /// `removeSubrange(0..<n)` was O(n) per read → O(n²) over a long log/stats stream).
+    private func compact() {
+        guard head > 0 else { return }
+        if head == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+        } else if head >= 16 * 1024 || head > buffer.count / 2 {
+            buffer.removeFirst(head)
+        } else {
+            return
+        }
+        head = 0
+    }
 
     /// Read the status line + headers. Returns (status, lowercased headers).
     func readResponseHead() throws -> (Int, [String: String]) {
@@ -167,9 +186,9 @@ final class SocketChannel {
     }
 
     func streamRaw(isCancelled: () -> Bool, onBytes: (Data) -> Void) throws {
-        // Flush anything already buffered, then read straight off the socket.
-        if !buffer.isEmpty {
-            onBytes(Data(buffer)); buffer.removeAll(keepingCapacity: true)
+        // Flush anything already buffered (read alongside the headers), then stream.
+        if available > 0 {
+            onBytes(Data(buffer[head...])); head = buffer.count
         }
         while !isCancelled(), let data = try readSome() {
             onBytes(data)
@@ -179,6 +198,7 @@ final class SocketChannel {
     // MARK: Primitives
 
     private func fill() throws {
+        compact() // reclaim the consumed prefix before growing the buffer
         var tmp = [UInt8](repeating: 0, count: 16 * 1024)
         let n = tmp.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
         if n > 0 { buffer.append(contentsOf: tmp[0..<n]) }
@@ -189,39 +209,47 @@ final class SocketChannel {
 
     private func readLine() throws -> String? {
         while true {
-            if let idx = buffer.firstIndex(of: 0x0A) { // \n
-                var end = idx
-                if end > 0 && buffer[end - 1] == 0x0D { end -= 1 } // drop \r
-                let line = String(decoding: buffer[0..<end], as: UTF8.self)
-                buffer.removeSubrange(0...idx)
+            if let nl = buffer[head...].firstIndex(of: 0x0A) { // absolute index into buffer
+                var end = nl
+                if end > head && buffer[end - 1] == 0x0D { end -= 1 } // drop \r
+                let line = String(decoding: buffer[head..<end], as: UTF8.self)
+                head = nl + 1
                 return line
             }
-            if eof { return buffer.isEmpty ? nil : String(decoding: buffer, as: UTF8.self) }
+            if eof {
+                if available == 0 { return nil }
+                let line = String(decoding: buffer[head...], as: UTF8.self)
+                head = buffer.count
+                return line
+            }
             try fill()
-            if eof && buffer.firstIndex(of: 0x0A) == nil && buffer.isEmpty { return nil }
         }
     }
 
     private func readExactly(_ count: Int) throws -> Data {
-        while buffer.count < count {
-            if eof { break }
+        while available < count {
+            if eof {
+                // Peer closed before the full Content-Length / chunk arrived. Surface a
+                // transport error rather than silently returning a truncated body (which
+                // would otherwise become a confusing JSON-decode failure downstream).
+                throw DockerError.transport("unexpected EOF: got \(available) of \(count) bytes")
+            }
             try fill()
         }
-        let take = min(count, buffer.count)
-        let data = Data(buffer[0..<take])
-        buffer.removeSubrange(0..<take)
+        let data = Data(buffer[head ..< head + count])
+        head += count
         return data
     }
 
     /// Return some bytes (buffered or freshly read), or nil at EOF.
     private func readSome() throws -> Data? {
-        if buffer.isEmpty {
+        if available == 0 {
             if eof { return nil }
             try fill()
-            if buffer.isEmpty { return nil }
+            if available == 0 { return nil }
         }
-        let data = Data(buffer)
-        buffer.removeAll(keepingCapacity: true)
+        let data = Data(buffer[head...])
+        head = buffer.count
         return data
     }
 }

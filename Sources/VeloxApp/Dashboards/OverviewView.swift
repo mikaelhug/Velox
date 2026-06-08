@@ -7,21 +7,10 @@ import VeloxCore
 @MainActor
 @Observable
 final class OverviewModel {
-    let docker: any DockerClientProtocol
     let store: DockerResourceStore
     private(set) var diskUsedBytes: Int64?
 
-    // Live aggregate, summed from each running container's stats stream.
-    private var latest: [String: ContainerStatsSample] = [:]
-    private(set) var totalCPU: Double = 0
-    private(set) var totalMemBytes: UInt64 = 0
-    private(set) var cpuHistory: [Double] = []
-    private(set) var memHistory: [Double] = []
-    private let historyCap = 90
-
-    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
-        self.docker = docker; self.store = store
-    }
+    init(store: DockerResourceStore) { self.store = store }
 
     // List data is read from the shared store (persistent across pane switches); the
     // live CPU/memory aggregate below stays Overview-scoped (it streams 18 stats only
@@ -35,65 +24,24 @@ final class OverviewModel {
     var totalImageBytes: Int64 { images.reduce(0) { $0 + $1.size } }
     var totalVolumeBytes: Int64 { volumes.reduce(0) { $0 + ($1.size ?? 0) } }
 
-    /// Identifies the current running set so the view restarts the stats fan-out
-    /// (via `.task(id:)`) only when a container actually starts or stops.
-    var runningKey: String { containers.filter(\.isRunning).map(\.id).sorted().joined(separator: ",") }
-
     /// Host-side read of the data disk's actual (sparse) footprint. Cheap; refreshed
-    /// when the Overview appears and whenever the running set changes.
+    /// on appear and when the container set changes.
     func refreshDiskUsage() {
         let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         diskUsedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
-    }
-
-    /// Subscribe to each running container's stats stream and keep a live sum.
-    /// Driven by `.task(id: runningKey)`, so it tears down and re-arms whenever
-    /// the running set changes — no manual per-stream lifecycle tracking.
-    func streamAggregate() async {
-        refreshDiskUsage()
-        let running = containers.filter(\.isRunning).map(\.id)
-        latest = latest.filter { running.contains($0.key) }
-        recompute()
-        guard !running.isEmpty else { return }
-        await withTaskGroup(of: Void.self) { group in
-            for id in running {
-                group.addTask { [docker] in
-                    for await sample in docker.stats(container: id) {
-                        await self.ingest(id, sample)
-                    }
-                }
-            }
-        }
-    }
-
-    private func ingest(_ id: String, _ sample: ContainerStatsSample) {
-        latest[id] = sample
-        recompute()
-    }
-
-    private func recompute() {
-        totalCPU = latest.values.reduce(0) { $0 + $1.cpuPercent }
-        totalMemBytes = latest.values.reduce(0) { $0 + $1.memoryBytes }
-        push(&cpuHistory, totalCPU)
-        push(&memHistory, Double(totalMemBytes))
-    }
-
-    private func push(_ array: inout [Double], _ value: Double) {
-        array.append(value)
-        if array.count > historyCap { array.removeFirst(array.count - historyCap) }
     }
 }
 
 /// The home page: an engine hero strip, a grid of resource metrics, and a live
 /// usage section. Shown by the shell only while the engine is running.
 struct OverviewView: View {
-    let docker: any DockerClientProtocol
+    let stats: StatsStore
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
 
-    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
-        self.docker = docker
-        _model = State(initialValue: OverviewModel(docker: docker, store: store))
+    init(store: DockerResourceStore, stats: StatsStore) {
+        self.stats = stats
+        _model = State(initialValue: OverviewModel(store: store))
     }
 
     private let columns = Array(repeating: GridItem(.flexible(minimum: 136), spacing: Theme.gridSpacing),
@@ -105,12 +53,15 @@ struct OverviewView: View {
                 hero
                 if let error = model.loadError { errorBanner(error) }
                 statGrid
-                liveSection
+                // A separate view so its per-sample stats reads don't re-evaluate the
+                // whole Overview body (and its O(N) stat-card reductions) every tick.
+                LiveUsageSection(stats: stats)
             }
             .padding(Theme.pagePadding)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .task(id: model.runningKey) { await model.streamAggregate() }
+        .retainingStats(stats)
+        .task(id: model.containers.count) { model.refreshDiskUsage() }
     }
 
     // MARK: Hero
@@ -166,9 +117,22 @@ struct OverviewView: View {
         }
     }
 
-    // MARK: Live usage
+    private func errorBanner(_ message: String) -> some View {
+        Label(message, systemImage: "exclamationmark.triangle.fill")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
 
-    private var liveSection: some View {
+/// The aggregate CPU/memory section. Its own view so the per-sample `stats` reads
+/// re-render only this — not the parent Overview body (and its stat-card reductions).
+private struct LiveUsageSection: View {
+    let stats: StatsStore
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Live Usage").font(.headline)
@@ -177,22 +141,13 @@ struct OverviewView: View {
             }
             HStack(spacing: Theme.gridSpacing) {
                 LiveMetricCard(title: "CPU", tint: .green,
-                               value: String(format: "%.0f%%", model.totalCPU),
-                               history: model.cpuHistory)
+                               value: String(format: "%.0f%%", stats.totalCPU),
+                               history: stats.cpuHistory)
                 LiveMetricCard(title: "Memory", tint: .blue,
-                               value: Format.bytes(model.totalMemBytes),
-                               history: model.memHistory)
+                               value: Format.bytes(stats.totalMemBytes),
+                               history: stats.memHistory)
             }
         }
-    }
-
-    private func errorBanner(_ message: String) -> some View {
-        Label(message, systemImage: "exclamationmark.triangle.fill")
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -233,7 +188,9 @@ private struct LiveMetricCard: View {
 #if DEBUG
 struct OverviewView_Previews: PreviewProvider {
     static var previews: some View {
-        OverviewView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
+        OverviewView(store: DockerResourceStore(docker: MockDockerClient()),
+                     stats: StatsStore(docker: MockDockerClient(),
+                                       resources: DockerResourceStore(docker: MockDockerClient())))
             .environment(EngineController())
             .frame(width: 820, height: 560)
     }

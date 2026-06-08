@@ -58,6 +58,12 @@ final class EngineController {
     private var watcher: DockerEventsWatcher?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
+    /// Held for the engine's lifetime to keep macOS App Nap from throttling the
+    /// embedded VM while Velox is backgrounded (see `start()`).
+    private var engineActivity: NSObjectProtocol?
+    /// Trailing-debounces the config disk write so dragging a Settings slider doesn't
+    /// JSON-encode + write the file on every integer tick.
+    private var configSaveTask: Task<Void, Never>?
     /// Live ring buffer of the guest serial console (kernel + vinit + dockerd),
     /// surfaced by the Engine Logs view. Fed from the VM's console pipe.
     let engineLog = EngineLogStore()
@@ -75,6 +81,11 @@ final class EngineController {
     /// switches — dashboards read already-loaded data instead of re-fetching on every
     /// switch. One events-driven informer feeds all of them (no per-view streams).
     private(set) var resources: DockerResourceStore?
+
+    /// Shared owner of live container CPU/memory stats (one stream per running
+    /// container, shared by the Containers table and the Overview; streams only while a
+    /// stats view is on screen). Created with the engine, torn down on stop.
+    private(set) var stats: StatsStore?
 
     /// Set true when the engine is running and the `velox` Docker context exists
     /// but isn't the active one — the shell shows a one-time prompt offering to
@@ -201,6 +212,7 @@ final class EngineController {
             let resourceStore = DockerResourceStore(docker: docker)
             resourceStore.start()
             self.resources = resourceStore
+            self.stats = StatsStore(docker: docker, resources: resourceStore)
             appliedSignature = config.bootSignature
             bootedMemoryBytes = resources.memoryBytes
 
@@ -236,6 +248,16 @@ final class EngineController {
             // events watcher's first successful reconcile — so the dashboards' first
             // load succeeds (no transient "Connection reset by peer", no manual refresh).
             await waitForDockerReady(watcher)
+            // Keep macOS App Nap from throttling the embedded VM while Velox is
+            // backgrounded (you're working in another app and the engine has real work
+            // to do). A napped process has its threads — including the VM's vCPUs —
+            // timer-throttled and pushed to efficiency cores, so a build/heavy container
+            // crawls exactly when it shouldn't. Hold a user-initiated activity for the
+            // engine's lifetime; `AllowingIdleSystemSleep` so the Mac can still sleep
+            // when idle (the guest pauses and ClockSync re-syncs on wake).
+            engineActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep],
+                reason: "Velox container engine is running")
             startedAt = Date()
             state = .running
             Log.info("engine started in-process (GUI)")
@@ -279,6 +301,10 @@ final class EngineController {
 
     private func cleanup() {
         startedAt = nil
+        if let engineActivity {
+            ProcessInfo.processInfo.endActivity(engineActivity)
+            self.engineActivity = nil
+        }
         watcher?.stop()
         watcher = nil
         forwarder?.stopAll()
@@ -292,6 +318,8 @@ final class EngineController {
         bridge = nil
         resources?.stop()
         resources = nil
+        stats?.stop()
+        stats = nil
         docker = nil
         clockSync?.stop()
         clockSync = nil
@@ -333,8 +361,16 @@ final class EngineController {
     /// Persist preferences and apply the live-tunable ones (Resource Saver) to a
     /// running engine. Settings calls this on change.
     func applyRuntimeConfig() {
-        saveConfig()
+        // Apply the live-tunable part (Resource Saver) immediately, but debounce the disk
+        // write: dragging a CPU/memory/disk slider fires this on every integer tick, and
+        // each `saveConfig` is a synchronous JSON encode + file write on the main actor.
         if state.isRunning { startResourceSaver() }
+        configSaveTask?.cancel()
+        configSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard let self, !Task.isCancelled else { return }
+            self.saveConfig()
+        }
     }
 
     /// First-run setup, on a background task (off the launch path): always (cheap)
