@@ -53,6 +53,18 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public var isRunning: Bool { state == "running" }
     public var isPaused: Bool { state == "paused" }
 
+    /// Only ports actually published to the host (a `-p` / compose `ports:` host
+    /// binding). Excludes Dockerfile `EXPOSE`-only ports — Docker reports those
+    /// with no `publicPort`, and they aren't reachable from the host, so they
+    /// shouldn't show up as if they were forwarded. Deduplicated (Docker lists the
+    /// IPv4 and IPv6 binding of the same publish separately).
+    public var publishedPortLabels: [String] {
+        var seen = Set<String>()
+        return ports.filter { $0.publicPort != nil }
+            .map(\.label)
+            .filter { seen.insert($0).inserted }
+    }
+
     /// Compose project this container belongs to, if any (the standard
     /// `com.docker.compose.project` label set by `docker compose`).
     public var composeProject: String? {

@@ -40,11 +40,21 @@ FROM ${ALPINE_IMAGE} AS assembly
 # nftables firewall backend (--firewall-backend=nftables), which drives the `nft`
 # binary directly — so we ship only `nftables`, NOT the legacy iptables/ip6tables
 # (iptables-nft) compat shim. Native dockerd capability > extra packages.
+# e2fsprogs-extra is pulled in ONLY for `resize2fs` (vinit grows the ext4 to fill the
+# data disk when the user raises diskGiB); the rest of its tools are trimmed below to
+# keep the rootfs lean. resize2fs reuses libext2fs/libe2p/libcom_err from base e2fsprogs.
 RUN apk add --no-cache --initdb --root /rootfs \
       --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys \
-      nftables e2fsprogs ca-certificates \
+      nftables e2fsprogs e2fsprogs-extra ca-certificates \
  && rm -rf /rootfs/etc/apk /rootfs/lib/apk /rootfs/var/cache /rootfs/etc/network \
            /rootfs/etc/init.d /rootfs/etc/conf.d /rootfs/sbin/openrc* /rootfs/usr/share/man \
+ && rm -f /rootfs/bin/chattr /rootfs/bin/lsattr \
+          /rootfs/usr/sbin/badblocks /rootfs/usr/sbin/debugfs /rootfs/usr/sbin/dumpe2fs \
+          /rootfs/usr/sbin/e2freefrag /rootfs/usr/sbin/e2image /rootfs/usr/sbin/e2label \
+          /rootfs/usr/sbin/e2mmpstatus /rootfs/usr/sbin/e2scrub /rootfs/usr/sbin/e2scrub_all \
+          /rootfs/usr/sbin/e2undo /rootfs/usr/sbin/e4crypt /rootfs/usr/sbin/e4defrag \
+          /rootfs/usr/sbin/filefrag /rootfs/usr/sbin/logsave /rootfs/usr/sbin/mklost+found \
+          /rootfs/usr/sbin/tune2fs \
  && mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev/pts /rootfs/dev/shm /rootfs/run \
       /rootfs/tmp /rootfs/var /rootfs/Users /rootfs/run/rosetta /rootfs/sys/fs/cgroup \
       /rootfs/lib/modules /rootfs/root /rootfs/bin \

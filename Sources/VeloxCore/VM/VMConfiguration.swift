@@ -17,7 +17,7 @@ public enum VMConfiguration {
         /// cmdline as `velox.swap=<MiB>`.
         public var swapMiB: UInt64
 
-        public init(cpuCount: Int, memoryBytes: UInt64, diskGiB: UInt64 = 16, swapMiB: UInt64 = 1024) {
+        public init(cpuCount: Int, memoryBytes: UInt64, diskGiB: UInt64 = 64, swapMiB: UInt64 = 1024) {
             self.cpuCount = cpuCount
             self.memoryBytes = memoryBytes
             self.diskGiB = diskGiB
@@ -29,7 +29,12 @@ public enum VMConfiguration {
             Resources(
                 cpuCount: max(1, min(4, ProcessInfo.processInfo.activeProcessorCount)),
                 memoryBytes: 4 * 1024 * 1024 * 1024, // 4 GiB (headroom for vfs-on-tmpfs)
-                diskGiB: 16,
+                // The data disk is a sparse ASIF image — it only consumes host space as
+                // the guest writes to it — so a generous default is ~free and avoids
+                // boxing users into an early "no space left on device". Raising this in
+                // config grows an existing disk on next start (Storage.ensureDataDisk +
+                // guest resize2fs); it is never shrunk.
+                diskGiB: 64,
                 swapMiB: 1024
             )
         }

@@ -713,6 +713,14 @@ fn setup_data_disk() {
         // the container hot path, and nothing under here needs atime/precise timestamps.
         do_mount(dev, "/var/lib/docker", "ext4",
                  libc::MS_NOATIME | libc::MS_LAZYTIME, None);
+        // Grow the ext4 to fill the block device in case the host enlarged the data
+        // disk (the user raised `diskGiB`). Online resize — the fs is already mounted —
+        // needs no e2fsck and is a no-op when the fs already spans the whole device, so
+        // it's safe to run every boot. resize2fs ships in e2fsprogs-extra.
+        match Command::new("/usr/sbin/resize2fs").arg(dev).status() {
+            Ok(s) if s.success() => {}
+            other => log!("resize2fs (grow data disk) skipped: {other:?}"),
+        }
         start_fstrim_timer();
     } else {
         log!("no {dev} — /var/lib/docker stays on tmpfs (non-persistent)");

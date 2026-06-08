@@ -212,7 +212,10 @@ struct ContainersView: View {
 
             TableColumn("Ports") { row in
                 if case .container(let c) = row {
-                    Text(c.ports.isEmpty ? "—" : c.ports.map(\.label).joined(separator: ", "))
+                    // Only published ports (host bindings) — not Dockerfile EXPOSE
+                    // metadata, which isn't reachable from the host.
+                    let labels = c.publishedPortLabels
+                    Text(labels.isEmpty ? "—" : labels.joined(separator: ", "))
                         .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                 }
             }

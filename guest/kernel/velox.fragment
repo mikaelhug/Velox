@@ -193,6 +193,12 @@ CONFIG_NETFILTER_ADVANCED=y
 CONFIG_NF_CONNTRACK=y
 CONFIG_NF_NAT=y
 CONFIG_NF_NAT_MASQUERADE=y
+# Conntrack netlink interface (nf_conntrack_netlink). dockerd/libnetwork flushes a
+# container's conntrack (NAT) state via this CTNETLINK interface when the endpoint
+# is torn down; without it every teardown logs "Failed to delete conntrack state
+# for IPv4-address … invalid argument" and stale NAT entries linger until they age
+# out (risking transient misroutes when a freed container IP is quickly reused).
+CONFIG_NF_CT_NETLINK=y
 # nftables core + IPv4/IPv6/inet families + the expressions Docker's nat/filter
 # chains use (nat, masquerade, conntrack, reject).
 CONFIG_NF_TABLES=y
