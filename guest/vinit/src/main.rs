@@ -44,12 +44,26 @@ fn main() {
     log!("starting (PID 1)");
     mount_all();
     set_clock();
-    if let Err(e) = setup_network() {
-        log!("network setup failed (continuing, no outbound until fixed): {e}");
-    }
+    // Network (DHCP) and the data disk (first-boot mkfs/resize) are independent and
+    // both potentially slow, so run them concurrently: the DHCP round-trip — and any
+    // retries on a lossy bridge — is hidden behind the disk format instead of summed
+    // with it. dockerd needs BOTH (the mounted /var/lib/docker, and GATEWAY_IP + DNS
+    // from the lease), so the network thread is joined before dockerd starts (below).
+    let net_handle = std::thread::spawn(|| {
+        if let Err(e) = setup_network() {
+            log!("network setup failed (continuing, no outbound until fixed): {e}");
+        }
+    });
     let data_ok = setup_data_disk();
-    if data_ok { setup_swap(); }
+    // Swap is a memory-pressure safety valve, not a startup dependency, and on first
+    // boot make_swapfile() fallocate()s a multi-GiB file — pure stall before dockerd.
+    // Build it off the critical path. Spawned only when data_ok, so the swapfile's
+    // parent (/var/lib/docker) is already mounted.
+    if data_ok { std::thread::spawn(setup_swap); }
     setup_virtiofs();
+    // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
+    // place, so the network must be fully applied before it starts.
+    let _ = net_handle.join();
     enable_ip_forwarding();
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
@@ -1286,7 +1300,12 @@ fn bridge(a: RawFd, b: RawFd) {
 }
 
 fn pump(from: RawFd, to: RawFd) {
-    let mut buf = [0u8; 32 * 1024];
+    // Heap (not stack) so the larger size doesn't bloat each pump thread's stack.
+    // 128 KiB cuts read/write syscalls on bulk transfers vs 32 KiB. This pump carries
+    // the docker.sock API proxy (port 2375) and the reverse port-forward TCP datapath
+    // (port 2376) — i.e. Docker-API traffic (image push/pull, build context, logs) and
+    // published-port localhost throughput. NOT container↔internet, which is direct VZNAT.
+    let mut buf = vec![0u8; 128 * 1024];
     loop {
         let n = unsafe { libc::read(from, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n <= 0 { break; }
