@@ -4,7 +4,7 @@
 /// Version numbers surfaced to the host (CLI, status, updater).
 public enum Versions {
     /// Velox release version.
-    public static let velox = "0.1.7"
+    public static let velox = "0.1.8"
     /// GitHub repo (owner/name) the updater checks for new releases.
     public static let githubRepo = "mikaelhug/Velox"
 

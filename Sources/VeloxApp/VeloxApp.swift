@@ -5,6 +5,7 @@ import VeloxCore
 enum WindowID {
     static let dashboard = "dashboard"
     static let settings = "settings"
+    static let logs = "logs"
 }
 
 /// The Velox desktop app: a menu-bar engine controller plus a dashboard window
@@ -64,5 +65,16 @@ struct VeloxApp: App {
         .defaultSize(width: 720, height: 560)
         .defaultLaunchBehavior(.suppressed)
         .windowToolbarStyle(.unified)
+
+        // One free-floating logs window per container (keyed by the target). Opened
+        // from the Containers list's "View Logs"; multiple can be open at once.
+        WindowGroup(id: WindowID.logs, for: LogWindowTarget.self) { $target in
+            if let target {
+                LogWindowHost(target: target)
+                    .environment(engine)
+            }
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 820, height: 560)
     }
 }

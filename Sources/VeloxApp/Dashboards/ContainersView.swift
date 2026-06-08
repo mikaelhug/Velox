@@ -1,6 +1,22 @@
 import SwiftUI
 import VeloxCore
 
+/// A user-initiated container lifecycle action, shown optimistically in the UI
+/// (the row reads "Stopping…") the instant it's clicked — Docker only reports the
+/// new state once the action actually finishes, which can take several seconds.
+enum PendingAction: Hashable {
+    case starting, stopping, restarting
+    var label: String {
+        switch self {
+        case .starting:   return "Starting…"
+        case .stopping:   return "Stopping…"
+        case .restarting: return "Restarting…"
+        }
+    }
+    /// Transitional tint, distinct from the green/red terminal states.
+    var tint: Color { .orange }
+}
+
 /// Loads and live-updates the container list. Refreshes on a Docker `events`
 /// subscription rather than polling, so start/stop/create/destroy reflect
 /// immediately.
@@ -12,7 +28,18 @@ final class ContainersModel {
     private(set) var loadError: String?
     var actionError: String?
 
+    /// Containers with an action in flight, keyed by id — drives the optimistic
+    /// "Starting…/Stopping…/Restarting…" badge until the action completes.
+    private(set) var pending: [String: PendingAction] = [:]
+
     init(docker: any DockerClientProtocol) { self.docker = docker }
+
+    func setPending(_ ids: [String], _ action: PendingAction) {
+        for id in ids { pending[id] = action }
+    }
+    func clearPending(_ ids: [String]) {
+        for id in ids { pending.removeValue(forKey: id) }
+    }
 
     func observe() async {
         await refresh()
@@ -35,15 +62,32 @@ final class ContainersModel {
         catch { actionError = "\(error)" }
     }
 
-    /// Run an action over many containers (a Compose project's members), then
-    /// refresh once. Collects the first failure into `actionError`.
+    /// Run an action over many containers (a selection, or a Compose project's
+    /// members), then refresh once. Runs them **concurrently** — `stopContainer`
+    /// blocks until the container actually stops, so a serial loop would stop a
+    /// multi-selection one-at-a-time; this stops them all at once. Concurrency is
+    /// capped so a huge "stop all" doesn't open hundreds of VSOCK connections at
+    /// once. Collects the first failure into `actionError`.
     func performAll(_ ids: [String],
                     _ action: @Sendable @escaping (any DockerClientProtocol, String) async throws -> Void) async {
         guard !ids.isEmpty else { return }
-        var firstError: String?
-        for id in ids {
-            do { try await action(docker, id) }
-            catch { if firstError == nil { firstError = "\(error)" } }
+        let docker = self.docker
+        let maxConcurrent = min(ids.count, 16)
+        let firstError = await withTaskGroup(of: String?.self) { group -> String? in
+            func add(_ id: String) {
+                group.addTask {
+                    do { try await action(docker, id); return nil }
+                    catch { return "\(error)" }
+                }
+            }
+            var iterator = ids.makeIterator()
+            for _ in 0..<maxConcurrent { if let id = iterator.next() { add(id) } }
+            var err: String?
+            while let result = await group.next() {
+                if let result, err == nil { err = result }
+                if let id = iterator.next() { add(id) }
+            }
+            return err
         }
         if let firstError { actionError = firstError }
         await refresh()
@@ -95,6 +139,7 @@ private enum TopLevelEntry: Identifiable {
 
 struct ContainersView: View {
     let docker: any DockerClientProtocol
+    @Environment(\.openWindow) private var openWindow
     @State private var model: ContainersModel
     @State private var selection: Set<ContainerRow.ID> = []
     @State private var searchText = ""
@@ -103,7 +148,6 @@ struct ContainersView: View {
     @State private var collapsed: Set<String> = []
     @State private var pendingDelete: ContainerSummary?
     @State private var pendingBulkDelete: [ContainerSummary] = []
-    @State private var logsTarget: ContainerSummary?
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
     init(docker: any DockerClientProtocol) {
@@ -271,9 +315,12 @@ struct ContainersView: View {
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
         ) { Button("OK", role: .cancel) {} } message: { Text(model.actionError ?? "") }
-        .sheet(item: $logsTarget) { c in
-            LogStreamView(docker: docker, container: c)
-        }
+    }
+
+    /// Open a free-floating logs window for `c` (reuses the existing one if already open).
+    private func openLogs(_ c: ContainerSummary) {
+        openWindow(id: WindowID.logs,
+                   value: LogWindowTarget(id: c.id, name: c.displayName, image: c.image))
     }
 
     // MARK: Cells
@@ -283,7 +330,7 @@ struct ContainersView: View {
         switch row {
         case .container(let c):
             HStack(spacing: 6) {
-                Circle().fill(color(for: c.state)).frame(width: 7, height: 7)
+                Circle().fill(dotColor(for: c)).frame(width: 7, height: 7)
                 VStack(alignment: .leading, spacing: 0) {
                     Text(c.displayName).fontWeight(.medium)
                     Text(c.shortID).font(.caption2.monospaced()).foregroundStyle(.secondary)
@@ -301,13 +348,29 @@ struct ContainersView: View {
     private func statusCell(_ row: ContainerRow) -> some View {
         switch row {
         case .container(let c):
-            StatusBadge(state: c.state, status: c.status)
+            if let action = model.pending[c.id] {
+                PendingBadge(action: action)
+            } else {
+                StatusBadge(state: c.state, status: c.status)
+            }
         case .project(let g):
             Text(projectStatus(g)).font(.caption).foregroundStyle(.secondary)
         }
     }
 
+    /// Name-dot tint: transitional (orange) while an action is in flight,
+    /// otherwise the container's real-state color.
+    private func dotColor(for c: ContainerSummary) -> Color {
+        model.pending[c.id]?.tint ?? color(for: c.state)
+    }
+
     private func projectStatus(_ g: ProjectGroup) -> String {
+        // If every member shares one in-flight action, surface it on the header.
+        let actions = g.containers.compactMap { model.pending[$0.id] }
+        if actions.count == g.containers.count, let first = actions.first,
+           actions.allSatisfy({ $0 == first }) {
+            return first.label
+        }
         let running = g.runningCount, total = g.containers.count
         if running == 0 { return "Stopped · \(total)" }
         if running == total { return "Running · \(total)" }
@@ -333,13 +396,26 @@ struct ContainersView: View {
     private var selectedContainers: [ContainerSummary] { containers(for: selection) }
 
     private func start(_ cs: [ContainerSummary]) {
-        Task { await model.performAll(cs.filter { !$0.isRunning }.map(\.id)) { try await $0.startContainer($1) } }
+        runPending(cs.filter { !$0.isRunning }.map(\.id), .starting) { try await $0.startContainer($1) }
     }
     private func stop(_ cs: [ContainerSummary]) {
-        Task { await model.performAll(cs.filter { $0.isRunning || $0.isPaused }.map(\.id)) { try await $0.stopContainer($1) } }
+        runPending(cs.filter { $0.isRunning || $0.isPaused }.map(\.id), .stopping) { try await $0.stopContainer($1) }
     }
     private func restart(_ cs: [ContainerSummary]) {
-        Task { await model.performAll(cs.map(\.id)) { try await $0.restartContainer($1) } }
+        runPending(cs.map(\.id), .restarting) { try await $0.restartContainer($1) }
+    }
+
+    /// Optimistically badge `ids` with `action`, run it concurrently, then clear
+    /// the badge. The row shows "Stopping…" etc. immediately instead of staying
+    /// on the old state until Docker reports the change.
+    private func runPending(_ ids: [String], _ action: PendingAction,
+                            _ body: @Sendable @escaping (any DockerClientProtocol, String) async throws -> Void) {
+        guard !ids.isEmpty else { return }
+        model.setPending(ids, action)
+        Task {
+            await model.performAll(ids, body)
+            model.clearPending(ids)
+        }
     }
 
     // MARK: Context menus
@@ -367,12 +443,12 @@ struct ContainersView: View {
     @ViewBuilder
     private func containerContext(_ c: ContainerSummary) -> some View {
         if c.isRunning || c.isPaused {
-            Button("Stop") { Task { await model.perform { try await $0.stopContainer(c.id) } } }
-            Button("Restart") { Task { await model.perform { try await $0.restartContainer(c.id) } } }
+            Button("Stop") { runPending([c.id], .stopping) { try await $0.stopContainer($1) } }
+            Button("Restart") { runPending([c.id], .restarting) { try await $0.restartContainer($1) } }
         } else {
-            Button("Start") { Task { await model.perform { try await $0.startContainer(c.id) } } }
+            Button("Start") { runPending([c.id], .starting) { try await $0.startContainer($1) } }
         }
-        Button("View Logs") { logsTarget = c }
+        Button("View Logs") { openLogs(c) }
         Divider()
         Button("Delete", role: .destructive) { pendingDelete = c }
     }
@@ -423,6 +499,22 @@ struct StatusBadge: View {
         case "exited", "dead": return .red
         default: return .secondary
         }
+    }
+}
+
+/// Capsule for an action in flight ("Stopping…"), with a small spinner. Shown in
+/// place of `StatusBadge` until the action completes.
+struct PendingBadge: View {
+    let action: PendingAction
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ProgressView().controlSize(.mini).tint(action.tint)
+            Text(action.label).font(.caption).lineLimit(1)
+        }
+        .padding(.horizontal, 7).padding(.vertical, 2)
+        .background(action.tint.opacity(0.16), in: Capsule())
+        .foregroundStyle(action.tint)
     }
 }
 

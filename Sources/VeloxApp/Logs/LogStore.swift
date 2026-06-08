@@ -25,6 +25,9 @@ final class LogStore {
 
     var autoScroll = true
     var filter = ""
+    /// True while the follow stream is live; flips false when it ends (container
+    /// stopped, or the connection closed). Drives the footer "Streaming" pill.
+    private(set) var isStreaming = false
 
     private let docker: any DockerClientProtocol
     private let containerID: String
@@ -49,17 +52,25 @@ final class LogStore {
 
     func start() {
         guard task == nil else { return }
+        isStreaming = true
         let stream = docker.logs(container: containerID, tail: 1000)
         task = Task { [weak self] in
             for await frame in stream {
                 self?.ingest(frame)
             }
+            self?.isStreaming = false       // follow stream ended
         }
     }
 
     func stop() {
         task?.cancel()
         task = nil
+        isStreaming = false
+    }
+
+    /// All buffered lines as plain text — for the "Copy" button.
+    func plainText() -> String {
+        lines.map(\.plain).joined(separator: "\n")
     }
 
     func clear() {
@@ -72,7 +83,12 @@ final class LogStore {
 
     private func ingest(_ frame: LogFrame) {
         let isErr = frame.stream == .stderr
-        var buffer = (isErr ? partialErr : partialOut) + frame.text
+        // Strip CR before splitting: in a Swift String "\r\n" is a *single* grapheme
+        // cluster, so `firstIndex(of: "\n")` never matches it — a container that emits
+        // CRLF-terminated lines would never split into lines and the view would stay
+        // empty (the same bug that was fixed for the Engine Logs view). Dropping CR
+        // makes lines break on the LF and avoids a stray CR rendering as a control glyph.
+        var buffer = (isErr ? partialErr : partialOut) + frame.text.replacingOccurrences(of: "\r", with: "")
         while let nl = buffer.firstIndex(of: "\n") {
             let raw = String(buffer[..<nl])
             buffer = String(buffer[buffer.index(after: nl)...])

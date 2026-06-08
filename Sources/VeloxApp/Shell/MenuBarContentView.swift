@@ -66,7 +66,7 @@ struct MenuBarContentView: View {
     /// matches the moon badge on the menu-bar icon.
     private var statusText: String {
         if engine.state.isRunning && engine.isResourceSaving {
-            return "Velox is idle · saving memory"
+            return "Velox is idle"
         }
         return "Velox is \(engine.state.label.lowercased())"
     }
