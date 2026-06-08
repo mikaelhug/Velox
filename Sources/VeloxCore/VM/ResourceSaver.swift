@@ -23,6 +23,12 @@ public final class ResourceSaver: @unchecked Sendable {
     private var idleTimer: DispatchSourceTimer?
     private var saving = false
 
+    /// Fired whenever saver mode toggles — `true` when the balloon is inflated to
+    /// reclaim idle RAM, `false` when full memory is restored. Invoked on an
+    /// internal queue, so hop to your own actor inside. The GUI uses it to badge
+    /// the menu-bar icon with a moon while idle.
+    public var onStateChange: (@Sendable (Bool) -> Void)?
+
     /// - Parameters:
     ///   - fullMemoryBytes: the configured (boot) memory size to restore on exit.
     ///   - floorBytes: the memory ceiling to hold while saving.
@@ -96,12 +102,15 @@ public final class ResourceSaver: @unchecked Sendable {
         guard !saving else { return }
         saving = true
         manager.setMemoryTarget(floorBytes)
+        onStateChange?(true)
         Log.info("resource saver: idle — reclaiming memory to \(floorBytes / (1024 * 1024)) MiB")
     }
 
     private func exitSaver() {
+        guard saving else { return }
         saving = false
         manager.setMemoryTarget(fullMemoryBytes)
+        onStateChange?(false)
         Log.info("resource saver: container started — restoring full memory")
     }
 }

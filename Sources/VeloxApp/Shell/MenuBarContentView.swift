@@ -12,7 +12,7 @@ struct MenuBarContentView: View {
     var body: some View {
         Group {
             Label {
-                Text("Velox is \(engine.state.label.lowercased())")
+                Text(statusText)
             } icon: {
                 Image(nsImage: statusIcon)
             }
@@ -60,6 +60,15 @@ struct MenuBarContentView: View {
         } else {
             Button("Start Engine") { Task { await engine.start() } }
         }
+    }
+
+    /// Status line. While Resource Saver is reclaiming idle RAM, say so — it
+    /// matches the moon badge on the menu-bar icon.
+    private var statusText: String {
+        if engine.state.isRunning && engine.isResourceSaving {
+            return "Velox is idle · saving memory"
+        }
+        return "Velox is \(engine.state.label.lowercased())"
     }
 
     private var statusIcon: NSImage {
