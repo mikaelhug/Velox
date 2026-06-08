@@ -65,7 +65,13 @@ final class EngineLogStore {
     // MARK: - Ingest
 
     private func ingest(_ chunk: String) {
-        partial += chunk
+        // The guest serial console terminates lines with CRLF. In a Swift String,
+        // "\r\n" is a *single* grapheme cluster, so `firstIndex(of: "\n")` never
+        // matches (there is no standalone "\n" Character to find) and nothing would
+        // ever split into lines — leaving the Engine Logs view empty. Strip the CR so
+        // lines break on the LF; this also makes a CRLF that straddles two reads split
+        // cleanly, with no spurious blank line.
+        partial += chunk.replacingOccurrences(of: "\r", with: "")
         while let nl = partial.firstIndex(of: "\n") {
             appendLine(String(partial[..<nl]))
             partial = String(partial[partial.index(after: nl)...])
