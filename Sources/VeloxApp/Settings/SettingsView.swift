@@ -189,9 +189,6 @@ private struct ResourcesPane: View {
 
     var body: some View {
         Form {
-            if engine.needsRestart {
-                Section { RestartBanner() }
-            }
             Section {
                 IntSlider(value: $config.cpuCount, range: 1...maxCores,
                           unit: config.cpuCount == 1 ? "core" : "cores")
@@ -226,6 +223,18 @@ private struct ResourcesPane: View {
             ResourceSaverSection(config: $config)
         }
         .formStyle(.grouped)
+        // The pending-restart bar lives OUTSIDE the scrolling Form (a fixed bottom
+        // inset) so it can appear/disappear without changing the Form's section
+        // structure — inserting it as a top Section reset the scroll to the top
+        // mid-drag, which moved the slider out from under the cursor and broke it.
+        .safeAreaInset(edge: .bottom) {
+            if engine.needsRestart {
+                RestartBanner()
+                    .padding(.horizontal, 20).padding(.vertical, 12)
+                    .background(.bar)
+                    .overlay(alignment: .top) { Divider() }
+            }
+        }
     }
 }
 

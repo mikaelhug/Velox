@@ -19,7 +19,17 @@ pillars that deliver it:
    OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)
 2. **A 100% Swift host.** The whole supervisor — VM lifecycle, Docker-API VSOCK
    proxy, port forwarding, clock sync, the SwiftUI GUI — is pure Swift on
-   `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons.**
+   `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons** — with
+   **one sanctioned exception**: `velox-porthelper`, a tiny root LaunchDaemon (still
+   Swift, `Sources/velox-porthelper/`) that exists *only* because macOS offers no
+   unprivileged way to bind ports below 1024. It binds a loopback `<1024` port on
+   request and passes the listening socket fd back to the host over a unix socket, then
+   steps out — it never touches connection data, so root stays out of the datapath. It
+   is installed on first use with a single admin prompt (no Developer ID ⇒ no
+   `SMAppService`; a manual `osascript`-authorized LaunchDaemon install), and the host
+   falls back to skipping privileged ports if the user declines. Keep it minimal: this
+   is the *only* privileged component, and nothing else may grow a daemon. See
+   `Sources/VeloxCore/Proxy/PortHelper.swift`.
 3. **Rust only for the tiny guest `vinit`.** One static-musl Rust binary is the
    guest's PID 1 and entire userland orchestration. Lean and fast by design.
 4. **A custom kernel, as lean as possible.** Built from kernel.org source —

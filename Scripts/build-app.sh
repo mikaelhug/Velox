@@ -36,9 +36,10 @@ DIST="${DIST:-dist}"
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> swift build -c $CONFIG (VeloxApp + velox CLI)"
+echo "==> swift build -c $CONFIG (VeloxApp + velox CLI + porthelper)"
 swift build -c "$CONFIG" --product VeloxApp
 swift build -c "$CONFIG" --product velox
+swift build -c "$CONFIG" --product velox-porthelper
 BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
 # --- fetch the stock Docker client for macOS (pinned DOCKER_VERSION) ----------
@@ -56,13 +57,15 @@ fi
 echo "==> assemble $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
-cp "$BIN_DIR/VeloxApp" "$APP/Contents/MacOS/VeloxApp"
-cp "$BIN_DIR/velox"    "$APP/Contents/Resources/bin/velox"
-cp "$DOCKER_CLI"       "$APP/Contents/Resources/bin/docker"
-cp "$KERNEL_SRC"       "$APP/Contents/Resources/kernel"
-cp "$ROOT_SRC"         "$APP/Contents/Resources/root.img"
+cp "$BIN_DIR/VeloxApp"          "$APP/Contents/MacOS/VeloxApp"
+cp "$BIN_DIR/velox"             "$APP/Contents/Resources/bin/velox"
+cp "$BIN_DIR/velox-porthelper"  "$APP/Contents/Resources/bin/velox-porthelper"
+cp "$DOCKER_CLI"                "$APP/Contents/Resources/bin/docker"
+cp "$KERNEL_SRC"                "$APP/Contents/Resources/kernel"
+cp "$ROOT_SRC"                  "$APP/Contents/Resources/root.img"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker"
+chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker" \
+         "$APP/Contents/Resources/bin/velox-porthelper"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -105,6 +108,9 @@ sign() {  # <path> [entitlements-file]
 }
 echo "==> codesign ($SIGN_IDENTITY)"
 sign "$APP/Contents/Resources/bin/docker"
+# The port helper runs as root via launchd; its power comes from that, not an
+# entitlement — so it's signed plain, like the docker client.
+sign "$APP/Contents/Resources/bin/velox-porthelper"
 sign "$APP/Contents/Resources/bin/velox" "$ENTITLEMENTS"
 sign "$APP" "$ENTITLEMENTS"
 

@@ -10,11 +10,18 @@ public final class PortForwarder: @unchecked Sendable {
     }
 
     private let bridge: VsockBridge
+    /// Source of loopback listeners for privileged (<1024) ports, which an
+    /// unprivileged process can't bind itself (nil ⇒ such ports are skipped).
+    private let privilegedBinder: PrivilegedPortBinder?
     private let queue = DispatchQueue(label: "dev.velox.portfwd")
     private var listeners: [UInt16: Listener] = [:]
+    /// Privileged ports we've already logged as "helper not ready", so a pending or
+    /// declined prompt doesn't re-warn on every reconcile (all access is on `queue`).
+    private var warnedPrivileged: Set<UInt16> = []
 
-    public init(bridge: VsockBridge) {
+    public init(bridge: VsockBridge, privilegedBinder: PrivilegedPortBinder? = nil) {
         self.bridge = bridge
+        self.privilegedBinder = privilegedBinder
     }
 
     /// Reconcile open listeners against the desired set of published ports.
@@ -33,24 +40,38 @@ public final class PortForwarder: @unchecked Sendable {
     // MARK: - private (all on `queue`)
 
     private func open(_ port: UInt16) {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return }
-        var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        let fd: Int32
+        if port < 1024 {
+            // Privileged port: an unprivileged bind(2) returns EACCES, so the
+            // listening socket comes from the root helper (already listening).
+            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .tcp) else {
+                if warnedPrivileged.insert(port).inserted {
+                    Log.warn("port-forward: 127.0.0.1:\(port) needs the privileged helper — not authorized yet")
+                }
+                return
             }
-        }
-        guard bound == 0, listen(fd, 128) == 0 else {
-            Log.warn("port-forward: could not bind 127.0.0.1:\(port) (errno \(errno))")
-            Darwin.close(fd)
-            return
+            fd = pfd
+        } else {
+            let s = socket(AF_INET, SOCK_STREAM, 0)
+            guard s >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let bound = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bound == 0, listen(s, 128) == 0 else {
+                Log.warn("port-forward: could not bind 127.0.0.1:\(port) (errno \(errno))")
+                Darwin.close(s)
+                return
+            }
+            fd = s
         }
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
@@ -60,10 +81,12 @@ public final class PortForwarder: @unchecked Sendable {
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
         listeners[port] = Listener(fd: fd, source: source)
+        warnedPrivileged.remove(port)
         Log.info("port-forward: localhost:\(port) → guest:\(port)")
     }
 
     private func closeListener(_ port: UInt16) {
+        warnedPrivileged.remove(port)
         guard let listener = listeners.removeValue(forKey: port) else { return }
         listener.source.cancel()
         Log.info("port-forward: closed localhost:\(port)")

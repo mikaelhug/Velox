@@ -5,27 +5,23 @@ import VeloxCore
 @Observable
 final class ImagesModel {
     let docker: any DockerClientProtocol
-    private(set) var images: [ImageSummary] = []
-    private(set) var loadError: String?
+    let store: DockerResourceStore
     var actionError: String?
 
     // Pull progress
     private(set) var isPulling = false
     private(set) var pullStatus = ""
 
-    init(docker: any DockerClientProtocol) { self.docker = docker }
-
-    func observe() async {
-        await refresh()
-        for await event in docker.events() {
-            if event.type == nil || event.type == "image" { await refresh() }
-        }
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+        self.docker = docker; self.store = store
     }
 
-    func refresh() async {
-        do { images = try await docker.images(); loadError = nil }
-        catch { loadError = "\(error)" }
-    }
+    // Data is read from the shared store (persistent across pane switches).
+    var images: [ImageSummary] { store.images }
+    var loadError: String? { store.imagesError }
+    var hasLoaded: Bool { store.imagesLoaded }
+
+    func refresh() async { await store.refreshImages() }
 
     func pull(_ reference: String) async {
         guard !reference.trimmingCharacters(in: .whitespaces).isEmpty else { return }
@@ -36,11 +32,11 @@ final class ImagesModel {
         } catch {
             actionError = "\(error)"
         }
-        await refresh()
+        await store.refreshImages()
     }
 
     func perform(_ action: @Sendable (any DockerClientProtocol) async throws -> Void) async {
-        do { try await action(docker); await refresh() }
+        do { try await action(docker); await store.refreshImages() }
         catch { actionError = "\(error)" }
     }
 
@@ -53,7 +49,7 @@ final class ImagesModel {
             catch { if firstError == nil { firstError = "\(error)" } }
         }
         if let firstError { actionError = firstError }
-        await refresh()
+        await store.refreshImages()
     }
 }
 
@@ -67,9 +63,9 @@ struct ImagesView: View {
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<ImageSummary>
 
-    init(docker: any DockerClientProtocol) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
         self.docker = docker
-        _model = State(initialValue: ImagesModel(docker: docker))
+        _model = State(initialValue: ImagesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("images"))
     }
 
@@ -109,7 +105,7 @@ struct ImagesView: View {
                 .customizationID("size")
         }
         .overlay {
-            if model.images.isEmpty {
+            if model.hasLoaded && model.images.isEmpty {
                 ContentUnavailableView("No Images", systemImage: SidebarItem.images.systemImage,
                                        description: Text(model.loadError ?? "Pull one to get started."))
             }
@@ -131,7 +127,6 @@ struct ImagesView: View {
                 .help(selection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
             }
         }
-        .task { await model.observe() }
         .persistTableLayout(tableLayout, "images")
         .confirmationDialog(
             "Remove \(selection.count) selected image\(selection.count == 1 ? "" : "s")?",
@@ -205,7 +200,7 @@ private struct ArchBadge: View {
 #if DEBUG
 struct ImagesView_Previews: PreviewProvider {
     static var previews: some View {
-        ImagesView(docker: MockDockerClient())
+        ImagesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
             .frame(width: 820, height: 420)
     }
 }

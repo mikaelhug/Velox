@@ -5,26 +5,22 @@ import VeloxCore
 @Observable
 final class VolumesModel {
     let docker: any DockerClientProtocol
-    private(set) var volumes: [Volume] = []
-    private(set) var loadError: String?
+    let store: DockerResourceStore
     var actionError: String?
 
-    init(docker: any DockerClientProtocol) { self.docker = docker }
-
-    func observe() async {
-        await refresh()
-        for await event in docker.events() {
-            if event.type == nil || event.type == "volume" { await refresh() }
-        }
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+        self.docker = docker; self.store = store
     }
 
-    func refresh() async {
-        do { volumes = try await docker.volumes(); loadError = nil }
-        catch { loadError = "\(error)" }
-    }
+    // Data is read from the shared store (persistent across pane switches).
+    var volumes: [Volume] { store.volumes }
+    var loadError: String? { store.volumesError }
+    var hasLoaded: Bool { store.volumesLoaded }
+
+    func refresh() async { await store.refreshVolumes() }
 
     func perform(_ action: @Sendable (any DockerClientProtocol) async throws -> Void) async {
-        do { try await action(docker); await refresh() }
+        do { try await action(docker); await store.refreshVolumes() }
         catch { actionError = "\(error)" }
     }
 
@@ -35,7 +31,7 @@ final class VolumesModel {
             catch { if firstError == nil { firstError = "\(error)" } }
         }
         if let firstError { actionError = firstError }
-        await refresh()
+        await store.refreshVolumes()
     }
 }
 
@@ -48,9 +44,9 @@ struct VolumesView: View {
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<Volume>
 
-    init(docker: any DockerClientProtocol) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
         self.docker = docker
-        _model = State(initialValue: VolumesModel(docker: docker))
+        _model = State(initialValue: VolumesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("volumes"))
     }
 
@@ -72,7 +68,7 @@ struct VolumesView: View {
                 .customizationID("created")
         }
         .overlay {
-            if model.volumes.isEmpty {
+            if model.hasLoaded && model.volumes.isEmpty {
                 ContentUnavailableView("No Volumes", systemImage: SidebarItem.volumes.systemImage,
                                        description: Text(model.loadError ?? "Named volumes appear here."))
             }
@@ -100,7 +96,6 @@ struct VolumesView: View {
             VolumeInspector(volume: selected)
                 .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
         }
-        .task { await model.observe() }
         .persistTableLayout(tableLayout, "volumes")
         .confirmationDialog("Prune unused volumes?", isPresented: $pruneConfirm) {
             Button("Prune Volumes", role: .destructive) {
@@ -157,7 +152,7 @@ private struct VolumeInspector: View {
 #if DEBUG
 struct VolumesView_Previews: PreviewProvider {
     static var previews: some View {
-        VolumesView(docker: MockDockerClient())
+        VolumesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
             .frame(width: 820, height: 420)
     }
 }

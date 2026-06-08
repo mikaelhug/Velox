@@ -1,0 +1,146 @@
+import Foundation
+import VeloxCore
+
+/// The single, persistent source of truth for the four Docker resource lists the
+/// dashboards render (containers, images, volumes, networks).
+///
+/// **Why it exists:** the sidebar's detail pane rebuilds each dashboard view from
+/// scratch on every selection change, so view-local fetching meant every pane switch
+/// threw away its data and re-fetched from empty — a visible "No images" flash plus
+/// the round-trip latency, every time, multiplied under many containers. This store is
+/// owned by `EngineController` (above the navigation), so it **survives pane switches**:
+/// the dashboards just read already-loaded data and switching is instant.
+///
+/// It follows the CLAUDE.md §8 informer pattern: one persistent `events()` stream is
+/// the trigger, a full per-resource reconcile is the source of truth (re-run on every
+/// (re)connect so a missed event or daemon restart self-heals). Per-event refreshes are
+/// coalesced, so a burst (e.g. `compose up` of 18 containers) collapses to one reconcile
+/// instead of a storm through the serialized `DockerClient`.
+@MainActor
+@Observable
+final class DockerResourceStore {
+    private(set) var containers: [ContainerSummary] = []
+    private(set) var images: [ImageSummary] = []
+    private(set) var volumes: [Volume] = []
+    private(set) var networks: [NetworkSummary] = []
+
+    private(set) var containersError: String?
+    private(set) var imagesError: String?
+    private(set) var volumesError: String?
+    private(set) var networksError: String?
+
+    // Whether each resource has completed at least one load — so a view shows a spinner
+    // on first load and "No X" only after a real empty result (never a startup flash).
+    private(set) var containersLoaded = false
+    private(set) var imagesLoaded = false
+    private(set) var volumesLoaded = false
+    private(set) var networksLoaded = false
+
+    enum Resource: CaseIterable { case containers, images, volumes, networks }
+
+    private let docker: any DockerClientProtocol
+    private var eventsTask: Task<Void, Never>?
+    private var debounce: [Resource: Task<Void, Never>] = [:]
+
+    init(docker: any DockerClientProtocol) { self.docker = docker }
+
+    /// Begin the informer: full reconcile on (re)connect, then refresh the affected
+    /// resource per event. Idempotent — safe to call once when the engine starts.
+    func start() {
+        guard eventsTask == nil else { return }
+        eventsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.refreshAll()
+                for await event in self.docker.events() {
+                    if Task.isCancelled { return }
+                    self.handle(event)
+                }
+                // Stream ended (daemon not up yet, or restarted). Back off, reconnect —
+                // the next loop's refreshAll() re-syncs the full state.
+                if Task.isCancelled { return }
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    func stop() {
+        eventsTask?.cancel(); eventsTask = nil
+        for task in debounce.values { task.cancel() }
+        debounce.removeAll()
+    }
+
+    /// Container lifecycle actions that change a network's attached-container list.
+    /// (Membership also arrives as `network` connect/disconnect events; this is the
+    /// robust trigger.) Deliberately excludes frequent `health_status` / `exec_*`
+    /// events so a healthcheck loop doesn't re-run the costly `networks()` in the
+    /// background when you aren't even viewing Networks.
+    private static let lifecycleActions: Set<String> =
+        ["create", "start", "stop", "die", "kill", "restart", "destroy", "rename"]
+
+    /// Route an event to the resource(s) it can change.
+    private func handle(_ event: DockerEvent) {
+        switch event.type {
+        case "image":   schedule(.images)
+        case "volume":  schedule(.volumes)
+        case "network": schedule(.networks)
+        case "container", nil:
+            schedule(.containers)
+            if let action = event.action, Self.lifecycleActions.contains(action) {
+                schedule(.networks)
+            }
+        default: break
+        }
+    }
+
+    /// Coalesce a burst into a single refresh ~120 ms after the *first* event of the
+    /// burst — a leading-edge schedule with a trailing fire. Crucially it does **not**
+    /// reset the timer on each event (that classic debounce would starve under a
+    /// sustained event stream and never fire); events arriving while one is pending are
+    /// simply absorbed. The slot is cleared just before the fetch, so an event that
+    /// lands during the fetch schedules the next one — eventual consistency, no misses.
+    private func schedule(_ resource: Resource) {
+        guard debounce[resource] == nil else { return }
+        debounce[resource] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard let self, !Task.isCancelled else { return }
+            self.debounce[resource] = nil
+            await self.refresh(resource)
+        }
+    }
+
+    func refreshAll() async {
+        await withTaskGroup(of: Void.self) { group in
+            for resource in Resource.allCases {
+                group.addTask { await self.refresh(resource) }
+            }
+        }
+    }
+
+    /// Re-read one resource list. Errors are surfaced per-resource (not thrown) so one
+    /// failing list never blanks the others. `…Loaded` flips only on the first *success*
+    /// (not a failed attempt), so the startup race — store starting before dockerd
+    /// answers — shows nothing rather than a false "No X".
+    func refresh(_ resource: Resource) async {
+        switch resource {
+        case .containers:
+            do { containers = try await docker.containers(); containersError = nil; containersLoaded = true }
+            catch { containersError = "\(error)" }
+        case .images:
+            do { images = try await docker.images(); imagesError = nil; imagesLoaded = true }
+            catch { imagesError = "\(error)" }
+        case .volumes:
+            do { volumes = try await docker.volumes(); volumesError = nil; volumesLoaded = true }
+            catch { volumesError = "\(error)" }
+        case .networks:
+            do { networks = try await docker.networks(); networksError = nil; networksLoaded = true }
+            catch { networksError = "\(error)" }
+        }
+    }
+
+    // Immediate refresh after a user action, so the UI doesn't wait for the event echo.
+    func refreshContainers() async { await refresh(.containers) }
+    func refreshImages() async { await refresh(.images) }
+    func refreshVolumes() async { await refresh(.volumes) }
+    func refreshNetworks() async { await refresh(.networks) }
+}

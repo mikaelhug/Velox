@@ -8,11 +8,8 @@ import VeloxCore
 @Observable
 final class OverviewModel {
     let docker: any DockerClientProtocol
-    private(set) var containers: [ContainerSummary] = []
-    private(set) var images: [ImageSummary] = []
-    private(set) var volumes: [Volume] = []
+    let store: DockerResourceStore
     private(set) var diskUsedBytes: Int64?
-    private(set) var loadError: String?
 
     // Live aggregate, summed from each running container's stats stream.
     private var latest: [String: ContainerStatsSample] = [:]
@@ -22,7 +19,17 @@ final class OverviewModel {
     private(set) var memHistory: [Double] = []
     private let historyCap = 90
 
-    init(docker: any DockerClientProtocol) { self.docker = docker }
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+        self.docker = docker; self.store = store
+    }
+
+    // List data is read from the shared store (persistent across pane switches); the
+    // live CPU/memory aggregate below stays Overview-scoped (it streams 18 stats only
+    // while this pane is on screen).
+    var containers: [ContainerSummary] { store.containers }
+    var images: [ImageSummary] { store.images }
+    var volumes: [Volume] { store.volumes }
+    var loadError: String? { store.containersError ?? store.imagesError ?? store.volumesError }
 
     var runningCount: Int { containers.lazy.filter(\.isRunning).count }
     var totalImageBytes: Int64 { images.reduce(0) { $0 + $1.size } }
@@ -32,24 +39,9 @@ final class OverviewModel {
     /// (via `.task(id:)`) only when a container actually starts or stops.
     var runningKey: String { containers.filter(\.isRunning).map(\.id).sorted().joined(separator: ",") }
 
-    func observe() async {
-        await refresh()
-        for await _ in docker.events() { await refresh() }
-    }
-
-    func refresh() async {
-        do {
-            async let c = docker.containers()
-            async let i = docker.images()
-            async let v = docker.volumes()
-            containers = try await c
-            images = try await i
-            volumes = try await v
-            loadError = nil
-        } catch {
-            loadError = "\(error)"
-        }
-        // Host-side read of the data disk's actual (sparse) footprint.
+    /// Host-side read of the data disk's actual (sparse) footprint. Cheap; refreshed
+    /// when the Overview appears and whenever the running set changes.
+    func refreshDiskUsage() {
         let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         diskUsedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
     }
@@ -58,6 +50,7 @@ final class OverviewModel {
     /// Driven by `.task(id: runningKey)`, so it tears down and re-arms whenever
     /// the running set changes — no manual per-stream lifecycle tracking.
     func streamAggregate() async {
+        refreshDiskUsage()
         let running = containers.filter(\.isRunning).map(\.id)
         latest = latest.filter { running.contains($0.key) }
         recompute()
@@ -98,9 +91,9 @@ struct OverviewView: View {
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
 
-    init(docker: any DockerClientProtocol) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
         self.docker = docker
-        _model = State(initialValue: OverviewModel(docker: docker))
+        _model = State(initialValue: OverviewModel(docker: docker, store: store))
     }
 
     private let columns = Array(repeating: GridItem(.flexible(minimum: 136), spacing: Theme.gridSpacing),
@@ -117,7 +110,6 @@ struct OverviewView: View {
             .padding(Theme.pagePadding)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .task { await model.observe() }
         .task(id: model.runningKey) { await model.streamAggregate() }
     }
 
@@ -241,7 +233,7 @@ private struct LiveMetricCard: View {
 #if DEBUG
 struct OverviewView_Previews: PreviewProvider {
     static var previews: some View {
-        OverviewView(docker: MockDockerClient())
+        OverviewView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
             .environment(EngineController())
             .frame(width: 820, height: 560)
     }

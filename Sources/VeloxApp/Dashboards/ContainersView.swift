@@ -24,15 +24,21 @@ enum PendingAction: Hashable {
 @Observable
 final class ContainersModel {
     let docker: any DockerClientProtocol
-    private(set) var containers: [ContainerSummary] = []
-    private(set) var loadError: String?
+    let store: DockerResourceStore
     var actionError: String?
 
     /// Containers with an action in flight, keyed by id — drives the optimistic
     /// "Starting…/Stopping…/Restarting…" badge until the action completes.
     private(set) var pending: [String: PendingAction] = [:]
 
-    init(docker: any DockerClientProtocol) { self.docker = docker }
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+        self.docker = docker; self.store = store
+    }
+
+    // Data is read from the shared store (persistent across pane switches).
+    var containers: [ContainerSummary] { store.containers }
+    var loadError: String? { store.containersError }
+    var hasLoaded: Bool { store.containersLoaded }
 
     func setPending(_ ids: [String], _ action: PendingAction) {
         for id in ids { pending[id] = action }
@@ -41,24 +47,10 @@ final class ContainersModel {
         for id in ids { pending.removeValue(forKey: id) }
     }
 
-    func observe() async {
-        await refresh()
-        for await event in docker.events() {
-            if event.type == nil || event.type == "container" { await refresh() }
-        }
-    }
-
-    func refresh() async {
-        do {
-            containers = try await docker.containers()
-            loadError = nil
-        } catch {
-            loadError = "\(error)"
-        }
-    }
+    func refresh() async { await store.refreshContainers() }
 
     func perform(_ action: @Sendable (any DockerClientProtocol) async throws -> Void) async {
-        do { try await action(docker); await refresh() }
+        do { try await action(docker); await store.refreshContainers() }
         catch { actionError = "\(error)" }
     }
 
@@ -90,7 +82,7 @@ final class ContainersModel {
             return err
         }
         if let firstError { actionError = firstError }
-        await refresh()
+        await store.refreshContainers()
     }
 }
 
@@ -150,9 +142,9 @@ struct ContainersView: View {
     @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
-    init(docker: any DockerClientProtocol) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
         self.docker = docker
-        _model = State(initialValue: ContainersModel(docker: docker))
+        _model = State(initialValue: ContainersModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("containers"))
     }
 
@@ -282,12 +274,11 @@ struct ContainersView: View {
             }
         }
         .overlay {
-            if model.containers.isEmpty {
+            if model.hasLoaded && model.containers.isEmpty {
                 ContentUnavailableView("No Containers", systemImage: SidebarItem.containers.systemImage,
                                        description: Text(model.loadError ?? "Run one with `docker run`."))
             }
         }
-        .task { await model.observe() }
         .persistTableLayout(tableLayout, "containers")
         .confirmationDialog(
             "Delete container \(pendingDelete?.displayName ?? "")?",
@@ -524,7 +515,7 @@ struct PendingBadge: View {
 #if DEBUG
 struct ContainersView_Previews: PreviewProvider {
     static var previews: some View {
-        ContainersView(docker: MockDockerClient())
+        ContainersView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
             .frame(width: 860, height: 420)
     }
 }

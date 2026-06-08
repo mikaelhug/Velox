@@ -92,13 +92,15 @@ func runStart(bind: BindMode) -> Never {
         // published port over VSOCK to the guest (which dials 127.0.0.1:<port>).
         // The watcher rides the same in-process VSOCK Docker client the GUI uses and
         // is push-based (the /events stream), so ports come up near-instantly.
-        let forwarder = PortForwarder(bridge: bridge)
-        let udpForwarder = UDPForwarder(manager: manager)
+        // Privileged ports (<1024) route through the root helper (installed on first
+        // use, with one admin prompt), so e.g. a reverse proxy on :80 reaches the Mac.
+        let portHelper = PortHelperManager()
+        let forwarder = PortForwarder(bridge: bridge, privilegedBinder: portHelper)
+        let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: portHelper)
         let docker = DockerClient(manager: manager)
-        let watcher = DockerEventsWatcher(docker: docker) { tcp, udp in
-            forwarder.reconcile(tcp)
-            udpForwarder.reconcile(udp)
-        }
+        let watcher = DockerEventsWatcher(docker: docker, onPorts: portHelper.reconciler(
+            tcp: { forwarder.reconcile($0) },
+            udp: { udpForwarder.reconcile($0) }))
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
             ? ResourceSaver(manager: manager, docker: docker,

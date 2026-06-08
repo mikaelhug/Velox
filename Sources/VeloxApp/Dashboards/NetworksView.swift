@@ -5,33 +5,27 @@ import VeloxCore
 @Observable
 final class NetworksModel {
     let docker: any DockerClientProtocol
-    private(set) var networks: [NetworkSummary] = []
-    private(set) var loadError: String?
+    let store: DockerResourceStore
 
-    init(docker: any DockerClientProtocol) { self.docker = docker }
-
-    func observe() async {
-        await refresh()
-        for await event in docker.events() {
-            if event.type == nil || event.type == "network" || event.type == "container" {
-                await refresh()
-            }
-        }
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+        self.docker = docker; self.store = store
     }
 
-    func refresh() async {
-        do { networks = try await docker.networks(); loadError = nil }
-        catch { loadError = "\(error)" }
-    }
+    // Data is read from the shared store (persistent across pane switches).
+    var networks: [NetworkSummary] { store.networks }
+    var loadError: String? { store.networksError }
+    var hasLoaded: Bool { store.networksLoaded }
+
+    func refresh() async { await store.refreshNetworks() }
 }
 
 struct NetworksView: View {
     let docker: any DockerClientProtocol
     @State private var model: NetworksModel
 
-    init(docker: any DockerClientProtocol) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
         self.docker = docker
-        _model = State(initialValue: NetworksModel(docker: docker))
+        _model = State(initialValue: NetworksModel(docker: docker, store: store))
     }
 
     var body: some View {
@@ -41,7 +35,7 @@ struct NetworksView: View {
             }
         }
         .overlay {
-            if model.networks.isEmpty {
+            if model.hasLoaded && model.networks.isEmpty {
                 ContentUnavailableView("No Networks", systemImage: SidebarItem.networks.systemImage,
                                        description: Text(model.loadError ?? "Docker networks appear here."))
             }
@@ -52,7 +46,6 @@ struct NetworksView: View {
                     .help("Refresh")
             }
         }
-        .task { await model.observe() }
     }
 }
 
@@ -116,7 +109,7 @@ private struct NetworkRow: View {
 #if DEBUG
 struct NetworksView_Previews: PreviewProvider {
     static var previews: some View {
-        NetworksView(docker: MockDockerClient())
+        NetworksView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
             .frame(width: 760, height: 420)
     }
 }

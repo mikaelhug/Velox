@@ -41,15 +41,19 @@ docker export "$cid" -o "$OUT/rootfs.tar"
 
 echo "==> mkfs.erofs (lz4hc) → $OUT/root.img"
 OUT_ABS="$(cd "$OUT" && pwd)"
-docker run --rm -i --platform linux/arm64 -v "$OUT_ABS":/out "${ALPINE_IMAGE}" sh -c '
+# Read the tar from the bind-mounted /out, NOT piped over the container's stdin: a
+# large (>100 MB) `-i` stdin stream silently chokes over the VSOCK docker transport
+# when this build runs on the Velox engine itself — mkfs never runs and root.img is
+# left stale. The tar is already at $OUT (mounted at /out), so read it from there.
+docker run --rm --platform linux/arm64 -v "$OUT_ABS":/out "${ALPINE_IMAGE}" sh -c '
     set -e
     apk add --no-cache erofs-utils >/dev/null 2>&1
     rm -rf /r && mkdir -p /r
-    tar -C /r -xf -
+    tar -C /r -xf /out/rootfs.tar
     rm -f /out/root.img
     # lz4hc: erofs default, fast demand-paged decompress, universally supported.
     mkfs.erofs -zlz4hc -T0 --all-root /out/root.img /r >/dev/null
-' < "$OUT/rootfs.tar"
+'
 rm -f "$OUT/rootfs.tar"
 
 # Sanity: erofs image should be tens of MB, not near-empty.

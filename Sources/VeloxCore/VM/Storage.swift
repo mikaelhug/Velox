@@ -8,10 +8,13 @@ public enum Storage {
     /// disk doesn't grow forever like the classic `Docker.raw`. Falls back to a raw
     /// sparse file if `diskutil`/ASIF is unavailable.
     ///
-    /// If the disk already exists but the user **raised** `diskGiB`, the image is
-    /// **grown** to the new size (never shrunk — that would truncate the guest ext4
-    /// and lose data). The guest (vinit) runs `resize2fs` on boot to expand the
-    /// filesystem into the enlarged disk, so `diskGiB` changes actually take effect.
+    /// If the user **raised** `diskGiB`, the image is **grown** to the new size here;
+    /// the guest (vinit) then `resize2fs`-grows the ext4 into it on boot. The image is
+    /// only ever grown — shrinking the *image* would truncate the guest ext4 and lose
+    /// data. **Lowering** `diskGiB` is honoured by the guest instead: vinit shrinks the
+    /// *filesystem* (offline e2fsck + resize2fs, driven by `velox.disk` on the cmdline)
+    /// so `df` reflects the smaller size, while the sparse ASIF stays at its high-water
+    /// mark — harmless, since it only consumes host space for blocks actually in use.
     public static func ensureDataDisk(at url: URL, sizeGiB: UInt64) throws {
         let fm = FileManager.default
         let bytes = sizeGiB * 1024 * 1024 * 1024

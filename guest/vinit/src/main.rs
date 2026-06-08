@@ -695,6 +695,50 @@ mod dhcp {
 
 // =================== data disk ===================
 
+enum ResizeDir { Grow, Shrink }
+
+/// ext4 `(block_size, block_count)` read straight from the on-disk superblock — used
+/// to decide whether the data fs must grow or shrink to match the configured size.
+fn ext4_geometry(dev: &str) -> Option<(u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(dev).ok()?;
+    f.seek(SeekFrom::Start(1024)).ok()?; // the ext4 superblock starts at byte 1024
+    let mut sb = [0u8; 64];
+    f.read_exact(&mut sb).ok()?;
+    let block_count = u32::from_le_bytes([sb[4], sb[5], sb[6], sb[7]]) as u64;        // s_blocks_count_lo (0x04)
+    let log_block_size = u32::from_le_bytes([sb[24], sb[25], sb[26], sb[27]]) as u64; // s_log_block_size (0x18)
+    if block_count == 0 { return None; }
+    Some((1024u64 << log_block_size, block_count))
+}
+
+/// Byte size of /dev/vdb from sysfs (512-byte sectors) — caps a grow so resize2fs is
+/// never asked for more blocks than the block device actually has.
+fn vdb_byte_size() -> Option<u64> {
+    std::fs::read_to_string("/sys/block/vdb/size")
+        .ok()?.trim().parse::<u64>().ok().map(|sectors| sectors * 512)
+}
+
+/// Whether the data ext4 must grow or shrink to match `velox.disk` (GiB on the kernel
+/// cmdline), and to how many blocks. `None` when it already matches (within one block)
+/// or the target/geometry can't be read. A grow is clamped to the real device size, so
+/// a re-raise after a shrink (device still larger than the old ext4) stops at the
+/// requested size rather than overshooting to the device and oscillating each boot.
+fn planned_resize(dev: &str) -> Option<(ResizeDir, u64)> {
+    let target_gib = cmdline_value("velox.disk").and_then(|v| v.parse::<u64>().ok())?;
+    let (block_size, block_count) = ext4_geometry(dev)?;
+    let current = block_size * block_count;
+    let target = target_gib * 1024 * 1024 * 1024;
+    if target + block_size < current {
+        Some((ResizeDir::Shrink, target / block_size))
+    } else if target > current + block_size {
+        let mut blocks = target / block_size;
+        if let Some(dev_bytes) = vdb_byte_size() { blocks = blocks.min(dev_bytes / block_size); }
+        if blocks > block_count { Some((ResizeDir::Grow, blocks)) } else { None }
+    } else {
+        None
+    }
+}
+
 fn setup_data_disk() {
     let dev = "/dev/vdb";
     if std::path::Path::new(dev).exists() {
@@ -706,6 +750,19 @@ fn setup_data_disk() {
             let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
             match st { Ok(s) if s.success() => {}, other => log!("mkfs.ext4 failed: {other:?}") }
         }
+        // Resize the data fs to the configured size (velox.disk on the cmdline). ext4
+        // can only SHRINK while unmounted (and needs a prior e2fsck), so do a shrink
+        // here, before the mount; a GROW is done online right after it. One-shot —
+        // planned_resize returns None once the fs already matches the target, so a
+        // normal boot pays nothing. resize2fs ships in e2fsprogs-extra; e2fsck is base.
+        let resize = planned_resize(dev);
+        if let Some((ResizeDir::Shrink, blocks)) = resize {
+            log!("data disk: shrinking ext4 → {blocks} blocks (velox.disk)");
+            let _ = Command::new("/sbin/e2fsck").args(["-f", "-y", dev]).status();
+            match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
+                Ok(s) if s.success() => {}, other => log!("resize2fs shrink failed: {other:?}"),
+            }
+        }
         // /var/lib/docker is overlay-snapshot churn central — every `docker run`
         // mounts/unmounts a snapshot. noatime drops read-driven atime writes; lazytime
         // keeps inode mtime/ctime in memory and flushes them lazily (on fsync / sync /
@@ -713,13 +770,11 @@ fn setup_data_disk() {
         // the container hot path, and nothing under here needs atime/precise timestamps.
         do_mount(dev, "/var/lib/docker", "ext4",
                  libc::MS_NOATIME | libc::MS_LAZYTIME, None);
-        // Grow the ext4 to fill the block device in case the host enlarged the data
-        // disk (the user raised `diskGiB`). Online resize — the fs is already mounted —
-        // needs no e2fsck and is a no-op when the fs already spans the whole device, so
-        // it's safe to run every boot. resize2fs ships in e2fsprogs-extra.
-        match Command::new("/usr/sbin/resize2fs").arg(dev).status() {
-            Ok(s) if s.success() => {}
-            other => log!("resize2fs (grow data disk) skipped: {other:?}"),
+        if let Some((ResizeDir::Grow, blocks)) = resize {
+            log!("data disk: growing ext4 → {blocks} blocks (velox.disk)");
+            match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
+                Ok(s) if s.success() => {}, other => log!("resize2fs grow failed: {other:?}"),
+            }
         }
         start_fstrim_timer();
     } else {

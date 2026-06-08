@@ -31,9 +31,11 @@ public enum VMConfiguration {
                 memoryBytes: 4 * 1024 * 1024 * 1024, // 4 GiB (headroom for vfs-on-tmpfs)
                 // The data disk is a sparse ASIF image — it only consumes host space as
                 // the guest writes to it — so a generous default is ~free and avoids
-                // boxing users into an early "no space left on device". Raising this in
-                // config grows an existing disk on next start (Storage.ensureDataDisk +
-                // guest resize2fs); it is never shrunk.
+                // boxing users into an early "no space left on device". Changing this in
+                // config re-sizes the ext4 on next start (via `velox.disk` → vinit's
+                // planned_resize): raising grows it, lowering shrinks it (down to the
+                // used space). The sparse ASIF image only ever grows; a shrink just
+                // trims the filesystem inside it, which costs nothing.
                 diskGiB: 64,
                 swapMiB: 1024
             )
@@ -66,6 +68,12 @@ public enum VMConfiguration {
         var cmdline = image.kernelCommandLine
             + " velox.epoch=\(Int(Date().timeIntervalSince1970))"
             + (resources.swapMiB > 0 ? " velox.swap=\(resources.swapMiB)" : "")
+            // Target data-disk size. vinit resizes the ext4 to match — growing online
+            // after mount, or shrinking offline (e2fsck + resize2fs) before mount, since
+            // ext4 can only be shrunk while unmounted. Lowering diskGiB therefore
+            // actually reduces the filesystem (matching Docker Desktop's behaviour); the
+            // sparse ASIF image stays at its high-water mark, which costs no host space.
+            + " velox.disk=\(resources.diskGiB)"
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
         // Optional host-supplied extra kernel parameters, appended LAST so a
         // duplicated key overrides the defaults (kernel takes the last value).

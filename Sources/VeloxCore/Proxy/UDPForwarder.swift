@@ -31,15 +31,20 @@ public final class UDPForwarder: @unchecked Sendable {
     }
 
     private let manager: VMManager
+    /// Source of loopback sockets for privileged (<1024) UDP ports (nil ⇒ skipped).
+    private let privilegedBinder: PrivilegedPortBinder?
     private let queue = DispatchQueue(label: "dev.velox.udpfwd")
     private var listeners: [UInt16: Listener] = [:]
+    /// Privileged ports already logged as "helper not ready" (warn-once; all on `queue`).
+    private var warnedPrivileged: Set<UInt16> = []
     private let idleSeconds: TimeInterval
     private var reaper: DispatchSourceTimer?
     private let maxPending = 32
 
-    public init(manager: VMManager, idleSeconds: TimeInterval = 60) {
+    public init(manager: VMManager, idleSeconds: TimeInterval = 60, privilegedBinder: PrivilegedPortBinder? = nil) {
         self.manager = manager
         self.idleSeconds = idleSeconds
+        self.privilegedBinder = privilegedBinder
     }
 
     /// Reconcile open UDP listeners against the desired set of published ports.
@@ -62,22 +67,35 @@ public final class UDPForwarder: @unchecked Sendable {
     // MARK: - private (all on `queue` unless noted)
 
     private func open(_ port: UInt16) {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return }
-        var yes: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        let fd: Int32
+        if port < 1024 {
+            // Privileged UDP port: bound by the root helper (loopback, <1024).
+            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp) else {
+                if warnedPrivileged.insert(port).inserted {
+                    Log.warn("udp-forward: 127.0.0.1:\(port)/udp needs the privileged helper — not authorized yet")
+                }
+                return
             }
-        }
-        guard bound == 0 else {
-            Log.warn("udp-forward: could not bind 127.0.0.1:\(port)/udp (errno \(errno))")
-            Darwin.close(fd); return
+            fd = pfd
+        } else {
+            let s = socket(AF_INET, SOCK_DGRAM, 0)
+            guard s >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let bound = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bound == 0 else {
+                Log.warn("udp-forward: could not bind 127.0.0.1:\(port)/udp (errno \(errno))")
+                Darwin.close(s); return
+            }
+            fd = s
         }
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
@@ -86,11 +104,13 @@ public final class UDPForwarder: @unchecked Sendable {
         source.setCancelHandler { Darwin.close(fd) }
         let listener = Listener(fd: fd, source: source)
         listeners[port] = listener
+        warnedPrivileged.remove(port)
         source.resume()
         Log.info("udp-forward: localhost:\(port)/udp → guest:\(port)/udp")
     }
 
     private func closeListener(_ port: UInt16) {
+        warnedPrivileged.remove(port)
         guard let listener = listeners.removeValue(forKey: port) else { return }
         for (_, flow) in listener.flows { teardown(flow) }   // close flows before the udp fd
         listener.source.cancel()

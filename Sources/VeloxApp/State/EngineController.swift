@@ -29,6 +29,11 @@ final class EngineController {
     /// a container starts or the engine stops.
     private(set) var isResourceSaving = false
 
+    /// True when a container published a port below 1024 but the user declined the
+    /// one-time admin prompt to install the privileged port helper, so that port
+    /// isn't forwarded to the Mac. Cleared on each (re)start.
+    private(set) var privilegedPortsNeedAuth = false
+
     /// Persisted user preferences (resources, file shares, etc.). Settings bind
     /// to this; `saveConfig()` writes it back to ~/.velox/config.json.
     var config: VeloxConfig
@@ -49,6 +54,7 @@ final class EngineController {
     private var proxy: DockerSocketProxy?
     private var forwarder: PortForwarder?
     private var udpForwarder: UDPForwarder?
+    private var portHelper: PortHelperManager?
     private var watcher: DockerEventsWatcher?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
@@ -63,6 +69,12 @@ final class EngineController {
     /// The Docker API client, valid only while the engine is running. Dashboards
     /// read this; it rides an in-process VSOCK connection to the guest (Phase 2).
     private(set) var docker: DockerClient?
+
+    /// Persistent, shared store of the dashboard resource lists (containers/images/
+    /// volumes/networks). Owned here, above the navigation, so it survives pane
+    /// switches — dashboards read already-loaded data instead of re-fetching on every
+    /// switch. One events-driven informer feeds all of them (no per-view streams).
+    private(set) var resources: DockerResourceStore?
 
     /// Set true when the engine is running and the `velox` Docker context exists
     /// but isn't the active one — the shell shows a one-time prompt offering to
@@ -184,18 +196,31 @@ final class EngineController {
             self.proxy = proxy
             let docker = DockerClient(manager: manager)
             self.docker = docker
+            // Start the shared resource informer immediately so the dashboards have
+            // data loaded before the user navigates to them (no per-pane re-fetch).
+            let resourceStore = DockerResourceStore(docker: docker)
+            resourceStore.start()
+            self.resources = resourceStore
             appliedSignature = config.bootSignature
             bootedMemoryBytes = resources.memoryBytes
 
             // Reverse-forward published container ports to localhost (watch the
             // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
-            let forwarder = PortForwarder(bridge: bridge)
-            let udpForwarder = UDPForwarder(manager: manager)
-            let watcher = DockerEventsWatcher(docker: docker) { tcp, udp in
-                forwarder.reconcile(tcp)
-                udpForwarder.reconcile(udp)
-            }
+            // Privileged ports (<1024) route through the root helper (installed on
+            // first use), so a reverse proxy published on :80 reaches the Mac.
+            privilegedPortsNeedAuth = false
+            let helper = PortHelperManager()
+            let forwarder = PortForwarder(bridge: bridge, privilegedBinder: helper)
+            let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: helper)
+            let onPorts = helper.reconciler(
+                tcp: { forwarder.reconcile($0) },
+                udp: { udpForwarder.reconcile($0) },
+                onAuthNeeded: { [weak self] in
+                    Task { @MainActor in self?.privilegedPortsNeedAuth = true }
+                })
+            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts)
             watcher.start()
+            self.portHelper = helper
             self.forwarder = forwarder
             self.udpForwarder = udpForwarder
             self.watcher = watcher
@@ -260,9 +285,13 @@ final class EngineController {
         forwarder = nil
         udpForwarder?.stopAll()
         udpForwarder = nil
+        // The installed helper daemon stays resident (it's idle); just drop our handle.
+        portHelper = nil
         proxy?.stop()
         proxy = nil
         bridge = nil
+        resources?.stop()
+        resources = nil
         docker = nil
         clockSync?.stop()
         clockSync = nil

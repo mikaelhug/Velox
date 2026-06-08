@@ -53,13 +53,13 @@ struct RootView: View {
             // Always available — also shows the boot log and why a start failed.
             EngineLogsView(store: engine.engineLog)
         case .overview, .containers, .images, .volumes, .networks:
-            if engine.state.isRunning, let docker = engine.docker {
+            if engine.state.isRunning, let docker = engine.docker, let store = engine.resources {
                 switch item {
-                case .overview:   OverviewView(docker: docker)
-                case .containers: ContainersView(docker: docker)
-                case .images:     ImagesView(docker: docker)
-                case .volumes:    VolumesView(docker: docker)
-                default:          NetworksView(docker: docker)
+                case .overview:   OverviewView(docker: docker, store: store)
+                case .containers: ContainersView(docker: docker, store: store)
+                case .images:     ImagesView(docker: docker, store: store)
+                case .volumes:    VolumesView(docker: docker, store: store)
+                default:          NetworksView(docker: docker, store: store)
                 }
             } else {
                 EngineDownView(item: item)

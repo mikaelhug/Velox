@@ -1,0 +1,84 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Debug velox",
+            "target": "velox",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug velox"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Release velox",
+            "target": "velox",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release velox"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Debug VeloxApp",
+            "target": "VeloxApp",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug VeloxApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Release VeloxApp",
+            "target": "VeloxApp",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release VeloxApp"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Debug velox-selftest",
+            "target": "velox-selftest",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug velox-selftest"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Release velox-selftest",
+            "target": "velox-selftest",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release velox-selftest"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Debug velox-porthelper",
+            "target": "velox-porthelper",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug velox-porthelper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:velox}",
+            "name": "Release velox-porthelper",
+            "target": "velox-porthelper",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release velox-porthelper"
+        }
+    ]
+}

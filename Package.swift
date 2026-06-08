@@ -9,7 +9,8 @@ let package = Package(
     products: [
         .library(name: "VeloxCore", targets: ["VeloxCore"]),
         .executable(name: "velox", targets: ["velox"]),
-        .executable(name: "VeloxApp", targets: ["VeloxApp"])
+        .executable(name: "VeloxApp", targets: ["VeloxApp"]),
+        .executable(name: "velox-porthelper", targets: ["velox-porthelper"])
     ],
     targets: [
         // Shared engine + Docker-API core. Links Virtualization.framework; both
@@ -32,6 +33,13 @@ let package = Package(
             name: "VeloxApp",
             dependencies: ["VeloxCore"],
             path: "Sources/VeloxApp"
+        ),
+        // The only privileged component: a tiny root LaunchDaemon that binds loopback
+        // ports <1024 and passes the listening fd back (CLAUDE.md §2 sanctioned
+        // exception). Pure Darwin — no VeloxCore/Virtualization — to stay minimal.
+        .executableTarget(
+            name: "velox-porthelper",
+            path: "Sources/velox-porthelper"
         ),
         // Dependency-free test runner (the repo targets Command Line Tools, which
         // ships no XCTest). Run with `swift run velox-selftest`.

@@ -40,8 +40,9 @@ FROM ${ALPINE_IMAGE} AS assembly
 # nftables firewall backend (--firewall-backend=nftables), which drives the `nft`
 # binary directly — so we ship only `nftables`, NOT the legacy iptables/ip6tables
 # (iptables-nft) compat shim. Native dockerd capability > extra packages.
-# e2fsprogs-extra is pulled in ONLY for `resize2fs` (vinit grows the ext4 to fill the
-# data disk when the user raises diskGiB); the rest of its tools are trimmed below to
+# e2fsprogs-extra is pulled in ONLY for `resize2fs`: vinit resizes the ext4 to match
+# diskGiB on boot — growing online, or shrinking offline (with a prior `e2fsck`, which
+# is kept from base e2fsprogs below). The rest of e2fsprogs-extra's tools are trimmed to
 # keep the rootfs lean. resize2fs reuses libext2fs/libe2p/libcom_err from base e2fsprogs.
 RUN apk add --no-cache --initdb --root /rootfs \
       --repositories-file /etc/apk/repositories --keys-dir /etc/apk/keys \
