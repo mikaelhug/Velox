@@ -24,6 +24,11 @@ final class EngineController {
     /// the shell should present onboarding instead of arming Start.
     private(set) var needsOnboarding: Bool
 
+    /// True while Resource Saver has reclaimed idle RAM (the memory balloon is
+    /// inflated). Drives the moon badge on the menu-bar icon; cleared the instant
+    /// a container starts or the engine stops.
+    private(set) var isResourceSaving = false
+
     /// Persisted user preferences (resources, file shares, etc.). Settings bind
     /// to this; `saveConfig()` writes it back to ~/.velox/config.json.
     var config: VeloxConfig
@@ -263,6 +268,7 @@ final class EngineController {
         clockSync = nil
         resourceSaver?.stop()
         resourceSaver = nil
+        isResourceSaving = false
         // Stop draining the (now-closing) console pipe; a restart attaches a fresh one.
         // Keep the buffered lines so the user can read why the engine stopped.
         engineLog.detach()
@@ -275,6 +281,7 @@ final class EngineController {
     private func startResourceSaver() {
         resourceSaver?.stop()
         resourceSaver = nil
+        isResourceSaving = false
         guard config.resourceSaverEnabled, bootedMemoryBytes > 0, let docker else { return }
         // Floor at ¼ of the booted RAM, clamped to [512 MiB, 1 GiB], so dockerd
         // stays responsive enough to notice the next container start.
@@ -285,6 +292,11 @@ final class EngineController {
             fullMemoryBytes: bootedMemoryBytes,
             floorBytes: floor,
             idleMinutes: config.resourceSaverMinutes)
+        // Reflect saver mode in the menu-bar icon (moon badge). The callback fires
+        // on the saver's internal queue; hop to the main actor for the @Observable.
+        saver.onStateChange = { [weak self] saving in
+            Task { @MainActor in self?.isResourceSaving = saving }
+        }
         saver.start()
         resourceSaver = saver
     }

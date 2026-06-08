@@ -24,6 +24,14 @@ struct VeloxApp: App {
     }
 
     var body: some Scene {
+        // Read engine state in `body` (not only inside the MenuBarExtra label
+        // closure) so SwiftUI registers these as dependencies of the App and
+        // rebuilds the menu-bar icon when they change. MenuBarExtra does NOT
+        // reliably observe @Observable reads that happen lazily inside its label
+        // closure, so the Resource Saver moon never appeared without this.
+        let menuSymbol = engine.state.menuBarSymbol
+        let saverActive = engine.isResourceSaving && engine.state.isRunning
+
         Window("Velox", id: WindowID.dashboard) {
             RootView()
                 .environment(engine)
@@ -38,9 +46,14 @@ struct VeloxApp: App {
         .windowResizability(.contentMinSize)
         .defaultSize(width: 920, height: 560)
 
-        MenuBarExtra("Velox", systemImage: engine.state.menuBarSymbol) {
+        MenuBarExtra {
             MenuBarContentView()
                 .environment(engine)
+        } label: {
+            // Same `Image(systemName:)` the old `systemImage:` form used (so it sizes
+            // and tints identically to the original menu-bar icon), with a moon badge
+            // knocked in only while Resource Saver is idling the VM.
+            MenuBarLabel(symbol: menuSymbol, saving: saverActive)
         }
 
         Window("Settings", id: WindowID.settings) {
