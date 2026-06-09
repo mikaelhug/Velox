@@ -109,7 +109,10 @@ public enum Updater {
     /// GUI "Update" entry point: check the configured repo and, if a newer release
     /// exists, download + self-replace. Same code path as `velox update --apply`
     /// (CLAUDE.md §3). Blocking — call off the main thread.
-    public static func applyLatestUpdate() {
+    /// `beforeRelaunch` runs after the new build is staged but before the in-place swap + the
+    /// `exit(0)` relaunch — the GUI uses it to gracefully stop the engine (flush the writeback
+    /// data disk + cleanly stop the VM) so the imminent process exit can't tear the filesystem.
+    public static func applyLatestUpdate(beforeRelaunch: (@Sendable () -> Void)? = nil) {
         let repo = Versions.githubRepo
         guard repo.contains("/"),
               let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest"),
@@ -120,13 +123,13 @@ public enum Updater {
         guard compareSemver(latest, Versions.velox) > 0 else {
             print("Velox is up to date (v\(Versions.velox))."); return
         }
-        applyUpdate(release)
+        applyUpdate(release, beforeRelaunch: beforeRelaunch)
     }
 
     /// Download the new release's macOS `.zip`, replace the installed `Velox.app` in
     /// place, and relaunch. Falls back to revealing the download in Finder if the app
     /// can't be replaced automatically (e.g. it lives somewhere read-only).
-    private static func applyUpdate(_ release: Release) {
+    private static func applyUpdate(_ release: Release, beforeRelaunch: (@Sendable () -> Void)? = nil) {
         // The .zip is programmatically unpackable; the .dmg is the human download.
         guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") })
                 ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") }),
@@ -165,6 +168,11 @@ public enum Updater {
                 .first(where: { $0.pathExtension == "app" }) else {
             Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return
         }
+        // The relaunch below ends in exit(0), which destroys this process and with it the running
+        // VM. Flush + cleanly stop the guest FIRST (the GUI passes a hook that does this) so the
+        // writeback data disk is synced and consistent — skipping it tore the ext4 and got it
+        // reformatted on the next boot.
+        beforeRelaunch?()
         do {
             _ = try fm.replaceItemAt(target, withItemAt: newApp)
             try? fm.removeItem(at: staging)

@@ -843,14 +843,28 @@ fn setup_data_disk() -> bool {
         return true; // intentional (dev/test) — not a failure
     }
     if !is_ext4(dev) {
-        log!("formatting {dev} ext4 (first boot)");
-        // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd
-        // runs as root anyway) — reclaim it for image/container storage. Applies to
-        // the first-boot format only; existing disks keep whatever they were made with.
-        let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
-        if !st.as_ref().map(|s| s.success()).unwrap_or(false) {
-            log!("mkfs.ext4 failed: {st:?}");
-            return false;
+        // No valid ext4 primary superblock. Format ONLY a disk we can positively confirm is blank
+        // (a freshly-created image — all zeros). A disk that holds data but whose superblock looks
+        // wrong (e.g. torn by an unclean stop while the disk is in host writeback mode) must NEVER
+        // be reformatted: that turns a recoverable fsck into total data loss. On any doubt we
+        // refuse rather than wipe.
+        if disk_is_blank(dev) {
+            log!("formatting {dev} ext4 (first boot — blank disk)");
+            // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd runs as root
+            // anyway) — reclaim it for image/container storage. First-boot format only.
+            let st = Command::new("/sbin/mkfs.ext4").args(["-F", "-q", "-m", "0", dev]).status();
+            if !st.as_ref().map(|s| s.success()).unwrap_or(false) {
+                log!("mkfs.ext4 failed: {st:?}");
+                return false;
+            }
+        } else {
+            // Has data but no clean ext4 superblock — try to recover (e2fsck will fall back to a
+            // backup superblock), then fall through to the mount attempt. We NEVER mkfs here. If
+            // recovery + mount both fail, the caller refuses to start dockerd (data left intact for
+            // manual recovery) instead of silently wiping it.
+            log!("WARNING: {dev} holds data but has no valid ext4 superblock — running e2fsck \
+                  recovery, NOT reformatting (data preserved)");
+            let _ = Command::new("/sbin/e2fsck").args(["-y", dev]).status();
         }
     }
     // Resize the data fs to the configured size (velox.disk on the cmdline). ext4
@@ -934,6 +948,24 @@ fn is_ext4(dev: &str) -> bool {
     let mut magic = [0u8; 2];
     if f.read_exact(&mut magic).is_err() { return false; }
     magic == [0x53, 0xEF] // EXT4 superblock magic 0xEF53 (LE)
+}
+
+/// True only if the first 1 MiB of `dev` is entirely zero — i.e. a freshly-created, never-written
+/// image. This gates `mkfs`: a positively-blank disk is a legitimate first-boot format, but a disk
+/// with *any* non-zero content holds data we must not destroy (its superblock may merely be torn).
+/// Any read error → false (treat as non-blank: never format on doubt).
+fn disk_is_blank(dev: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(dev) else { return false };
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return false,
+        }
+    }
+    filled > 0 && buf[..filled].iter().all(|&b| b == 0)
 }
 
 /// True if the ext4 data disk was cleanly unmounted — superblock `s_state` has
