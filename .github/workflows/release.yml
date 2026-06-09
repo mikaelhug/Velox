@@ -21,12 +21,6 @@ on:
 permissions:
   contents: write
 
-# Run all JavaScript-based actions (checkout, cache, artifact, gh-release) on Node.js 24.
-# GitHub forces this by default from 2026-06-16 and removes Node 20 on 2026-09-16; opting in
-# now silences the deprecation warning and de-risks the forced switch.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   # ---------------------------------------------------------------------------
   # 1) Guest (custom kernel + erofs rootfs) on a NATIVE arm64 Linux runner —
@@ -36,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04-arm      # GitHub-hosted Linux arm64 (native — no qemu). NB: label is
                                     # `-arm`, not `-arm64`; ubuntu-26.04 has no hosted runner yet.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Verify tag matches VELOX_VERSION
         if: startsWith(github.ref, 'refs/tags/')
@@ -64,7 +58,7 @@ jobs:
 
       - name: Restore cached kernel
         id: kcache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: Assets/velox-vmlinux
           key: ${{ steps.keys.outputs.kernel }}
@@ -74,7 +68,7 @@ jobs:
 
       - name: Restore cached rootfs
         id: rcache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: guest/build/root.img
           key: ${{ steps.keys.outputs.rootfs }}
@@ -83,7 +77,7 @@ jobs:
         run: ./Scripts/make-guest.sh
 
       - name: Upload guest artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guest
           path: |
@@ -105,9 +99,9 @@ jobs:
       HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 }}
       HAS_NOTARY: ${{ secrets.AC_API_KEY_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Fetch guest artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with: { name: guest, path: . }
       - run: swift --version && xcode-select -p && xcrun --sdk macosx --show-sdk-version
 
@@ -149,12 +143,12 @@ jobs:
           done
 
       - name: Upload build artifacts (every run, for inspection)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with: { name: velox-app, path: dist/Velox-*, retention-days: 7 }
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')      # tags publish; manual runs don't
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/Velox-*.zip
           generate_release_notes: true
