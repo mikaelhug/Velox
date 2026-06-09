@@ -1491,7 +1491,7 @@ fn bridge_to_target(fd: RawFd, header: &str) {
 // and wrecks tail latency. Instead a small pool of epoll workers multiplexes many
 // conduit<->container pairs each: non-blocking, with backpressure (a stalled write disables
 // reads on the source) and half-close. Only the conduit datapath uses this; the vsock relays
-// keep bridge(). 64 KiB buffers preserve bulk throughput.
+// keep bridge(). 256 KiB buffers + a per-event drain loop preserve bulk throughput.
 
 const RELAY_WORKERS: usize = 4;
 

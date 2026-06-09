@@ -22,12 +22,13 @@ public final class PublishedEndpoints: @unchecked Sendable {
 
 /// Host end of the VZNAT reverse-dial conduit pool. The guest dials a pool of TCP conduits
 /// to `gatewayIP:ConduitPort.pool` over VZNAT (the fast guest→host direction); we park them
-/// here as a warm pool. When a published-port client connects, we pop a warm conduit, write
-/// the target `"<port>\n"` (byte-identical to the vsock reverse header), and splice the two
-/// with `SocketPump`. The data then rides VZNAT (~95 serving / ~17 ingress) instead of the
-/// ~6 Gbit/s vsock relay, and the conduit's TCP handshake was pre-paid off the hot path —
-/// so per-connection setup never touches the VM serial queue. If the pool is empty the caller
-/// falls back to the vsock reverse relay, so this is strictly a fast path, never required.
+/// here as a warm pool. When a published-port client connects, we pop a warm conduit, write the
+/// target (`<container-ip>:<port>` for direct-dial, else the bare `<port>` → docker-proxy), and
+/// splice the two via the event-loop relay (`EventRelay`). The data then rides VZNAT
+/// (~95 serving / ~17 ingress) instead of the ~6 Gbit/s vsock relay, and the conduit's TCP
+/// handshake was pre-paid off the hot path — so per-connection setup never touches the VM serial
+/// queue. If the pool is empty the caller falls back to the vsock reverse relay, so this is
+/// strictly a fast path, never required.
 public final class ConduitPool: @unchecked Sendable {
     /// A parked, idle conduit plus a read source that prunes it if it dies. The guest never
     /// writes to a conduit before the host assigns it, so *any* readable event on a parked
