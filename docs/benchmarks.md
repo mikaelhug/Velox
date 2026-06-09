@@ -13,13 +13,14 @@ results.
 
 | | Velox | Docker Desktop |
 | --- | --- | --- |
-| 🟢 **Wins** | install 10× smaller, idle RAM 2.6× less, startup 1.5× faster, **container launch 1.8×**, container→host net 3.6×, VirtioFS write 2.9× / small-files 10×, **in-VM commit 2.3× / pgbench 1.15×** | |
-| ⚪ **Par** | cold pull, bulk DB load (`pgbench` init) | |
+| 🟢 **Wins** | install 10× smaller, idle RAM 2.6× less, startup 1.5× faster, **container launch 1.8×**, container→host net 3.6×, VirtioFS write 2.9× / small-files 10×, **durable commit 1.5× (0.31 ms vs 0.47 ms)** | |
+| ⚪ **Par** | cold pull, bulk DB load (`pgbench` init), **pgbench TPS (0.98×)** | |
 | 🔴 **Trails** | inbound published-port throughput (~8–17×) | |
 
-Full numbers in [Results](#results). The original `.fsync`/barrier baseline below is the
-**pre-tuning** measurement; see [Disk & launch tuning](#disk--launch-tuning-2026-06-09) for
-the changes that flipped launch and the disk/pgbench rows to wins.
+Full numbers in [Results](#results). The scorecard's disk/pgbench rows are the **old ASIF
+`.fsync`** baseline; see [Disk: raw image + durable `.fsync`](#disk-raw-image--durable-fsync-2026-06-09)
+for the raw-disk re-measurement (durable commits now beat DD with full durability intact) and
+[Launch: expedited RCU](#launch-expedited-rcu-2026-06-09) for the launch wins.
 
 ## Test environment (recorded run)
 
@@ -118,38 +119,45 @@ this is the inbound VSOCK relay, not the datapath. Apple caps the VSOCK credit w
 host-side (untunable from macOS), so the in-scope fix is to carry published-port *data* over
 the fast VZNAT path with *control* over VSOCK (VZNAT-reverse-dial) — designed, not yet built.
 
-## Disk & launch tuning (2026-06-09)
+## Disk: raw image + durable `.fsync` (2026-06-09)
 
-Two low-risk changes turned the disk/pgbench trail and the container-launch par into wins —
-appropriate for a *development* engine (recreatable container state, speed over per-commit
-crash durability):
+The data disk is a **raw** sparse image attached `synchronizationMode: .fsync`, with `vinit`
+mounting `/var/lib/docker` with barriers **on**. This is both fully durable — it survives a
+clean stop, a guest crash, *and* a host crash (ext4 journal recovery) — **and faster than
+Docker Desktop on durable commits.**
 
-**1. Writeback data disk.** `VMConfiguration` attaches `data.img` `synchronizationMode:
-.none` (was `.fsync`) and `vinit` mounts `/var/lib/docker` `barrier=0` (was on), with a boot
-`e2fsck -p` if the disk wasn't cleanly unmounted. A native macOS `fsync` costs ~3.9 ms on
-this volume, so a durable-per-commit disk caps at a few hundred commits/s; the writeback
-profile (what Docker Desktop also runs) removes the per-commit host sync, and `nobarrier`
-drops the now-pointless guest FLUSH round-trips DD still pays.
+The earlier sparse **ASIF** disk was the problem, on two counts:
 
-**2. Expedited RCU.** Kernel cmdline `rcupdate.rcu_expedited=1`. Every `docker run --rm`
-tears down a veth pair + netns, each otherwise blocking on a normal multi-ms RCU grace
-period; expedited forces them via IPIs in ~µs (~23% of launch on its own).
+- **Slow.** ASIF is copy-on-write, so every durable `fsync` also had to commit its
+  allocation-map metadata — ~15× the cost (4.6 ms vs 0.31 ms on raw).
+- **Data loss.** A brief `synchronizationMode: .none` "writeback" experiment (chasing the
+  pgbench number) was catastrophic on ASIF: the allocation map was never committed, so the
+  guest read zeros on the next boot, saw ext4 "bad magic", and **reformatted — wiping every
+  container/image/volume on *every* restart, graceful or not.** `.none` was reverted. Raw
+  makes `.fsync` cheap enough that there is no reason to trade away durability.
 
-| Metric | before | after | Docker Desktop |
+Measured (4k random write, fsync each; pgbench scale 50, 8 clients, 30 s; Velox and DD both on
+Apple Virtualization.framework, one engine at a time):
+
+| Metric | ASIF + `.fsync` (was) | **raw + `.fsync` (now)** | Docker Desktop |
 | --- | --: | --: | --: |
-| `fdatasync` commit latency | 2,329 µs | **58 µs** | 131 µs |
-| durable commits/s | 427 | **16,238** | 7,420 |
-| pgbench TPS | 5,698 | **14,903** | 12,904 |
-| named-volume write | 1,556 MB/s | **2,393 MB/s** | 1,670 MB/s |
-| container-overlay write | 1,732 MB/s | **2,537 MB/s** | 1,590 MB/s |
-| container launch (`run --rm true`) | 175 ms | **89 ms** | 158 ms |
-| parallel launch ×20 | 1.27 s | **0.82 s** | 1.19 s |
+| fsync latency | 4.65 ms | **0.31 ms** | 0.47 ms |
+| durable commits/s | 215 | **3,216** | 2,086 |
+| pgbench TPS | 5,524 | **10,948** | 11,184 |
+| named-volume bulk write | — | **1,012 MB/s** | 655 MB/s |
 
-**Durability ladder:** DD `.none` (guest-crash-safe only) ≈ Velox now < Velox old `.fsync`
-(host-crash-safe) < `.full` / `F_FULLFSYNC` (power-loss-safe). The risk window is an unclean
-*host* shutdown losing the last unflushed writes; a guest crash or a clean quit is safe.
-**To revert to the durable disk**, set `synchronizationMode: .fsync` and drop `barrier=0`;
-to disable expedited RCU, boot with `VELOX_KCMDLINE_EXTRA="rcupdate.rcu_expedited=0"`.
+Raw still reclaims host space: `vinit`'s periodic `FITRIM` hole-punches the raw backing file
+(verified — a deleted 4 GiB file is reclaimed after a trim pass), so the image doesn't grow
+forever like DD's `Docker.raw`. So raw beats ASIF on every axis that mattered (commit latency,
+durability, *and* reclaim), which is why ASIF was dropped entirely.
+
+## Launch: expedited RCU (2026-06-09)
+
+Kernel cmdline `rcupdate.rcu_expedited=1`. Every `docker run --rm` tears down a veth pair +
+netns, each otherwise blocking on a normal multi-ms RCU grace period; expedited forces them via
+IPIs in ~µs (~23% of launch on its own): container launch (`run --rm true`) 175 ms → **89 ms**
+(DD 158 ms); parallel launch ×20 1.27 s → **0.82 s** (DD 1.19 s). Disable with
+`VELOX_KCMDLINE_EXTRA="rcupdate.rcu_expedited=0"`.
 
 ## Caveats
 

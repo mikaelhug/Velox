@@ -843,11 +843,12 @@ fn setup_data_disk() -> bool {
         return true; // intentional (dev/test) — not a failure
     }
     if !is_ext4(dev) {
-        // No valid ext4 primary superblock. Format ONLY a disk we can positively confirm is blank
-        // (a freshly-created image — all zeros). A disk that holds data but whose superblock looks
-        // wrong (e.g. torn by an unclean stop while the disk is in host writeback mode) must NEVER
-        // be reformatted: that turns a recoverable fsck into total data loss. On any doubt we
-        // refuse rather than wipe.
+        // No valid ext4 superblock: either a genuinely blank first-boot disk (format it), or a disk
+        // that holds data we don't recognise (NEVER reformat — let the mount below fail so the
+        // caller refuses dockerd, leaving the data intact, rather than wiping a disk we don't
+        // understand). The raw + `.fsync` data disk commits the superblock durably, so a non-blank
+        // disk reaching here is real content, not a torn primary: an unclean stop leaves the
+        // superblock valid and only the journal to replay (handled by the preen-fsck below).
         if disk_is_blank(dev) {
             log!("formatting {dev} ext4 (first boot — blank disk)");
             // -m 0: a dedicated data disk needs no 5%-reserved root headroom (dockerd runs as root
@@ -858,13 +859,7 @@ fn setup_data_disk() -> bool {
                 return false;
             }
         } else {
-            // Has data but no clean ext4 superblock — try to recover (e2fsck will fall back to a
-            // backup superblock), then fall through to the mount attempt. We NEVER mkfs here. If
-            // recovery + mount both fail, the caller refuses to start dockerd (data left intact for
-            // manual recovery) instead of silently wiping it.
-            log!("WARNING: {dev} holds data but has no valid ext4 superblock — running e2fsck \
-                  recovery, NOT reformatting (data preserved)");
-            let _ = Command::new("/sbin/e2fsck").args(["-y", dev]).status();
+            log!("WARNING: {dev} holds data but no valid ext4 superblock — NOT reformatting; attempting mount (dockerd refused if it fails)");
         }
     }
     // Resize the data fs to the configured size (velox.disk on the cmdline). ext4
@@ -886,21 +881,20 @@ fn setup_data_disk() -> bool {
     // 24h) instead of journalling every metadata touch — less write amplification on
     // the container hot path, and nothing under here needs atime/precise timestamps.
     //
-    // barrier=0: the host attaches this disk in writeback (VMConfiguration uses
-    // `synchronizationMode: .none`), so the guest's per-commit FLUSH barrier is dead
-    // weight — the host just no-ops it. Dropping it removes a virtio FLUSH round-trip
-    // per fsync; measured ~3x the durable commits/s of Docker Desktop (which keeps
-    // barriers on). Velox is a development engine — image/volume state is recreatable —
-    // so this speed-over-crash-ordering trade is the right default. Its one cost is
-    // crash *ordering*: after an unclean shutdown the journal/metadata can be torn, so
-    // preen-fsck first. A clean boot (the norm — graceful stop unmounts cleanly) reads
-    // a clean superblock and pays nothing.
+    // Barriers stay ON (no barrier=0). The data disk is a raw image attached
+    // `synchronizationMode: .fsync` (VMConfiguration), so each ext4 journal-commit FLUSH
+    // becomes a durable host fsync — that's what keeps the filesystem consistent across a
+    // crash. Drop the FLUSH (barrier=0) and the host never durably commits, so an unclean
+    // stop can leave a torn journal. The FLUSH round-trip per fsync is the price of
+    // persistence — and cheap on a raw image (an fdatasync of the dirty page, ~0.3 ms).
+    // After an unclean stop the journal may need replay, so preen-fsck first; a clean boot
+    // reads a clean superblock and pays nothing.
     if !data_disk_clean(dev) {
         log!("data disk: not cleanly unmounted — running e2fsck -p before mount");
         let _ = Command::new("/sbin/e2fsck").args(["-p", dev]).status();
     }
     if !do_mount(dev, "/var/lib/docker", "ext4",
-                 libc::MS_NOATIME | libc::MS_LAZYTIME, Some("barrier=0")) {
+                 libc::MS_NOATIME | libc::MS_LAZYTIME, None) {
         return false; // mount failed — caller refuses dockerd (don't run on tmpfs)
     }
     if let Some((ResizeDir::Grow, blocks)) = resize {
@@ -914,10 +908,10 @@ fn setup_data_disk() -> bool {
 }
 
 /// Periodically TRIM the data disk so blocks freed by deleted image layers /
-/// containers are released back to the host. Paired with the host's ASIF data disk,
-/// the discard hole-punches the backing file — so the disk shrinks instead of
-/// growing forever like Docker Desktop's `Docker.raw`. Periodic (not `-o discard`)
-/// to keep delete latency off the hot path, exactly like OrbStack/Docker Desktop.
+/// containers are released back to the host. VZ honours the discard by hole-punching
+/// the raw backing file (verified: a deleted 4 GiB file reclaims after a trim pass) —
+/// so the disk shrinks instead of growing forever like Docker Desktop's `Docker.raw`.
+/// Periodic (not `-o discard`) to keep delete latency off the hot path, like OrbStack/DD.
 fn start_fstrim_timer() {
     // FITRIM: _IOWR('X', 121, struct fstrim_range) — trims the whole filesystem.
     const FITRIM: libc::c_ulong = 0xC018_5879;
@@ -969,8 +963,8 @@ fn disk_is_blank(dev: &str) -> bool {
 }
 
 /// True if the ext4 data disk was cleanly unmounted — superblock `s_state` has
-/// VALID_FS set and ERROR_FS clear. Read before the `barrier=0` mount to decide
-/// whether a preen-fsck is needed first. The kernel clears VALID_FS while the fs is
+/// VALID_FS set and ERROR_FS clear. Read before the mount to decide whether a
+/// preen-fsck is needed first. The kernel clears VALID_FS while the fs is
 /// mounted rw and re-sets it on a clean unmount, so a clear bit here means last
 /// session crashed. Unreadable → assume clean (never stall boot on a probe).
 fn data_disk_clean(dev: &str) -> bool {

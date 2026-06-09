@@ -225,7 +225,7 @@ private struct ResourcesPane: View {
     }
 }
 
-/// Shows the data disk's **actual** on-disk footprint (the ASIF image is sparse, so
+/// Shows the data disk's **actual** on-disk footprint (the raw image is sparse, so
 /// this is far below the allocated maximum) against the allocated size — the
 /// equivalent of Docker Desktop's disk-usage readout. Read host-side in pure Swift
 /// via the file's allocated-size resource value; refreshed on appear and on demand.

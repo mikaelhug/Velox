@@ -27,13 +27,13 @@ public enum VMConfiguration {
             Resources(
                 cpuCount: max(1, min(4, ProcessInfo.processInfo.activeProcessorCount)),
                 memoryBytes: 4 * 1024 * 1024 * 1024, // 4 GiB (headroom for vfs-on-tmpfs)
-                // The data disk is a sparse ASIF image — it only consumes host space as
+                // The data disk is a sparse raw image — it only consumes host space as
                 // the guest writes to it — so a generous default is ~free and avoids
                 // boxing users into an early "no space left on device". Changing this in
                 // config re-sizes the ext4 on next start (via `velox.disk` → vinit's
                 // planned_resize): raising grows it, lowering shrinks it (down to the
-                // used space). The sparse ASIF image only ever grows; a shrink just
-                // trims the filesystem inside it, which costs nothing.
+                // used space). The sparse image only ever grows; a shrink just trims the
+                // filesystem inside it, which costs nothing.
                 diskGiB: 64,
                 swapMiB: 1024
             )
@@ -70,7 +70,7 @@ public enum VMConfiguration {
             // after mount, or shrinking offline (e2fsck + resize2fs) before mount, since
             // ext4 can only be shrunk while unmounted. Lowering diskGiB therefore
             // actually reduces the filesystem (matching Docker Desktop's behaviour); the
-            // sparse ASIF image stays at its high-water mark, which costs no host space.
+            // sparse raw image stays at its high-water mark, which costs no host space.
             + " velox.disk=\(resources.diskGiB)"
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
             // Expedited RCU grace periods. Every `docker run --rm` tears down a veth pair
@@ -123,27 +123,21 @@ public enum VMConfiguration {
             cachingMode: .cached, synchronizationMode: .none)
         storage.append(VZVirtioBlockDeviceConfiguration(attachment: rootAttachment))
         if let dataDisk, FileManager.default.fileExists(atPath: dataDisk.path) {
-            // /var/lib/docker is the hot path for `docker run` and for any IO/DB
-            // workload in a container: each guest fsync → ext4 barrier → virtio FLUSH.
-            // `.cached` keeps the disk in the host page cache; `synchronizationMode`
-            // decides what a guest flush costs:
-            //   .fsync → a real host fsync() per flush — durable across a host crash, but
-            //            on macOS APFS that's ~2–4 ms each, so durable commits cap at a
-            //            few hundred/s (Postgres pgbench, image unpacks, etc. crawl).
-            //   .none  → acknowledge the flush from the host page cache, no per-flush host
-            //            sync (a writeback cache). ~18× faster commits. This is exactly
-            //            what Docker Desktop does — measured on this Mac: DD 131 µs/commit
-            //            vs a real native macOS fsync at 3.9 ms (i.e. DD is *not* durably
-            //            syncing). Velox `.fsync` was 2.3 ms.
-            // Velox is a *development* engine (containers/images/volumes are recreatable
-            // dev state, not a system of record), so we match DD and take `.none`: speed
-            // over per-commit durability. Risk window = an unclean *host* shutdown (power
-            // loss / host kernel panic) loses the last unflushed writes; a guest crash or
-            // a clean Velox quit is safe — graceful stop sync's the guest, and the host
-            // page cache survives the VM teardown for macOS to flush.
+            // /var/lib/docker is the hot path for `docker run` and any container I/O. The
+            // data disk is a **raw** image (Storage.swift) attached `.cached` + `.fsync`:
+            // each guest journal-commit FLUSH becomes a host fsync, so the ext4 is durable
+            // across a clean stop AND a crash (journal recovery) — never lost. On a raw
+            // image that fsync is just an fdatasync of the dirty data page (~0.3 ms), so
+            // this is both fully durable and FASTER than Docker Desktop's durable commit
+            // (measured: 0.31 ms vs DD 0.47 ms; 3,216 vs 2,086 durable IOPS; pgbench TPS
+            // on par). The earlier sparse ASIF disk made the same fsync ~15× slower
+            // (4.6 ms) by also committing its copy-on-write allocation map on every
+            // commit — and `.none` on ASIF lost the whole disk on every restart. Switching
+            // to raw removed both problems. The guest mounts WITH barriers (main.rs) so
+            // journal commits emit the FLUSHes this mode makes durable.
             let attachment = try VZDiskImageStorageDeviceAttachment(
                 url: dataDisk, readOnly: false,
-                cachingMode: .cached, synchronizationMode: .none)
+                cachingMode: .cached, synchronizationMode: .fsync)
             storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
         }
         config.storageDevices = storage

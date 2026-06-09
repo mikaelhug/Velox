@@ -166,6 +166,17 @@ The binding architecture:
   directly (`root=/dev/vda rootfstype=erofs ro init=/sbin/vinit`, **no initramfs**);
   the data disk is `/dev/vdb` (ext4, `/var/lib/docker`). Because the root is
   demand-paged from disk, the big Docker binaries are NOT all held in RAM.
+- **Data disk = a RAW image + `.fsync`, guest barriers ON — NEVER `.none`, ASIF, or
+  `barrier=0`.** `Storage.swift` creates `data.img` as a *raw* sparse file (pure-Swift
+  `truncate`, no `diskutil`); `VMConfiguration` attaches it `cachingMode: .cached` +
+  `synchronizationMode: .fsync`; `vinit` mounts `/var/lib/docker` ext4 with barriers on.
+  This is non-negotiable. A sparse **ASIF** image attached `.none` (a past benchmark
+  "writeback optimization") never durably commits its allocation map, so the guest reads
+  zeros and **reformats on every restart — wiping all containers/images/volumes** (measured
+  and reproduced). raw + `.fsync` is fully crash-durable (ext4 journal recovery) *and* beats
+  Docker Desktop's durable commit (0.31 ms vs 0.47 ms); periodic `fstrim` hole-punches the
+  raw file to reclaim host space. Do **not** trade this back to `.none`/ASIF/`barrier=0` for
+  a TPS number — it loses data. (`isLegacyASIF` migrates any old ASIF `data.img` to raw.)
 - **`vinit` (`guest/vinit/`, Rust → static musl) IS PID 1**: it does every boot step
   via direct syscalls (`libc`) — mounts, cgroup2, clock from `velox.epoch`, **native
   DHCP via ioctl** (no udhcpc/dhcpcd), data-disk format/mount + swap, VirtioFS,
