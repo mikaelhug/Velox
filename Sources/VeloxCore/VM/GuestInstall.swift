@@ -39,6 +39,16 @@ public enum GuestInstall {
         }
     }
 
+    /// True when a guest image is available to boot — already installed under `~/.velox`, or
+    /// bundled in the app (it's installed from the bundle by `refreshFromBundleIfNeeded()`). For a
+    /// shipped `.app` this is always true; only a source build with neither returns false. Used by
+    /// onboarding so a packaged app never tells the user to build the guest themselves.
+    public static var guestAvailable: Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: Paths.kernel.path) && fm.fileExists(atPath: Paths.rootDisk.path) { return true }
+        return bundled("kernel") != nil && bundled("root.img") != nil
+    }
+
     /// Copy `src` over `dst` via a temp file + rename, so a crash mid-copy never leaves a
     /// truncated kernel/rootfs in place (the rename is atomic on the same filesystem).
     private static func replace(_ src: URL, into dst: URL) throws {

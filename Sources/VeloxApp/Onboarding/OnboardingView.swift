@@ -30,7 +30,7 @@ struct OnboardingView: View {
         case .welcome:
             stepBody(icon: "shippingbox.fill", title: "Welcome to Velox",
                      subtitle: "A lightweight, native Docker engine for macOS.") {
-                Text("Velox runs a minimal Linux VM with Docker inside it, and talks to it directly — no Docker Desktop required. Let's make sure your Mac is ready.")
+                Text("Velox runs a minimal Linux VM with Docker inside it, and talks to it directly. Let's make sure your Mac is ready.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
             }
@@ -41,7 +41,7 @@ struct OnboardingView: View {
                     checkRow("Virtualization supported", ok: VZVirtualMachine.isSupported,
                              hint: "Requires Apple Silicon and macOS 15+.")
                     checkRow("Guest image installed", ok: guestInstalled,
-                             hint: "Build it once with ./Scripts/make-guest.sh")
+                             hint: "The guest image ships with Velox and installs on first launch.")
                     Button("Re-check") { engine.refreshReadiness() }
                         .padding(.top, 4)
                 }
@@ -87,10 +87,9 @@ struct OnboardingView: View {
         }
     }
 
-    private var guestInstalled: Bool {
-        FileManager.default.fileExists(atPath: Paths.kernel.path)
-            && FileManager.default.fileExists(atPath: Paths.rootDisk.path)
-    }
+    /// The guest is "installed" for onboarding purposes if it's on disk OR bundled in the app
+    /// (it's installed from the bundle on launch), so a packaged build is always satisfied.
+    private var guestInstalled: Bool { GuestInstall.guestAvailable }
 
     @ViewBuilder
     private func stepBody(icon: String, title: String, subtitle: String,
