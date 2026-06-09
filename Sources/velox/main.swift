@@ -98,9 +98,11 @@ func runStart(bind: BindMode) -> Never {
         let forwarder = PortForwarder(bridge: bridge, privilegedBinder: portHelper)
         let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: portHelper)
         let docker = DockerClient(manager: manager)
+        // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
+        let endpoints = PublishedEndpoints()
         let watcher = DockerEventsWatcher(docker: docker, onPorts: portHelper.reconciler(
             tcp: { forwarder.reconcile($0) },
-            udp: { udpForwarder.reconcile($0) }))
+            udp: { udpForwarder.reconcile($0) }), endpoints: endpoints)
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
             ? ResourceSaver(manager: manager, docker: docker,
@@ -150,6 +152,15 @@ func runStart(bind: BindMode) -> Never {
                     watcher.start() // dynamic -p port forwarding
                     clockSync.start() // keep guest clock aligned across host sleep
                     resourceSaver?.start() // reclaim RAM while idle
+                    // Fast published-port datapath: learn the VZNAT gateway from the guest,
+                    // then bind a warm conduit pool so published ports ride VZNAT (~95/~17)
+                    // instead of the vsock relay. Best-effort; falls back to vsock on failure.
+                    Task {
+                        guard let info = await GatewayProbe.probe(manager: manager) else { return }
+                        let pool = ConduitPool(gateway: info, endpoints: endpoints)
+                        do { try pool.start(); forwarder.attachConduitPool(pool) }
+                        catch { Log.warn("conduit pool failed to start: \(error); using vsock fallback") }
+                    }
                 } catch {
                     Log.error("docker socket proxy failed to start: \(error)")
                 }

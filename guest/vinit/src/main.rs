@@ -27,6 +27,10 @@ const DOCKER_PORT: u32 = 2375;
 const CONTROL_PORT: u32 = 2374;
 const REVERSE_PORT: u32 = 2376;
 const CLOCK_PORT: u32 = 2377;
+const GW_PORT: u32 = 2378; // host probes this once at boot; we reply "<gw> <ip> <mask>\n"
+// TCP port (on the vmnet bridge, NOT a vsock port) the guest dials back to the host for the
+// VZNAT reverse-dial conduit pool. Matches the host's `ConduitPort.pool` (Paths.swift).
+const POOL_PORT: u16 = 2379;
 const DOCKER_SOCK: &str = "/run/docker.sock";
 /// PID of the currently-supervised dockerd. The reaper compares each reaped child
 /// against this (atomic) value and signals the supervisor thread to respawn when it
@@ -80,6 +84,7 @@ fn main() {
               non-persistent tmpfs and lose all images/volumes). Fix /dev/vdb and restart.");
     }
     start_vsock_agent();
+    start_conduit_pool();
     log!("init complete — supervising");
     reap_forever(deaths_tx);
 }
@@ -173,8 +178,14 @@ const SIOCGIFHWADDR: libc::c_ulong = 0x8927;
 const SIOCADDRT: libc::c_ulong = 0x890B;
 const IFNAME: &str = "eth0";
 /// The VZNAT gateway (the Mac on the vmnet bridge), learned from DHCP and read by
-/// spawn_dockerd to wire `host.docker.internal` → the host.
+/// spawn_dockerd to wire `host.docker.internal` → the host. Also dialed by the conduit
+/// pool (the reverse-dial datapath). All three are network-byte-order u32 (same as the
+/// DHCP lease fields); 0 means "not learned yet".
 static GATEWAY_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The guest's own VZNAT IP and netmask, reported to the host (`handle_gateway`) so it can
+/// find the vmnet bridge interface to bind the conduit pool on and validate conduit peers.
+static GUEST_IP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static GUEST_MASK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[repr(C)]
 struct IfReqAddr { name: [u8; 16], addr: libc::sockaddr_in }
@@ -245,8 +256,11 @@ fn setup_network() -> std::io::Result<()> {
     if lease.router != 0 {
         add_default_route(s, lease.router);
     }
-    // Remember the gateway (the Mac on the vmnet bridge) for host.docker.internal.
+    // Remember the gateway (the Mac on the vmnet bridge) for host.docker.internal, plus our
+    // own IP/mask so the host can locate the bridge interface for the conduit pool.
     GATEWAY_IP.store(lease.router, std::sync::atomic::Ordering::Relaxed);
+    GUEST_IP.store(lease.ip, std::sync::atomic::Ordering::Relaxed);
+    GUEST_MASK.store(lease.mask, std::sync::atomic::Ordering::Relaxed);
     unsafe { libc::close(s); }
 
     // DNS: run an in-guest responder so every container gets `host.docker.internal`
@@ -1112,6 +1126,7 @@ fn start_vsock_agent() {
     spawn_listener(REVERSE_PORT, handle_reverse);
     spawn_listener(CLOCK_PORT, handle_clock);
     spawn_listener(DOCKER_PORT, handle_data);
+    spawn_listener(GW_PORT, handle_gateway);
 }
 
 fn vsock_listen(port: u32) -> std::io::Result<RawFd> {
@@ -1214,6 +1229,140 @@ fn handle_data(fd: RawFd) {
     match UnixStream::connect(DOCKER_SOCK) {
         Ok(up) => bridge(fd, up.into_raw_fd()),
         Err(e) => { log!("dial docker.sock: {e}"); unsafe { libc::close(fd); } }
+    }
+}
+
+/// Gateway probe. The host's `GatewayProbe` connects once at boot; reply with the vmnet
+/// gateway, our own IP, and our mask (`"<gw> <ip> <mask>\n"`) so the host can locate the
+/// bridge interface to bind the conduit pool on and validate conduit peers. Block briefly
+/// until DHCP has populated these (normally sub-second; cap ~10s so we never wedge a probe).
+fn handle_gateway(fd: RawFd) {
+    let mut tries = 0;
+    let gw = loop {
+        let gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
+        if gw != 0 || tries >= 200 { break gw; }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let ip = GUEST_IP.load(std::sync::atomic::Ordering::Relaxed);
+    let mask = GUEST_MASK.load(std::sync::atomic::Ordering::Relaxed);
+    let line = format!("{} {} {}\n", ipstr(gw), ipstr(ip), ipstr(mask));
+    let _ = nix_write(fd, line.as_bytes());
+    unsafe { libc::close(fd); }
+}
+
+// =================== VZNAT reverse-dial conduit pool ===================
+//
+// Published-port data normally relays over vsock (host→guest 2376), which Apple caps at
+// ~6 Gbit/s. Instead we keep a pool of TCP conduits dialed guest→host over VZNAT (the fast
+// direction, ~95 up / ~17 down), each parked waiting for the host to assign it a published
+// port. The host pops a warm conduit, writes "<port>\n", and splices the client to it — so
+// the data rides VZNAT and the connection handshake is pre-paid off the hot path.
+//
+// We keep ~CONDUIT_IDLE_TARGET conduits *idle and parked* at all times. The instant one is
+// assigned, its slot hands the data bridge to a detached thread and immediately redials a
+// replacement — so the idle pool stays full and concurrent connections all take the fast
+// path (active bridges scale up to CONDUIT_MAX_ACTIVE) instead of capping at a fixed count.
+const CONDUIT_IDLE_TARGET: usize = 16;
+const CONDUIT_MAX_ACTIVE: usize = 256;
+static CONDUIT_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn start_conduit_pool() {
+    for _ in 0..CONDUIT_IDLE_TARGET {
+        std::thread::spawn(conduit_slot);
+    }
+}
+
+/// One idle-conduit slot: dial, park waiting for an assignment, and the moment the host
+/// assigns a port, run the data bridge on a detached thread and loop to redial — so this slot
+/// is only ever briefly non-idle and ~CONDUIT_IDLE_TARGET conduits stay warm.
+fn conduit_slot() {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let fd = match dial_conduit() {
+            Some(fd) => fd,
+            None => { std::thread::sleep(std::time::Duration::from_millis(250)); continue; }
+        };
+        match read_assignment(fd) {
+            Some(target) => {
+                if CONDUIT_ACTIVE.fetch_add(1, Relaxed) < CONDUIT_MAX_ACTIVE {
+                    std::thread::spawn(move || {
+                        bridge_to_target(fd, &target);
+                        CONDUIT_ACTIVE.fetch_sub(1, Relaxed);
+                    });
+                } else {
+                    // At the active cap — handle inline (this slot drops out of idle until done).
+                    CONDUIT_ACTIVE.fetch_sub(1, Relaxed);
+                    bridge_to_target(fd, &target);
+                }
+            }
+            None => {} // conduit died/closed before assignment — loop to redial a fresh one
+        }
+    }
+}
+
+/// Dial one conduit to the host's pool listener over VZNAT, with keepalive so a silently
+/// evicted idle conduit is detected + redialled within ~40s. None on failure (caller backs off).
+fn dial_conduit() -> Option<RawFd> {
+    let gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
+    if gw == 0 { return None; }
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::from(gw), POOL_PORT));
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
+        Ok(stream) => {
+            let _ = stream.set_nodelay(true); // assignment + data flow without Nagle delay
+            let fd = stream.into_raw_fd();
+            set_conduit_keepalive(fd);
+            Some(fd)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Short TCP keepalive on a parked conduit: if VZNAT's conntrack silently evicts an idle
+/// conduit, the probes fail and `read()` in `handle_conduit` errors, so the slot redials a
+/// fresh one (~25s idle + 3×5s probes ≈ 40s) instead of parking a dead connection forever.
+fn set_conduit_keepalive(fd: RawFd) {
+    let on: libc::c_int = 1;
+    let idle: libc::c_int = 25;
+    let intvl: libc::c_int = 5;
+    let cnt: libc::c_int = 3;
+    let sz = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, &on as *const _ as *const _, sz);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, &idle as *const _ as *const _, sz);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, &intvl as *const _ as *const _, sz);
+        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, &cnt as *const _ as *const _, sz);
+    }
+}
+
+/// Block reading the host's "<port>\n" assignment on a parked conduit. `Some(target)` once
+/// assigned; `None` (and the fd is closed) if the conduit dies/closes first. Same framing as
+/// `handle_reverse`.
+fn read_assignment(fd: RawFd) -> Option<String> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut _, 1) };
+        if n <= 0 { unsafe { libc::close(fd); } return None; }
+        if b[0] == b'\n' { break; }
+        line.push(b[0]);
+        if line.len() > 64 { break; }
+    }
+    let header = String::from_utf8_lossy(&line).trim().to_string();
+    if header.is_empty() { unsafe { libc::close(fd); } return None; }
+    Some(header)
+}
+
+/// Dial the assigned target inside the guest and bridge it to the conduit. The host sends
+/// either `<container-ip>:<port>` (direct-dial — the guest reaches the container over docker0
+/// in its root netns, skipping docker-proxy's userspace copy) or a bare `<port>` (→
+/// 127.0.0.1:<port>, i.e. docker-proxy) when it couldn't resolve an unambiguous endpoint.
+fn bridge_to_target(fd: RawFd, header: &str) {
+    let mut target = header.to_string();
+    if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
+    match std::net::TcpStream::connect(&target) {
+        Ok(up) => bridge(fd, up.into_raw_fd()),
+        Err(e) => { log!("conduit dial {target}: {e}"); unsafe { libc::close(fd); } }
     }
 }
 

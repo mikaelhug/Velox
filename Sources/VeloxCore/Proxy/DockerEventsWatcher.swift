@@ -15,6 +15,9 @@ import Foundation
 public final class DockerEventsWatcher: @unchecked Sendable {
     private let docker: any DockerClientProtocol
     private let onPorts: @Sendable (Set<UInt16>, Set<UInt16>) -> Void
+    /// Updated each reconcile with `hostPort → "containerIP:containerPort"` for direct-dial
+    /// (the conduit pool reads it). Optional — nil when the conduit fast path isn't used.
+    private let endpoints: PublishedEndpoints?
     private var task: Task<Void, Never>?
     private var lastTCP: Set<UInt16> = []
     private var lastUDP: Set<UInt16> = []
@@ -32,9 +35,12 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     private var readyWaiters: [ReadyWaiter] = []
 
     /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
-    public init(docker: any DockerClientProtocol, onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void) {
+    public init(docker: any DockerClientProtocol,
+                onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void,
+                endpoints: PublishedEndpoints? = nil) {
         self.docker = docker
         self.onPorts = onPorts
+        self.endpoints = endpoints
     }
 
     public func start() {
@@ -127,16 +133,24 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         signalReady()
         var tcp: Set<UInt16> = []
         var udp: Set<UInt16> = []
+        var endpointMap: [UInt16: String] = [:]
         for c in containers where c.state == "running" {
             for p in c.ports {
                 guard let pub = p.publicPort, pub > 0, pub <= 65_535 else { continue }
                 switch p.type {
-                case "tcp": tcp.insert(UInt16(pub))
+                case "tcp":
+                    tcp.insert(UInt16(pub))
+                    // Direct-dial endpoint — only when the container's IP is unambiguous;
+                    // otherwise omit and the conduit falls back to docker-proxy.
+                    if let ip = c.directIP { endpointMap[UInt16(pub)] = "\(ip):\(p.privatePort)" }
                 case "udp": udp.insert(UInt16(pub))
                 default: break
                 }
             }
         }
+        // Refresh the direct-dial map every reconcile (a restart can change a container's IP
+        // without changing the published-port *set*), independent of the onPorts diff below.
+        endpoints?.update(endpointMap)
         if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
     }
 

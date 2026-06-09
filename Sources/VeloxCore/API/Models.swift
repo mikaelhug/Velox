@@ -17,11 +17,24 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public let created: Int
     public let ports: [PortMapping]
     public let labels: [String: String]
+    /// The container's IP(s) across its attached networks (`NetworkSettings.Networks[*].
+    /// IPAddress`), non-empty only. Used by the conduit pool to dial the container directly
+    /// (bypassing docker-proxy). See `directIP`.
+    public let networkIPs: [String]
 
     enum CodingKeys: String, CodingKey {
         case id = "Id", names = "Names", image = "Image", imageID = "ImageID"
         case state = "State", status = "Status", created = "Created", ports = "Ports"
-        case labels = "Labels"
+        case labels = "Labels", networkSettings = "NetworkSettings"
+    }
+
+    private struct NetworkSettings: Decodable {
+        let networks: [String: Endpoint]?
+        struct Endpoint: Decodable {
+            let ipAddress: String?
+            enum CodingKeys: String, CodingKey { case ipAddress = "IPAddress" }
+        }
+        enum CodingKeys: String, CodingKey { case networks = "Networks" }
     }
 
     public init(from decoder: Decoder) throws {
@@ -37,16 +50,24 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         created = try c.decodeIfPresent(Int.self, forKey: .created) ?? 0
         ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
         labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
+        let ns = try c.decodeIfPresent(NetworkSettings.self, forKey: .networkSettings)
+        networkIPs = (ns?.networks?.values.compactMap { $0.ipAddress } ?? [])
+            .filter { !$0.isEmpty }
     }
 
     /// Memberwise init for mock fixtures and tests.
     public init(id: String, names: [String], image: String, imageID: String = "",
                 state: String, status: String, created: Int = 0, ports: [PortMapping] = [],
-                labels: [String: String] = [:]) {
+                labels: [String: String] = [:], networkIPs: [String] = []) {
         self.id = id; self.names = names; self.image = image; self.imageID = imageID
         self.state = state; self.status = status; self.created = created; self.ports = ports
-        self.labels = labels
+        self.labels = labels; self.networkIPs = networkIPs
     }
+
+    /// The container's IP for direct-dial — only when unambiguous (exactly one attached
+    /// network). With multiple networks the list endpoint can't tie a published port to a
+    /// specific IP, so we return nil and the conduit falls back to docker-proxy (correct).
+    public var directIP: String? { networkIPs.count == 1 ? networkIPs.first : nil }
 
     public var displayName: String { names.first ?? String(id.prefix(12)) }
     public var shortID: String { String(id.prefix(12)) }

@@ -13,15 +13,28 @@ public final class PortForwarder: @unchecked Sendable {
     /// Source of loopback listeners for privileged (<1024) ports, which an
     /// unprivileged process can't bind itself (nil ⇒ such ports are skipped).
     private let privilegedBinder: PrivilegedPortBinder?
+    /// Fast path: a warm VZNAT conduit pool. Attached once `GatewayProbe` resolves; until
+    /// then (or when the pool is empty) `accept` falls back to the vsock reverse relay.
+    private var conduitPool: ConduitPool?
     private let queue = DispatchQueue(label: "dev.velox.portfwd")
     private var listeners: [UInt16: Listener] = [:]
     /// Privileged ports we've already logged as "helper not ready", so a pending or
     /// declined prompt doesn't re-warn on every reconcile (all access is on `queue`).
     private var warnedPrivileged: Set<UInt16> = []
 
-    public init(bridge: VsockBridge, privilegedBinder: PrivilegedPortBinder? = nil) {
+    public init(bridge: VsockBridge,
+                privilegedBinder: PrivilegedPortBinder? = nil,
+                conduitPool: ConduitPool? = nil) {
         self.bridge = bridge
         self.privilegedBinder = privilegedBinder
+        self.conduitPool = conduitPool
+    }
+
+    /// Attach the VZNAT conduit pool once `GatewayProbe` has resolved (the probe is async, so
+    /// the forwarder is usually constructed before the pool exists). Future connections take
+    /// the fast path; in-flight ones are unaffected.
+    public func attachConduitPool(_ pool: ConduitPool) {
+        queue.async { self.conduitPool = pool }
     }
 
     /// Reconcile open listeners against the desired set of published ports.
@@ -96,6 +109,9 @@ public final class PortForwarder: @unchecked Sendable {
         while true {
             let client = Darwin.accept(fd, nil, nil)
             if client < 0 { break }
+            // Fast path: hand off to a warm VZNAT conduit if one's available; otherwise fall
+            // back to the vsock reverse relay (correctness preserved, just slower).
+            if conduitPool?.tryForward(clientFd: client, port: port) == true { continue }
             bridge.bridge(localFd: client, toGuestPort: VsockPort.reverse, header: "\(port)\n")
         }
     }

@@ -28,7 +28,7 @@ public enum Paths {
 }
 
 /// Well-known guest VSOCK ports. MUST stay in sync with the guest-side constants in
-/// `guest/vinit/src/main.rs` (`DOCKER_PORT`/`CONTROL_PORT`/`REVERSE_PORT`/`CLOCK_PORT`).
+/// `guest/vinit/src/main.rs` (`DOCKER_PORT`/`CONTROL_PORT`/`REVERSE_PORT`/`CLOCK_PORT`/`GW_PORT`).
 public enum VsockPort {
     /// Guest relay forwarding to dockerd.
     public static let docker: UInt32 = 2375
@@ -38,4 +38,16 @@ public enum VsockPort {
     public static let reverse: UInt32 = 2376
     /// Clock sync: host sends "<unix-epoch>\n", guest re-sets its clock on drift.
     public static let clock: UInt32 = 2377
+    /// Gateway probe: host connects once at boot, guest replies "<gw> <ip> <mask>\n".
+    /// VZNATNetworkDeviceAttachment is opaque to Swift, so the host learns the vmnet
+    /// gateway IP (and guest IP/mask) this way — needed to bind the conduit pool.
+    public static let gateway: UInt32 = 2378
+}
+
+/// The VZNAT reverse-dial conduit pool's **TCP** port (NOT a vsock port). The guest dials
+/// `GATEWAY_IP:<this>` over the fast VZNAT path; the host binds it on the gateway-IP (vmnet
+/// bridge) interface and parks the connections as a warm pool. Kept in sync with the guest's
+/// `POOL_PORT`. See `Sources/VeloxCore/Proxy/ConduitPool.swift`.
+public enum ConduitPort {
+    public static let pool: UInt16 = 2379
 }

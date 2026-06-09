@@ -53,6 +53,7 @@ final class EngineController {
     private var bridge: VsockBridge?
     private var proxy: DockerSocketProxy?
     private var forwarder: PortForwarder?
+    private var conduitPool: ConduitPool?
     private var udpForwarder: UDPForwarder?
     private var portHelper: PortHelperManager?
     private var watcher: DockerEventsWatcher?
@@ -230,12 +231,31 @@ final class EngineController {
                 onAuthNeeded: { [weak self] in
                     Task { @MainActor in self?.privilegedPortsNeedAuth = true }
                 })
-            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts)
+            // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
+            let endpoints = PublishedEndpoints()
+            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts, endpoints: endpoints)
             watcher.start()
             self.portHelper = helper
             self.forwarder = forwarder
             self.udpForwarder = udpForwarder
             self.watcher = watcher
+
+            // Fast published-port datapath: learn the (Swift-opaque) VZNAT gateway from the
+            // guest, then bind a warm conduit pool so published-port traffic rides VZNAT
+            // (~95 serving / ~17 ingress) instead of the ~6 Gbit/s vsock relay. Best-effort
+            // and async (the probe waits on guest DHCP): if it fails, the forwarder keeps the
+            // vsock fallback, so nothing blocks engine readiness on it.
+            Task { [weak self] in
+                guard let info = await GatewayProbe.probe(manager: manager) else { return }
+                let pool = ConduitPool(gateway: info, endpoints: endpoints)
+                do {
+                    try pool.start()
+                    forwarder.attachConduitPool(pool)
+                    self?.conduitPool = pool
+                } catch {
+                    Log.warn("conduit pool failed to start: \(error); using vsock fallback")
+                }
+            }
 
             // Keep the guest clock aligned with the host (survives Mac sleep), and
             // arm Resource Saver to reclaim RAM while idle.
@@ -309,6 +329,8 @@ final class EngineController {
         watcher = nil
         forwarder?.stopAll()
         forwarder = nil
+        conduitPool?.stop()
+        conduitPool = nil
         udpForwarder?.stopAll()
         udpForwarder = nil
         // The installed helper daemon stays resident (it's idle); just drop our handle.
