@@ -69,6 +69,7 @@ fn main() {
     // place, so the network must be fully applied before it starts.
     let _ = net_handle.join();
     enable_ip_forwarding();
+    tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
@@ -294,6 +295,25 @@ fn enable_ip_forwarding() {
         ("/proc/sys/net/ipv4/ip_forward", "1"),
         ("/proc/sys/net/ipv4/conf/all/forwarding", "1"),
         ("/proc/sys/net/ipv6/conf/all/forwarding", "1"),
+    ] {
+        if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
+    }
+}
+
+/// Tune the guest TCP stack for high outbound-connection churn. The published-port datapath dials
+/// a fresh conduit (guest→host over VZNAT) *and* a fresh container connection per non-keep-alive
+/// request; both are guest-side outbound sockets that land in TIME_WAIT on close. Under a churn
+/// storm (thousands of req/s) the default ~28k ephemeral-port range fills with TIME_WAIT sockets
+/// in seconds, `connect()` starts returning EADDRNOTAVAIL, the conduit pool can't redial, and the
+/// whole published-port path stalls. Widening the port range and enabling TIME_WAIT reuse (safe —
+/// it relies on TCP timestamps to reject stale segments) keeps source ports available.
+fn tune_network_sysctls() {
+    for (path, val) in [
+        ("/proc/sys/net/ipv4/ip_local_port_range", "10240\t65535"), // ~55k ephemeral ports (was ~28k)
+        ("/proc/sys/net/ipv4/tcp_tw_reuse", "1"),                    // reuse TIME_WAIT for new outbound conns
+        ("/proc/sys/net/ipv4/tcp_fin_timeout", "10"),               // drain FIN-WAIT-2 faster
+        ("/proc/sys/net/ipv4/tcp_max_tw_buckets", "262144"),        // don't overflow TIME_WAIT under churn (default 32k stalls)
+        ("/proc/sys/net/core/somaxconn", "1024"),                   // deeper accept backlog for guest listeners
     ] {
         if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
     }
@@ -1259,23 +1279,99 @@ fn handle_gateway(fd: RawFd) {
 // port. The host pops a warm conduit, writes "<port>\n", and splices the client to it — so
 // the data rides VZNAT and the connection handshake is pre-paid off the hot path.
 //
-// We keep ~CONDUIT_IDLE_TARGET conduits *idle and parked* at all times. The instant one is
-// assigned, its slot hands the data bridge to a detached thread and immediately redials a
-// replacement — so the idle pool stays full and concurrent connections all take the fast
-// path (active bridges scale up to CONDUIT_MAX_ACTIVE) instead of capping at a fixed count.
-const CONDUIT_IDLE_TARGET: usize = 16;
-const CONDUIT_MAX_ACTIVE: usize = 256;
-static CONDUIT_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// We keep ~CONDUIT_FLOOR conduits *idle and parked* at rest, and grow the pool under load: the
+// moment a slot is assigned and the idle count is below the floor (demand outran the warm pool),
+// it spawns another slot, up to CONDUIT_CAP total. Over-floor idle slots reap after a timeout
+// when load subsides. A slot is only ever a thread while *idle* (parked, blocked) — the actual
+// data relaying is done by the epoll workers (relay_submit), so active connections cost no
+// threads. The host pairs these conduits to waiting clients, so concurrent connections all take
+// the fast path instead of capping at a fixed count.
+const CONDUIT_FLOOR: usize = 16;       // warm idle conduits at true idle (lean baseline)
+// Hard cap on total slots. Kept modest on purpose: the guest has only a handful of vCPUs, and a
+// large pool *hurts* — hundreds of slots maintaining/redialing idle conduits thrash the scheduler
+// and overrun the host listener's accept backlog (SYN drops → redial storm). ~128 covers the
+// largest realistic keep-alive fan-out; excess connections spill to the vsock relay, which is fine.
+const CONDUIT_CAP: usize = 128;
+const CONDUIT_REAP_MS: i32 = 10_000;   // an over-target idle conduit reaps after this with no work
+const CONDUIT_GROW_STEP: usize = 16;   // target growth per starvation signal
+static CONDUIT_IDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CONDUIT_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// Adaptive target for total slots: starts at the floor, rises on starvation (a burst drained the
+// warm pool, so clients would otherwise wait), decays back to the floor when load subsides. This
+// keeps the pool lean at idle yet deep enough under sustained load that clients rarely wait for a
+// conduit — which is what was costing connection-churn throughput.
+static DESIRED_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(CONDUIT_FLOOR);
+
+struct PoolMgr { pending: std::sync::Mutex<bool>, cv: std::sync::Condvar }
+static POOL_MGR: std::sync::OnceLock<PoolMgr> = std::sync::OnceLock::new();
 
 fn start_conduit_pool() {
-    for _ in 0..CONDUIT_IDLE_TARGET {
-        std::thread::spawn(conduit_slot);
+    relay_init(); // epoll workers must exist before any conduit is assigned
+    POOL_MGR.get_or_init(|| PoolMgr {
+        pending: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    });
+    // The manager owns all spawning; its first pass grows the pool up to the floor, then it adapts.
+    std::thread::spawn(conduit_manager);
+}
+
+fn spawn_conduit_slot() {
+    CONDUIT_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(conduit_slot);
+}
+
+/// Wake the pool manager: a slot saw the warm pool run low and raised `DESIRED_SLOTS`.
+fn notify_manager() {
+    if let Some(m) = POOL_MGR.get() {
+        *m.pending.lock().unwrap() = true;
+        m.cv.notify_one();
     }
 }
 
-/// One idle-conduit slot: dial, park waiting for an assignment, and the moment the host
-/// assigns a port, run the data bridge on a detached thread and loop to redial — so this slot
-/// is only ever briefly non-idle and ~CONDUIT_IDLE_TARGET conduits stay warm.
+/// Sole owner of slot *spawning*. Centralising it means a burst that drains the pool can't
+/// trigger a thundering herd of simultaneous spawns (the failure mode of per-slot growth): the
+/// manager grows toward `DESIRED_SLOTS` in one place, then parks on a condvar until the next
+/// starvation signal. While the target sits above the floor it also wakes ~1×/s to decay the
+/// target back down, so the pool unwinds to its lean idle size once load subsides. At true idle
+/// (target == floor) it parks indefinitely — no timer, no wakeups (event-driven, per convention).
+fn conduit_manager() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = POOL_MGR.get().unwrap();
+    loop {
+        // Grow toward the target. `CONDUIT_SLOTS` is incremented up-front in `spawn_conduit_slot`,
+        // so it counts in-flight (still-dialing) slots — no overshoot even before they park idle.
+        let target = DESIRED_SLOTS.load(Relaxed).min(CONDUIT_CAP);
+        while CONDUIT_SLOTS.load(Relaxed) < target { spawn_conduit_slot(); }
+
+        // Park until a starvation signal (or, while decaying, a 1s tick to step the target down).
+        let decaying = DESIRED_SLOTS.load(Relaxed) > CONDUIT_FLOOR;
+        {
+            let mut pending = m.pending.lock().unwrap();
+            while !*pending {
+                if decaying {
+                    let (g, to) = m.cv.wait_timeout(pending, std::time::Duration::from_millis(1000)).unwrap();
+                    pending = g;
+                    if to.timed_out() { break; }
+                } else {
+                    pending = m.cv.wait(pending).unwrap();
+                }
+            }
+            *pending = false;
+        }
+        // Decay the target toward the floor only when there's comfortable idle headroom — during a
+        // burst idle stays low, so this never fights active growth.
+        let (idle, cur) = (CONDUIT_IDLE.load(Relaxed), DESIRED_SLOTS.load(Relaxed));
+        if cur > CONDUIT_FLOOR && idle > CONDUIT_FLOOR {
+            DESIRED_SLOTS.store((cur - (cur / 8).max(1)).max(CONDUIT_FLOOR), Relaxed);
+        }
+    }
+}
+
+enum Assignment { Got(String), Idle, Dead }
+
+/// One idle-conduit slot: dial, park waiting for an assignment, hand the connection to the
+/// epoll relay on assignment (then redial to stay warm), grow the pool when demand is high, and
+/// reap itself when over the floor and idle.
 fn conduit_slot() {
     use std::sync::atomic::Ordering::Relaxed;
     loop {
@@ -1283,20 +1379,37 @@ fn conduit_slot() {
             Some(fd) => fd,
             None => { std::thread::sleep(std::time::Duration::from_millis(250)); continue; }
         };
-        match read_assignment(fd) {
-            Some(target) => {
-                if CONDUIT_ACTIVE.fetch_add(1, Relaxed) < CONDUIT_MAX_ACTIVE {
-                    std::thread::spawn(move || {
-                        bridge_to_target(fd, &target);
-                        CONDUIT_ACTIVE.fetch_sub(1, Relaxed);
-                    });
-                } else {
-                    // At the active cap — handle inline (this slot drops out of idle until done).
-                    CONDUIT_ACTIVE.fetch_sub(1, Relaxed);
-                    bridge_to_target(fd, &target);
+        // Park on this conduit; re-park on idle (at floor) so we don't churn it needlessly.
+        loop {
+            CONDUIT_IDLE.fetch_add(1, Relaxed);
+            let res = read_assignment_timed(fd, CONDUIT_REAP_MS);
+            CONDUIT_IDLE.fetch_sub(1, Relaxed);
+            match res {
+                Assignment::Got(target) => {
+                    // The warm pool ran low (a burst outran it) → raise the adaptive target and
+                    // wake the manager, which grows the pool centrally (no thundering herd).
+                    if CONDUIT_IDLE.load(Relaxed) < CONDUIT_FLOOR {
+                        let cur = DESIRED_SLOTS.load(Relaxed);
+                        if cur < CONDUIT_CAP {
+                            DESIRED_SLOTS.store((cur + CONDUIT_GROW_STEP).min(CONDUIT_CAP), Relaxed);
+                            notify_manager();
+                        }
+                    }
+                    bridge_to_target(fd, &target); // dials container + hands to the relay (fast)
+                    break; // redial a fresh warm conduit
                 }
+                Assignment::Idle => {
+                    // Reap toward the (decaying) adaptive target, not the hard floor, so the pool
+                    // holds depth while the target is still high but unwinds as load subsides.
+                    if CONDUIT_SLOTS.load(Relaxed) > DESIRED_SLOTS.load(Relaxed) {
+                        unsafe { libc::close(fd); }
+                        CONDUIT_SLOTS.fetch_sub(1, Relaxed);
+                        return; // reap this slot — load has subsided
+                    }
+                    // else keep cycling on the same conduit (re-park)
+                }
+                Assignment::Dead => break, // conduit closed before assignment → redial
             }
-            None => {} // conduit died/closed before assignment — loop to redial a fresh one
         }
     }
 }
@@ -1335,22 +1448,26 @@ fn set_conduit_keepalive(fd: RawFd) {
     }
 }
 
-/// Block reading the host's "<port>\n" assignment on a parked conduit. `Some(target)` once
-/// assigned; `None` (and the fd is closed) if the conduit dies/closes first. Same framing as
-/// `handle_reverse`.
-fn read_assignment(fd: RawFd) -> Option<String> {
+/// Wait up to `timeout_ms` for the host's "<target>\n" assignment on a parked conduit. `Got` =
+/// assigned; `Idle` = timed out (conduit still alive — caller reaps or re-parks); `Dead` = the
+/// conduit closed/errored (fd already closed). Same line framing as `handle_reverse`.
+fn read_assignment_timed(fd: RawFd, timeout_ms: i32) -> Assignment {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if r == 0 { return Assignment::Idle; }
+    if r < 0 { unsafe { libc::close(fd); } return Assignment::Dead; }
     let mut line = Vec::new();
     let mut b = [0u8; 1];
     loop {
         let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut _, 1) };
-        if n <= 0 { unsafe { libc::close(fd); } return None; }
+        if n <= 0 { unsafe { libc::close(fd); } return Assignment::Dead; }
         if b[0] == b'\n' { break; }
         line.push(b[0]);
         if line.len() > 64 { break; }
     }
     let header = String::from_utf8_lossy(&line).trim().to_string();
-    if header.is_empty() { unsafe { libc::close(fd); } return None; }
-    Some(header)
+    if header.is_empty() { unsafe { libc::close(fd); } return Assignment::Dead; }
+    Assignment::Got(header)
 }
 
 /// Dial the assigned target inside the guest and bridge it to the conduit. The host sends
@@ -1361,9 +1478,167 @@ fn bridge_to_target(fd: RawFd, header: &str) {
     let mut target = header.to_string();
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
     match std::net::TcpStream::connect(&target) {
-        Ok(up) => bridge(fd, up.into_raw_fd()),
+        // Hand the pair to the epoll relay (no thread per connection) instead of bridge().
+        Ok(up) => relay_submit(fd, up.into_raw_fd()),
         Err(e) => { log!("conduit dial {target}: {e}"); unsafe { libc::close(fd); } }
     }
+}
+
+// =================== epoll event-loop relay (conduit datapath) ===================
+//
+// bridge() spawns 2 pump threads per connection — fine for a handful of conduits, but under
+// real serving load (100s of short/concurrent connections) it explodes to 100s of threads
+// and wrecks tail latency. Instead a small pool of epoll workers multiplexes many
+// conduit<->container pairs each: non-blocking, with backpressure (a stalled write disables
+// reads on the source) and half-close. Only the conduit datapath uses this; the vsock relays
+// keep bridge(). 64 KiB buffers preserve bulk throughput.
+
+const RELAY_WORKERS: usize = 4;
+
+struct RelayWorker { epfd: RawFd, evfd: RawFd, queue: std::sync::Mutex<std::collections::VecDeque<(RawFd, RawFd)>> }
+struct Relay { workers: Vec<std::sync::Arc<RelayWorker>>, next: std::sync::atomic::AtomicUsize }
+static RELAY: std::sync::OnceLock<Relay> = std::sync::OnceLock::new();
+
+fn relay_init() {
+    RELAY.get_or_init(|| {
+        let mut workers = Vec::new();
+        for _ in 0..RELAY_WORKERS {
+            let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            let evfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+            let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: evfd as u64 };
+            unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, evfd, &mut ev); }
+            let w = std::sync::Arc::new(RelayWorker { epfd, evfd, queue: std::sync::Mutex::new(std::collections::VecDeque::new()) });
+            let wc = w.clone();
+            std::thread::spawn(move || relay_worker_loop(wc));
+            workers.push(w);
+        }
+        Relay { workers, next: std::sync::atomic::AtomicUsize::new(0) }
+    });
+}
+
+/// Submit a (conduit, target) fd pair to a worker. Falls back to bridge() if the relay isn't
+/// initialised yet (shouldn't happen — relay_init runs before the pool dials).
+fn relay_submit(conduit: RawFd, container: RawFd) {
+    let Some(r) = RELAY.get() else { bridge(conduit, container); return };
+    relay_set_nonblocking(conduit); relay_set_nonblocking(container);
+    let i = r.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % r.workers.len();
+    let w = &r.workers[i];
+    w.queue.lock().unwrap().push_back((conduit, container));
+    let one: u64 = 1;
+    unsafe { libc::write(w.evfd, &one as *const u64 as *const _, 8); }
+}
+
+fn relay_set_nonblocking(fd: RawFd) {
+    unsafe { let fl = libc::fcntl(fd, libc::F_GETFL, 0); libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK); }
+}
+
+struct Dir { src: RawFd, dst: RawFd, buf: Vec<u8>, off: usize, len: usize, eof: bool }
+impl Dir {
+    fn new(src: RawFd, dst: RawFd) -> Self { Dir { src, dst, buf: vec![0u8; 256 * 1024], off: 0, len: 0, eof: false } }
+    fn finished(&self) -> bool { self.eof && self.len == 0 }
+}
+struct Conn { a: RawFd, b: RawFd, ab: Dir, ba: Dir }
+
+fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
+    use std::collections::HashMap; use std::rc::Rc; use std::cell::RefCell;
+    let mut conns: HashMap<RawFd, Rc<RefCell<Conn>>> = HashMap::new();
+    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 512];
+    loop {
+        let n = unsafe { libc::epoll_wait(w.epfd, events.as_mut_ptr(), 512, -1) };
+        if n < 0 { continue; }
+        for i in 0..n as usize {
+            let ev = events[i];
+            let fd = ev.u64 as RawFd;
+            let mask = ev.events;
+            if fd == w.evfd {
+                let mut b = [0u8; 8];
+                while unsafe { libc::read(w.evfd, b.as_mut_ptr() as *mut _, 8) } > 0 {}
+                let mut q = w.queue.lock().unwrap();
+                while let Some((a, bfd)) = q.pop_front() {
+                    let conn = Rc::new(RefCell::new(Conn { a, b: bfd, ab: Dir::new(a, bfd), ba: Dir::new(bfd, a) }));
+                    conns.insert(a, conn.clone()); conns.insert(bfd, conn.clone());
+                    relay_add(w.epfd, a); relay_add(w.epfd, bfd);
+                }
+                continue;
+            }
+            let Some(conn) = conns.get(&fd).cloned() else { continue };
+            let finished = {
+                let mut c = conn.borrow_mut();
+                if mask & (libc::EPOLLIN as u32) != 0 {
+                    if fd == c.a { relay_read(&mut c.ab); } else { relay_read(&mut c.ba); }
+                }
+                if mask & (libc::EPOLLOUT as u32) != 0 {
+                    if fd == c.a { relay_flush(&mut c.ba); } else { relay_flush(&mut c.ab); }
+                }
+                if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
+                    if fd == c.a && !c.ab.eof { c.ab.eof = true; unsafe { libc::shutdown(c.ab.dst, libc::SHUT_WR); } }
+                    if fd == c.b && !c.ba.eof { c.ba.eof = true; unsafe { libc::shutdown(c.ba.dst, libc::SHUT_WR); } }
+                }
+                let done = c.ab.finished() && c.ba.finished();
+                if !done { relay_update(w.epfd, &*c, c.a); relay_update(w.epfd, &*c, c.b); }
+                done
+            };
+            if finished {
+                let c = conn.borrow();
+                conns.remove(&c.a); conns.remove(&c.b);
+                unsafe { libc::close(c.a); libc::close(c.b); }
+            }
+        }
+    }
+}
+
+fn relay_read(d: &mut Dir) {
+    if d.len > 0 { return; } // currently flushing
+    loop {
+        let n = unsafe { libc::read(d.src, d.buf.as_mut_ptr() as *mut _, d.buf.len()) };
+        if n > 0 {
+            let n = n as usize;
+            let w = unsafe { libc::write(d.dst, d.buf.as_ptr() as *const _, n) };
+            if w == n as isize { continue; } // fully written — keep draining the source (bulk)
+            d.off = if w > 0 { w as usize } else { 0 };
+            d.len = n;
+            return; // backpressure: wait for EPOLLOUT on dst
+        } else if n == 0 {
+            d.eof = true; unsafe { libc::shutdown(d.dst, libc::SHUT_WR); }
+            return;
+        } else {
+            let e = std::io::Error::last_os_error();
+            if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) { return; }
+            d.eof = true; unsafe { libc::shutdown(d.dst, libc::SHUT_WR); }
+            return;
+        }
+    }
+}
+
+fn relay_flush(d: &mut Dir) {
+    while d.off < d.len {
+        let w = unsafe { libc::write(d.dst, d.buf[d.off..].as_ptr() as *const _, d.len - d.off) };
+        if w > 0 { d.off += w as usize; }
+        else {
+            let e = std::io::Error::last_os_error();
+            if w < 0 && matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) { return; }
+            d.eof = true; d.off = 0; d.len = 0; return; // write error → finish this direction
+        }
+    }
+    d.off = 0; d.len = 0;
+}
+
+fn relay_add(epfd: RawFd, fd: RawFd) {
+    let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: fd as u64 };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev); }
+}
+
+fn relay_update(epfd: RawFd, c: &Conn, fd: RawFd) {
+    let mut m: u32 = 0;
+    if fd == c.a {
+        if c.ab.len == 0 && !c.ab.eof { m |= libc::EPOLLIN as u32; }
+        if c.ba.len > 0 { m |= libc::EPOLLOUT as u32; }
+    } else {
+        if c.ba.len == 0 && !c.ba.eof { m |= libc::EPOLLIN as u32; }
+        if c.ab.len > 0 { m |= libc::EPOLLOUT as u32; }
+    }
+    let mut ev = libc::epoll_event { events: m, u64: fd as u64 };
+    unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev); }
 }
 
 fn handle_reverse(fd: RawFd) {

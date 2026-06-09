@@ -44,14 +44,42 @@ public final class ConduitPool: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var source: DispatchSourceRead?
     private var ready: [Parked] = []   // parked idle conduits (all access on `queue`)
-    private var pumps: [UUID: BulkPump] = [:]
-    private let pumpLock = NSLock()
+    private var waiting: [(id: Int, fd: Int32, port: UInt16, deadline: DispatchTime)] = [] // clients awaiting a conduit
+    private var nextId = 0
+    private var sweepArmed = false     // at most one pending timeout sweep (all access on `queue`)
+    private var fallbackHandler: (@Sendable (Int32, UInt16) -> Void)?
     private let endpoints: PublishedEndpoints?
+    // Churn circuit breaker. A flood of *non-keep-alive* connections (a new connection per request)
+    // drains the pool faster than the guest can redial — each request would otherwise wait out the
+    // timeout and force a conduit redial, which under sustained churn buries the guest in TIME_WAIT
+    // sockets and collapses the whole published-port path. So when the pool stays *continuously*
+    // empty longer than any keep-alive establishment burst lasts, we declare churn and bypass the
+    // pool: connections go straight to the vsock relay (no wait), and with nothing consuming
+    // conduits the guest stops redialing (no TIME_WAIT storm). It auto-recovers after a cooldown.
+    private var emptySince: DispatchTime?        // start of the current continuously-empty streak
+    private var lastEmptyAt: DispatchTime?       // last empty-on-submit (to detect a gap → restart)
+    private var breakerOpenUntil: DispatchTime?  // while set & future, bypass the pool entirely
+    private var breakerBypassSecs = 2.0          // current bypass duration; backs off under sustained churn
+    private let breakerTripAfter: DispatchTimeInterval = .milliseconds(300) // > a keep-alive burst
+    private let breakerBypassMax = 16.0          // cap on the backed-off bypass duration
+    private let breakerGap: DispatchTimeInterval = .milliseconds(100)       // quiet gap restarts the streak
+    /// How long a client waits for a fresh conduit (while the guest's adaptive pool grows to meet
+    /// a burst) before dropping to the vsock relay. Long enough to absorb a persistent-connection
+    /// burst (which then reuses its fast conduit for the rest of its life); the adaptive pool keeps
+    /// the warm buffer deep under sustained load, so brief (non-keep-alive) connections seldom
+    /// reach this wait once the pool has grown.
+    private let waitTimeout: DispatchTimeInterval = .milliseconds(150)
 
     public init(gateway: GatewayInfo, endpoints: PublishedEndpoints? = nil) {
         self.bindIP = gateway.gatewayIP
         self.guestIP = gateway.guestIP
         self.endpoints = endpoints
+    }
+
+    /// The vsock reverse-relay fallback, used when no conduit is available in time. Set by the
+    /// PortForwarder when it attaches the pool.
+    public func setFallback(_ handler: @escaping @Sendable (Int32, UInt16) -> Void) {
+        queue.async { self.fallbackHandler = handler }
     }
 
     public func start() throws {
@@ -68,7 +96,7 @@ public final class ConduitPool: @unchecked Sendable {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bound == 0, listen(fd, 128) == 0 else {
+        guard bound == 0, listen(fd, 256) == 0 else { // deep backlog: the pool can redial a burst of conduits at once
             let e = errno; close(fd)
             throw VeloxError.socketSetupFailed("conduit pool bind/listen", e)
         }
@@ -88,6 +116,8 @@ public final class ConduitPool: @unchecked Sendable {
             self.source?.cancel(); self.source = nil
             for p in self.ready { p.source.cancel(); close(p.fd) }
             self.ready.removeAll()
+            for w in self.waiting { close(w.fd) }
+            self.waiting.removeAll()
         }
     }
 
@@ -111,7 +141,14 @@ public final class ConduitPool: @unchecked Sendable {
                 close(cfd); continue
             }
             Self.setKeepalive(cfd)
-            // Watch the parked conduit: a readable event before assignment is EOF/error
+            // A client is already waiting (a burst drained the pool) → assign this conduit to it
+            // immediately instead of parking it.
+            if !waiting.isEmpty {
+                let w = waiting.removeFirst()
+                assign(conduit: cfd, clientFd: w.fd, port: w.port)
+                continue
+            }
+            // Otherwise park it. Watch for a readable event before assignment — that's EOF/error
             // (conntrack eviction / guest gone) → prune it so the pool can't accrue dead fds.
             let src = DispatchSource.makeReadSource(fileDescriptor: cfd, queue: queue)
             src.setEventHandler { [weak self] in self?.discardDead(cfd) }
@@ -131,33 +168,81 @@ public final class ConduitPool: @unchecked Sendable {
 
     // MARK: - forward
 
-    /// Try to forward `clientFd` to the guest's `port` over a warm conduit. Returns true if a
-    /// conduit was used (this object now owns `clientFd` + the conduit); false if the pool is
-    /// empty or the popped conduit was stale (caller keeps `clientFd` for the vsock fallback).
-    public func tryForward(clientFd: Int32, port: UInt16) -> Bool {
-        queue.sync {
-            guard let p = ready.popLast() else { return false }
-            p.source.cancel() // stop monitoring; we own the fd now
-            // In-band assignment. Prefer the container endpoint (guest dials it directly,
-            // skipping docker-proxy); fall back to the bare port (guest → docker-proxy).
-            let target = endpoints?.endpoint(for: port) ?? "\(port)"
-            guard Self.writeAll(p.fd, Array("\(target)\n".utf8)) else {
-                close(p.fd) // stale (e.g. conntrack-evicted) — let the caller fall back
-                return false
+    /// Forward `clientFd` to the guest's published `port`. Splices to a warm conduit immediately
+    /// if one is parked; otherwise queues the client and waits briefly for the guest to grow the
+    /// pool (a burst drains it), dropping to the vsock relay only if no conduit arrives within
+    /// `waitTimeout`. Always takes ownership of `clientFd`.
+    public func submit(clientFd: Int32, port: UInt16) {
+        queue.async {
+            let now = DispatchTime.now()
+            // Breaker open (churn) → bypass the pool entirely; straight to vsock, no wait.
+            if let until = self.breakerOpenUntil, now < until {
+                self.fallbackHandler?(clientFd, port)
+                return
             }
-            startPump(clientFd, p.fd)
-            return true
+            if let p = self.ready.popLast() {
+                p.source.cancel() // stop monitoring; we own the fd now
+                self.emptySince = nil       // a spare conduit was waiting → pool is healthy
+                self.breakerBypassSecs = 2.0 // real traffic served → reset the churn backoff
+                self.assign(conduit: p.fd, clientFd: clientFd, port: port)
+            } else {
+                // Pool empty. Track how long it's been *continuously* empty-on-submit; a quiet gap
+                // (or a served submit above) restarts the streak, so only sustained emptiness —
+                // churn, not a keep-alive establishment burst — trips the breaker.
+                if let last = self.lastEmptyAt, now > last + self.breakerGap { self.emptySince = now }
+                else if self.emptySince == nil { self.emptySince = now }
+                self.lastEmptyAt = now
+                if let since = self.emptySince, now > since + self.breakerTripAfter {
+                    self.breakerOpenUntil = now + .milliseconds(Int(self.breakerBypassSecs * 1000))
+                    self.breakerBypassSecs = min(self.breakerBypassMax, self.breakerBypassSecs * 2) // back off if churn persists
+                    self.emptySince = nil
+                    self.fallbackHandler?(clientFd, port) // sustained churn → straight to vsock
+                    return
+                }
+                // Queue the client and let one shared sweep enforce the timeout. A per-client
+                // asyncAfter here would flood the serial queue under churn (thousands/s) and starve
+                // the conduit-accept handler that refills the pool — so the pool would never recover.
+                self.waiting.append((id: self.nextId, fd: clientFd, port: port,
+                                     deadline: now + self.waitTimeout))
+                self.nextId += 1
+                self.armSweep()
+            }
         }
     }
 
-    private func startPump(_ a: Int32, _ b: Int32) {
-        let id = UUID()
-        let pump = BulkPump(fdA: a, fdB: b) { [weak self] in
-            guard let self else { return }
-            self.pumpLock.lock(); self.pumps[id] = nil; self.pumpLock.unlock()
+    /// Ensure exactly one pending timeout sweep is scheduled (idempotent). Armed only while clients
+    /// wait, so there's no timer at idle — and never more than one in flight regardless of load.
+    private func armSweep() {
+        guard !sweepArmed else { return }
+        sweepArmed = true
+        queue.asyncAfter(deadline: .now() + .milliseconds(20)) { [weak self] in self?.sweep() }
+    }
+
+    /// Fall back any waiting clients past their deadline to the vsock relay; re-arm while any remain.
+    private func sweep() {
+        sweepArmed = false
+        guard !waiting.isEmpty else { return }
+        let now = DispatchTime.now()
+        var still: [(id: Int, fd: Int32, port: UInt16, deadline: DispatchTime)] = []
+        for w in waiting {
+            if w.deadline <= now { fallbackHandler?(w.fd, w.port) } else { still.append(w) }
         }
-        pumpLock.lock(); pumps[id] = pump; pumpLock.unlock()
-        pump.start()
+        waiting = still
+        if !waiting.isEmpty { armSweep() }
+    }
+
+    /// Write the in-band target (container endpoint when known, else the bare port → docker-proxy)
+    /// and splice `clientFd` ↔ `conduit` via the event-loop relay. Stale conduit → vsock fallback.
+    private func assign(conduit: Int32, clientFd: Int32, port: UInt16) {
+        let target = endpoints?.endpoint(for: port) ?? "\(port)"
+        guard Self.writeAll(conduit, Array("\(target)\n".utf8)) else {
+            close(conduit)
+            fallbackHandler?(clientFd, port)
+            return
+        }
+        // The event-loop relay multiplexes this pair onto its worker pool (no thread per
+        // connection) and owns both fds until they close.
+        EventRelay.shared.relay(clientFd, conduit) {}
     }
 
     // MARK: - helpers

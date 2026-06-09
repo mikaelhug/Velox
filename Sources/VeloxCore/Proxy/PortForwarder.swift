@@ -32,8 +32,12 @@ public final class PortForwarder: @unchecked Sendable {
 
     /// Attach the VZNAT conduit pool once `GatewayProbe` has resolved (the probe is async, so
     /// the forwarder is usually constructed before the pool exists). Future connections take
-    /// the fast path; in-flight ones are unaffected.
+    /// the fast path; in-flight ones are unaffected. The pool gets the vsock relay as its
+    /// last-resort fallback (used only when no conduit is available in time).
     public func attachConduitPool(_ pool: ConduitPool) {
+        pool.setFallback { [bridge] clientFd, port in
+            bridge.bridge(localFd: clientFd, toGuestPort: VsockPort.reverse, header: "\(port)\n")
+        }
         queue.async { self.conduitPool = pool }
     }
 
@@ -109,10 +113,14 @@ public final class PortForwarder: @unchecked Sendable {
         while true {
             let client = Darwin.accept(fd, nil, nil)
             if client < 0 { break }
-            // Fast path: hand off to a warm VZNAT conduit if one's available; otherwise fall
-            // back to the vsock reverse relay (correctness preserved, just slower).
-            if conduitPool?.tryForward(clientFd: client, port: port) == true { continue }
-            bridge.bridge(localFd: client, toGuestPort: VsockPort.reverse, header: "\(port)\n")
+            // When the conduit pool is up it owns the connection — it splices to a warm conduit,
+            // briefly waits for the guest to grow the pool under a burst, and drops to the vsock
+            // relay only as a timed last resort. Without a pool, use the vsock relay directly.
+            if let pool = conduitPool {
+                pool.submit(clientFd: client, port: port)
+            } else {
+                bridge.bridge(localFd: client, toGuestPort: VsockPort.reverse, header: "\(port)\n")
+            }
         }
     }
 }
