@@ -341,10 +341,7 @@ struct ContainersView: View {
         case .container(let c):
             HStack(spacing: 6) {
                 Circle().fill(dotColor(for: c)).frame(width: 7, height: 7)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(c.displayName).fontWeight(.medium)
-                    Text(c.shortID).font(.caption2.monospaced()).foregroundStyle(.secondary)
-                }
+                Text(c.displayName).fontWeight(.medium)
             }
         case .project(let g):
             HStack(spacing: 6) {
