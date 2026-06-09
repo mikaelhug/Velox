@@ -92,8 +92,6 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         let p = labels["com.docker.compose.project"]
         return (p?.isEmpty == false) ? p : nil
     }
-    /// The Compose service name within its project, when present.
-    public var composeService: String? { labels["com.docker.compose.service"] }
 }
 
 public struct PortMapping: Codable, Sendable, Hashable {
@@ -320,11 +318,6 @@ public struct ContainerStatsSample: Sendable, Hashable {
 
     public init(cpuPercent: Double, memoryBytes: UInt64, memoryLimit: UInt64) {
         self.cpuPercent = cpuPercent; self.memoryBytes = memoryBytes; self.memoryLimit = memoryLimit
-    }
-
-    public var memoryPercent: Double {
-        guard memoryLimit > 0 else { return 0 }
-        return Double(memoryBytes) / Double(memoryLimit) * 100
     }
 }
 

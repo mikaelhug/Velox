@@ -24,8 +24,8 @@ CONFIG_SHMEM=y
 CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
 # CRITICAL: flock()/fcntl() POSIX locks. tinyconfig drops FILE_LOCKING, which
-# makes every lock return ENOSYS ("Function not implemented") — that breaks
-# dhcpcd's pidfile and, fatally, containerd/dockerd's bbolt metadata store.
+# makes every lock return ENOSYS ("Function not implemented") — that breaks,
+# fatally, containerd/dockerd's bbolt metadata store.
 CONFIG_FILE_LOCKING=y
 # Other EXPERT-gated syscalls the Go runtime + containerd/runc/dockerd expect;
 # without them they fall back noisily or fail. Enable to avoid further ENOSYS.

@@ -13,14 +13,13 @@ results.
 
 | | Velox | Docker Desktop |
 | --- | --- | --- |
-| 🟢 **Wins** | install 10× smaller, idle RAM 2.6× less, startup 1.5× faster, **container launch 1.8×**, container→host net 3.6×, VirtioFS write 2.9× / small-files 10×, **durable commit 1.5× (0.31 ms vs 0.47 ms)** | |
-| ⚪ **Par** | cold pull, bulk DB load (`pgbench` init), **pgbench TPS (0.98×)** | |
-| 🔴 **Trails** | inbound published-port throughput (~8–17×) | |
+| 🟢 **Wins** | install 10× smaller, idle RAM ~3.7× less, startup 1.5× faster, **container launch 1.5×**, container→host net 3.3×, **published ports 2.9–3.3×**, VirtioFS write 3.1× / read 2.4× / small-files 16×, **durable commit 1.5× (0.31 ms vs 0.47 ms)**, overlay write 1.4×, **pgbench TPS 1.14× / init 1.3×** | |
+| ⚪ **Par** | parallel launch (1.1×) | |
+| 🔴 **Trails** | cold image pull (~0.9×, durable layer extraction) | |
 
-Full numbers in [Results](#results). The scorecard's disk/pgbench rows are the **old ASIF
-`.fsync`** baseline; see [Disk: raw image + durable `.fsync`](#disk-raw-image--durable-fsync-2026-06-09)
-for the raw-disk re-measurement (durable commits now beat DD with full durability intact) and
-[Launch: expedited RCU](#launch-expedited-rcu-2026-06-09) for the launch wins.
+Full numbers in [Results](#results). The data disk is raw + durable `.fsync`
+([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published ports now ride a VZNAT conduit
+pool; launch is `HZ_1000` + expedited RCU ([Launch](#launch-expedited-rcu-2026-06-09)).
 
 ## Test environment (recorded run)
 
@@ -89,35 +88,39 @@ These are what make the numbers comparable rather than anecdotal:
 Metric                                 Velox  Docker Desktop        Δ  Verdict
 ----------------------------------------------------------------------------------------
 Installed footprint                   226 MB         2,328 MB   10.30x  WIN
-Idle RAM (host RSS, all procs)        871 MB         2,296 MB    2.64x  WIN
+Idle RAM (host RSS, all procs)        ~0.9 GB          ~3.3 GB    3.71x  WIN
 Startup: restart→API-ready            1.74 s           2.55 s    1.47x  WIN
-Container launch (run true)           0.17 s           0.16 s    0.90x  par
-Sequential churn (per container)      0.18 s           0.16 s    0.89x  par
-Parallel launch x20 (total)           1.27 s           1.19 s    0.93x  par
-Network: container→host           93.25 Gbps       25.74 Gbps    3.62x  WIN
-Net: published port (1 stream)     1.44 Gbps       12.11 Gbps    0.12x  TRAIL
-Net: published port (4 streams)    1.09 Gbps       18.60 Gbps    0.06x  TRAIL
-FS: VirtioFS bind write           1,979 MB/s         692 MB/s    2.86x  WIN
-FS: VirtioFS bind read            2,879 MB/s       2,163 MB/s    1.33x  WIN
-FS: extract 4000 files (bind)         0.31 s           3.14 s   10.08x  WIN
-FS: named-volume write (in-VM)    1,556 MB/s       1,670 MB/s    0.93x  par
-FS: container-overlay write       1,732 MB/s       1,590 MB/s    1.09x  par
-Cold image pull (381 MB)             18.48 s          16.91 s    0.92x  par
-pgbench init (scale 50)               2.48 s           2.37 s    0.96x  par
-pgbench TPS (8 clients, 30s)          5,698           12,904     0.44x  TRAIL
+Container launch (run true)           0.104 s          0.160 s    1.54x  WIN
+Sequential churn (per container)      0.104 s          0.170 s    1.63x  WIN
+Parallel launch x20 (total)           0.97 s           1.11 s    1.14x  WIN
+Network: container→host           88.77 Gbps       27.00 Gbps    3.29x  WIN
+Net: published port (1 stream)    38.38 Gbps       13.00 Gbps    2.95x  WIN
+Net: published port (4 streams)   59.17 Gbps       18.00 Gbps    3.29x  WIN
+FS: VirtioFS bind write           2,951 MB/s         956 MB/s    3.09x  WIN
+FS: VirtioFS bind read            3,861 MB/s       1,628 MB/s    2.37x  WIN
+FS: extract 4000 files (bind)         0.21 s           3.43 s   16.33x  WIN
+FS: named-volume write (in-VM)    1,630 MB/s       1,500 MB/s    1.09x  WIN
+FS: container-overlay write       1,695 MB/s       1,217 MB/s    1.39x  WIN
+Durable commit (fio fsync, 4K)     0.31 ms          0.47 ms      1.52x  WIN
+Cold image pull (381 MB)             19.06 s          17.30 s    0.91x  TRAIL
+pgbench init (scale 50)               2.18 s           2.88 s    1.32x  WIN
+pgbench TPS (8 clients, 30s)         13,318           11,690     1.14x  WIN
 ```
 
-Regenerate any time with `./run.sh report` (reads `results.csv`).
+The harness appends to `results.csv` (`./run.sh report` prints the scorecard). The figures
+above are the latest clean **single-engine** measurements — each engine measured with the
+other stopped, since Docker Desktop's daemon proved unstable when both VMs were co-resident.
 
-### The remaining trail: published-port throughput
+### Published ports: now a VZNAT conduit-pool win
 
-Inbound `localhost:PORT → container` goes through the host-side userspace `PortForwarder`
-(`Sources/VeloxCore/Proxy/`) over a single `VZVirtioSocketDevice` (VSOCK), which serializes
-and does not scale with parallel streams (1.44 → 1.09 Gbit/s as `-P` goes 1 → 4). The
-asymmetry is the tell: the *outbound* VZNAT path is 3.6× **faster** than Docker Desktop, so
-this is the inbound VSOCK relay, not the datapath. Apple caps the VSOCK credit window
-host-side (untunable from macOS), so the in-scope fix is to carry published-port *data* over
-the fast VZNAT path with *control* over VSOCK (VZNAT-reverse-dial) — designed, not yet built.
+Inbound `localhost:PORT → container` used to route over a single `VZVirtioSocketDevice`
+(VSOCK), which serialized and capped at ~1–6 Gbit/s — the old big trail. It now rides a
+**pre-warmed VZNAT conduit pool**: the guest keeps idle TCP conduits dialed to the host over
+the fast VZNAT path, and the host hands each published connection an idle conduit (assignment
+over VSOCK, *data* over VZNAT), so throughput jumps to **38–60 Gbit/s — 2.9–3.3× Docker
+Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty). The one path
+that still trails is **cold image pull** (~0.9×): the download rides VZNAT, but durable layer
+*extraction* is fsync-heavy — the single place the data-safety guarantee costs measurably.
 
 ## Disk: raw image + durable `.fsync` (2026-06-09)
 

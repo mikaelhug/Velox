@@ -110,8 +110,8 @@ public enum Updater {
     /// exists, download + self-replace. Same code path as `velox update --apply`
     /// (CLAUDE.md §3). Blocking — call off the main thread.
     /// `beforeRelaunch` runs after the new build is staged but before the in-place swap + the
-    /// `exit(0)` relaunch — the GUI uses it to gracefully stop the engine (flush the writeback
-    /// data disk + cleanly stop the VM) so the imminent process exit can't tear the filesystem.
+    /// `exit(0)` relaunch — the GUI uses it to gracefully stop the engine (flush the data disk
+    /// + cleanly stop the VM) so the imminent process exit can't tear the filesystem.
     public static func applyLatestUpdate(beforeRelaunch: (@Sendable () -> Void)? = nil) {
         let repo = Versions.githubRepo
         guard repo.contains("/"),
@@ -170,7 +170,7 @@ public enum Updater {
         }
         // The relaunch below ends in exit(0), which destroys this process and with it the running
         // VM. Flush + cleanly stop the guest FIRST (the GUI passes a hook that does this) so the
-        // writeback data disk is synced and consistent — skipping it tore the ext4 and got it
+        // data disk is synced and consistent — skipping it tore the ext4 and got it
         // reformatted on the next boot.
         beforeRelaunch?()
         do {

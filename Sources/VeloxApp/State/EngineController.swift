@@ -132,7 +132,7 @@ final class EngineController {
             Updater.applyLatestUpdate(beforeRelaunch: { [weak self] in
                 // The updater is about to exit(0) to relaunch, which tears down this VM. Block
                 // here until the guest has flushed (sync over the control channel) and the VM has
-                // cleanly stopped, so the writeback data disk isn't left torn (which would be
+                // cleanly stopped, so the data disk isn't left torn (which would be
                 // reformatted on next boot, losing all containers/images).
                 guard let self else { return }
                 let sem = DispatchSemaphore(value: 0)

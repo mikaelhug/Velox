@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate Sources/Velox/Support/Versions.swift from versions.env.
+# Generate Sources/VeloxCore/Support/Versions.swift from versions.env.
 # Run automatically by build.sh; the generated file is also committed so the
 # package always compiles from a clean checkout.
 set -euo pipefail
