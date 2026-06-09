@@ -45,8 +45,7 @@ public final class ConduitPool: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var source: DispatchSourceRead?
     private var ready: [Parked] = []   // parked idle conduits (all access on `queue`)
-    private var waiting: [(id: Int, fd: Int32, port: UInt16, deadline: DispatchTime)] = [] // clients awaiting a conduit
-    private var nextId = 0
+    private var waiting: [(fd: Int32, port: UInt16, deadline: DispatchTime)] = [] // clients awaiting a conduit
     private var sweepArmed = false     // at most one pending timeout sweep (all access on `queue`)
     private var fallbackHandler: (@Sendable (Int32, UInt16) -> Void)?
     private let endpoints: PublishedEndpoints?
@@ -121,9 +120,6 @@ public final class ConduitPool: @unchecked Sendable {
             self.waiting.removeAll()
         }
     }
-
-    /// Parked-conduit count (diagnostics / tests). Synchronous read on `queue`.
-    public var readyCount: Int { queue.sync { ready.count } }
 
     // MARK: - accept (on `queue`)
 
@@ -203,9 +199,7 @@ public final class ConduitPool: @unchecked Sendable {
                 // Queue the client and let one shared sweep enforce the timeout. A per-client
                 // asyncAfter here would flood the serial queue under churn (thousands/s) and starve
                 // the conduit-accept handler that refills the pool — so the pool would never recover.
-                self.waiting.append((id: self.nextId, fd: clientFd, port: port,
-                                     deadline: now + self.waitTimeout))
-                self.nextId += 1
+                self.waiting.append((fd: clientFd, port: port, deadline: now + self.waitTimeout))
                 self.armSweep()
             }
         }
@@ -224,7 +218,7 @@ public final class ConduitPool: @unchecked Sendable {
         sweepArmed = false
         guard !waiting.isEmpty else { return }
         let now = DispatchTime.now()
-        var still: [(id: Int, fd: Int32, port: UInt16, deadline: DispatchTime)] = []
+        var still: [(fd: Int32, port: UInt16, deadline: DispatchTime)] = []
         for w in waiting {
             if w.deadline <= now { fallbackHandler?(w.fd, w.port) } else { still.append(w) }
         }

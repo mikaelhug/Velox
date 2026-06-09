@@ -21,8 +21,6 @@ final class ImagesModel {
     var loadError: String? { store.imagesError }
     var hasLoaded: Bool { store.imagesLoaded }
 
-    func refresh() async { await store.refreshImages() }
-
     func pull(_ reference: String) async {
         guard !reference.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         isPulling = true; pullStatus = "Starting…"

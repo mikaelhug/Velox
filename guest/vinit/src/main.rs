@@ -1104,8 +1104,9 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 /// The reaper (`reap_forever`) watches this PID and relaunches the daemon if it
 /// ever exits, so a dockerd crash never leaves the engine permanently dead.
 fn spawn_dockerd() -> i32 {
-    // dockerd discovers containerd/runc/nft/iptables on PATH and manages its own
-    // containerd. Unix socket (not TCP) — the vsock agent bridges to it directly.
+    // dockerd discovers containerd/runc/nft on PATH and manages its own containerd
+    // (no iptables binary is shipped — see the nftables firewall backend below). Unix
+    // socket (not TCP) — the vsock agent bridges to it directly.
     let mut args: Vec<String> = vec![
         "--host=unix:///run/docker.sock".into(),
         "--feature=containerd-snapshotter=true".into(),
@@ -1116,9 +1117,6 @@ fn spawn_dockerd() -> i32 {
         // `fib` expression (kernel fragment) and ip_forward preset (below).
         "--firewall-backend=nftables".into(),
     ];
-    // In netstack (static) mode the gateway IP is fixed and is also
-    // host.docker.internal; tell dockerd so `--add-host host.docker.internal:
-    // host-gateway` (and compose extra_hosts) resolve to the Mac.
     // host.docker.internal → the vmnet gateway (the Mac), so containers can reach
     // host services. Containers add it via `--add-host host.docker.internal:host-gateway`
     // (Docker Desktop sets the same hostname automatically too).

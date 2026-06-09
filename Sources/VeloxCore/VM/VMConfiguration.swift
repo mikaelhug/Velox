@@ -1,11 +1,9 @@
 import Foundation
 import Virtualization
 
-/// Builds a validated `VZVirtualMachineConfiguration` for the Linux guest.
-///
-/// Phase 2 covers boot essentials: linux boot loader, serial console, entropy,
-/// and a memory balloon. Block/VirtioFS/NAT/VSOCK devices are layered on in
-/// later phases.
+/// Builds a validated `VZVirtualMachineConfiguration` for the Linux guest: the linux
+/// boot loader, serial console, entropy source, memory balloon, root + data block
+/// devices, VirtioFS shares, VZNAT networking, and the VSOCK device.
 public enum VMConfiguration {
     public struct Resources: Sendable, Codable, Equatable {
         public var cpuCount: Int

@@ -95,7 +95,7 @@ final class StatsStore {
             }
         }
         for (id, task) in streams where !running.contains(id) {
-            task.cancel()              // Fix-1 shutdown unwinds an idle stats read promptly
+            task.cancel()              // cancel unwinds an idle stats read promptly on shutdown
             streams[id] = nil
             latest[id] = nil
         }

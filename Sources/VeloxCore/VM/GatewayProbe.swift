@@ -10,10 +10,6 @@ public struct GatewayInfo: Sendable {
     public let gatewayIP: in_addr_t
     /// The guest's own VZNAT IP, network byte order (used to validate conduit peers).
     public let guestIP: in_addr_t
-    /// The bridge netmask, network byte order.
-    public let mask: in_addr_t
-    /// The host interface carrying `gatewayIP` (e.g. "bridge100").
-    public let interfaceName: String
 }
 
 public enum GatewayProbe {
@@ -66,7 +62,7 @@ public enum GatewayProbe {
             return nil
         }
         Log.info("gateway probe: gw=\(parts[0]) guest=\(parts[1]) mask=\(parts[2]) iface=\(iface)")
-        return GatewayInfo(gatewayIP: gw, guestIP: ip, mask: mask, interfaceName: iface)
+        return GatewayInfo(gatewayIP: gw, guestIP: ip)
     }
 
     /// Parse dotted-decimal → `in_addr_t` (network byte order), or nil.

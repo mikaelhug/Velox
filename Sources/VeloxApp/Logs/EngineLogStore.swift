@@ -13,8 +13,6 @@ final class EngineLogStore {
     struct Line: Identifiable, Sendable { let id: Int; let text: String }
 
     private(set) var lines: [Line] = []
-    /// Bumps when the ring trims, so the text view re-renders from scratch.
-    private(set) var generation = 0
     var autoScroll = true
     var filter = ""
 
@@ -59,7 +57,6 @@ final class EngineLogStore {
     func clear() {
         lines.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
-        generation += 1
     }
 
     // MARK: - Ingest
@@ -102,7 +99,6 @@ final class EngineLogStore {
         pending.removeAll(keepingCapacity: true)
         if lines.count > capacity {
             lines.removeFirst(lines.count - capacity)
-            generation += 1
         }
     }
 }

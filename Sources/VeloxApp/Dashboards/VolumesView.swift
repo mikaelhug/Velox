@@ -17,8 +17,6 @@ final class VolumesModel {
     var loadError: String? { store.volumesError }
     var hasLoaded: Bool { store.volumesLoaded }
 
-    func refresh() async { await store.refreshVolumes() }
-
     func perform(_ action: @Sendable (any DockerClientProtocol) async throws -> Void) async {
         do { try await action(docker); await store.refreshVolumes() }
         catch { actionError = "\(error)" }

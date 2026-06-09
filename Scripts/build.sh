@@ -10,8 +10,10 @@ ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
 
-echo "==> swift build -c $CONFIG (velox CLI)"
-swift build -c "$CONFIG" --product velox
+# Build every product (velox CLI + VeloxApp GUI + velox-porthelper) so a break in any
+# target is caught in the dev loop — not only the CLI (a GUI-only break once shipped silently).
+echo "==> swift build -c $CONFIG (all products)"
+swift build -c "$CONFIG"
 
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/velox"
 

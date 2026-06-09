@@ -133,6 +133,7 @@ func runStart(bind: BindMode) -> Never {
                 teardown.run()
                 watcher.stop()
                 forwarder.stopAll()
+                udpForwarder.stopAll()
                 clockSync.stop()
                 resourceSaver?.stop()
                 proxy.stop()

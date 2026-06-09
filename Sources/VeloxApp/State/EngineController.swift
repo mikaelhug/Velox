@@ -74,7 +74,7 @@ final class EngineController {
     private var bootedMemoryBytes: UInt64 = 0
 
     /// The Docker API client, valid only while the engine is running. Dashboards
-    /// read this; it rides an in-process VSOCK connection to the guest (Phase 2).
+    /// read this; it rides an in-process VSOCK connection to the guest.
     private(set) var docker: DockerClient?
 
     /// Persistent, shared store of the dashboard resource lists (containers/images/
@@ -245,7 +245,7 @@ final class EngineController {
             // (~95 serving / ~17 ingress) instead of the ~6 Gbit/s vsock relay. Best-effort
             // and async (the probe waits on guest DHCP): if it fails, the forwarder keeps the
             // vsock fallback, so nothing blocks engine readiness on it.
-            Task { [weak self] in
+            Task { [weak self, manager = self.manager] in
                 guard let info = await GatewayProbe.probe(manager: manager) else { return }
                 let pool = ConduitPool(gateway: info, endpoints: endpoints)
                 do {
