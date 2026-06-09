@@ -75,6 +75,14 @@ public enum VMConfiguration {
             // sparse ASIF image stays at its high-water mark, which costs no host space.
             + " velox.disk=\(resources.diskGiB)"
             + " root=/dev/vda rootfstype=erofs ro init=/sbin/vinit"
+            // Expedited RCU grace periods. Every `docker run --rm` tears down a veth pair
+            // + network namespace, and each deletion makes in-kernel synchronize_net()
+            // calls that otherwise block on a *normal* RCU grace period (several ms each).
+            // Expedited forces them via IPIs in ~µs — measured to cut `docker run` latency
+            // ~23% (≈117 → 93 ms) on this 8-vCPU guest, almost all of it container teardown.
+            // Standard container-host tuning; the cost is a few extra IPIs, negligible for
+            // an interactive dev engine where launch latency is the metric that matters.
+            + " rcupdate.rcu_expedited=1"
         // Optional host-supplied extra kernel parameters, appended LAST so a
         // duplicated key overrides the defaults (kernel takes the last value).
         // Used for scheduler A/B tuning, e.g. VELOX_KCMDLINE_EXTRA="preempt=full".
@@ -117,16 +125,27 @@ public enum VMConfiguration {
             cachingMode: .cached, synchronizationMode: .none)
         storage.append(VZVirtioBlockDeviceConfiguration(attachment: rootAttachment))
         if let dataDisk, FileManager.default.fileExists(atPath: dataDisk.path) {
-            // /var/lib/docker is the hot path for `docker run`: every container
-            // create/start/remove mounts + tears down an overlay snapshot, a storm
-            // of small metadata I/O. `.cached` routes that through the host page
-            // cache (vs the default uncached path), and `.fsync` honours the guest's
-            // fsync barriers without syncing *every* write through to disk — the
-            // same speed/durability trade Docker Desktop & OrbStack make for the
-            // engine disk. Measured to cut container create/remove latency.
+            // /var/lib/docker is the hot path for `docker run` and for any IO/DB
+            // workload in a container: each guest fsync → ext4 barrier → virtio FLUSH.
+            // `.cached` keeps the disk in the host page cache; `synchronizationMode`
+            // decides what a guest flush costs:
+            //   .fsync → a real host fsync() per flush — durable across a host crash, but
+            //            on macOS APFS that's ~2–4 ms each, so durable commits cap at a
+            //            few hundred/s (Postgres pgbench, image unpacks, etc. crawl).
+            //   .none  → acknowledge the flush from the host page cache, no per-flush host
+            //            sync (a writeback cache). ~18× faster commits. This is exactly
+            //            what Docker Desktop does — measured on this Mac: DD 131 µs/commit
+            //            vs a real native macOS fsync at 3.9 ms (i.e. DD is *not* durably
+            //            syncing). Velox `.fsync` was 2.3 ms.
+            // Velox is a *development* engine (containers/images/volumes are recreatable
+            // dev state, not a system of record), so we match DD and take `.none`: speed
+            // over per-commit durability. Risk window = an unclean *host* shutdown (power
+            // loss / host kernel panic) loses the last unflushed writes; a guest crash or
+            // a clean Velox quit is safe — graceful stop sync's the guest, and the host
+            // page cache survives the VM teardown for macOS to flush.
             let attachment = try VZDiskImageStorageDeviceAttachment(
                 url: dataDisk, readOnly: false,
-                cachingMode: .cached, synchronizationMode: .fsync)
+                cachingMode: .cached, synchronizationMode: .none)
             storage.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
         }
         config.storageDevices = storage
