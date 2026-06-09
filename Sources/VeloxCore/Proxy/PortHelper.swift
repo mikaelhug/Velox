@@ -205,10 +205,11 @@ enum PortHelperInstaller {
     static let versionMarker = "/Library/Application Support/Velox/porthelper.version"
     static let socketPath = PortHelperClient.socketPath
 
-    /// The app version this build of the helper ships with; a mismatch reinstalls.
-    static var currentVersion: String {
-        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? Versions.velox
-    }
+    /// The helper revision that must be installed, from versions.env (`Versions.porthelperRevision`).
+    /// The install (one admin prompt) is repeated ONLY when this changes — i.e. only when the
+    /// helper's binary/socket protocol actually changes — not on every Velox update. (It used to be
+    /// the app version, which changes every release, so the install re-prompted on every update.)
+    static var requiredRevision: String { Versions.porthelperRevision }
 
     /// Installed, current, and the daemon's socket is present (so it's actually running).
     static func isInstalledAndCurrent() -> Bool {
@@ -218,7 +219,12 @@ enum PortHelperInstaller {
               fm.fileExists(atPath: socketPath) else { return false }
         let marker = (try? String(contentsOfFile: versionMarker, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return marker == currentVersion
+        // Grandfather installs from the old scheme (the marker was an app version like "0.1.12",
+        // which contains dots) as revision "1" — the immutable baseline the revision scheme launched
+        // at — so existing users aren't re-prompted merely to migrate the marker. Only a genuine
+        // `PORTHELPER_REVISION` bump (a changed helper) reinstalls thereafter.
+        let installedRevision = (marker?.contains(".") ?? false) ? "1" : marker
+        return installedRevision == requiredRevision
     }
 
     /// Locate the helper binary shipped inside the app bundle (or next to the CLI,
@@ -241,7 +247,7 @@ enum PortHelperInstaller {
             return false
         }
         let plistB64 = Data(launchDaemonPlist(uid: getuid()).utf8).base64EncodedString()
-        let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: currentVersion)
+        let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: requiredRevision)
         Log.info("port-helper: requesting authorization to install the privileged port helper")
         let prompt = "Velox needs administrator access to install a small helper so it can "
             + "publish container ports below 1024 (for example 80 and 443). This is a one-time "
