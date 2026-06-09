@@ -142,96 +142,90 @@ End-to-end: open Velox → `docker run -d -p 8080:80 nginx` → `curl localhost:
 
 ## Performance
 
-The north star is to be **as lean, efficient, and fast as possible with the smallest
-footprint** — beating the leading VM-based Docker engines where possible, and at least on
-par otherwise. Numbers below were measured on Apple Silicon, same Docker Engine version
-(29.x) on both sides, 10 vCPU / 16 GB both, 2026-06. They vary by host; each table has a
-one-line reproduction. The comparison column is the leading VM-based alternative for
-macOS, measured the same way.¹
+The north star is to be **as lean, efficient, and fast as possible, with the smallest
+footprint** — beating Docker Desktop where possible, and on par where not. The table below
+is a full head-to-head measured on the same Mac, the same way, with **both engines
+configured identically (8 vCPU / 8 GB)**. Velox wins on footprint, startup, container
+launch, the VZNAT uplink, VirtioFS, and the in-VM disk hot path; it's on par on cold pulls
+and bulk DB load; and the one path it still **trails** is inbound published-port throughput,
+called out honestly below.
 
-**Scorecard:** Velox **wins** on container launch, cold start, idle RAM, network
-throughput, and `docker cp`; and is **on par** on disk reclaim, VirtioFS, x86 emulation,
-and published-port reachability.
+- **Host:** Apple M4 Pro (8P+4E), 24 GB, macOS 26.5.1 · **2026-06-09**
+- **Engines:** Velox 0.1.11 (dockerd 29.5.3) vs Docker Desktop (dockerd 29.4.3), both on
+  `Virtualization.framework`, 8 vCPU / 8 GB, idle baseline.
+- Velox runs a **dev-tuned profile**: a host writeback data disk (`.none` + `nobarrier`,
+  with a boot `e2fsck`) and **expedited-RCU** launch tuning — see [the disk &
+  launch notes](docs/benchmarks.md) for the speed/durability trade.
+- **Method + runnable harness:** [`docs/benchmarks.md`](docs/benchmarks.md). One engine
+  under load at a time, identical pinned images, medians where applicable. Absolute figures
+  vary by host — the doc ships the scripts to measure your own.
 
-### Container launch — **win** (`docker run --rm alpine true`, warm)
+### Scorecard
 
-| | Velox | Leading alternative |
-| --- | --- | --- |
-| full network | **~0.17 s** | ~0.19 s |
-| `--network none` | **~0.12 s** | ~0.15 s |
+| Metric | Velox | Docker Desktop | Result |
+| --- | --- | --- | --- |
+| Install footprint | **226 MB** | 2,328 MB | 🟢 **10× smaller** |
+| Idle RAM (host RSS, all processes) | **871 MB** | 2,296 MB | 🟢 **2.6× less** |
+| Startup (restart → API-ready, warm) | **1.74 s** | 2.55 s | 🟢 **1.5× faster** |
+| Container launch (`run --rm alpine true`) | **89 ms** | 158 ms | 🟢 **1.8× faster** |
+| Sequential churn (per container, ×30) | **0.113 s** | 0.160 s | 🟢 **1.4× faster** |
+| Parallel launch ×20 (total) | **0.82 s** | 1.19 s | 🟢 **1.4× faster** |
+| Network — container → host (iperf3) | **93.3 Gbit/s** | 25.7 Gbit/s | 🟢 **3.6× faster** |
+| VirtioFS bind-mount write (`dd` 1 GiB) | **1,979 MB/s** | 692 MB/s | 🟢 **2.9× faster** |
+| VirtioFS bind-mount read | **2,879 MB/s** | 2,163 MB/s | 🟢 1.3× faster |
+| Small-file extract (4,000 files → bind) | **0.31 s** | 3.14 s | 🟢 **10× faster** |
+| In-VM durable commit (`fdatasync`) | **58 µs** | 131 µs | 🟢 **2.3× faster** |
+| Named-volume write (in-VM ext4) | **2,393 MB/s** | 1,670 MB/s | 🟢 **1.4× faster** |
+| Container-overlay write | **2,537 MB/s** | 1,590 MB/s | 🟢 **1.6× faster** |
+| Postgres `pgbench` TPS (8 clients, 30 s) | **14,903** | 12,904 | 🟢 **1.15× faster** |
+| Cold image pull (381 MB on disk) | 18.5 s | 16.9 s | ⚪ par |
+| Postgres `pgbench` init (scale 50) | 2.48 s | 2.37 s | ⚪ par |
+| Published port — host → container (1 stream) | 1.44 Gbit/s | 12.1 Gbit/s | 🔴 **trails ~8×** |
+| Published port — host → container (4 streams) | 1.09 Gbit/s | 18.6 Gbit/s | 🔴 **trails ~17×** |
 
-Both engines do the same per-container veth/bridge work; Velox does the rest faster. The
-win comes from a finer scheduler tick (`HZ=1000` + lazy preemption) — per-container
-network setup is full of short kernel waits that round up to the tick — and a
-**host-cached engine disk** (the VZ block device runs `cachingMode: .cached`), which
-routes overlay-snapshot metadata I/O through the page cache. Repro:
-`time docker run --rm alpine true` (warm image, average a few runs); compare `--network none`.
+### Where Velox wins
 
-### Cold start — **win** (launch → `docker` ready, warm caches)
+- **Footprint & startup.** A self-contained **226 MB** app (vs a 2.3 GB install) and one
+  lean Swift supervisor + VM — **871 MB** resident at idle vs Docker Desktop's UI + backend
+  daemons (~2.3 GB) — that also restarts to a ready Docker API in **~1.7 s**.
+- **Container launch.** `docker run --rm alpine true` is **~89 ms vs 158 ms**. Two tunings
+  get there: the writeback data disk removes the per-commit fsync tax on overlay-snapshot
+  setup, and `rcupdate.rcu_expedited=1` collapses the RCU grace-period waits that dominate
+  veth/netns *teardown* on every `--rm` (~23% of launch on its own).
+- **VZNAT uplink.** The container→host path is Apple's in-kernel NAT driven by a far leaner
+  host, hitting **93 Gbit/s** vs ~26. Repro: `iperf3 -s -B 0.0.0.0` on the Mac, then in a
+  container `iperf3 -c host.docker.internal`.
+- **VirtioFS.** Bulk bind-mount writes run ~2.9× faster, and metadata-heavy small-file work
+  (the `node_modules` / `git clone` case) ~10× faster.
+- **In-VM disk.** The writeback data disk (`.none` + `nobarrier`) gives **~2.3× lower
+  commit latency** and ~1.4–1.6× write bandwidth, so `pgbench` TPS beats DD too. A native
+  macOS `fsync` costs ~3.9 ms here, so durable-per-commit (Velox's old default, and what
+  the *guarantee* costs) caps throughput; the dev profile trades that for speed — see below.
 
-| Velox | Leading alternative |
-| --- | --- |
-| **~0.8–1.3 s** | ~5.6 s |
+### The dev-speed disk trade
 
-Repro: `time` from `velox start` until `docker version` succeeds.
+Velox is a development engine — containers/images/volumes are recreatable, not a system of
+record — so the data disk runs as a **host writeback cache** (no durable host `fsync` per
+commit), exactly like Docker Desktop, plus `nobarrier` to drop the now-pointless guest FLUSH
+round-trips. The only risk window is an unclean **host** shutdown (power loss / kernel
+panic) losing the last unflushed writes; a guest crash or clean quit is safe, and `vinit`
+preen-`fsck`s the disk on boot if it wasn't unmounted cleanly. This is a deliberate
+speed-over-durability default; the full ladder and how to revert it are in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
-### Idle RAM — **win** (host-side resident memory, no containers)
+### On par
 
-| Velox | Leading alternative |
-| --- | --- |
-| **~13 MiB** | ~630 MiB |
+Cold image pulls and bulk DB load (`pgbench` init) land within ~10% of Docker Desktop —
+same Apple primitives, same stock `dockerd`, same containerd image store.
 
-One lean VM-supervisor process vs a UI + backend daemons + helpers. (Guest RAM is
-accounted separately by VZ for both.) Repro:
-`ps -o rss= -p "$(pgrep -f release/velox)"`.
+### Where Velox trails (today)
 
-### Network throughput — **win** (iperf3, container ↔ Mac, Apple VZNAT both sides)
+- **Inbound published-port throughput.** A host→container connection to a published port
+  (`-p`) routes through the host-side userspace `PortForwarder` over VSOCK, which **serializes
+  and does not scale with parallel streams** (~1.1–1.4 Gbit/s vs 12–19). This is the *inbound*
+  path only — the *outbound* VZNAT path is 3.6× faster than Docker Desktop. The in-scope fix
+  (carry the data over the fast VZNAT path, control over VSOCK) is on the roadmap. Repro:
+  `docker run -d -p 5301:5201 networkstatic/iperf3 -s` then `iperf3 -c 127.0.0.1 -p 5301`.
 
-| direction | Velox | Leading alternative |
-| --- | --- | --- |
-| upload (container → host) | **~87 Gbit/s** | ~25 Gbit/s |
-| download (host → container) | **~13.5 Gbit/s** | ~12.5 Gbit/s |
-
-Same in-kernel datapath, but Velox's far leaner host gets closer to the ceiling. Repro:
-`iperf3 -s -B 0.0.0.0` on the Mac, then in a container
-`apk add iperf3 && iperf3 -c host.docker.internal` (add `-R` for download).
-
-### `docker cp` throughput — **win** (1 GiB in/out of a container, over the VSOCK data plane)
-
-| direction | Velox | Leading alternative |
-| --- | --- | --- |
-| cp in (host → container) | **~393 MiB/s** | ~149 MiB/s |
-| cp out (container → host) | **~508 MiB/s** | ~226 MiB/s |
-
-Velox's lean Rust VSOCK relay is ~2.5× faster. Repro:
-`docker run -d --name c alpine sleep 300 && time docker cp <1GiB-file> c:/big && time docker cp c:/big /tmp/out`.
-
-### Disk reclaim — **on par** (pull 1 GiB image → remove → trim)
-
-Velox's data disk is a sparse ASIF image that starts at tens of MiB and returns freed
-space to macOS (guest `fstrim` + ASIF hole-punch). Repro: `du -m ~/.velox/data.img`
-before/after `docker pull python:3.12`, then `docker rmi python:3.12` + an `fstrim`.
-
-### VirtioFS write — **on par** (`dd` 1 GiB, `conv=fsync`; same Apple VirtioFS)
-
-~1.0–1.9 GB/s — bounded by Apple's VirtioFS, which both engines use. Repro:
-`docker run --rm -v "$PWD":/mnt alpine dd if=/dev/zero of=/mnt/big bs=1M count=1024 conv=fsync`.
-
-### x86 emulation — **on par** (Rosetta, amd64 workload)
-
-~0.2 s for a small amd64 workload (container-start subtracted) — native Apple Rosetta
-both sides. Repro:
-`time docker run --platform linux/amd64 --rm python:3.12-slim python3 -c pass`.
-
-### Published-port reachability — **on par** (`docker run -d -p` → `curl` 200)
-
-~0.4–0.6 s — a published port becomes reachable almost immediately, because the watcher
-is **event-driven** (it rides the Docker `/events` stream over the in-process VSOCK client
-rather than polling). Repro: `docker run -d -p 18080:80 nginx`, then poll
-`curl -s localhost:18080` until it answers.
-
----
-
-¹ Comparisons are against the leading VM-based Docker engine for macOS, on the same Docker
-Engine version and resource allocation, measured on the same Mac. Absolute figures vary by
-hardware; the reproduction commands above let you measure your own.
+Full methodology, fairness controls, caveats, and the runnable harness live in
+[`docs/benchmarks.md`](docs/benchmarks.md).
