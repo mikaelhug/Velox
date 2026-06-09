@@ -243,7 +243,10 @@ enum PortHelperInstaller {
         let plistB64 = Data(launchDaemonPlist(uid: getuid()).utf8).base64EncodedString()
         let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: currentVersion)
         Log.info("port-helper: requesting authorization to install the privileged port helper")
-        guard await runAsAdmin(script) else {
+        let prompt = "Velox needs administrator access to install a small helper so it can "
+            + "publish container ports below 1024 (for example 80 and 443). This is a one-time "
+            + "setup — you won't be asked again."
+        guard await runAsAdmin(script, prompt: prompt) else {
             Log.warn("port-helper: installation was not authorized")
             return false
         }
@@ -265,7 +268,7 @@ enum PortHelperInstaller {
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
             "rm -f \(shq(plistPath)) \(shq(installedBinary)) \(shq(versionMarker))",
         ].joined(separator: " && ")
-        return await runAsAdmin(script)
+        return await runAsAdmin(script, prompt: "Velox needs administrator access to remove its privileged-port helper.")
     }
 
     /// POSIX single-quote a value so it can't break out of the privileged install
@@ -318,12 +321,17 @@ enum PortHelperInstaller {
         """
     }
 
-    /// Run a shell command as root via a single GUI authorization prompt.
-    private static func runAsAdmin(_ shell: String) async -> Bool {
-        let escaped = shell
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let appleScript = "do shell script \"\(escaped)\" with administrator privileges"
+    /// Run a shell command as root via a single GUI authorization prompt. `prompt` is shown in
+    /// the macOS authorization dialog so the user reads a clear, Velox-specific reason instead of
+    /// a bare password request. (A fully native dialog with the app's own name + icon would need
+    /// SMAppService, which requires a Developer ID signature this build doesn't carry — so the
+    /// custom prompt is the best UX available on the osascript path.)
+    private static func runAsAdmin(_ shell: String, prompt: String) async -> Bool {
+        func esc(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        }
+        let appleScript = "do shell script \"\(esc(shell))\" with administrator privileges "
+            + "with prompt \"\(esc(prompt))\""
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
