@@ -73,6 +73,9 @@ func runStart(bind: BindMode) -> Never {
         let prefs = VeloxConfig.load()
         try Paths.ensureRoot()
         try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: prefs.resources.diskGiB)
+        // After an app update, refresh the installed guest from the (newer) bundled copy so we
+        // never boot a stale ~/.velox kernel/rootfs against a new host.
+        GuestInstall.refreshFromBundleIfNeeded()
 
         let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
         let config = try VMConfiguration.build(

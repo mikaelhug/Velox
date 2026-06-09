@@ -164,6 +164,9 @@ final class EngineController {
             let shareURLs = config.shareURLs
             try Paths.ensureRoot()
             try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: resources.diskGiB)
+            // After an app update, refresh the installed guest from the (newer) bundled copy so we
+            // never boot a stale ~/.velox kernel/rootfs against a new host.
+            GuestInstall.refreshFromBundleIfNeeded()
             let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
                 ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                               kernelCommandLine: GuestImage.defaultCommandLine)

@@ -64,6 +64,9 @@ fi
 
 cp "$KERNEL_ARTIFACT" "$DEST/kernel"
 cp "$OUT/root.img" "$DEST/root.img"
+# Stamp the installed guest with this version so a same-version Velox.app launch leaves this
+# dev build in place (GuestInstall only refreshes from the bundle when the stamp differs).
+echo "$VELOX_VERSION" > "$DEST/guest.version"
 # The old initramfs is gone — remove a stale one so the boot path is unambiguous.
 rm -f "$DEST/initrd.img"
 echo "==> Installed kernel + root.img → $DEST"
