@@ -21,6 +21,12 @@ on:
 permissions:
   contents: write
 
+# Run all JavaScript-based actions (checkout, cache, artifact, gh-release) on Node.js 24.
+# GitHub forces this by default from 2026-06-16 and removes Node 20 on 2026-09-16; opting in
+# now silences the deprecation warning and de-risks the forced switch.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # 1) Guest (custom kernel + erofs rootfs) on a NATIVE arm64 Linux runner —
