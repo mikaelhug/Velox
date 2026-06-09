@@ -53,6 +53,13 @@ rootfs of static binaries — **no LinuxKit, no initramfs**, see §7) running st
 
 The following conventions are **binding** — keep them true in all future work.
 
+> **Releasing is opt-in, never automatic.** Do **not** ship a release on your own:
+> no `VELOX_VERSION` bump in `versions.env`, no `release: vX.Y.Z` commit, and above all
+> no `vX.Y.Z` tag or tag push — a `v*` tag push triggers the CI release that the updater
+> serves to users. Implement and commit requested fixes as normal, but **cut a release
+> only when the user explicitly asks for it** ("ship it", "release vX", "tag it"). When
+> in doubt, leave it untagged and ask.
+
 ## 1. User-facing CLI is the stock `docker`, via a Docker **context**
 
 Velox is "as original as possible": it ships **no wrapper command**. Users drive
