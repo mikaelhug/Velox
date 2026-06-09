@@ -26,6 +26,9 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
 
     public func start(configuration: VZVirtualMachineConfiguration,
                       completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
+        // The configuration is only ever touched on the VM queue (where the machine is created
+        // and runs) and the caller hands it off without reusing it — safe to carry into the queue.
+        nonisolated(unsafe) let configuration = configuration
         queue.async {
             let machine = VZVirtualMachine(configuration: configuration, queue: self.queue)
             machine.delegate = self

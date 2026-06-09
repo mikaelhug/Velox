@@ -20,11 +20,9 @@ final class NetworksModel {
 }
 
 struct NetworksView: View {
-    let docker: any DockerClientProtocol
     @State private var model: NetworksModel
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore) {
-        self.docker = docker
         _model = State(initialValue: NetworksModel(docker: docker, store: store))
     }
 

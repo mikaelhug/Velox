@@ -33,7 +33,6 @@ final class VolumesModel {
 }
 
 struct VolumesView: View {
-    let docker: any DockerClientProtocol
     @State private var model: VolumesModel
     @State private var selection = Set<Volume.ID>()
     @State private var showInspector = true
@@ -42,7 +41,6 @@ struct VolumesView: View {
     @State private var tableLayout: TableColumnCustomization<Volume>
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore) {
-        self.docker = docker
         _model = State(initialValue: VolumesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("volumes"))
     }

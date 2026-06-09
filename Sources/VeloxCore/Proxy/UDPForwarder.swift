@@ -201,7 +201,8 @@ public final class UDPForwarder: @unchecked Sendable {
                 }
                 self?.touch(port: port, key: key)
             }
-            self?.queue.async { self?.reclaim(port: port, key: key) }
+            guard let self else { return }
+            self.queue.async { [weak self] in self?.reclaim(port: port, key: key) }
         }
     }
 

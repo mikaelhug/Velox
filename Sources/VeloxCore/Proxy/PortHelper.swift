@@ -79,8 +79,7 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
     /// the *latest* set is re-reconciled so those ports bind. Shared by GUI + CLI.
     public func reconciler(
         tcp tcpReconcile: @escaping @Sendable (Set<UInt16>) -> Void,
-        udp udpReconcile: @escaping @Sendable (Set<UInt16>) -> Void,
-        onAuthNeeded: (@Sendable () -> Void)? = nil
+        udp udpReconcile: @escaping @Sendable (Set<UInt16>) -> Void
     ) -> @Sendable (Set<UInt16>, Set<UInt16>) -> Void {
         return { [weak self] tcp, udp in
             // Always reconcile the complete set, in the watcher's serialized callback.
@@ -88,7 +87,7 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
             guard let self, tcp.contains(where: { $0 < 1024 }) || udp.contains(where: { $0 < 1024 }) else { return }
             self.setLatest(tcp: tcp, udp: udp)
             Task {
-                guard await self.ensureInstalled() else { onAuthNeeded?(); return }
+                guard await self.ensureInstalled() else { return }
                 // Re-reconcile the newest set so the now-bindable privileged ports open.
                 let (t, u) = self.latest()
                 tcpReconcile(t); udpReconcile(u)

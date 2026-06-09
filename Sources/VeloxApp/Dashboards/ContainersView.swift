@@ -160,7 +160,6 @@ private enum TopLevelEntry: Identifiable {
 }
 
 struct ContainersView: View {
-    let docker: any DockerClientProtocol
     let stats: StatsStore
     @Environment(\.openWindow) private var openWindow
     @State private var model: ContainersModel
@@ -174,7 +173,6 @@ struct ContainersView: View {
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore, stats: StatsStore) {
-        self.docker = docker
         self.stats = stats
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("containers"))

@@ -51,7 +51,6 @@ final class ImagesModel {
 }
 
 struct ImagesView: View {
-    let docker: any DockerClientProtocol
     @State private var model: ImagesModel
     @State private var selection = Set<ImageSummary.ID>()
     @State private var searchText = ""
@@ -61,7 +60,6 @@ struct ImagesView: View {
     @State private var tableLayout: TableColumnCustomization<ImageSummary>
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore) {
-        self.docker = docker
         _model = State(initialValue: ImagesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("images"))
     }

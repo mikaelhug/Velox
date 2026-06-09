@@ -103,11 +103,6 @@ private struct GeneralPane: View {
 
             Section {
                 Toggle("Check for updates on startup", isOn: $config.checkUpdatesOnStartup)
-                Picker("When an update is available", selection: $config.updateBehavior) {
-                    Text("Notify me").tag(VeloxConfig.UpdateBehavior.notify)
-                    Text("Download automatically").tag(VeloxConfig.UpdateBehavior.automatic)
-                    Text("Do nothing").tag(VeloxConfig.UpdateBehavior.manual)
-                }
                 LabeledContent("Status") { updateControls }
                 if engine.availableUpdate?.isUpdateAvailable == true,
                    let urlString = engine.availableUpdate?.releaseURL,
@@ -131,14 +126,6 @@ private struct GeneralPane: View {
                 Text("Docker CLI")
             } footer: {
                 Text("Points the `docker` CLI at the Velox engine, so `docker` commands target Velox from any terminal.")
-            }
-
-            Section {
-                TextField("Terminal app", text: $config.defaultTerminal)
-            } header: {
-                Text("Terminal")
-            } footer: {
-                Text("Opened when Velox needs to drop you into a shell.")
             }
 
             Section("About") {

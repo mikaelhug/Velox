@@ -29,11 +29,6 @@ final class EngineController {
     /// a container starts or the engine stops.
     private(set) var isResourceSaving = false
 
-    /// True when a container published a port below 1024 but the user declined the
-    /// one-time admin prompt to install the privileged port helper, so that port
-    /// isn't forwarded to the Mac. Cleared on each (re)start.
-    private(set) var privilegedPortsNeedAuth = false
-
     /// Persisted user preferences (resources, file shares, etc.). Settings bind
     /// to this; `saveConfig()` writes it back to ~/.velox/config.json.
     var config: VeloxConfig
@@ -221,16 +216,12 @@ final class EngineController {
             // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
             // Privileged ports (<1024) route through the root helper (installed on
             // first use), so a reverse proxy published on :80 reaches the Mac.
-            privilegedPortsNeedAuth = false
             let helper = PortHelperManager()
             let forwarder = PortForwarder(bridge: bridge, privilegedBinder: helper)
             let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: helper)
             let onPorts = helper.reconciler(
                 tcp: { forwarder.reconcile($0) },
-                udp: { udpForwarder.reconcile($0) },
-                onAuthNeeded: { [weak self] in
-                    Task { @MainActor in self?.privilegedPortsNeedAuth = true }
-                })
+                udp: { udpForwarder.reconcile($0) })
             // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
             let endpoints = PublishedEndpoints()
             let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts, endpoints: endpoints)

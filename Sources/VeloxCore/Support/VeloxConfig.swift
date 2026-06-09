@@ -4,12 +4,6 @@ import Foundation
 /// source of truth for resource allocation and file sharing; the engine reads it
 /// at boot. Decoding tolerates missing keys so older/newer files still load.
 public struct VeloxConfig: Codable, Sendable, Equatable {
-    public enum UpdateBehavior: String, Codable, Sendable, CaseIterable {
-        case manual    // never check automatically
-        case notify    // check and notify (default)
-        case automatic // download + install when available
-    }
-
     public var cpuCount: Int
     public var memoryGiB: Int
     public var diskGiB: Int
@@ -17,8 +11,6 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     public var swapGiB: Int
     public var fileShares: [String]      // absolute host directory paths
     public var launchAtLogin: Bool
-    public var updateBehavior: UpdateBehavior
-    public var defaultTerminal: String   // app name used for "Open in Terminal"
     /// Resource Saver: when no containers have been running for
     /// `resourceSaverMinutes`, reclaim guest RAM (inflate the balloon) until a
     /// container starts again. Mirrors Docker Desktop's Resource Saver.
@@ -34,13 +26,12 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     public var checkUpdatesOnStartup: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
-                launchAtLogin: Bool, updateBehavior: UpdateBehavior, defaultTerminal: String,
+                launchAtLogin: Bool,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
                 dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
-        self.updateBehavior = updateBehavior; self.defaultTerminal = defaultTerminal
         self.resourceSaverEnabled = resourceSaverEnabled
         self.resourceSaverMinutes = resourceSaverMinutes
         self.dontSuggestContext = dontSuggestContext
@@ -56,8 +47,6 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             swapGiB: Int(r.swapMiB / 1024),
             fileShares: [],
             launchAtLogin: false,
-            updateBehavior: .notify,
-            defaultTerminal: "Terminal",
             resourceSaverEnabled: true,
             resourceSaverMinutes: 5,
             dontSuggestContext: false,
@@ -73,8 +62,6 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         swapGiB = try c.decodeIfPresent(Int.self, forKey: .swapGiB) ?? d.swapGiB
         fileShares = try c.decodeIfPresent([String].self, forKey: .fileShares) ?? d.fileShares
         launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? d.launchAtLogin
-        updateBehavior = try c.decodeIfPresent(UpdateBehavior.self, forKey: .updateBehavior) ?? d.updateBehavior
-        defaultTerminal = try c.decodeIfPresent(String.self, forKey: .defaultTerminal) ?? d.defaultTerminal
         resourceSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .resourceSaverEnabled) ?? d.resourceSaverEnabled
         resourceSaverMinutes = try c.decodeIfPresent(Int.self, forKey: .resourceSaverMinutes) ?? d.resourceSaverMinutes
         dontSuggestContext = try c.decodeIfPresent(Bool.self, forKey: .dontSuggestContext) ?? d.dontSuggestContext

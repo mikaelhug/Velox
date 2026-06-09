@@ -85,7 +85,8 @@ public enum Updater {
         request.timeoutInterval = 15
 
         let sem = DispatchSemaphore(value: 0)
-        var release: Release?
+        // Synchronized by the semaphore (the closure signals; we read only after wait()).
+        nonisolated(unsafe) var release: Release?
         URLSession.shared.dataTask(with: request) { data, response, _ in
             defer { sem.signal() }
             guard let data,
@@ -138,12 +139,14 @@ public enum Updater {
         let dest = dir.appendingPathComponent(asset.name)
 
         print("Downloading \(asset.name)…")
-        let sem = DispatchSemaphore(value: 0); var saved = false
+        let sem = DispatchSemaphore(value: 0)
+        // Synchronized by the semaphore (the closure signals; we read only after wait()).
+        nonisolated(unsafe) var saved = false
         URLSession.shared.downloadTask(with: assetURL) { tmp, _, _ in
             defer { sem.signal() }
             guard let tmp else { return }
-            try? fm.removeItem(at: dest)
-            saved = (try? fm.moveItem(at: tmp, to: dest)) != nil
+            try? FileManager.default.removeItem(at: dest)
+            saved = (try? FileManager.default.moveItem(at: tmp, to: dest)) != nil
         }.resume()
         _ = sem.wait(timeout: .now() + 600)
         guard saved else { Log.error("update: download failed"); return }
