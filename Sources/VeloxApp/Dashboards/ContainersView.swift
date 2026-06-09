@@ -283,6 +283,19 @@ struct ContainersView: View {
         }
         .persistTableLayout(tableLayout, "containers")
         .retainingStats(stats)
+        .task {
+            // Keep Docker's own status strings current ("Up About a minute" → "Up 3 minutes" →
+            // "Up 2 hours"). They're computed by the daemon at list time and have no event to
+            // refresh on — uptime just ticks — so the informer leaves a stable container's status
+            // frozen until its next lifecycle event. While this view is on screen, re-list every
+            // few seconds (via the persistent DockerClient, not a new connection per poll) so the
+            // daemon recomputes them. The native strings are shown as-is — it's what `docker ps`
+            // prints — only kept fresh, alongside the live CPU/mem stats.
+            while !Task.isCancelled {
+                await model.refresh()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
         .confirmationDialog(
             "Delete container \(pendingDelete?.displayName ?? "")?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
