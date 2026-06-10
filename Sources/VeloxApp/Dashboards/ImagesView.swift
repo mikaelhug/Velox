@@ -100,6 +100,7 @@ struct ImagesView: View {
             }
                 .customizationID("size")
         }
+        .suppressHorizontalScroller()
         .overlay {
             if model.hasLoaded && model.images.isEmpty {
                 ContentUnavailableView("No Images", systemImage: SidebarItem.images.systemImage,

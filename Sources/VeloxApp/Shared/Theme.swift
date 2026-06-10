@@ -22,6 +22,60 @@ enum Theme {
     static let consoleText = NSColor(calibratedWhite: 0.88, alpha: 1)
 }
 
+extension View {
+    /// Hide the horizontal scroll bar of the nearest AppKit table behind this view.
+    /// Inspector show/hide resizes the table mid-animation, and AppKit flashes the
+    /// horizontal overlay scroller while the content is briefly wider than the
+    /// clip — reads as a glitch. Sideways trackpad scrolling still works when
+    /// columns genuinely overflow; only the indicator and the sideways rubber-band
+    /// are suppressed. (SwiftUI's `.scrollIndicators` doesn't reach Table's
+    /// underlying scroll view, hence the introspection.)
+    func suppressHorizontalScroller() -> some View {
+        background(HorizontalScrollerSuppressor())
+    }
+}
+
+private struct HorizontalScrollerSuppressor: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let probe = NSView()
+        // The AppKit table materializes a beat after this background lands — retry
+        // on a short ladder. Pane switches recreate the view, re-running this.
+        for delay: TimeInterval in [0, 0.25, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak probe] in
+                if let probe { Self.apply(around: probe) }
+            }
+        }
+        return probe
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    /// Climb from the probe until an ancestor's subtree contains a table scroll
+    /// view, then stop — never wander up to the window (the sidebar List is also
+    /// an NSTableView and isn't ours to touch).
+    private static func apply(around probe: NSView) {
+        var node = probe.superview
+        for _ in 0..<6 {
+            guard let host = node else { return }
+            if disable(in: host) { return }
+            node = host.superview
+        }
+    }
+
+    @discardableResult
+    private static func disable(in root: NSView, depth: Int = 0) -> Bool {
+        if depth > 12 { return false }
+        var found = false
+        if let scroll = root as? NSScrollView, scroll.documentView is NSTableView {
+            scroll.hasHorizontalScroller = false
+            scroll.horizontalScrollElasticity = .none
+            found = true
+        }
+        for sub in root.subviews { found = disable(in: sub, depth: depth + 1) || found }
+        return found
+    }
+}
+
 @MainActor
 enum TableLayout {
     private static func key(_ name: String) -> String { "velox.tableLayout.v2.\(name)" }

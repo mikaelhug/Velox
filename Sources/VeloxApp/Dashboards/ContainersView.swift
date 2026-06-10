@@ -243,6 +243,7 @@ struct ContainersView: View {
                 }
             }
         }
+        .suppressHorizontalScroller()
         .contextMenu(forSelectionType: ContainerRow.ID.self) { ids in
             contextMenu(for: ids)
         }
