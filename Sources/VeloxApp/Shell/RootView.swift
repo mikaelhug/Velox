@@ -23,7 +23,7 @@ struct RootView: View {
                     row(.engineLogs)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 270)
+            .navigationSplitViewColumnWidth(min: 160, ideal: 160, max: 270)
             .safeAreaInset(edge: .bottom) {
                 EngineStatusBar()
                     .padding(10)
@@ -96,7 +96,6 @@ struct EngineStatusBar: View {
                 .shadow(color: engine.state.tint.opacity(0.6), radius: engine.state.isRunning ? 2.5 : 0)
             Text(engine.state.label)
                 .font(.callout.weight(.medium))
-            Spacer()
             if engine.state.isBusy {
                 ProgressView().controlSize(.small)
             } else if engine.state.isRunning {
