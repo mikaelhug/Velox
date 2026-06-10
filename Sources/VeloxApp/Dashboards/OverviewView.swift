@@ -40,8 +40,12 @@ struct OverviewView: View {
     @State private var model: OverviewModel
     @State private var showReclaim = false
     /// `/system/df` snapshot for the breakdown card — refreshed with the disk gauge
-    /// (on appear + when the container set changes; no timer).
+    /// (on appear + when the container set changes; no timer). A failure keeps the
+    /// last snapshot and surfaces the error in the banner — never a silent vanish
+    /// (df 500s when the engine's stores are inconsistent, which is exactly when
+    /// the user needs to see why).
     @State private var dockerDF: DiskUsage?
+    @State private var dfError: String?
 
     init(store: DockerResourceStore, stats: StatsStore) {
         self.stats = stats
@@ -55,7 +59,7 @@ struct OverviewView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 hero
-                if let error = model.loadError { errorBanner(error) }
+                if let error = model.loadError ?? dfError { errorBanner(error) }
                 statGrid
                 if let df = dockerDF { DiskBreakdownCard(usage: df) }
                 // A separate view so its per-sample stats reads don't re-evaluate the
@@ -68,7 +72,7 @@ struct OverviewView: View {
         .retainingStats(stats)
         .task(id: model.containers.count) {
             model.refreshDiskUsage()
-            dockerDF = try? await engine.docker?.systemDiskUsage()
+            await refreshDF()
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -82,7 +86,7 @@ struct OverviewView: View {
             if let docker = engine.docker {
                 ReclaimSpaceSheet(docker: docker, isPresented: $showReclaim) {
                     model.refreshDiskUsage()
-                    Task { dockerDF = try? await docker.systemDiskUsage() }
+                    Task { await refreshDF() }
                 }
             }
         }
@@ -117,6 +121,18 @@ struct OverviewView: View {
                     Text("Docker \(Versions.dockerVersion)").font(.caption).foregroundStyle(.tertiary)
                 }
             }
+        }
+    }
+
+    /// Refresh the `/system/df` snapshot. On failure the previous snapshot stays on
+    /// screen and the error is shown in the banner.
+    private func refreshDF() async {
+        guard let docker = engine.docker else { return }
+        do {
+            dockerDF = try await docker.systemDiskUsage()
+            dfError = nil
+        } catch {
+            dfError = "Disk breakdown unavailable: \(error)"
         }
     }
 
