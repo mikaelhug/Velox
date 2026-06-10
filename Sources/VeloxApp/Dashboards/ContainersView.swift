@@ -39,6 +39,7 @@ final class ContainersModel {
     var containers: [ContainerSummary] { store.containers }
     var loadError: String? { store.containersError }
     var hasLoaded: Bool { store.containersLoaded }
+    var anchors: [String: DockerResourceStore.LifeAnchor] { store.anchors }
 
     func setPending(_ ids: [String], _ action: PendingAction) {
         for id in ids { pending[id] = action }
@@ -303,19 +304,10 @@ struct ContainersView: View {
         }
         .persistTableLayout(tableLayout, "containers2")
         .retainingStats(stats)
-        .task {
-            // Keep Docker's own status strings current ("Up About a minute" → "Up 3 minutes" →
-            // "Up 2 hours"). They're computed by the daemon at list time and have no event to
-            // refresh on — uptime just ticks — so the informer leaves a stable container's status
-            // frozen until its next lifecycle event. While this view is on screen, re-list every
-            // few seconds (via the persistent DockerClient, not a new connection per poll) so the
-            // daemon recomputes them. The native strings are shown as-is — it's what `docker ps`
-            // prints — only kept fresh, alongside the live CPU/mem stats.
-            while !Task.isCancelled {
-                await model.refresh()
-                try? await Task.sleep(for: .seconds(5))
-            }
-        }
+        // No uptime re-list: rows render "Up …" from each container's lifecycle anchor
+        // (dockerd's StartedAt/FinishedAt, fetched once per transition) with
+        // self-ticking relative date text — the system updates the label, events
+        // update the anchor, and the GUI's last repeating timer is gone.
         .confirmationDialog(
             "Delete container \(pendingDelete?.displayName ?? "")?",
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
@@ -389,7 +381,7 @@ struct ContainersView: View {
             if let action = model.pending[c.id] {
                 PendingBadge(action: action)
             } else {
-                StatusBadge(state: c.state, status: c.status)
+                UptimeBadge(container: c, anchor: model.anchors[c.id])
             }
         case .project(let g):
             Text(projectStatus(g)).font(.caption).foregroundStyle(.secondary)
@@ -714,8 +706,13 @@ private struct ContainerInspector: View {
     @ViewBuilder
     private func lifecycleSection(_ c: ContainerSummary) -> some View {
         Section("Lifecycle") {
-            if let started = inspect?.state?.startedAt, c.isRunning {
-                LabeledContent("Started", value: Format.age(iso: started))
+            if c.isRunning, let date = DockerDates.parse(inspect?.state?.startedAt) {
+                LabeledContent("Started") {
+                    HStack(spacing: 3) {
+                        Text(date, style: .relative) // self-ticking, no timer
+                        Text("ago")
+                    }
+                }
             }
             if let restarts = inspect?.restartCount {
                 LabeledContent("Restarts") {
@@ -784,13 +781,17 @@ private struct PortLink: View {
     }
 }
 
-/// A small status capsule colored by container state.
-struct StatusBadge: View {
-    let state: String
-    let status: String
+/// Status capsule with NATIVE uptime: the state plus a self-ticking relative time
+/// from the container's lifecycle anchor (dockerd's own StartedAt/FinishedAt +
+/// ExitCode). SwiftUI's `Text(_, style: .relative)` updates itself — no timer, no
+/// re-list; the anchor refreshes only on lifecycle events. Until the anchor lands
+/// (a beat after a transition), Docker's pre-rendered status string fills in.
+struct UptimeBadge: View {
+    let container: ContainerSummary
+    let anchor: DockerResourceStore.LifeAnchor?
 
     var body: some View {
-        Text(status.isEmpty ? state.capitalized : status)
+        content
             .font(.caption)
             .lineLimit(1)
             .padding(.horizontal, 7).padding(.vertical, 2)
@@ -798,10 +799,34 @@ struct StatusBadge: View {
             .foregroundStyle(tint)
     }
 
+    /// The anchor only speaks for the state it was fetched for.
+    private var validAnchor: DockerResourceStore.LifeAnchor? {
+        anchor?.state == container.state ? anchor : nil
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if container.isRunning, let date = validAnchor?.date {
+            HStack(spacing: 3) {
+                Text("Up")
+                Text(date, style: .relative)
+                if container.isUnhealthy { Text("· unhealthy") }
+            }
+        } else if container.state == "exited", let a = validAnchor, let date = a.date {
+            HStack(spacing: 3) {
+                Text(verbatim: "Exited (\(a.exitCode ?? 0))")
+                Text(date, style: .relative)
+                Text("ago")
+            }
+        } else {
+            Text(container.status.isEmpty ? container.state.capitalized : container.status)
+        }
+    }
+
     private var tint: Color {
         // A failing healthcheck outranks "running" — the row should look wrong.
-        if status.localizedCaseInsensitiveContains("(unhealthy)") { return .orange }
-        switch state {
+        if container.isUnhealthy { return .orange }
+        switch container.state {
         case "running": return .green
         case "paused":  return .yellow
         case "restarting": return .orange

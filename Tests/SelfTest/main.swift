@@ -310,6 +310,20 @@ do {
     equal(DockerRunCommand.build(from: bare), "docker run -d --name x alpine", "minimal container")
 }
 
+// MARK: DockerDates (RFC3339 + Go zero-time sentinel)
+
+section("DockerDates")
+do {
+    let d = DockerDates.parse("2026-06-10T09:15:01.123456789Z")
+    check(d != nil, "nanosecond-fraction timestamp parses")
+    if let d {
+        equal(Int(d.timeIntervalSince1970), 1_781_082_901, "fraction stripped, seconds exact")
+    }
+    check(DockerDates.parse("2026-06-10T09:15:01Z") != nil, "no-fraction timestamp parses")
+    check(DockerDates.parse("0001-01-01T00:00:00Z") == nil, "Go zero time → nil (never)")
+    check(DockerDates.parse(nil) == nil && DockerDates.parse("") == nil, "nil/empty → nil")
+}
+
 // MARK: DiskUsage (/system/df) category math
 
 section("DiskUsage")

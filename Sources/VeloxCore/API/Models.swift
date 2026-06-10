@@ -365,6 +365,8 @@ public struct ContainerInspect: Decodable, Sendable {
     public struct StateInfo: Decodable, Sendable {
         public let status: String?
         public let startedAt: String?
+        public let finishedAt: String?
+        public let exitCode: Int?
         public let health: Health?
         public struct Health: Decodable, Sendable {
             public let status: String?
@@ -372,10 +374,13 @@ public struct ContainerInspect: Decodable, Sendable {
             public init(status: String?) { self.status = status }
         }
         enum CodingKeys: String, CodingKey {
-            case status = "Status", startedAt = "StartedAt", health = "Health"
+            case status = "Status", startedAt = "StartedAt", finishedAt = "FinishedAt"
+            case exitCode = "ExitCode", health = "Health"
         }
-        public init(status: String? = nil, startedAt: String? = nil, health: Health? = nil) {
-            self.status = status; self.startedAt = startedAt; self.health = health
+        public init(status: String? = nil, startedAt: String? = nil, finishedAt: String? = nil,
+                    exitCode: Int? = nil, health: Health? = nil) {
+            self.status = status; self.startedAt = startedAt; self.finishedAt = finishedAt
+            self.exitCode = exitCode; self.health = health
         }
     }
 
@@ -428,6 +433,28 @@ public struct ContainerInspect: Decodable, Sendable {
                 state: StateInfo? = nil, restartCount: Int? = nil) {
         self.name = name; self.config = config; self.hostConfig = hostConfig
         self.state = state; self.restartCount = restartCount
+    }
+}
+
+/// Parses dockerd's RFC3339 timestamps (`2026-06-10T09:15:01.123456789Z`). The
+/// nanosecond fraction is stripped (ISO8601DateFormatter chokes past milliseconds and
+/// sub-second precision is irrelevant for uptime), and Go's zero-time sentinel
+/// (`0001-01-01T00:00:00Z`, "never") returns nil.
+public enum DockerDates {
+    // ISO8601DateFormatter is documented thread-safe; the Sendable warning is about
+    // the type, not this usage (same pattern as the cached formatter in the GUI).
+    nonisolated(unsafe) private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    public static func parse(_ s: String?) -> Date? {
+        guard let s, !s.isEmpty else { return nil }
+        let cleaned = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        guard let date = iso.date(from: cleaned) else { return nil }
+        // Go zero time / anything pre-epoch means "hasn't happened".
+        return date.timeIntervalSince1970 > 0 ? date : nil
     }
 }
 

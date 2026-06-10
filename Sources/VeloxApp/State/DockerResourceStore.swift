@@ -95,6 +95,13 @@ final class DockerResourceStore {
             }
             if let action = event.action, Self.lifecycleActions.contains(action) {
                 schedule(.networks)
+                // A transition invalidates the lifecycle anchor even when the listed
+                // state ends up unchanged (restart: running → running) — drop it so
+                // the next refresh re-anchors from fresh StartedAt/FinishedAt.
+                if let name = event.containerName,
+                   let id = containers.first(where: { $0.displayName == name })?.id {
+                    anchors[id] = nil
+                }
             }
         default: break
         }
@@ -131,7 +138,11 @@ final class DockerResourceStore {
     func refresh(_ resource: Resource) async {
         switch resource {
         case .containers:
-            do { containers = try await docker.containers(); containersError = nil; containersLoaded = true }
+            do {
+                containers = try await docker.containers()
+                containersError = nil; containersLoaded = true
+                await refreshAnchors()
+            }
             catch { containersError = "\(error)" }
         case .images:
             do { images = try await docker.images(); imagesError = nil; imagesLoaded = true }
@@ -150,4 +161,48 @@ final class DockerResourceStore {
     func refreshImages() async { await refresh(.images) }
     func refreshVolumes() async { await refresh(.volumes) }
     func refreshNetworks() async { await refresh(.networks) }
+
+    // MARK: - Lifecycle anchors (native uptime, no polling)
+
+    /// A container's lifecycle anchor: when it started (running) or finished (exited)
+    /// per dockerd's own RFC3339 timestamps, plus the exit code. The UI renders
+    /// uptime from these with self-ticking relative date text — replacing the old
+    /// re-list of Docker's pre-rendered "Up 3 minutes" strings (the last GUI timer).
+    struct LifeAnchor: Equatable {
+        let state: String
+        let date: Date?
+        let exitCode: Int?
+    }
+
+    private(set) var anchors: [String: LifeAnchor] = [:]
+
+    /// Fetch anchors for containers whose (id, state) we haven't inspected yet, and
+    /// drop anchors for containers that are gone. One inspect per lifecycle
+    /// transition — never per render, never on a timer. Bounded parallel.
+    private func refreshAnchors() async {
+        let current = containers
+        let ids = Set(current.map(\.id))
+        anchors = anchors.filter { ids.contains($0.key) }
+        let missing = current.filter { anchors[$0.id]?.state != $0.state }
+        guard !missing.isEmpty else { return }
+        let docker = self.docker
+        let fetched: [(String, LifeAnchor)] = await withTaskGroup(
+            of: (String, LifeAnchor)?.self
+        ) { group in
+            for c in missing.prefix(32) {
+                group.addTask {
+                    guard let info = try? await docker.inspectContainer(c.id) else { return nil }
+                    let date = c.isRunning
+                        ? DockerDates.parse(info.state?.startedAt)
+                        : DockerDates.parse(info.state?.finishedAt)
+                    return (c.id, LifeAnchor(state: c.state, date: date,
+                                             exitCode: info.state?.exitCode))
+                }
+            }
+            var out: [(String, LifeAnchor)] = []
+            for await item in group { if let item { out.append(item) } }
+            return out
+        }
+        for (id, anchor) in fetched { anchors[id] = anchor }
+    }
 }
