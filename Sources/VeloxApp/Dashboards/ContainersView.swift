@@ -227,15 +227,8 @@ struct ContainersView: View {
                         HStack(spacing: 8) {
                             ForEach(bindings, id: \.self) { p in
                                 if let pub = p.publicPort {
-                                    let blocked = issues.blocked.contains(UInt16(pub))
-                                    Button(p.label) { WorkspaceActions.openPort(pub) }
-                                        .buttonStyle(.plain)
-                                        .font(.caption.monospaced())
-                                        .foregroundStyle(blocked ? AnyShapeStyle(.red)
-                                                                 : AnyShapeStyle(.link))
-                                        .help(blocked
-                                              ? "localhost:\(pub) couldn't bind — another app holds it"
-                                              : "Open http://localhost:\(pub)/")
+                                    PortLink(label: p.label, port: pub,
+                                             blocked: issues.blocked.contains(UInt16(pub)))
                                 }
                             }
                         }
@@ -541,7 +534,9 @@ struct ContainersView: View {
             if let domain = c.namedAccessDomain { Button("Domain") { WorkspaceActions.copy(domain) } }
             ForEach(c.publishedBindings, id: \.self) { p in
                 if let pub = p.publicPort {
-                    Button("URL (localhost:\(pub))") { WorkspaceActions.copy("http://localhost:\(pub)/") }
+                    // String-built (a literal's Int interpolation is locale-formatted).
+                    let title = "URL (localhost:" + String(pub) + ")"
+                    Button(title) { WorkspaceActions.copy("http://localhost:" + String(pub) + "/") }
                 }
             }
         }
@@ -652,6 +647,27 @@ private struct ContainerInspector: View {
             ContentUnavailableView("No Selection", systemImage: "shippingbox",
                                    description: Text("Select a container to inspect."))
         }
+    }
+}
+
+/// A clickable published-port link; red with an explanatory tooltip when its
+/// localhost listener couldn't bind. Strings are String-built on purpose — a
+/// literal's Int interpolation becomes a LocalizedStringKey and locale number
+/// grouping renders port 3000 as "3 000".
+private struct PortLink: View {
+    let label: String
+    let port: Int
+    let blocked: Bool
+
+    var body: some View {
+        let portText = String(port)
+        Button(label) { WorkspaceActions.openPort(port) }
+            .buttonStyle(.plain)
+            .font(.caption.monospaced())
+            .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.link))
+            .help(blocked
+                  ? "localhost:" + portText + " couldn't bind — another app holds it"
+                  : "Open http://localhost:" + portText + "/")
     }
 }
 

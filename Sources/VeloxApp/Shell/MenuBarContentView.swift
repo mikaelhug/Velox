@@ -11,7 +11,7 @@ struct MenuBarContentView: View {
     @Environment(EngineController.self) private var engine
     @Environment(\.openWindow) private var openWindow
 
-    private static let maxRows = 6
+    private static let maxRows = 7
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -25,16 +25,20 @@ struct MenuBarContentView: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 2)
                 } else {
-                    VStack(alignment: .leading, spacing: 7) {
-                        ForEach(running.prefix(Self.maxRows)) { c in
+                    // Up to 7 rows render inline; beyond that the full list scrolls in
+                    // a fixed-height viewport (like the Wi-Fi menu) — every container
+                    // stays reachable, the panel never grows past the screen.
+                    let rows = VStack(alignment: .leading, spacing: 7) {
+                        ForEach(running) { c in
                             ContainerQuickRow(container: c) {
                                 Task { try? await engine.docker?.stopContainer(c.id) }
                             }
                         }
-                        if running.count > Self.maxRows {
-                            Button("…and \(running.count - Self.maxRows) more") { openDashboard() }
-                                .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
-                        }
+                    }
+                    if running.count <= Self.maxRows {
+                        rows
+                    } else {
+                        ScrollView { rows }.frame(height: 280)
                     }
                     if let stats = engine.stats { UsageLine(stats: stats) }
                 }
@@ -149,13 +153,22 @@ private struct ContainerQuickRow: View {
                             .buttonStyle(.plain).font(.caption2).foregroundStyle(.link)
                             .help("Open http://\(domain)/")
                     }
-                    ForEach(container.publishedBindings, id: \.self) { p in
+                    // String-built titles on purpose: a literal with an Int interpolation
+                    // becomes a LocalizedStringKey, and locale number formatting turns
+                    // port 3000 into "3 000". Ports are never locale-formatted.
+                    let bindings = container.publishedBindings
+                    ForEach(bindings.prefix(3), id: \.self) { p in
                         if let pub = p.publicPort {
-                            Button(":\(pub)") { WorkspaceActions.openPort(pub) }
+                            let title = ":" + String(pub)
+                            Button(title) { WorkspaceActions.openPort(pub) }
                                 .buttonStyle(.plain).font(.caption2.monospaced())
                                 .foregroundStyle(.link)
-                                .help("Open http://localhost:\(pub)/")
+                                .help("Open http://localhost:" + String(pub) + "/")
                         }
+                    }
+                    if bindings.count > 3 {
+                        Text("+" + String(bindings.count - 3))
+                            .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }
@@ -178,7 +191,8 @@ private struct UsageLine: View {
         let samples = stats.latest.values
         let cpu = samples.reduce(0.0) { $0 + $1.cpuPercent }
         let mem = samples.reduce(UInt64(0)) { $0 + $1.memoryBytes }
-        Text("\(Int(cpu))% CPU · \(Format.bytes(mem)) RAM")
+        // Verbatim: Int interpolation in a Text literal is locale-formatted.
+        Text(verbatim: "\(Int(cpu))% CPU · \(Format.bytes(mem)) RAM")
             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
     }
 }
