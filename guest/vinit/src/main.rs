@@ -727,6 +727,9 @@ mod dhcp {
         res
     }
 
+    /// Consecutive failed renewals before falling back to a full re-acquire.
+    const REACQUIRE_AFTER: u32 = 5;
+
     /// Background renewal loop: re-request the lease at ~half its lifetime (or
     /// every 30 min if the server gave no lease time). Runs for the life of the VM.
     /// `force_interval` (from `velox.dhcprenew`) overrides the cadence for testing.
@@ -734,11 +737,32 @@ mod dhcp {
                       lease_secs: u32, force_interval: Option<u64>) {
         let interval = force_interval
             .unwrap_or(if lease_secs >= 120 { (lease_secs / 2) as u64 } else { 1800 });
+        let mut failures = 0u32;
         loop {
             std::thread::sleep(std::time::Duration::from_secs(interval));
             match renew(ifname, mac, ip, server) {
-                Ok(()) => log!("DHCP lease renewed ({})", super::ipstr(ip)),
-                Err(e) => log!("DHCP renew failed: {e} (retrying next cycle)"),
+                Ok(()) => { failures = 0; log!("DHCP lease renewed ({})", super::ipstr(ip)) }
+                Err(e) => {
+                    failures += 1;
+                    log!("DHCP renew failed: {e} ({failures}/{REACQUIRE_AFTER} before re-acquire)");
+                    if failures >= REACQUIRE_AFTER {
+                        failures = 0;
+                        // A server that lost its lease table (e.g. a vmnet restart)
+                        // ignores renewing REQUESTs for an IP it no longer knows —
+                        // forever. A fresh DISCOVER re-registers us; vmnet re-offers
+                        // the same IP per MAC, so addressing normally needs no change.
+                        match acquire(ifname, mac) {
+                            Ok(l) if l.ip == ip =>
+                                log!("DHCP lease re-acquired after failed renewals ({})",
+                                     super::ipstr(ip)),
+                            Ok(l) => log!("WARNING: DHCP re-acquire returned a different \
+                                           lease (ip {} -> {}) — keeping the configured \
+                                           address; restart the VM to adopt the new one",
+                                          super::ipstr(ip), super::ipstr(l.ip)),
+                            Err(e) => log!("DHCP re-acquire failed: {e} (retrying next cycle)"),
+                        }
+                    }
+                }
             }
         }
     }
