@@ -73,10 +73,13 @@ fn main() {
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
+    // Direct-access (named containers) re-asserts its nft rules after every dockerd
+    // (re)spawn — the supervisor signals this channel instead of anything polling.
+    let (nft_tx, nft_rx) = std::sync::mpsc::channel::<()>();
     if data_ok {
         let pid = spawn_dockerd();
         DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
-        std::thread::spawn(move || dockerd_supervisor(deaths_rx));
+        std::thread::spawn(move || dockerd_supervisor(deaths_rx, nft_tx));
     } else {
         // Persistence was expected (/dev/vdb present) but the data fs didn't mount.
         // Running dockerd now would silently use the tmpfs /var and lose every image
@@ -86,7 +89,7 @@ fn main() {
     }
     start_vsock_agent();
     start_conduit_pool();
-    start_direct_access();
+    start_direct_access(nft_rx);
     log!("init complete — supervising");
     reap_forever(deaths_tx);
 }
@@ -428,22 +431,50 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
             });
         }
     });
+    // TCP :53 fallback — a stub resolver that got a truncated (TC) UDP reply retries
+    // over TCP, and without this listener large records simply fail. Same answers,
+    // `[u16 BE len]` framing; shares the UDP inflight budget so a flood on either
+    // transport hits the one cap.
+    match std::net::TcpListener::bind(listen) {
+        Ok(l) => {
+            std::thread::spawn(move || {
+                for conn in l.incoming() {
+                    let Ok(conn) = conn else { continue };
+                    if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
+                        DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        continue; // drop (conn closes on drop); the resolver retries
+                    }
+                    std::thread::spawn(move || {
+                        handle_dns_tcp(conn, gateway, upstream);
+                        DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+        Err(e) => log!("dns: tcp bind {listen} failed ({e}); UDP only"),
+    }
 }
 
 fn answer_dns(sock: &std::net::UdpSocket, query: &[u8], src: std::net::SocketAddr, gateway: u32, upstream: u32) {
-    if let Some((name, qtype, qend)) = parse_qname(query) {
-        if DOCKER_INTERNAL_NAMES.contains(&name.as_str()) {
-            // A -> gateway; anything else (e.g. AAAA) -> empty NOERROR so the client
-            // falls back to the A record instead of chasing a bogus NXDOMAIN.
-            let reply = if qtype == 1 { build_a_reply(query, qend, gateway) }
-                        else { build_empty_reply(query, qend) };
-            let _ = sock.send_to(&reply, src);
-            return;
-        }
-    }
-    if let Some(reply) = forward_dns(query, upstream) {
+    if let Some(reply) = dns_reply_for(query, gateway, upstream, false) {
         let _ = sock.send_to(&reply, src);
     }
+}
+
+/// Reply bytes for one DNS query: `*.docker.internal` answered locally (A → gateway;
+/// anything else, e.g. AAAA → empty NOERROR so the client falls back to the A record
+/// instead of chasing a bogus NXDOMAIN), everything else forwarded upstream. `via_tcp`
+/// picks the upstream transport: TCP clients are here because UDP truncated, so try TCP
+/// first, falling back to UDP if the upstream has no TCP :53.
+fn dns_reply_for(query: &[u8], gateway: u32, upstream: u32, via_tcp: bool) -> Option<Vec<u8>> {
+    if let Some((name, qtype, qend)) = parse_qname(query) {
+        if DOCKER_INTERNAL_NAMES.contains(&name.as_str()) {
+            return Some(if qtype == 1 { build_a_reply(query, qend, gateway) }
+                        else { build_empty_reply(query, qend) });
+        }
+    }
+    if via_tcp { forward_dns_tcp(query, upstream).or_else(|| forward_dns(query, upstream)) }
+    else { forward_dns(query, upstream) }
 }
 
 /// Extract the (lowercased) query name, qtype, and the offset just past the question.
@@ -492,6 +523,51 @@ fn forward_dns(query: &[u8], upstream: u32) -> Option<Vec<u8>> {
     let mut buf = [0u8; 4096];
     let (n, _) = up.recv_from(&mut buf).ok()?;
     Some(buf[..n].to_vec())
+}
+
+/// Forward one query to the upstream over TCP :53 (`[u16 BE len]` framing, RFC 1035 §4.2.2).
+fn forward_dns_tcp(query: &[u8], upstream: u32) -> Option<Vec<u8>> {
+    use std::io::{Read, Write};
+    let t = std::time::Duration::from_secs(2);
+    let dst = std::net::SocketAddr::from((std::net::Ipv4Addr::from(upstream), 53));
+    let mut s = std::net::TcpStream::connect_timeout(&dst, t).ok()?;
+    s.set_read_timeout(Some(t)).ok()?;
+    s.set_write_timeout(Some(t)).ok()?;
+    let mut msg = Vec::with_capacity(2 + query.len());
+    msg.extend_from_slice(&u16::try_from(query.len()).ok()?.to_be_bytes());
+    msg.extend_from_slice(query);
+    s.write_all(&msg).ok()?;
+    let mut lenb = [0u8; 2];
+    s.read_exact(&mut lenb).ok()?;
+    let len = u16::from_be_bytes(lenb) as usize;
+    if len < 12 { return None; }
+    let mut reply = vec![0u8; len];
+    s.read_exact(&mut reply).ok()?;
+    Some(reply)
+}
+
+/// Serve one TCP DNS client — stub resolvers retry here after a truncated (TC) UDP
+/// reply. Same answers as UDP, `[u16 BE len]` framing; a handful of queries per
+/// connection with bounded timeouts so a chatty client can't pin an inflight slot.
+fn handle_dns_tcp(mut conn: std::net::TcpStream, gateway: u32, upstream: u32) {
+    use std::io::{Read, Write};
+    let t = std::time::Duration::from_secs(2);
+    let _ = conn.set_read_timeout(Some(t));
+    let _ = conn.set_write_timeout(Some(t));
+    for _ in 0..8 {
+        let mut lenb = [0u8; 2];
+        if conn.read_exact(&mut lenb).is_err() { return; }
+        let len = u16::from_be_bytes(lenb) as usize;
+        if !(12..=4096).contains(&len) { return; }
+        let mut q = vec![0u8; len];
+        if conn.read_exact(&mut q).is_err() { return; }
+        let Some(reply) = dns_reply_for(&q, gateway, upstream, true) else { return };
+        let Ok(rlen) = u16::try_from(reply.len()) else { return };
+        let mut out = Vec::with_capacity(2 + reply.len());
+        out.extend_from_slice(&rlen.to_be_bytes());
+        out.extend_from_slice(&reply);
+        if conn.write_all(&out).is_err() { return; }
+    }
 }
 
 mod dhcp {
@@ -941,35 +1017,56 @@ fn start_fstrim_timer() {
 /// the per-bridge "UNPUBLISHED PORT DROP" in `filter-FORWARD` (forward hook) and the per-container
 /// "DROP DIRECT ACCESS" in `raw-PREROUTING` (a separate prerouting hook, so the forward allow alone
 /// doesn't cover it). One `ip saddr <gateway> accept` at the TOP of each chain. Each survives
-/// dockerd's per-network reconciles (it edits per-bridge sub-chains, not these base chains); the
-/// loop re-asserts after a dockerd *restart* rebuilds the whole table. Inert until the host adds a
-/// route to the container subnets, so it exposes nothing on its own — and a container cannot spoof
-/// the gateway IP (it lives on eth0, not docker0). Verified by spike + e2e (curl → 200 by name).
-fn start_direct_access() {
+/// dockerd's per-network reconciles (it edits per-bridge sub-chains, not these base chains); only
+/// a dockerd *restart* rebuilds the whole table — and the supervisor signals `restarts` on every
+/// respawn, so the rules are re-asserted event-driven (CLAUDE.md §8), no standing poll. Inert
+/// until the host adds a route to the container subnets, so it exposes nothing on its own — and a
+/// container cannot spoof the gateway IP (it lives on eth0, not docker0). Verified by spike + e2e
+/// (curl → 200 by name).
+fn start_direct_access(restarts: std::sync::mpsc::Receiver<()>) {
+    std::thread::spawn(move || loop {
+        assert_direct_access_rules();
+        // Block until the supervisor respawns dockerd — pure event, no timer. Senders
+        // live in main (never returns) and the supervisor, so Err is unreachable; treat
+        // it as terminal anyway rather than spinning.
+        if restarts.recv().is_err() { return }
+        while restarts.try_recv().is_ok() {} // coalesce a respawn burst into one assert
+    });
+}
+
+/// Insert the gateway allow into both drop chains, retrying until dockerd has built its
+/// table (a bounded settle delay after boot/restart — not a status poll: it stops the
+/// moment both rules are in, and gives up after ~2 min if dockerd never comes up).
+fn assert_direct_access_rules() {
     use std::sync::atomic::Ordering::Relaxed;
-    std::thread::spawn(|| {
-        let nft = |args: &[&str]| Command::new("nft")
-            .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args).output();
-        loop {
-            let gw = GATEWAY_IP.load(Relaxed);
-            if gw != 0 {
-                let gws = ipstr(gw);
-                // Only act once dockerd's table exists; re-assert per chain only if our rule is
-                // gone (i.e. after a dockerd restart rebuilt the table).
-                for chain in ["filter-FORWARD", "raw-PREROUTING"] {
-                    if let Ok(out) = nft(&["list", "chain", "ip", "docker-bridges", chain]) {
-                        if out.status.success()
-                            && !String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
-                            let _ = nft(&["insert", "rule", "ip", "docker-bridges", chain,
-                                          "ip", "saddr", &gws, "counter", "accept"]);
-                            log!("direct-access: allowed {gws} → containers ({chain})");
+    let nft = |args: &[&str]| Command::new("nft")
+        .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args).output();
+    for _ in 0..60 {
+        let gw = GATEWAY_IP.load(Relaxed);
+        if gw != 0 {
+            let gws = ipstr(gw);
+            let mut settled = true;
+            for chain in ["filter-FORWARD", "raw-PREROUTING"] {
+                match nft(&["list", "chain", "ip", "docker-bridges", chain]) {
+                    Ok(out) if out.status.success() => {
+                        if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
+                            continue; // rule already in place
+                        }
+                        match nft(&["insert", "rule", "ip", "docker-bridges", chain,
+                                    "ip", "saddr", &gws, "counter", "accept"]) {
+                            Ok(ins) if ins.status.success() =>
+                                log!("direct-access: allowed {gws} → containers ({chain})"),
+                            _ => settled = false,
                         }
                     }
+                    _ => settled = false, // table/chain not built yet
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(15));
+            if settled { return }
         }
-    });
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    log!("direct-access: gave up waiting for dockerd's nft table (no named access)");
 }
 
 fn is_ext4(dev: &str) -> bool {
@@ -1844,8 +1941,9 @@ fn nix_write(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 
 /// Respawn dockerd whenever the reaper signals it died. Runs on its own thread so the
 /// reaper itself stays a tight `waitpid` loop. Backs off before each (re)spawn so a
-/// daemon that crashes on startup doesn't spin the CPU.
-fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>) {
+/// daemon that crashes on startup doesn't spin the CPU. Each successful respawn pings
+/// `nft_restarted` so direct-access re-asserts its rules in the rebuilt nft table.
+fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>, nft_restarted: std::sync::mpsc::Sender<()>) {
     while deaths.recv().is_ok() {
         log!("dockerd exited — restarting");
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1853,6 +1951,7 @@ fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>) {
             let pid = spawn_dockerd();
             if pid >= 0 {
                 DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+                let _ = nft_restarted.send(());
                 break;
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
