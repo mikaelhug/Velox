@@ -91,11 +91,11 @@ final class EngineController {
 
     init() {
         config = VeloxConfig.load()
-        // Install the guest bundled in the app (or refresh it after an update) before evaluating
-        // readiness, so a fresh install boots straight away instead of showing onboarding asking
-        // the user to build a guest image they have no way to build.
-        GuestInstall.refreshFromBundleIfNeeded()
-        needsOnboarding = !EngineController.isReady
+        // Don't copy the bundled guest here — on update day that's a ~90 MB write
+        // blocking app launch, and `start()` refreshes it anyway. Onboarding only
+        // needs to know whether a guest is *available* (installed or bundled), which
+        // `guestAvailable` answers without copying.
+        needsOnboarding = !(VZVirtualMachine.isSupported && GuestInstall.guestAvailable)
         // Autostart the engine on app launch (unless onboarding is needed). Skipped
         // under SwiftUI previews so the canvas doesn't try to boot a VM.
         let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"

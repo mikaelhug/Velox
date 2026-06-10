@@ -67,7 +67,7 @@ public final class NameDNSResponder: @unchecked Sendable {
 
     // MARK: wire-format (ported from the guest: parse_qname / build_a_reply / build_empty_reply)
 
-    static func buildReply(_ q: [UInt8], registry: NameRegistry) -> [UInt8] {
+    public static func buildReply(_ q: [UInt8], registry: NameRegistry) -> [UInt8] {
         guard let (name, qtype, qend) = parseQName(q), name.hasSuffix(domainSuffix) else { return nxdomain(q) }
         let bare = String(name.dropLast(domainSuffix.count))
         guard let ip = registry.address(for: bare) else { return nxdomain(q) }
@@ -75,7 +75,7 @@ public final class NameDNSResponder: @unchecked Sendable {
     }
 
     /// Extract the lowercased query name, qtype, and the offset just past the question.
-    static func parseQName(_ q: [UInt8]) -> (String, UInt16, Int)? {
+    public static func parseQName(_ q: [UInt8]) -> (String, UInt16, Int)? {
         guard q.count >= 12 else { return nil }
         var pos = 12, name = ""
         while true {

@@ -4,10 +4,13 @@ import VeloxCore
 
 // Velox CLI entry point.
 
-/// Holds the CLI-binding teardown closure so it can be shared across the VM's
-/// @Sendable stop/signal handlers (the closure itself isn't Sendable).
+/// Holds the CLI-binding teardown closure and the engine runtime so they can be
+/// shared across the VM's @Sendable stop/signal handlers (the runtime is created
+/// only once the VM has started).
 private final class Teardown: @unchecked Sendable {
     var run: () -> Void = {}
+    var runtime: EngineRuntime?
+    var saver: ResourceSaver?
 }
 
 private func hostArch() -> String {
@@ -86,51 +89,11 @@ func runStart(bind: BindMode) -> Never {
                  + "cmdline=\"\(image.kernelCommandLine)\"")
 
         let manager = VMManager()
-        let bridge = VsockBridge(manager: manager)
-        let proxy = DockerSocketProxy(
-            socketPath: Paths.dockerSocket.path,
-            guestPort: VsockPort.docker,
-            bridge: bridge)
-        // Inbound published ports: watch the Docker API and reverse-forward each
-        // published port over VSOCK to the guest (which dials 127.0.0.1:<port>).
-        // The watcher rides the same in-process VSOCK Docker client the GUI uses and
-        // is push-based (the /events stream), so ports come up near-instantly.
-        // Privileged ports (<1024) route through the root helper (installed on first
-        // use, with one admin prompt), so e.g. a reverse proxy on :80 reaches the Mac.
-        let portHelper = PortHelperManager()
-        let forwarder = PortForwarder(bridge: bridge, privilegedBinder: portHelper)
-        let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: portHelper)
-        let docker = DockerClient(manager: manager)
-        // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
-        let endpoints = PublishedEndpoints()
-        // Direct (named) container access (same wiring as the GUI EngineController): the watcher
-        // fills name→IP for the loopback DNS responder and surfaces bridge subnets, which the router
-        // routes to the guest via the porthelper. Gated on the one-time grant; inert if declined.
-        let nameRegistry = NameRegistry()
-        let namedRouter = NamedAccessRouter(helper: portHelper)
-        let nameDNS = NameDNSResponder(registry: nameRegistry)
-        let watcher = DockerEventsWatcher(docker: docker, onPorts: portHelper.reconciler(
-            tcp: { forwarder.reconcile($0) },
-            udp: { udpForwarder.reconcile($0) }), endpoints: endpoints,
-            names: nameRegistry, onSubnets: { namedRouter.update(subnets: $0) })
-        let clockSync = ClockSync(manager: manager)
-        let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
-            ? ResourceSaver(manager: manager, docker: docker,
-                            fullMemoryBytes: prefs.resources.memoryBytes,
-                            floorBytes: prefs.resourceSaverFloorBytes,
-                            idleMinutes: prefs.resourceSaverMinutes)
-            : nil
         let teardown = Teardown()
         manager.onStop { error in
             teardown.run()
-            watcher.stop()
-            nameDNS.stop()
-            namedRouter.stop()
-            forwarder.stopAll()
-            udpForwarder.stopAll()
-            clockSync.stop()
-            resourceSaver?.stop()
-            proxy.stop()
+            teardown.runtime?.stop()
+            teardown.saver?.stop()
             exit(error == nil ? 0 : 1)
         }
 
@@ -143,14 +106,8 @@ func runStart(bind: BindMode) -> Never {
             source.setEventHandler {
                 Log.info("signal \(sig) — flushing and stopping guest…")
                 teardown.run()
-                watcher.stop()
-                nameDNS.stop()
-                namedRouter.stop()
-                forwarder.stopAll()
-                udpForwarder.stopAll()
-                clockSync.stop()
-                resourceSaver?.stop()
-                proxy.stop()
+                teardown.runtime?.stop()
+                teardown.saver?.stop()
                 manager.stopGracefully { exit(0) }
             }
             source.resume()
@@ -161,25 +118,24 @@ func runStart(bind: BindMode) -> Never {
         manager.start(configuration: config) { result in
             switch result {
             case .success:
+                // All the engine plumbing (Docker socket proxy, port forwarders, events
+                // watcher, named access, clock sync, conduit pool) is shared with the
+                // GUI via EngineRuntime — one wiring, no CLI/GUI drift.
+                let runtime = EngineRuntime(manager: manager)
                 do {
-                    try proxy.start()
+                    try runtime.start()
+                    teardown.runtime = runtime
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
-                    watcher.start() // dynamic -p port forwarding
-                    try? nameDNS.start() // named-access DNS responder (loopback only)
-                    clockSync.start() // keep guest clock aligned across host sleep
-                    resourceSaver?.start() // reclaim RAM while idle
-                    // Fast published-port datapath: learn the VZNAT gateway from the guest,
-                    // then bind a warm conduit pool so published ports ride VZNAT (~95/~17)
-                    // instead of the vsock relay. Best-effort; falls back to vsock on failure.
-                    Task {
-                        guard let info = await GatewayProbe.probe(manager: manager) else { return }
-                        let pool = ConduitPool(gateway: info, endpoints: endpoints)
-                        do { try pool.start(); forwarder.attachConduitPool(pool) }
-                        catch { Log.warn("conduit pool failed to start: \(error); using vsock fallback") }
-                        // Named access: route container subnets to the guest + request the one-time
-                        // grant (porthelper install + /etc/resolver). Silent if already installed.
-                        namedRouter.setGateway(info.guestIP)
-                        if await portHelper.ensureInstalled() { namedRouter.refresh() }
+                    // Resource Saver stays outside EngineRuntime (the GUI re-arms its
+                    // own on settings changes) but rides the runtime's Docker client.
+                    if prefs.resourceSaverEnabled {
+                        let saver = ResourceSaver(
+                            manager: manager, docker: runtime.docker,
+                            fullMemoryBytes: prefs.resources.memoryBytes,
+                            floorBytes: prefs.resourceSaverFloorBytes,
+                            idleMinutes: prefs.resourceSaverMinutes)
+                        saver.start() // reclaim RAM while idle
+                        teardown.saver = saver
                     }
                 } catch {
                     Log.error("docker socket proxy failed to start: \(error)")

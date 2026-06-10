@@ -224,6 +224,48 @@ do {
     }
 }
 
+// MARK: NameDNSResponder wire format
+
+section("NameDNSResponder")
+do {
+    /// A minimal DNS query: header (id 0xBEEF, RD) + QNAME labels + qtype/qclass IN.
+    func query(_ name: String, qtype: UInt8 = 1) -> [UInt8] {
+        var q: [UInt8] = [0xBE, 0xEF, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
+        for label in name.split(separator: ".") {
+            q.append(UInt8(label.utf8.count)); q.append(contentsOf: Array(label.utf8))
+        }
+        q.append(contentsOf: [0, 0, qtype, 0, 1])
+        return q
+    }
+    let registry = NameRegistry()
+    registry.update(["web": inet_addr("172.17.0.2")])
+
+    if let (name, qtype, qend) = NameDNSResponder.parseQName(query("WeB.Velox.Local")) {
+        equal(name, "web.velox.local", "qname lowercased")
+        equal(qtype, 1, "qtype A")
+        equal(qend, 12 + 17 + 4, "qend just past the question")
+    } else { failures += 1; print("FAIL  parseQName on valid query") }
+    check(NameDNSResponder.parseQName([0xBE, 0xEF, 0x01]) == nil, "short packet → nil")
+    check(NameDNSResponder.parseQName(query("web.velox.local").dropLast(3).map { $0 }) == nil,
+          "truncated question → nil")
+
+    let a = NameDNSResponder.buildReply(query("web.velox.local"), registry: registry)
+    check(a[2] & 0x80 != 0 && a[3] & 0x0F == 0, "known name → QR=1, NOERROR")
+    equal(Int(a[7]), 1, "known name → ANCOUNT=1")
+    equal(Array(a.suffix(4)), [172, 17, 0, 2], "answer carries the container IP")
+
+    let nx = NameDNSResponder.buildReply(query("ghost.velox.local"), registry: registry)
+    equal(Int(nx[3] & 0x0F), 3, "unknown name → NXDOMAIN")
+    equal(Int(nx[7]), 0, "unknown name → no answers")
+
+    let aaaa = NameDNSResponder.buildReply(query("web.velox.local", qtype: 28), registry: registry)
+    equal(Int(aaaa[3] & 0x0F), 0, "AAAA → NOERROR (so the client falls back to A)")
+    equal(Int(aaaa[7]), 0, "AAAA → empty answer section")
+
+    let foreign = NameDNSResponder.buildReply(query("example.com"), registry: registry)
+    equal(Int(foreign[3] & 0x0F), 3, "non-velox.local suffix → NXDOMAIN")
+}
+
 // MARK: Summary
 
 print("\n----------------------------------------")

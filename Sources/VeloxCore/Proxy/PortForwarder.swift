@@ -5,8 +5,11 @@ import Foundation
 /// (which dials the same port inside the guest, where dockerd published it).
 public final class PortForwarder: @unchecked Sendable {
     private struct Listener {
-        let fd: Int32
-        let source: DispatchSourceRead
+        /// One accept source per bound socket: always 127.0.0.1, plus best-effort ::1
+        /// (macOS resolves `localhost` to ::1 first, and a v4-only bind leaves that
+        /// first connect to whoever else holds the v6 port — e.g. a dormant Docker
+        /// Desktop wildcard listener). Each source's cancel handler closes its own fd.
+        let sources: [DispatchSourceRead]
     }
 
     private let bridge: VsockBridge
@@ -90,22 +93,54 @@ public final class PortForwarder: @unchecked Sendable {
             }
             fd = s
         }
+        var sources = [makeAcceptSource(fd: fd, port: port)]
+        // Best-effort ::1 twin (unprivileged ports only — the helper hands out v4).
+        // Failure (e.g. another process wildcard-bound the v6 port) is non-fatal: the
+        // v4 listener still serves, exactly as before.
+        if port >= 1024, let v6 = Self.bindV6Loopback(port) {
+            sources.append(makeAcceptSource(fd: v6, port: port))
+        }
+        listeners[port] = Listener(sources: sources)
+        warnedPrivileged.remove(port)
+        Log.info("port-forward: localhost:\(port) → guest:\(port)"
+                 + (sources.count == 2 ? " (v4+v6)" : ""))
+    }
+
+    /// Non-blocking accept source for a listening socket; owns + closes the fd on cancel.
+    private func makeAcceptSource(fd: Int32, port: UInt16) -> DispatchSourceRead {
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.accept(on: fd, port: port) }
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
-        listeners[port] = Listener(fd: fd, source: source)
-        warnedPrivileged.remove(port)
-        Log.info("port-forward: localhost:\(port) → guest:\(port)")
+        return source
+    }
+
+    /// A `[::1]:port` listener (V6ONLY so it never shadows the v4 one), or nil.
+    private static func bindV6Loopback(_ port: UInt16) -> Int32? {
+        let s = socket(AF_INET6, SOCK_STREAM, 0)
+        guard s >= 0 else { return nil }
+        var yes: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = port.bigEndian
+        addr.sin6_addr = in6addr_loopback
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(s, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        guard bound == 0, listen(s, 128) == 0 else { Darwin.close(s); return nil }
+        return s
     }
 
     private func closeListener(_ port: UInt16) {
         warnedPrivileged.remove(port)
         guard let listener = listeners.removeValue(forKey: port) else { return }
-        listener.source.cancel()
+        for source in listener.sources { source.cancel() }
         Log.info("port-forward: closed localhost:\(port)")
     }
 
