@@ -176,7 +176,7 @@ struct ContainersView: View {
         self.stats = stats
         self.ui = ui
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
-        _tableLayout = State(initialValue: TableLayout.load("containers"))
+        _tableLayout = State(initialValue: TableLayout.load("containers2"))
     }
 
     /// Standalone containers and Compose project groups, interleaved alphabetically —
@@ -197,12 +197,16 @@ struct ContainersView: View {
             TableColumn("Name") { row in nameCell(row) }
                 .customizationID("name")
 
+            // Hidden by default: the image string is long and rarely the scanning key
+            // (the inspector shows it for the selected row). Right-click the header to
+            // re-enable — useful when auto-named containers make the image the only hint.
             TableColumn("Image") { row in
                 if case .container(let c) = row {
                     Text(c.image).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
                 }
             }
                 .customizationID("image")
+                .defaultVisibility(.hidden)
 
             TableColumn("Status") { row in statusCell(row) }
                 .customizationID("status")
@@ -307,7 +311,7 @@ struct ContainersView: View {
                                        description: Text(model.loadError ?? "Run one with `docker run`."))
             }
         }
-        .persistTableLayout(tableLayout, "containers")
+        .persistTableLayout(tableLayout, "containers2")
         .retainingStats(stats)
         .task {
             // Keep Docker's own status strings current ("Up About a minute" → "Up 3 minutes" →
@@ -565,7 +569,8 @@ private struct ContainerInspector: View {
                     LabeledContent("Image") {
                         Text(c.image).lineLimit(1).truncationMode(.middle)
                     }
-                    LabeledContent("Status", value: c.status.isEmpty ? c.state.capitalized : c.status)
+                    // No Status here — the row's badge already shows it; the inspector
+                    // holds what the table deliberately doesn't.
                     if let project = c.composeProject {
                         LabeledContent("Compose", value: project)
                     }
