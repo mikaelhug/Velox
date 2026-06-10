@@ -54,25 +54,27 @@ enum Format {
         return duration.string(from: seconds) ?? "—"
     }
 
-    /// Docker-style coarse duration — mirrors go-units `HumanDuration`, the function
-    /// behind `docker ps`'s "Up 5 minutes" / "Up About an hour" / "Up 3 weeks", so the
-    /// status badge reads exactly like Docker. Pure in `now` so a minute-tick
-    /// `TimelineView` drives it; the sub-minute tier says "Less than a minute"
-    /// (never seconds) so it's never stale between ticks.
-    static func dockerUptime(since start: Date, now: Date) -> String {
-        let seconds = max(0, now.timeIntervalSince(start))
-        let minutes = Int(seconds / 60)
-        let hours = Int((seconds / 3600).rounded())
+    /// Container uptime with Docker's tier structure but plain numeric wording (no
+    /// "About a minute" / "Less than a minute"): seconds only inside the first
+    /// minute, then a single coarse unit — "1 minute", "26 hours", "3 weeks". Pure
+    /// in `now` so the badge's TimelineView drives it: second ticks during the first
+    /// minute, minute ticks after, so it's never stale between ticks.
+    static func containerUptime(since start: Date, now: Date) -> String {
+        let seconds = max(1, Int(now.timeIntervalSince(start)))
+        let minutes = seconds / 60
+        let hours = seconds / 3600
         switch true {
-        case seconds < 60:   return "Less than a minute"
-        case minutes == 1:   return "About a minute"
-        case minutes < 60:   return "\(minutes) minutes"
-        case hours == 1:     return "About an hour"
-        case hours < 48:     return "\(hours) hours"
-        case hours < 24*7*2:   return "\(hours / 24) days"
-        case hours < 24*30*2:  return "\(hours / 24 / 7) weeks"
-        case hours < 24*365*2: return "\(hours / 24 / 30) months"
-        default:               return "\(hours / 24 / 365) years"
+        case seconds < 60:     return plural(seconds, "second")
+        case minutes < 60:     return plural(minutes, "minute")
+        case hours < 48:       return plural(hours, "hour")
+        case hours < 24*7*2:   return plural(hours / 24, "day")
+        case hours < 24*30*2:  return plural(hours / 24 / 7, "week")
+        case hours < 24*365*2: return plural(hours / 24 / 30, "month")
+        default:               return plural(hours / 24 / 365, "year")
         }
+    }
+
+    private static func plural(_ n: Int, _ unit: String) -> String {
+        "\(n) \(unit)\(n == 1 ? "" : "s")"
     }
 }

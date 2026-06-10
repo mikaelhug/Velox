@@ -760,13 +760,14 @@ private struct PortLink: View {
     }
 }
 
-/// Status capsule with NATIVE uptime: Docker's own wording ("Up 5 minutes"),
+/// Status capsule with NATIVE uptime ("Up 12 seconds" → "Up 5 minutes"),
 /// re-rendered from the container's lifecycle anchor (dockerd's StartedAt) by a
-/// minute-tick `TimelineView` — ticks only while visible, no per-second churn
-/// (SwiftUI's `.relative` text style shows seconds, which read as noise here);
-/// the anchor itself refreshes only on lifecycle events. Until the anchor lands
-/// (a beat after a transition), Docker's pre-rendered status string fills in.
-/// Stopped containers just say "Stopped" — exit code + when live in the tooltip.
+/// `TimelineView` on `UptimeTickSchedule`: second ticks only during the first
+/// minute of uptime, minute ticks after — only while visible, no per-second churn
+/// on settled rows; the anchor itself refreshes only on lifecycle events. Until
+/// the anchor lands (a beat after a transition), Docker's pre-rendered status
+/// string fills in. Stopped containers just say "Stopped" — exit code + when
+/// live in the hover tooltip.
 struct UptimeBadge: View {
     let container: ContainerSummary
     let anchor: DockerResourceStore.LifeAnchor?
@@ -789,8 +790,8 @@ struct UptimeBadge: View {
     @ViewBuilder
     private var content: some View {
         if container.isRunning, let date = validAnchor?.date {
-            TimelineView(.everyMinute) { context in
-                Text(verbatim: "Up " + Format.dockerUptime(since: date, now: context.date)
+            TimelineView(UptimeTickSchedule(start: date)) { context in
+                Text(verbatim: "Up " + Format.containerUptime(since: date, now: context.date)
                               + (container.isUnhealthy ? " · unhealthy" : ""))
             }
         } else if container.state == "exited" {
@@ -809,6 +810,23 @@ struct UptimeBadge: View {
         case "restarting": return .orange
         case "exited", "dead": return .red
         default: return .secondary
+        }
+    }
+}
+
+/// Tick schedule matching the badge text's resolution: every second while the
+/// container is in its first minute of uptime (the only window where seconds are
+/// rendered), then once a minute. Rows older than a minute never wake per-second,
+/// and TimelineView only ticks while the badge is on screen.
+private struct UptimeTickSchedule: TimelineSchedule {
+    let start: Date
+
+    func entries(from startDate: Date, mode: Mode) -> AnyIterator<Date> {
+        let cutover = start.addingTimeInterval(60)
+        var next = startDate
+        return AnyIterator {
+            defer { next = next.addingTimeInterval(next < cutover ? 1 : 60) }
+            return next
         }
     }
 }
