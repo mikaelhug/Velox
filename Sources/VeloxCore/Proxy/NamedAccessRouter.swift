@@ -37,7 +37,10 @@ public final class NamedAccessRouter: @unchecked Sendable {
     /// Remove every installed route (on engine stop).
     public func stop() {
         queue.async {
-            for s in self.routed { self.helper.route(add: false, subnet: s, gateway: "") }
+            for s in self.routed where !self.helper.route(add: false, subnet: s, gateway: "") {
+                // Not fatal: the delete-before-add in `reconcile` repoints it next start.
+                Log.warn("named-access: could not remove route \(s)")
+            }
             self.routed = []; self.desired = []; self.gateway = nil
         }
     }
@@ -45,8 +48,13 @@ public final class NamedAccessRouter: @unchecked Sendable {
     /// Diff desired vs installed and apply — always on `queue`.
     private func reconcile() {
         guard let gw = gateway else { return }   // wait until the guest IP is known
-        for s in desired.subtracting(routed) where helper.route(add: true, subnet: s, gateway: gw) {
-            routed.insert(s)
+        for s in desired.subtracting(routed) {
+            // A route left over from a crashed session (stop() never ran) can point at a
+            // stale guest IP, and BSD `route add` can't repoint an existing route — so
+            // delete first to make the add idempotent. Deleting a missing route is a no-op
+            // to the helper, and subnet adds are rare (engine start / network create).
+            helper.route(add: false, subnet: s, gateway: "")
+            if helper.route(add: true, subnet: s, gateway: gw) { routed.insert(s) }
         }
         for s in routed.subtracting(desired) {
             helper.route(add: false, subnet: s, gateway: gw)
