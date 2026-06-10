@@ -244,6 +244,9 @@ struct ContainersView: View {
             }
         }
         .suppressHorizontalScroller()
+        // Uniform rows: the alternating stripes repaint out of sync with the clip
+        // during inspector-resize animations and read as flicker.
+        .alternatingRowBackgrounds(.disabled)
         .contextMenu(forSelectionType: ContainerRow.ID.self) { ids in
             contextMenu(for: ids)
         }

@@ -71,6 +71,7 @@ struct VolumesView: View {
                 .customizationID("created")
         }
         .suppressHorizontalScroller()
+        .alternatingRowBackgrounds(.disabled)
         .overlay {
             if model.hasLoaded && model.volumes.isEmpty {
                 ContentUnavailableView("No Volumes", systemImage: SidebarItem.volumes.systemImage,
