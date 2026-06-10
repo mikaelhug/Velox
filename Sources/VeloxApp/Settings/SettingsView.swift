@@ -238,6 +238,7 @@ private struct ResourcesPane: View {
                 Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — only the space actually used is allocated on your Mac, and reclaimed when you remove images.")
             }
             ResourceSaverSection(config: $config)
+            NestedVirtualizationSection(config: $config)
         }
         .formStyle(.grouped)
         // The pending-restart bar lives OUTSIDE the scrolling Form (a fixed bottom
@@ -297,6 +298,25 @@ private struct DiskUsageRow: View {
     private func refresh() {
         let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         usedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
+    }
+}
+
+/// Nested virtualization (KVM inside the guest) — restart-required, M3+/macOS 15.
+private struct NestedVirtualizationSection: View {
+    @Binding var config: VeloxConfig
+    private let supported = VMConfiguration.nestedVirtualizationSupported
+
+    var body: some View {
+        Section {
+            Toggle("Enable nested virtualization", isOn: $config.nestedVirtualization)
+                .disabled(!supported)
+        } header: {
+            Text("Nested Virtualization")
+        } footer: {
+            Text(supported
+                 ? "Exposes /dev/kvm inside the engine, so containers you grant it to (--device /dev/kvm) can run their own hardware-accelerated VMs — QEMU, Firecracker, Android emulators. Off by default; takes effect on restart."
+                 : "Requires an Apple M3 or later. This Mac's chip doesn't support nested virtualization.")
+        }
     }
 }
 

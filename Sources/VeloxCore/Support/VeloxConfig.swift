@@ -27,12 +27,15 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// Post a macOS notification when a container exits with a non-zero code
     /// (opt-in; rides the existing events stream — nothing polls).
     public var notifyOnCrash: Bool
+    /// Expose KVM inside the guest (VZ nested virtualization — M3+/macOS 15).
+    /// Opt-in, default off: off means the VZ flag is never set and nothing changes.
+    public var nestedVirtualization: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
                 launchAtLogin: Bool,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
                 dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true,
-                notifyOnCrash: Bool = false) {
+                notifyOnCrash: Bool = false, nestedVirtualization: Bool = false) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
@@ -41,6 +44,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         self.dontSuggestContext = dontSuggestContext
         self.checkUpdatesOnStartup = checkUpdatesOnStartup
         self.notifyOnCrash = notifyOnCrash
+        self.nestedVirtualization = nestedVirtualization
     }
 
     public static var `default`: VeloxConfig {
@@ -72,6 +76,8 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         dontSuggestContext = try c.decodeIfPresent(Bool.self, forKey: .dontSuggestContext) ?? d.dontSuggestContext
         checkUpdatesOnStartup = try c.decodeIfPresent(Bool.self, forKey: .checkUpdatesOnStartup) ?? d.checkUpdatesOnStartup
         notifyOnCrash = try c.decodeIfPresent(Bool.self, forKey: .notifyOnCrash) ?? d.notifyOnCrash
+        nestedVirtualization = try c.decodeIfPresent(Bool.self, forKey: .nestedVirtualization)
+            ?? d.nestedVirtualization
     }
 
     // MARK: - Derived
@@ -100,7 +106,8 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// Fields that require an engine restart to take effect (resources + shares).
     /// Resource Saver settings apply live, so they are deliberately excluded.
     public var bootSignature: [String] {
-        ["\(cpuCount)", "\(memoryGiB)", "\(diskGiB)", "\(swapGiB)"] + fileShares.sorted()
+        ["\(cpuCount)", "\(memoryGiB)", "\(diskGiB)", "\(swapGiB)", "\(nestedVirtualization)"]
+            + fileShares.sorted()
     }
 
     // MARK: - Persistence

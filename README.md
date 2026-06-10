@@ -151,6 +151,10 @@ A full, daily-driver Docker engine plus a native menu-bar app:
 - **Engine** — `docker run/build/compose`, the **containerd image store** (multi-platform
   images, attestations, Wasm), a persistent data disk, **VirtioFS `-v` host mounts**, and
   **Rosetta x86** (`--platform linux/amd64`). Stock `dockerd`, native nftables firewall.
+- **Nested virtualization** (opt-in, M3+ Macs) — `/dev/kvm` inside the engine: containers
+  you grant it to (`docker run --device /dev/kvm …`) run their own hardware-accelerated
+  VMs — QEMU, Firecracker, Android emulators. Something neither Docker Desktop nor
+  OrbStack offers. Settings → Resources → Nested Virtualization.
 - **Networking** — Apple VZNAT, `host.docker.internal`, reverse port forwarding for
   published **TCP and UDP** ports (`-p 8080:80`, `-p 53:53/udp`) → `localhost`, and
   **direct named access** — reach any container from the Mac at `<name>.velox.local`

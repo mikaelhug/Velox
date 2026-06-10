@@ -121,6 +121,17 @@ CONFIG_VIRTIO_FS=y
 # --- Rosetta x86-64: runs IN-GUEST via binfmt_misc + the rosetta virtiofs share ---
 CONFIG_BINFMT_MISC=y
 
+# --- Nested virtualization: KVM inside the guest (opt-in host setting) ---
+# On M3+ Macs (VZ nested virt, macOS 15+) the guest kernel can itself host VMs:
+# /dev/kvm appears, and containers granted it (--device /dev/kvm) run QEMU/
+# Firecracker at hardware speed — something neither Docker Desktop nor OrbStack
+# offers. Cost: ~1 MiB of resident kernel text (measured at adoption), and
+# nothing at runtime — when the host flag is off or the chip lacks EL2, KVM
+# self-disables at boot and the kernel runs at EL1 exactly as before. One
+# kernel serves all Macs; the host toggles VZ's isNestedVirtualizationEnabled.
+CONFIG_VIRTUALIZATION=y
+CONFIG_KVM=y
+
 # NOTE: there is deliberately NO initramfs support here. Velox boots the erofs
 # root directly off /dev/vda (root=/dev/vda rootfstype=erofs, init=/sbin/vinit),
 # so CONFIG_BLK_DEV_INITRD and the RD_* decompressors are intentionally omitted —

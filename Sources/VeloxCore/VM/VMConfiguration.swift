@@ -60,17 +60,35 @@ public enum VMConfiguration {
     /// `extraShares` lists additional host directories to expose to the guest
     /// over VirtioFS (the File Sharing setting). The host `/Users` share is
     /// always present so `docker run -v /Users/…` keeps working.
+    /// Whether this Mac can give the guest nested virtualization (M3+ on macOS 15+).
+    /// Drives the Settings toggle's availability.
+    public static var nestedVirtualizationSupported: Bool {
+        VZGenericPlatformConfiguration.isNestedVirtualizationSupported
+    }
+
     public static func build(image: GuestImage,
                              dataDisk: URL? = nil,
                              resources: Resources = .default,
                              extraShares: [URL] = [],
-                             consoleOutput: FileHandle? = nil)
+                             consoleOutput: FileHandle? = nil,
+                             nestedVirtualization: Bool = false)
         throws -> VZVirtualMachineConfiguration
     {
         let config = VZVirtualMachineConfiguration()
 
         config.cpuCount = clampCPUCount(resources.cpuCount)
         config.memorySize = clampMemory(resources.memoryBytes)
+
+        // Nested virtualization (opt-in, M3+): the guest kernel boots with EL2 and
+        // KVM comes alive — /dev/kvm for containers the user grants it to. Off (the
+        // default) sets nothing, so the VM is byte-identical to before the feature
+        // existed; unsupported hardware is double-checked so a stale config.json
+        // flag can never make the VM fail validation.
+        if nestedVirtualization && Self.nestedVirtualizationSupported {
+            let platform = VZGenericPlatformConfiguration()
+            platform.isNestedVirtualizationEnabled = true
+            config.platform = platform
+        }
 
         let bootLoader = VZLinuxBootLoader(kernelURL: image.kernelURL)
         // The kernel mounts the read-only erofs root directly off /dev/vda (the

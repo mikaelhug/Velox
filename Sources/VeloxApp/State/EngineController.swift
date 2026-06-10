@@ -200,7 +200,8 @@ final class EngineController {
                 dataDisk: Paths.dataDisk,
                 resources: resources,
                 extraShares: shareURLs,
-                consoleOutput: pipe.fileHandleForWriting)
+                consoleOutput: pipe.fileHandleForWriting,
+                nestedVirtualization: config.nestedVirtualization)
 
             // Unexpected guest exits / crashes route here too.
             manager.onStop { [weak self] error in

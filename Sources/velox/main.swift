@@ -83,7 +83,8 @@ func runStart(bind: BindMode) -> Never {
         let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
         let config = try VMConfiguration.build(
             image: image, dataDisk: Paths.dataDisk,
-            resources: prefs.resources, extraShares: prefs.shareURLs)
+            resources: prefs.resources, extraShares: prefs.shareURLs,
+            nestedVirtualization: prefs.nestedVirtualization)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
                  + "root=\(image.rootDiskURL.lastPathComponent) "
                  + "cmdline=\"\(image.kernelCommandLine)\"")

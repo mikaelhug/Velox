@@ -65,6 +65,11 @@ fn main() {
     // parent (/var/lib/docker) is already mounted.
     if data_ok { std::thread::spawn(setup_swap); }
     setup_virtiofs();
+    // Diagnosability: one line when the host granted nested virtualization (shows
+    // in Engine Logs / Copy Diagnostics). KVM self-disables without EL2 — silent.
+    if std::path::Path::new("/dev/kvm").exists() {
+        log!("KVM available — nested virtualization enabled");
+    }
     // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
     // place, so the network must be fully applied before it starts.
     let _ = net_handle.join();
