@@ -11,10 +11,8 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public let id: String
     public let names: [String]
     public let image: String
-    public let imageID: String
     public let state: String          // running | exited | paused | created | restarting | dead
     public let status: String         // "Up 3 minutes", "Exited (0) 2 hours ago"
-    public let created: Int
     public let ports: [PortMapping]
     public let labels: [String: String]
     /// The container's IP(s) across its attached networks (`NetworkSettings.Networks[*].
@@ -23,8 +21,8 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public let networkIPs: [String]
 
     enum CodingKeys: String, CodingKey {
-        case id = "Id", names = "Names", image = "Image", imageID = "ImageID"
-        case state = "State", status = "Status", created = "Created", ports = "Ports"
+        case id = "Id", names = "Names", image = "Image"
+        case state = "State", status = "Status", ports = "Ports"
         case labels = "Labels", networkSettings = "NetworkSettings"
     }
 
@@ -44,10 +42,8 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         names = (try c.decodeIfPresent([String].self, forKey: .names) ?? [])
             .map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
         image = try c.decodeIfPresent(String.self, forKey: .image) ?? "<none>"
-        imageID = try c.decodeIfPresent(String.self, forKey: .imageID) ?? ""
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "unknown"
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
-        created = try c.decodeIfPresent(Int.self, forKey: .created) ?? 0
         ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
         labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
         let ns = try c.decodeIfPresent(NetworkSettings.self, forKey: .networkSettings)
@@ -56,11 +52,11 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     }
 
     /// Memberwise init for mock fixtures and tests.
-    public init(id: String, names: [String], image: String, imageID: String = "",
-                state: String, status: String, created: Int = 0, ports: [PortMapping] = [],
+    public init(id: String, names: [String], image: String,
+                state: String, status: String, ports: [PortMapping] = [],
                 labels: [String: String] = [:], networkIPs: [String] = []) {
-        self.id = id; self.names = names; self.image = image; self.imageID = imageID
-        self.state = state; self.status = status; self.created = created; self.ports = ports
+        self.id = id; self.names = names; self.image = image
+        self.state = state; self.status = status; self.ports = ports
         self.labels = labels; self.networkIPs = networkIPs
     }
 
