@@ -25,7 +25,13 @@ public enum VMConfiguration {
         /// Sensible defaults, clamped to the framework's allowed range.
         public static var `default`: Resources {
             Resources(
-                cpuCount: max(1, min(4, ProcessInfo.processInfo.activeProcessorCount)),
+                // All P-cores by default: vCPUs beyond the P-core count spill onto slow
+                // E-cores under host contention, and fewer (the old cap of 4) handicaps
+                // `docker build` on Pro/Max machines for no RAM saving (idle vCPUs cost
+                // nothing). Falls back to the old conservative cap if the sysctl is
+                // missing (non-hybrid CPU).
+                cpuCount: max(1, performanceCoreCount
+                                 ?? min(4, ProcessInfo.processInfo.activeProcessorCount)),
                 memoryBytes: 4 * 1024 * 1024 * 1024, // 4 GiB (headroom for vfs-on-tmpfs)
                 // The data disk is a sparse raw image — it only consumes host space as
                 // the guest writes to it — so a generous default is ~free and avoids
@@ -37,6 +43,15 @@ public enum VMConfiguration {
                 diskGiB: 64,
                 swapMiB: 1024
             )
+        }
+
+        /// Logical P-core count (`hw.perflevel0.logicalcpu`), or nil where the sysctl
+        /// doesn't exist. On Apple silicon perflevel0 is the performance cluster.
+        private static var performanceCoreCount: Int? {
+            var n: Int32 = 0
+            var len = MemoryLayout<Int32>.size
+            guard sysctlbyname("hw.perflevel0.logicalcpu", &n, &len, nil, 0) == 0, n > 0 else { return nil }
+            return Int(n)
         }
     }
 
