@@ -22,8 +22,8 @@ struct MenuBarContentView: View {
                 if running.isEmpty {
                     Text("No running containers")
                         .font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 2)
+                        .padding(.horizontal, 24)
                 } else {
                     // Up to 7 rows render inline; beyond that the full list scrolls in
                     // a fixed-height viewport (like the Wi-Fi menu) — every container
@@ -47,7 +47,11 @@ struct MenuBarContentView: View {
             footer
         }
         .padding(12)
-        .frame(width: 300)
+        // Hug the content: the panel is exactly as wide as its widest row needs
+        // (footer ≈ the floor; a long domain the ceiling — rows cap their own text
+        // width below, so this stays in [230, ~330] instead of a fixed worst-case).
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(minWidth: 230, alignment: .leading)
         .modifier(RetainStatsIfPresent(stats: engine.state.isRunning ? engine.stats : nil))
     }
 
@@ -144,14 +148,21 @@ private struct ContainerQuickRow: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Circle().fill(.green).frame(width: 6, height: 6)
+            // Cap the text column so one long name/domain can't widen the whole
+            // panel — it truncates in the middle instead (the click still works).
             VStack(alignment: .leading, spacing: 1) {
                 Text(container.displayName)
-                    .font(.callout.weight(.medium)).lineLimit(1)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1).truncationMode(.middle)
                 HStack(spacing: 8) {
                     if let domain = container.namedAccessDomain {
-                        Button(domain) { WorkspaceActions.openDomain(domain) }
-                            .buttonStyle(.plain).font(.caption2).foregroundStyle(.link)
-                            .help("Open http://\(domain)/")
+                        Button {
+                            WorkspaceActions.openDomain(domain)
+                        } label: {
+                            Text(domain).lineLimit(1).truncationMode(.middle)
+                        }
+                        .buttonStyle(.plain).font(.caption2).foregroundStyle(.link)
+                        .help("Open http://\(domain)/")
                     }
                     // String-built titles on purpose: a literal with an Int interpolation
                     // becomes a LocalizedStringKey, and locale number formatting turns
@@ -172,6 +183,7 @@ private struct ContainerQuickRow: View {
                     }
                 }
             }
+            .frame(maxWidth: 260, alignment: .leading)
             Spacer(minLength: 8)
             Button(action: stop) {
                 Image(systemName: "stop.fill")
