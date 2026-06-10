@@ -182,7 +182,16 @@ public actor DockerClient: DockerClientProtocol {
         _ = try await send("DELETE", Self.path("/volumes/\(name)?force=\(force ? 1 : 0)"))
     }
     public func pruneVolumes() async throws -> UInt64 {
-        Self.spaceReclaimed(try await send("POST", Self.path("/volumes/prune")))
+        // `all=true` (docker volume prune -a): since API 1.42 the default prunes only
+        // ANONYMOUS volumes — named unused volumes (what the size estimate counts and
+        // what users mean by "unused") silently survive and the button looks broken
+        // (measured: VolumesDeleted:[] with 1.8 GB of named unused volumes present).
+        // Our UI gates this behind an off-by-default toggle + confirmation, and the
+        // Reclaim flow prunes stopped containers FIRST, releasing the references that
+        // otherwise make volumes un-prunable — so deliver what the dialog promises.
+        let filters = "{\"all\":[\"true\"]}"
+        return Self.spaceReclaimed(
+            try await send("POST", Self.path("/volumes/prune?filters=\(filters.urlEncoded)")))
     }
 
     private static func spaceReclaimed(_ data: Data) -> UInt64 {
