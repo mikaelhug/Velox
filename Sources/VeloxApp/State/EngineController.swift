@@ -43,18 +43,11 @@ final class EngineController {
         return applied != config.bootSignature
     }
 
-    // Engine plumbing — created on `start`, torn down on stop.
+    // Engine plumbing — created on `start`, torn down on stop. All the wiring shared
+    // with the CLI (proxy, forwarders, watcher, named access, clock sync, conduit
+    // pool) lives in EngineRuntime; only GUI-specific pieces stay here.
     private let manager = VMManager()
-    private var bridge: VsockBridge?
-    private var proxy: DockerSocketProxy?
-    private var forwarder: PortForwarder?
-    private var conduitPool: ConduitPool?
-    private var udpForwarder: UDPForwarder?
-    private var portHelper: PortHelperManager?
-    private var watcher: DockerEventsWatcher?
-    private var nameDNS: NameDNSResponder?
-    private var namedRouter: NamedAccessRouter?
-    private var clockSync: ClockSync?
+    private var runtime: EngineRuntime?
     private var resourceSaver: ResourceSaver?
     /// Held for the engine's lifetime to keep macOS App Nap from throttling the
     /// embedded VM while Velox is backgrounded (see `start()`).
@@ -210,92 +203,27 @@ final class EngineController {
                 }
             }
 
-            // Engine is up: expose the unix socket for the `docker` CLI (via the
-            // `velox` context), and open the in-process Docker client for the dashboards.
-            let bridge = VsockBridge(manager: manager)
-            let proxy = DockerSocketProxy(
-                socketPath: Paths.dockerSocket.path,
-                guestPort: VsockPort.docker,
-                bridge: bridge)
-            try proxy.start()
-            self.bridge = bridge
-            self.proxy = proxy
-            let docker = DockerClient(manager: manager)
-            self.docker = docker
+            // Engine is up: all the shared plumbing (Docker socket proxy, port
+            // forwarders, events watcher, named access, clock sync, conduit pool) is
+            // wired by EngineRuntime — the same code path as the `velox` CLI.
+            let runtime = EngineRuntime(manager: manager)
+            try runtime.start()
+            self.runtime = runtime
+            self.docker = runtime.docker
             // Start the shared resource informer immediately so the dashboards have
             // data loaded before the user navigates to them (no per-pane re-fetch).
-            let resourceStore = DockerResourceStore(docker: docker)
+            let resourceStore = DockerResourceStore(docker: runtime.docker)
             resourceStore.start()
             self.resources = resourceStore
-            self.stats = StatsStore(docker: docker, resources: resourceStore)
+            self.stats = StatsStore(docker: runtime.docker, resources: resourceStore)
             appliedSignature = config.bootSignature
             bootedMemoryBytes = resources.memoryBytes
-
-            // Reverse-forward published container ports to localhost (watch the
-            // Docker API for -p ports, open 127.0.0.1 listeners, pipe over VSOCK).
-            // Privileged ports (<1024) route through the root helper (installed on
-            // first use), so a reverse proxy published on :80 reaches the Mac.
-            let helper = PortHelperManager()
-            let forwarder = PortForwarder(bridge: bridge, privilegedBinder: helper)
-            let udpForwarder = UDPForwarder(manager: manager, privilegedBinder: helper)
-            let onPorts = helper.reconciler(
-                tcp: { forwarder.reconcile($0) },
-                udp: { udpForwarder.reconcile($0) })
-            // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
-            let endpoints = PublishedEndpoints()
-            // Direct (named) container access: the watcher fills a name→IP map for the loopback DNS
-            // responder and surfaces bridge subnets, which the router routes to the guest (via the
-            // porthelper) so the Mac reaches containers by their real IP — any protocol, no proxy.
-            // All best-effort and gated on the one-time porthelper grant; inert if declined.
-            let nameRegistry = NameRegistry()
-            let namedRouter = NamedAccessRouter(helper: helper)
-            let nameDNS = NameDNSResponder(registry: nameRegistry)
-            try? nameDNS.start()
-            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts, endpoints: endpoints,
-                                              names: nameRegistry,
-                                              onSubnets: { namedRouter.update(subnets: $0) })
-            watcher.start()
-            self.portHelper = helper
-            self.forwarder = forwarder
-            self.udpForwarder = udpForwarder
-            self.watcher = watcher
-            self.nameDNS = nameDNS
-            self.namedRouter = namedRouter
-
-            // Fast published-port datapath: learn the (Swift-opaque) VZNAT gateway from the
-            // guest, then bind a warm conduit pool so published-port traffic rides VZNAT
-            // (~95 serving / ~17 ingress) instead of the ~6 Gbit/s vsock relay. Best-effort
-            // and async (the probe waits on guest DHCP): if it fails, the forwarder keeps the
-            // vsock fallback, so nothing blocks engine readiness on it.
-            Task { [weak self, manager = self.manager] in
-                guard let info = await GatewayProbe.probe(manager: manager) else { return }
-                let pool = ConduitPool(gateway: info, endpoints: endpoints)
-                do {
-                    try pool.start()
-                    forwarder.attachConduitPool(pool)
-                    self?.conduitPool = pool
-                } catch {
-                    Log.warn("conduit pool failed to start: \(error); using vsock fallback")
-                }
-                // Named access: route container subnets to the guest (gateway = guest IP), and
-                // request the one-time grant (porthelper install + /etc/resolver) so routes apply.
-                // If already installed this is silent; if declined, named access stays off. (v1
-                // re-offers on the next launch until granted — persisting the decline is a follow-up.)
-                namedRouter.setGateway(info.guestIP)
-                if await helper.ensureInstalled() { namedRouter.refresh() }
-            }
-
-            // Keep the guest clock aligned with the host (survives Mac sleep), and
-            // arm Resource Saver to reclaim RAM while idle.
-            let clockSync = ClockSync(manager: manager)
-            clockSync.start()
-            self.clockSync = clockSync
             startResourceSaver()
             // The VM has booted, but dockerd needs a few more seconds inside the
             // guest. Stay in `.starting` until it actually answers — signaled by the
             // events watcher's first successful reconcile — so the dashboards' first
             // load succeeds (no transient "Connection reset by peer", no manual refresh).
-            await waitForDockerReady(watcher)
+            await waitForDockerReady(runtime)
             // Keep macOS App Nap from throttling the embedded VM while Velox is
             // backgrounded (you're working in another app and the engine has real work
             // to do). A napped process has its threads — including the VM's vCPUs —
@@ -322,7 +250,9 @@ final class EngineController {
     func stop() async {
         guard state.isRunning || state.isBusy else { return }
         state = .stopping
-        proxy?.stop()
+        // Tear the plumbing down first (stop accepting docker CLI connections, remove
+        // host routes) — idempotent, so the post-stop cleanup() calling it again is fine.
+        runtime?.stop()
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             manager.stopGracefully { cont.resume() }
         }
@@ -353,31 +283,15 @@ final class EngineController {
             ProcessInfo.processInfo.endActivity(engineActivity)
             self.engineActivity = nil
         }
-        watcher?.stop()
-        watcher = nil
-        nameDNS?.stop()
-        nameDNS = nil
-        // Remove the host routes so none dangle once the VM (their next hop) is gone.
-        namedRouter?.stop()
-        namedRouter = nil
-        forwarder?.stopAll()
-        forwarder = nil
-        conduitPool?.stop()
-        conduitPool = nil
-        udpForwarder?.stopAll()
-        udpForwarder = nil
-        // The installed helper daemon stays resident (it's idle); just drop our handle.
-        portHelper = nil
-        proxy?.stop()
-        proxy = nil
-        bridge = nil
+        // Shared plumbing teardown (watcher, named access, forwarders, conduit pool,
+        // clock sync, proxy) — idempotent; also removes host routes so none dangle.
+        runtime?.stop()
+        runtime = nil
         resources?.stop()
         resources = nil
         stats?.stop()
         stats = nil
         docker = nil
-        clockSync?.stop()
-        clockSync = nil
         resourceSaver?.stop()
         resourceSaver = nil
         isResourceSaving = false
@@ -482,8 +396,8 @@ final class EngineController {
     /// first success is the readiness signal — we don't poll `/_ping` (which would
     /// churn a fresh VSOCK connection every 250 ms; CLAUDE.md §8). Bounded so a
     /// broken guest can't hang the UI in `.starting`.
-    private func waitForDockerReady(_ watcher: DockerEventsWatcher) async {
-        if await watcher.waitUntilReady(timeout: .seconds(30)) {
+    private func waitForDockerReady(_ runtime: EngineRuntime) async {
+        if await runtime.waitUntilDockerReady(timeout: .seconds(30)) {
             Log.info("dockerd ready")
         } else {
             Log.warn("dockerd did not respond within 30s — continuing")
