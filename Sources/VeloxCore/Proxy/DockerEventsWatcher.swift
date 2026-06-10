@@ -18,9 +18,15 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// Updated each reconcile with `hostPort → "containerIP:containerPort"` for direct-dial
     /// (the conduit pool reads it). Optional — nil when the conduit fast path isn't used.
     private let endpoints: PublishedEndpoints?
+    /// Updated each reconcile with `name → container IPv4` for direct (named) access. Optional.
+    private let names: NameRegistry?
+    /// Fired with the set of bridge-network subnets (CIDRs) whenever it changes — the host routes
+    /// each to the guest so container IPs are reachable. Nil → named-access routing disabled.
+    private let onSubnets: (@Sendable (Set<String>) -> Void)?
     private var task: Task<Void, Never>?
     private var lastTCP: Set<UInt16> = []
     private var lastUDP: Set<UInt16> = []
+    private var lastSubnets: Set<String> = []
     /// Coalesces event-driven reconciles so a healthcheck / `compose up` storm collapses
     /// to one `containers()` fetch instead of one per event (CLAUDE.md §8).
     private var coalescer: Coalescer?
@@ -37,10 +43,14 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
     public init(docker: any DockerClientProtocol,
                 onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void,
-                endpoints: PublishedEndpoints? = nil) {
+                endpoints: PublishedEndpoints? = nil,
+                names: NameRegistry? = nil,
+                onSubnets: (@Sendable (Set<String>) -> Void)? = nil) {
         self.docker = docker
         self.onPorts = onPorts
         self.endpoints = endpoints
+        self.names = names
+        self.onSubnets = onSubnets
     }
 
     public func start() {
@@ -57,7 +67,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                     if Task.isCancelled { return }
                     // Coalesce: a burst of container events fans into a single
                     // reconcile rather than one full `containers()` fetch each.
-                    if event.type == nil || event.type == "container" {
+                    if event.type == nil || event.type == "container" || event.type == "network" {
                         coalescer.trigger()
                     }
                 }
@@ -134,7 +144,22 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         var tcp: Set<UInt16> = []
         var udp: Set<UInt16> = []
         var endpointMap: [UInt16: String] = [:]
+        var nameMap: [String: in_addr_t] = [:]
         for c in containers where c.state == "running" {
+            // Named access: `name → container IP` (+ compose `<service>` and `<service>.<project>`
+            // aliases). `directIP` is non-nil only when the container's network is unambiguous.
+            if let ip = c.directIP {
+                let addr = inet_addr(ip)
+                if addr != INADDR_NONE {
+                    if let n = c.names.first { nameMap[n.lowercased()] = addr }
+                    if let svc = c.labels["com.docker.compose.service"] {
+                        nameMap[svc.lowercased()] = addr
+                        if let proj = c.labels["com.docker.compose.project"] {
+                            nameMap["\(svc).\(proj)".lowercased()] = addr
+                        }
+                    }
+                }
+            }
             for p in c.ports {
                 guard let pub = p.publicPort, pub > 0, pub <= 65_535 else { continue }
                 switch p.type {
@@ -151,7 +176,23 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         // Refresh the direct-dial map every reconcile (a restart can change a container's IP
         // without changing the published-port *set*), independent of the onPorts diff below.
         endpoints?.update(endpointMap)
+        names?.update(nameMap)
+        // Bridge-network subnets → the host routes each to the guest so container IPs are
+        // reachable. A second cheap list (coalesced); only fires the callback on a real change.
+        if let onSubnets, let nets = try? await docker.networks() {
+            let subnets = Set(nets.filter { $0.driver == "bridge" }.flatMap { $0.subnets }
+                                  .filter { $0.contains(".") })   // IPv4 CIDRs only
+            if commitSubnets(subnets) { onSubnets(subnets) }
+        }
         if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
+    }
+
+    /// Atomically diff + store the bridge-subnet set; returns whether it changed.
+    private func commitSubnets(_ s: Set<String>) -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard s != lastSubnets else { return false }
+        lastSubnets = s
+        return true
     }
 
     /// Atomically diff + store the published-port sets; returns whether they changed.

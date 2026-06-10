@@ -21,8 +21,9 @@ command. Apple Silicon (arm64) first.
 
 The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are shared via
 **VirtioFS**; the container network is Apple's in-kernel **VZNAT** (outbound + NAT in
-the kernel); published **TCP and UDP** ports map back to `localhost`; and
-`host.docker.internal` reaches the Mac.
+the kernel); published **TCP and UDP** ports map back to `localhost`; `host.docker.internal`
+reaches the Mac; and every container is reachable from the Mac by name at
+**`<name>.velox.local`** — its real IP, any protocol, no `-p` required.
 
 ## Installation
 
@@ -81,6 +82,23 @@ export DOCKER_HOST=unix://~/.velox/docker.sock   # …or via an env var
 Prefer your own command? Alias it: `alias vdocker='docker --context velox'`.
 `velox version` shows component versions.
 
+### Reach containers by name
+
+Every running container is reachable from the Mac at **`<name>.velox.local`** — its real
+container IP, **any protocol**, no published port needed:
+
+```bash
+docker run -d --name web nginx
+curl http://web.velox.local                 # → the nginx welcome page (no -p)
+docker run -d --name db -e POSTGRES_HOST_AUTH_METHOD=trust postgres
+psql -h db.velox.local -U postgres          # works for any protocol, not just HTTP
+```
+
+Compose services also resolve as `<service>.<project>.velox.local`. This needs a **one-time
+admin grant** on first launch (it installs the `velox-porthelper` and a
+`/etc/resolver/velox.local` entry) — decline it and everything else still works, just without
+named access.
+
 ## Updating
 
 `velox update` (CLI), or the **Update** button in **Settings → General**, checks GitHub
@@ -129,8 +147,10 @@ A full, daily-driver Docker engine plus a native menu-bar app:
 - **Engine** — `docker run/build/compose`, the **containerd image store** (multi-platform
   images, attestations, Wasm), a persistent data disk, **VirtioFS `-v` host mounts**, and
   **Rosetta x86** (`--platform linux/amd64`). Stock `dockerd`, native nftables firewall.
-- **Networking** — Apple VZNAT, `host.docker.internal`, and reverse port forwarding for
-  published **TCP and UDP** ports (`-p 8080:80`, `-p 53:53/udp`) → `localhost`.
+- **Networking** — Apple VZNAT, `host.docker.internal`, reverse port forwarding for
+  published **TCP and UDP** ports (`-p 8080:80`, `-p 53:53/udp`) → `localhost`, and
+  **direct named access** — reach any container from the Mac at `<name>.velox.local`
+  (its real IP, any protocol, no `-p`): `curl http://web.velox.local`, `psql -h db.velox.local`.
 - **Lifecycle** — host-authoritative clock (survives sleep), a Resource Saver that
   reclaims idle guest RAM, graceful stop that flushes the data disk, and event-driven
   reconciliation (no polling — ports come up the instant a container publishes them).

@@ -86,6 +86,7 @@ fn main() {
     }
     start_vsock_agent();
     start_conduit_pool();
+    start_direct_access();
     log!("init complete — supervising");
     reap_forever(deaths_tx);
 }
@@ -931,6 +932,42 @@ fn start_fstrim_timer() {
                 log!("fstrim failed: {}", std::io::Error::last_os_error());
             }
             unsafe { libc::close(fd); }
+        }
+    });
+}
+
+/// Direct (named) container access: once dockerd has built its nftables ruleset, allow the Mac
+/// (the vmnet gateway) to reach containers directly past dockerd 29's TWO host→container drops —
+/// the per-bridge "UNPUBLISHED PORT DROP" in `filter-FORWARD` (forward hook) and the per-container
+/// "DROP DIRECT ACCESS" in `raw-PREROUTING` (a separate prerouting hook, so the forward allow alone
+/// doesn't cover it). One `ip saddr <gateway> accept` at the TOP of each chain. Each survives
+/// dockerd's per-network reconciles (it edits per-bridge sub-chains, not these base chains); the
+/// loop re-asserts after a dockerd *restart* rebuilds the whole table. Inert until the host adds a
+/// route to the container subnets, so it exposes nothing on its own — and a container cannot spoof
+/// the gateway IP (it lives on eth0, not docker0). Verified by spike + e2e (curl → 200 by name).
+fn start_direct_access() {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::thread::spawn(|| {
+        let nft = |args: &[&str]| Command::new("nft")
+            .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args).output();
+        loop {
+            let gw = GATEWAY_IP.load(Relaxed);
+            if gw != 0 {
+                let gws = ipstr(gw);
+                // Only act once dockerd's table exists; re-assert per chain only if our rule is
+                // gone (i.e. after a dockerd restart rebuilt the table).
+                for chain in ["filter-FORWARD", "raw-PREROUTING"] {
+                    if let Ok(out) = nft(&["list", "chain", "ip", "docker-bridges", chain]) {
+                        if out.status.success()
+                            && !String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
+                            let _ = nft(&["insert", "rule", "ip", "docker-bridges", chain,
+                                          "ip", "saddr", &gws, "counter", "accept"]);
+                            log!("direct-access: allowed {gws} → containers ({chain})");
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
         }
     });
 }

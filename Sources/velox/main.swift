@@ -103,9 +103,16 @@ func runStart(bind: BindMode) -> Never {
         let docker = DockerClient(manager: manager)
         // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
         let endpoints = PublishedEndpoints()
+        // Direct (named) container access (same wiring as the GUI EngineController): the watcher
+        // fills name→IP for the loopback DNS responder and surfaces bridge subnets, which the router
+        // routes to the guest via the porthelper. Gated on the one-time grant; inert if declined.
+        let nameRegistry = NameRegistry()
+        let namedRouter = NamedAccessRouter(helper: portHelper)
+        let nameDNS = NameDNSResponder(registry: nameRegistry)
         let watcher = DockerEventsWatcher(docker: docker, onPorts: portHelper.reconciler(
             tcp: { forwarder.reconcile($0) },
-            udp: { udpForwarder.reconcile($0) }), endpoints: endpoints)
+            udp: { udpForwarder.reconcile($0) }), endpoints: endpoints,
+            names: nameRegistry, onSubnets: { namedRouter.update(subnets: $0) })
         let clockSync = ClockSync(manager: manager)
         let resourceSaver: ResourceSaver? = prefs.resourceSaverEnabled
             ? ResourceSaver(manager: manager, docker: docker,
@@ -117,6 +124,8 @@ func runStart(bind: BindMode) -> Never {
         manager.onStop { error in
             teardown.run()
             watcher.stop()
+            nameDNS.stop()
+            namedRouter.stop()
             forwarder.stopAll()
             udpForwarder.stopAll()
             clockSync.stop()
@@ -135,6 +144,8 @@ func runStart(bind: BindMode) -> Never {
                 Log.info("signal \(sig) — flushing and stopping guest…")
                 teardown.run()
                 watcher.stop()
+                nameDNS.stop()
+                namedRouter.stop()
                 forwarder.stopAll()
                 udpForwarder.stopAll()
                 clockSync.stop()
@@ -154,6 +165,7 @@ func runStart(bind: BindMode) -> Never {
                     try proxy.start()
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
                     watcher.start() // dynamic -p port forwarding
+                    try? nameDNS.start() // named-access DNS responder (loopback only)
                     clockSync.start() // keep guest clock aligned across host sleep
                     resourceSaver?.start() // reclaim RAM while idle
                     // Fast published-port datapath: learn the VZNAT gateway from the guest,
@@ -164,6 +176,10 @@ func runStart(bind: BindMode) -> Never {
                         let pool = ConduitPool(gateway: info, endpoints: endpoints)
                         do { try pool.start(); forwarder.attachConduitPool(pool) }
                         catch { Log.warn("conduit pool failed to start: \(error); using vsock fallback") }
+                        // Named access: route container subnets to the guest + request the one-time
+                        // grant (porthelper install + /etc/resolver). Silent if already installed.
+                        namedRouter.setGateway(info.guestIP)
+                        if await portHelper.ensureInstalled() { namedRouter.refresh() }
                     }
                 } catch {
                     Log.error("docker socket proxy failed to start: \(error)")

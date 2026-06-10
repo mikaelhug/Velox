@@ -17,19 +17,32 @@ pillars that deliver it:
    `localhost`, and dockerd `--host-gateway-ip` wires `host.docker.internal`.
    (Truly *beating* VZNAT on raw throughput would need a custom hypervisor —
    OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)
+   **Direct named access** (`<name>.velox.local` → the container's *real* IP, any
+   protocol — OrbStack-style, no `-p`) is **pure DNS + routing, never a proxy or
+   netstack**: a loopback DNS responder (`NameDNSResponder`, reached via
+   `/etc/resolver/velox.local`) answers names from the event-driven container map
+   (`NameRegistry`, filled by `DockerEventsWatcher`); a porthelper-installed host route
+   (`NamedAccessRouter`) carries the Mac to the container subnet over VZNAT; and `vinit`
+   adds one `nft` allow for the gateway IP in **both** dockerd-29 host→container drop
+   chains (`filter-FORWARD` *and* `raw-PREROUTING`), re-asserted after a dockerd restart.
+   No entitlement, no ongoing root (one-time grant only — folded into the porthelper).
+   Don't replace this with a reverse proxy or re-add `trusted_host_interfaces` (it doesn't
+   apply to `docker0`).
 2. **A 100% Swift host.** The whole supervisor — VM lifecycle, Docker-API VSOCK
    proxy, port forwarding, clock sync, the SwiftUI GUI — is pure Swift on
    `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons** — with
    **one sanctioned exception**: `velox-porthelper`, a tiny root LaunchDaemon (still
-   Swift, `Sources/velox-porthelper/`) that exists *only* because macOS offers no
-   unprivileged way to bind ports below 1024. It binds a loopback `<1024` port on
-   request and passes the listening socket fd back to the host over a unix socket, then
-   steps out — it never touches connection data, so root stays out of the datapath. It
-   is installed on first use with a single admin prompt (no Developer ID ⇒ no
-   `SMAppService`; a manual `osascript`-authorized LaunchDaemon install), and the host
-   falls back to skipping privileged ports if the user declines. Keep it minimal: this
-   is the *only* privileged component, and nothing else may grow a daemon. See
-   `Sources/VeloxCore/Proxy/PortHelper.swift`.
+   Swift, `Sources/velox-porthelper/`) that exists *only* for the two things macOS gives
+   an unprivileged process no other way to do, both **control-plane**: (a) bind a loopback
+   port `<1024` and pass the listening socket fd back over a unix socket, and (b) add/remove
+   a host route to a container subnet (for direct **named-container access** — `<name>.velox.local`
+   → the container's real IP). It never touches connection data, so **root stays out of the
+   datapath**. It is installed on first use with a single admin prompt (no Developer ID ⇒ no
+   `SMAppService`; a manual `osascript`-authorized LaunchDaemon install that *also* writes
+   `/etc/resolver/velox.local`), and the host degrades gracefully (skip privileged ports / no
+   named access) if the user declines. Keep it minimal: this is the *only* privileged component,
+   nothing else may grow a daemon, and any new helper command must stay control-plane (route/port
+   setup, never connection bytes). See `Sources/VeloxCore/Proxy/PortHelper.swift`.
 3. **Rust only for the tiny guest `vinit`.** One static-musl Rust binary is the
    guest's PID 1 and entire userland orchestration. Lean and fast by design.
 4. **A custom kernel, as lean as possible.** Built from kernel.org source —

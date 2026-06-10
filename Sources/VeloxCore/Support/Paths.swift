@@ -51,3 +51,13 @@ public enum VsockPort {
 public enum ConduitPort {
     public static let pool: UInt16 = 2379
 }
+
+/// Direct (named) container access. The host runs a loopback DNS responder on `dnsPort`;
+/// `/etc/resolver/<domain>` (installed once by the porthelper grant) routes `*.<domain>` there,
+/// and it answers with the target container's real IP. The port is FIXED so the resolver file
+/// stays static (an ephemeral port would force a re-install every launch). See
+/// `Sources/VeloxCore/Proxy/NameDNSResponder.swift`.
+public enum NamedAccess {
+    public static let domain = "velox.local"
+    public static let dnsPort: UInt16 = 49252
+}

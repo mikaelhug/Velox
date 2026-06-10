@@ -42,6 +42,14 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
         PortHelperClient.requestListener(port: port, proto: proto)
     }
 
+    /// Add/remove a host route to a container subnet via the helper (named-access routing).
+    /// Best-effort; requires the helper to be installed (the same one-time grant). Routes are
+    /// control-plane — the helper never sees connection data.
+    @discardableResult
+    public func route(add: Bool, subnet: String, gateway: String) -> Bool {
+        PortHelperClient.route(add: add, subnet: subnet, gateway: gateway)
+    }
+
     /// Ensure the helper is installed and running, prompting for admin authorization
     /// once if needed. Single-flight; never re-prompts after a decline.
     public func ensureInstalled() async -> Bool {
@@ -149,6 +157,42 @@ enum PortHelperClient {
         return received
     }
 
+    /// Ask the helper to add/remove a host route to a container subnet (named-access routing).
+    /// The helper strictly validates the CIDR/IPv4. Returns true on status 0.
+    static func route(add: Bool, subnet: String, gateway: String) -> Bool {
+        guard let fd = connectToDaemon() else { return false }
+        defer { close(fd) }
+        let req = add ? "route add \(subnet) \(gateway)\n" : "route del \(subnet)\n"
+        guard writeAll(fd, Array(req.utf8)) else { return false }
+        var status: UInt8 = 0xFF
+        return recv(fd, &status, 1, 0) == 1 && status == 0
+    }
+
+    /// Connect to the daemon's unix socket with send/recv timeouts. nil if it isn't running.
+    private static func connectToDaemon() -> Int32? {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var tv = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(socketPath.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { close(fd); return nil }
+        withUnsafeMutablePointer(to: &addr.sun_path) { p in
+            p.withMemoryRebound(to: CChar.self, capacity: pathBytes.count + 1) { dst in
+                for (i, b) in pathBytes.enumerated() { dst[i] = CChar(bitPattern: b) }
+                dst[pathBytes.count] = 0
+            }
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
+        }
+        guard connected == 0 else { close(fd); return nil }
+        return fd
+    }
+
     private static func writeAll(_ fd: Int32, _ buf: [UInt8]) -> Bool {
         var off = 0
         return buf.withUnsafeBytes { raw in
@@ -249,9 +293,9 @@ enum PortHelperInstaller {
         let plistB64 = Data(launchDaemonPlist(uid: getuid()).utf8).base64EncodedString()
         let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: requiredRevision)
         Log.info("port-helper: requesting authorization to install the privileged port helper")
-        let prompt = "Velox needs administrator access to install a small helper so it can "
-            + "publish container ports below 1024 (for example 80 and 443). This is a one-time "
-            + "setup — you won't be asked again."
+        let prompt = "Velox needs administrator access once to enable direct container access — "
+            + "reaching containers by name (like web.velox.local) and publishing ports below 1024 "
+            + "(such as 80 and 443). This is a one-time setup — you won't be asked again."
         guard await runAsAdmin(script, prompt: prompt) else {
             Log.warn("port-helper: installation was not authorized")
             return false
@@ -272,7 +316,7 @@ enum PortHelperInstaller {
     static func uninstall() async -> Bool {
         let script = [
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
-            "rm -f \(shq(plistPath)) \(shq(installedBinary)) \(shq(versionMarker))",
+            "rm -f \(shq(plistPath)) \(shq(installedBinary)) \(shq(versionMarker)) /etc/resolver/\(NamedAccess.domain)",
         ].joined(separator: " && ")
         return await runAsAdmin(script, prompt: "Velox needs administrator access to remove its privileged-port helper.")
     }
@@ -300,6 +344,12 @@ enum PortHelperInstaller {
             "chown root:wheel \(shq(plistPath))",
             "chmod 644 \(shq(plistPath))",
             "printf '%s' \(shq(version)) > \(shq(versionMarker))",
+            // Direct (named) container access: route *.<domain> DNS queries to Velox's loopback
+            // responder. Folded into the same one-time grant as the port helper (CLAUDE.md §2) so
+            // the user is prompted only once. The responder port is fixed, so the file is static.
+            "mkdir -p /etc/resolver",
+            "printf 'nameserver 127.0.0.1\\nport %s\\n' \(shq(String(NamedAccess.dnsPort))) > /etc/resolver/\(NamedAccess.domain)",
+            "chmod 644 /etc/resolver/\(NamedAccess.domain)",
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
             "launchctl bootstrap system \(shq(plistPath))",
         ].joined(separator: " && ")

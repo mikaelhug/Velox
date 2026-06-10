@@ -52,6 +52,8 @@ final class EngineController {
     private var udpForwarder: UDPForwarder?
     private var portHelper: PortHelperManager?
     private var watcher: DockerEventsWatcher?
+    private var nameDNS: NameDNSResponder?
+    private var namedRouter: NamedAccessRouter?
     private var clockSync: ClockSync?
     private var resourceSaver: ResourceSaver?
     /// Held for the engine's lifetime to keep macOS App Nap from throttling the
@@ -241,12 +243,24 @@ final class EngineController {
                 udp: { udpForwarder.reconcile($0) })
             // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
             let endpoints = PublishedEndpoints()
-            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts, endpoints: endpoints)
+            // Direct (named) container access: the watcher fills a name→IP map for the loopback DNS
+            // responder and surfaces bridge subnets, which the router routes to the guest (via the
+            // porthelper) so the Mac reaches containers by their real IP — any protocol, no proxy.
+            // All best-effort and gated on the one-time porthelper grant; inert if declined.
+            let nameRegistry = NameRegistry()
+            let namedRouter = NamedAccessRouter(helper: helper)
+            let nameDNS = NameDNSResponder(registry: nameRegistry)
+            try? nameDNS.start()
+            let watcher = DockerEventsWatcher(docker: docker, onPorts: onPorts, endpoints: endpoints,
+                                              names: nameRegistry,
+                                              onSubnets: { namedRouter.update(subnets: $0) })
             watcher.start()
             self.portHelper = helper
             self.forwarder = forwarder
             self.udpForwarder = udpForwarder
             self.watcher = watcher
+            self.nameDNS = nameDNS
+            self.namedRouter = namedRouter
 
             // Fast published-port datapath: learn the (Swift-opaque) VZNAT gateway from the
             // guest, then bind a warm conduit pool so published-port traffic rides VZNAT
@@ -263,6 +277,12 @@ final class EngineController {
                 } catch {
                     Log.warn("conduit pool failed to start: \(error); using vsock fallback")
                 }
+                // Named access: route container subnets to the guest (gateway = guest IP), and
+                // request the one-time grant (porthelper install + /etc/resolver) so routes apply.
+                // If already installed this is silent; if declined, named access stays off. (v1
+                // re-offers on the next launch until granted — persisting the decline is a follow-up.)
+                namedRouter.setGateway(info.guestIP)
+                if await helper.ensureInstalled() { namedRouter.refresh() }
             }
 
             // Keep the guest clock aligned with the host (survives Mac sleep), and
@@ -335,6 +355,11 @@ final class EngineController {
         }
         watcher?.stop()
         watcher = nil
+        nameDNS?.stop()
+        nameDNS = nil
+        // Remove the host routes so none dangle once the VM (their next hop) is gone.
+        namedRouter?.stop()
+        namedRouter = nil
         forwarder?.stopAll()
         forwarder = nil
         conduitPool?.stop()
