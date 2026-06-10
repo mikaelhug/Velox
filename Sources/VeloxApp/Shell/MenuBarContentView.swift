@@ -164,17 +164,26 @@ private struct ContainerQuickRow: View {
                         .buttonStyle(.plain).font(.caption2).foregroundStyle(.link)
                         .help("Open http://\(domain)/")
                     }
-                    // String-built titles on purpose: a literal with an Int interpolation
-                    // becomes a LocalizedStringKey, and locale number formatting turns
-                    // port 3000 into "3 000". Ports are never locale-formatted.
+                    // Port links render as capsule chips so they read as their own
+                    // buttons (localhost:<port>), not as a suffix of the domain link
+                    // beside them. String-built titles on purpose: a literal with an
+                    // Int interpolation becomes a LocalizedStringKey and locale number
+                    // grouping turns port 3000 into "3 000".
                     let bindings = container.publishedBindings
                     ForEach(bindings.prefix(3), id: \.self) { p in
                         if let pub = p.publicPort {
-                            let title = ":" + String(pub)
-                            Button(title) { WorkspaceActions.openPort(pub) }
-                                .buttonStyle(.plain).font(.caption2.monospaced())
-                                .foregroundStyle(.link)
-                                .help("Open http://localhost:" + String(pub) + "/")
+                            Button {
+                                WorkspaceActions.openPort(pub)
+                            } label: {
+                                Text(":" + String(pub))
+                                    .font(.caption2.monospaced())
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.link)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.quaternary.opacity(0.5), in: Capsule())
+                            .help("Open http://localhost:" + String(pub) + "/")
                         }
                     }
                     if bindings.count > 3 {
