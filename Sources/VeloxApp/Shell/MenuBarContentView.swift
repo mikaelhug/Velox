@@ -51,7 +51,7 @@ struct MenuBarContentView: View {
         // fixedSize content hug (it proposes its own width), so size explicitly to
         // the footer row plus a little air. Long names/domains truncate in
         // the rows (230pt text cap) rather than widening the panel.
-        .frame(width: 290, alignment: .leading)
+        .frame(width:270, alignment: .leading)
         .modifier(RetainStatsIfPresent(stats: engine.state.isRunning ? engine.stats : nil))
     }
 
