@@ -241,7 +241,7 @@ connections stall and serialize on the VM queue.
   poll. (Even the guest's named-access `nft` re-assert is event-driven — the dockerd
   supervisor signals it on respawn and a local `/events` network informer on endpoint
   changes — and container uptime in the GUI renders from per-transition lifecycle
-  anchors with self-ticking relative date text, not a re-list.) If you find yourself
+  anchors via a visible-only minute-tick TimelineView, not a re-list.) If you find yourself
   adding a repeating timer to *check* something, find the event instead.
 - Do NOT hand-roll raw-socket HTTP against the docker socket for streaming; use
   `DockerClient` (it handles persistent streams + cancellation correctly). A

@@ -53,4 +53,26 @@ enum Format {
         if seconds < 60 { return "just now" }
         return duration.string(from: seconds) ?? "—"
     }
+
+    /// Docker-style coarse duration — mirrors go-units `HumanDuration`, the function
+    /// behind `docker ps`'s "Up 5 minutes" / "Up About an hour" / "Up 3 weeks", so the
+    /// status badge reads exactly like Docker. Pure in `now` so a minute-tick
+    /// `TimelineView` drives it; the sub-minute tier says "Less than a minute"
+    /// (never seconds) so it's never stale between ticks.
+    static func dockerUptime(since start: Date, now: Date) -> String {
+        let seconds = max(0, now.timeIntervalSince(start))
+        let minutes = Int(seconds / 60)
+        let hours = Int((seconds / 3600).rounded())
+        switch true {
+        case seconds < 60:   return "Less than a minute"
+        case minutes == 1:   return "About a minute"
+        case minutes < 60:   return "\(minutes) minutes"
+        case hours == 1:     return "About an hour"
+        case hours < 48:     return "\(hours) hours"
+        case hours < 24*7*2:   return "\(hours / 24) days"
+        case hours < 24*30*2:  return "\(hours / 24 / 7) weeks"
+        case hours < 24*365*2: return "\(hours / 24 / 30) months"
+        default:               return "\(hours / 24 / 365) years"
+        }
+    }
 }

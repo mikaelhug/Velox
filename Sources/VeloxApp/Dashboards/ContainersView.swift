@@ -760,12 +760,13 @@ private struct PortLink: View {
     }
 }
 
-/// Status capsule with NATIVE uptime: a self-ticking relative time from the
-/// container's lifecycle anchor (dockerd's own StartedAt). SwiftUI's
-/// `Text(_, style: .relative)` updates itself — no timer, no re-list; the anchor
-/// refreshes only on lifecycle events. Until the anchor lands (a beat after a
-/// transition), Docker's pre-rendered status string fills in. Stopped containers
-/// just say "Stopped" — the exit code + when live in the hover tooltip.
+/// Status capsule with NATIVE uptime: Docker's own wording ("Up 5 minutes"),
+/// re-rendered from the container's lifecycle anchor (dockerd's StartedAt) by a
+/// minute-tick `TimelineView` — ticks only while visible, no per-second churn
+/// (SwiftUI's `.relative` text style shows seconds, which read as noise here);
+/// the anchor itself refreshes only on lifecycle events. Until the anchor lands
+/// (a beat after a transition), Docker's pre-rendered status string fills in.
+/// Stopped containers just say "Stopped" — exit code + when live in the tooltip.
 struct UptimeBadge: View {
     let container: ContainerSummary
     let anchor: DockerResourceStore.LifeAnchor?
@@ -788,10 +789,9 @@ struct UptimeBadge: View {
     @ViewBuilder
     private var content: some View {
         if container.isRunning, let date = validAnchor?.date {
-            HStack(spacing: 3) {
-                Text("Up")
-                Text(date, style: .relative)
-                if container.isUnhealthy { Text("· unhealthy") }
+            TimelineView(.everyMinute) { context in
+                Text(verbatim: "Up " + Format.dockerUptime(since: date, now: context.date)
+                              + (container.isUnhealthy ? " · unhealthy" : ""))
             }
         } else if container.state == "exited" {
             Text("Stopped")

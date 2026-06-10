@@ -165,8 +165,8 @@ final class DockerResourceStore {
     // MARK: - Lifecycle anchors (native uptime, no polling)
 
     /// A running container's lifecycle anchor: when it started, per dockerd's own
-    /// RFC3339 StartedAt. The UI renders uptime from it with self-ticking relative
-    /// date text — replacing the old re-list of Docker's pre-rendered "Up 3 minutes"
+    /// RFC3339 StartedAt. The UI renders Docker-style uptime from it on a minute-tick
+    /// TimelineView — replacing the old re-list of Docker's pre-rendered "Up 3 minutes"
     /// strings (the last GUI timer). Stopped containers don't get one — the UI shows
     /// a plain "Stopped", so inspecting them would be a wasted round-trip.
     struct LifeAnchor: Equatable {
