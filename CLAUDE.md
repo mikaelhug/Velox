@@ -72,6 +72,12 @@ The following conventions are **binding** — keep them true in all future work.
 > serves to users. Implement and commit requested fixes as normal, but **cut a release
 > only when the user explicitly asks for it** ("ship it", "release vX", "tag it"). When
 > in doubt, leave it untagged and ask.
+>
+> **Pre-release gate:** the North Star is comparative, so before a release that touches
+> the datapath, kernel, disk, or engine version, re-run the benchmark scorecard
+> (`docs/bench/run.sh`) and check it against `docs/benchmarks.md` — a regression vs
+> Docker Desktop is a release blocker, not a footnote. On a `DOCKER_VERSION` major bump,
+> also walk the checklist comment above it in `versions.env` (named-access nft chains).
 
 ## 1. User-facing CLI is the stock `docker`, via a Docker **context**
 
