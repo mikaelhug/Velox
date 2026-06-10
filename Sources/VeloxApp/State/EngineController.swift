@@ -82,6 +82,12 @@ final class EngineController {
     /// pane switches (the dashboard views themselves are recreated per switch).
     let paneUI = PaneUIState()
 
+    /// Crash notifications (opt-in) — fed by the resource store's die events.
+    private let crashNotifier = CrashNotifier()
+
+    /// Published ports that couldn't bind localhost — the Containers pane badges them.
+    let portIssues = PortIssues()
+
     /// Set true when the engine is running and the `velox` Docker context exists
     /// but isn't the active one — the shell shows a one-time prompt offering to
     /// switch, so a plain `docker ps` in the terminal targets Velox.
@@ -211,12 +217,19 @@ final class EngineController {
             // forwarders, events watcher, named access, clock sync, conduit pool) is
             // wired by EngineRuntime — the same code path as the `velox` CLI.
             let runtime = EngineRuntime(manager: manager)
+            runtime.setPortIssueHandler { [portIssues] port, blocked in
+                Task { @MainActor in portIssues.set(port, blocked: blocked) }
+            }
             try runtime.start()
             self.runtime = runtime
             self.docker = runtime.docker
             // Start the shared resource informer immediately so the dashboards have
             // data loaded before the user navigates to them (no per-pane re-fetch).
             let resourceStore = DockerResourceStore(docker: runtime.docker)
+            crashNotifier.enabled = config.notifyOnCrash
+            resourceStore.onContainerDied = { [crashNotifier] name, code in
+                crashNotifier.containerDied(name: name, exitCode: code)
+            }
             resourceStore.start()
             self.resources = resourceStore
             self.stats = StatsStore(docker: runtime.docker, resources: resourceStore)
@@ -291,6 +304,7 @@ final class EngineController {
         // clock sync, proxy) — idempotent; also removes host routes so none dangle.
         runtime?.stop()
         runtime = nil
+        portIssues.clear()
         resources?.stop()
         resources = nil
         stats?.stop()
@@ -334,9 +348,10 @@ final class EngineController {
     /// Persist preferences and apply the live-tunable ones (Resource Saver) to a
     /// running engine. Settings calls this on change.
     func applyRuntimeConfig() {
-        // Apply the live-tunable part (Resource Saver) immediately, but debounce the disk
-        // write: dragging a CPU/memory/disk slider fires this on every integer tick, and
-        // each `saveConfig` is a synchronous JSON encode + file write on the main actor.
+        // Apply the live-tunable parts (Resource Saver, crash notifications) immediately,
+        // but debounce the disk write: dragging a CPU/memory/disk slider fires this on
+        // every integer tick, and each `saveConfig` is a synchronous JSON encode + write.
+        crashNotifier.enabled = config.notifyOnCrash
         if state.isRunning { startResourceSaver() }
         configSaveTask?.cancel()
         configSaveTask = Task { [weak self] in

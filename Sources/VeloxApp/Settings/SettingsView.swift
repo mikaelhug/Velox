@@ -102,6 +102,14 @@ private struct GeneralPane: View {
             }
 
             Section {
+                Toggle("Notify when a container crashes", isOn: $config.notifyOnCrash)
+            } header: {
+                Text("Notifications")
+            } footer: {
+                Text("Posts a macOS notification when a container exits with a non-zero code (clean stops are ignored). Event-driven — nothing polls.")
+            }
+
+            Section {
                 Toggle("Check for updates on startup", isOn: $config.checkUpdatesOnStartup)
                 LabeledContent("Status") { updateControls }
                 if engine.availableUpdate?.isUpdateAvailable == true,

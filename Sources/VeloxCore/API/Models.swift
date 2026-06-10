@@ -334,7 +334,73 @@ public struct AttachedContainer: Sendable, Hashable, Identifiable {
 public struct DockerEvent: Codable, Sendable {
     public let type: String?       // "container", "image", "network", "volume"
     public let action: String?     // "start", "stop", "die", "create", "destroy", "pull"
-    enum CodingKeys: String, CodingKey { case type = "Type", action = "Action" }
+    public let actor: Actor?
+
+    public struct Actor: Codable, Sendable {
+        public let attributes: [String: String]?
+        enum CodingKeys: String, CodingKey { case attributes = "Attributes" }
+    }
+    enum CodingKeys: String, CodingKey { case type = "Type", action = "Action", actor = "Actor" }
+
+    /// Convenience for the crash notifier: `die` events carry the container name
+    /// and exit code in the actor attributes.
+    public var containerName: String? { actor?.attributes?["name"] }
+    public var exitCode: Int? { actor?.attributes?["exitCode"].flatMap(Int.init) }
+}
+
+/// The subset of `GET /containers/{id}/json` needed to reconstruct a `docker run`
+/// command (the "Copy as docker run" affordance). Decoded on demand, never on the
+/// list hot path.
+public struct ContainerInspect: Decodable, Sendable {
+    public let name: String
+    public let config: Config
+    public let hostConfig: HostConfig
+
+    public struct Config: Decodable, Sendable {
+        public let image: String
+        public let env: [String]?
+        public let cmd: [String]?
+        public let entrypoint: [String]?
+        public let workingDir: String?
+        enum CodingKeys: String, CodingKey {
+            case image = "Image", env = "Env", cmd = "Cmd"
+            case entrypoint = "Entrypoint", workingDir = "WorkingDir"
+        }
+        public init(image: String, env: [String]? = nil, cmd: [String]? = nil,
+                    entrypoint: [String]? = nil, workingDir: String? = nil) {
+            self.image = image; self.env = env; self.cmd = cmd
+            self.entrypoint = entrypoint; self.workingDir = workingDir
+        }
+    }
+
+    public struct HostConfig: Decodable, Sendable {
+        public let binds: [String]?
+        public let portBindings: [String: [PortBinding]]?
+        public let restartPolicy: RestartPolicy?
+
+        public struct PortBinding: Decodable, Sendable {
+            public let hostPort: String?
+            enum CodingKeys: String, CodingKey { case hostPort = "HostPort" }
+            public init(hostPort: String?) { self.hostPort = hostPort }
+        }
+        public struct RestartPolicy: Decodable, Sendable {
+            public let name: String?
+            enum CodingKeys: String, CodingKey { case name = "Name" }
+            public init(name: String?) { self.name = name }
+        }
+        enum CodingKeys: String, CodingKey {
+            case binds = "Binds", portBindings = "PortBindings", restartPolicy = "RestartPolicy"
+        }
+        public init(binds: [String]? = nil, portBindings: [String: [PortBinding]]? = nil,
+                    restartPolicy: RestartPolicy? = nil) {
+            self.binds = binds; self.portBindings = portBindings; self.restartPolicy = restartPolicy
+        }
+    }
+    enum CodingKeys: String, CodingKey { case name = "Name", config = "Config", hostConfig = "HostConfig" }
+
+    public init(name: String, config: Config, hostConfig: HostConfig) {
+        self.name = name; self.config = config; self.hostConfig = hostConfig
+    }
 }
 
 // MARK: - Stats

@@ -11,8 +11,21 @@ import SwiftUI
 struct MenuBarLabel: View {
     let symbol: String
     let saving: Bool
+    /// Running-container count, shown beside the icon when non-zero — the
+    /// zero-click glance ("anything running?") before even opening the panel.
+    var count: Int = 0
 
     var body: some View {
+        HStack(spacing: 2) {
+            icon
+            if count > 0 {
+                Text("\(count)").font(.system(size: 11, weight: .medium))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var icon: some View {
         if saving {
             Image(nsImage: MenuBarIcon.image(symbol: symbol, saving: true))
                 .resizable()

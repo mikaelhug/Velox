@@ -24,6 +24,10 @@ public final class PortForwarder: @unchecked Sendable {
     /// Privileged ports we've already logged as "helper not ready", so a pending or
     /// declined prompt doesn't re-warn on every reconcile (all access is on `queue`).
     private var warnedPrivileged: Set<UInt16> = []
+    /// Fired when a published port can't get its localhost listener (true) or the
+    /// condition clears (false) — the GUI badges the port instead of burying the
+    /// only signal in a log line. Set before `reconcile` is first called.
+    public var onBindIssue: (@Sendable (UInt16, Bool) -> Void)?
 
     public init(bridge: VsockBridge,
                 privilegedBinder: PrivilegedPortBinder? = nil,
@@ -68,6 +72,7 @@ public final class PortForwarder: @unchecked Sendable {
                 if warnedPrivileged.insert(port).inserted {
                     Log.warn("port-forward: 127.0.0.1:\(port) needs the privileged helper — not authorized yet")
                 }
+                onBindIssue?(port, true)
                 return
             }
             fd = pfd
@@ -89,6 +94,7 @@ public final class PortForwarder: @unchecked Sendable {
             guard bound == 0, listen(s, 128) == 0 else {
                 Log.warn("port-forward: could not bind 127.0.0.1:\(port) (errno \(errno))")
                 Darwin.close(s)
+                onBindIssue?(port, true)
                 return
             }
             fd = s
@@ -109,6 +115,7 @@ public final class PortForwarder: @unchecked Sendable {
         }
         listeners[port] = Listener(sources: sources)
         warnedPrivileged.remove(port)
+        onBindIssue?(port, false)
         Log.info("port-forward: localhost:\(port) → guest:\(port)"
                  + (sources.count == 2 ? " (v4+v6)" : ""))
     }
@@ -146,6 +153,7 @@ public final class PortForwarder: @unchecked Sendable {
 
     private func closeListener(_ port: UInt16) {
         warnedPrivileged.remove(port)
+        onBindIssue?(port, false) // unpublished → whatever issue it had is moot
         guard let listener = listeners.removeValue(forKey: port) else { return }
         for source in listener.sources { source.cancel() }
         Log.info("port-forward: closed localhost:\(port)")

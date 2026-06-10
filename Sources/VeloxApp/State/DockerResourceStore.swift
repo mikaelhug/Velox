@@ -78,6 +78,10 @@ final class DockerResourceStore {
     private static let lifecycleActions: Set<String> =
         ["create", "start", "stop", "die", "kill", "restart", "destroy", "rename"]
 
+    /// Fired on container `die` events with the name and exit code — the crash
+    /// notifier hangs off this so it shares the one events stream (CLAUDE.md §8).
+    var onContainerDied: ((String, Int) -> Void)?
+
     /// Route an event to the resource(s) it can change.
     private func handle(_ event: DockerEvent) {
         switch event.type {
@@ -86,6 +90,9 @@ final class DockerResourceStore {
         case "network": schedule(.networks)
         case "container", nil:
             schedule(.containers)
+            if event.action == "die", let onContainerDied {
+                onContainerDied(event.containerName ?? "container", event.exitCode ?? 0)
+            }
             if let action = event.action, Self.lifecycleActions.contains(action) {
                 schedule(.networks)
             }

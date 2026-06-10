@@ -1,4 +1,6 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 import VeloxCore
 
 @MainActor
@@ -39,6 +41,11 @@ struct VolumesView: View {
     @State private var pruneConfirm = false
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<Volume>
+    // Volume ↔ tar transfer (backup/migrate): export streams `tar cf` straight to the
+    // chosen file; import creates the volume and untars into it. Both via the engine.
+    @State private var importTar: URL?
+    @State private var importName = ""
+    @State private var transferMessage: String?
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore, ui: PaneUIState) {
         self.ui = ui
@@ -74,6 +81,8 @@ struct VolumesView: View {
                 Button("Copy Name") { WorkspaceActions.copy(v.name) }
                 Button("Copy Mountpoint") { WorkspaceActions.copy(v.mountpoint) }
                 Divider()
+                Button("Export as tar…") { exportVolume(v) }
+                Divider()
                 Button("Remove", role: .destructive) { ui.volumeSelection = ids; removeConfirm = true }
             } else if !ids.isEmpty {
                 Button("Remove \(ids.count) Volumes", role: .destructive) {
@@ -96,10 +105,34 @@ struct VolumesView: View {
                 .help(ui.volumeSelection.isEmpty ? "Select volumes to remove" : "Remove the selected volume(s)")
             }
             ToolbarItem(placement: .automatic) {
+                Button { pickImportTar() } label: { Label("Import Volume", systemImage: "square.and.arrow.down") }
+                    .help("Create a volume from a tar archive")
+            }
+            ToolbarItem(placement: .automatic) {
                 Button { ui.volumeInspector.toggle() } label: { Image(systemName: "sidebar.right") }
                     .help("Toggle inspector")
             }
         }
+        .alert("Import Volume", isPresented: Binding(
+            get: { importTar != nil }, set: { if !$0 { importTar = nil } })
+        ) {
+            TextField("Volume name", text: $importName)
+            Button("Import") {
+                guard let tar = importTar, !importName.isEmpty else { return }
+                importTar = nil
+                WorkspaceActions.importVolume(importName, from: tar) { failure in
+                    transferMessage = failure.map { "Import failed: \($0)" }
+                        ?? "Imported \(tar.lastPathComponent) into volume “\(importName)”"
+                    Task { await model.perform { _ in } } // refresh the list
+                }
+            }
+            Button("Cancel", role: .cancel) { importTar = nil }
+        } message: {
+            Text("The archive's contents become the volume's contents. An existing volume with this name is merged into.")
+        }
+        .alert("Volume Transfer", isPresented: Binding(
+            get: { transferMessage != nil }, set: { if !$0 { transferMessage = nil } })
+        ) { Button("OK", role: .cancel) {} } message: { Text(transferMessage ?? "") }
         .inspector(isPresented: $ui.volumeInspector) {
             VolumeInspector(volume: selected)
                 .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
@@ -129,6 +162,30 @@ struct VolumesView: View {
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
         ) { Button("OK", role: .cancel) {} } message: { Text(model.actionError ?? "") }
+    }
+}
+
+extension VolumesView {
+    private static let tarType = UTType(filenameExtension: "tar") ?? .data
+
+    fileprivate func exportVolume(_ v: Volume) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "\(v.name).tar"
+        panel.allowedContentTypes = [Self.tarType]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        WorkspaceActions.exportVolume(v.name, to: url) { failure in
+            transferMessage = failure.map { "Export failed: \($0)" }
+                ?? "Exported “\(v.name)” to \(url.lastPathComponent)"
+        }
+    }
+
+    fileprivate func pickImportTar() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [Self.tarType]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        importName = url.deletingPathExtension().lastPathComponent
+        importTar = url
     }
 }
 

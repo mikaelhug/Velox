@@ -24,11 +24,15 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     public var dontSuggestContext: Bool
     /// Check GitHub Releases for a newer Velox on app launch (default on).
     public var checkUpdatesOnStartup: Bool
+    /// Post a macOS notification when a container exits with a non-zero code
+    /// (opt-in; rides the existing events stream — nothing polls).
+    public var notifyOnCrash: Bool
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
                 launchAtLogin: Bool,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
-                dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true) {
+                dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true,
+                notifyOnCrash: Bool = false) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
@@ -36,6 +40,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         self.resourceSaverMinutes = resourceSaverMinutes
         self.dontSuggestContext = dontSuggestContext
         self.checkUpdatesOnStartup = checkUpdatesOnStartup
+        self.notifyOnCrash = notifyOnCrash
     }
 
     public static var `default`: VeloxConfig {
@@ -66,6 +71,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         resourceSaverMinutes = try c.decodeIfPresent(Int.self, forKey: .resourceSaverMinutes) ?? d.resourceSaverMinutes
         dontSuggestContext = try c.decodeIfPresent(Bool.self, forKey: .dontSuggestContext) ?? d.dontSuggestContext
         checkUpdatesOnStartup = try c.decodeIfPresent(Bool.self, forKey: .checkUpdatesOnStartup) ?? d.checkUpdatesOnStartup
+        notifyOnCrash = try c.decodeIfPresent(Bool.self, forKey: .notifyOnCrash) ?? d.notifyOnCrash
     }
 
     // MARK: - Derived

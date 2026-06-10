@@ -288,6 +288,28 @@ do {
     check(multi.namedAccessDomain == nil, "multi-network (ambiguous IP) → no domain")
 }
 
+// MARK: DockerRunCommand reconstruction
+
+section("DockerRunCommand")
+do {
+    let inspect = ContainerInspect(
+        name: "/web",
+        config: .init(image: "nginx:latest", env: ["A=plain", "B=has space"],
+                      cmd: ["nginx", "-g", "daemon off;"], workingDir: "/app"),
+        hostConfig: .init(binds: ["pgdata:/data"],
+                          portBindings: ["80/tcp": [.init(hostPort: "8080")],
+                                         "53/udp": [.init(hostPort: "5353")]],
+                          restartPolicy: .init(name: "unless-stopped")))
+    equal(DockerRunCommand.build(from: inspect),
+          "docker run -d --name web -p 5353:53/udp -p 8080:80 -v pgdata:/data "
+        + "-e A=plain -e 'B=has space' --restart unless-stopped -w /app "
+        + "nginx:latest nginx -g 'daemon off;'",
+          "full docker run reconstruction")
+    equal(DockerRunCommand.quote("it's"), "'it'\\''s'", "single-quote escaping")
+    let bare = ContainerInspect(name: "/x", config: .init(image: "alpine"), hostConfig: .init())
+    equal(DockerRunCommand.build(from: bare), "docker run -d --name x alpine", "minimal container")
+}
+
 // MARK: ChurnBreaker state machine
 
 section("ChurnBreaker")

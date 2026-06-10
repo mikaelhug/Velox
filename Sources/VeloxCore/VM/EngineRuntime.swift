@@ -135,4 +135,10 @@ public final class EngineRuntime: @unchecked Sendable {
     public func waitUntilDockerReady(timeout: Duration) async -> Bool {
         await watcher.waitUntilReady(timeout: timeout)
     }
+
+    /// Surface published-port bind failures (port, blocked?) — the GUI badges the
+    /// affected port links. Call before `start()`.
+    public func setPortIssueHandler(_ handler: @escaping @Sendable (UInt16, Bool) -> Void) {
+        forwarder.onBindIssue = handler
+    }
 }

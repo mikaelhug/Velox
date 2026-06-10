@@ -38,6 +38,7 @@ struct OverviewView: View {
     let stats: StatsStore
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
+    @State private var showReclaim = false
 
     init(store: DockerResourceStore, stats: StatsStore) {
         self.stats = stats
@@ -62,6 +63,21 @@ struct OverviewView: View {
         }
         .retainingStats(stats)
         .task(id: model.containers.count) { model.refreshDiskUsage() }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { showReclaim = true } label: {
+                    Label("Reclaim Space", systemImage: "sparkles")
+                }
+                .help("Free disk space — prune unused Docker data")
+            }
+        }
+        .sheet(isPresented: $showReclaim) {
+            if let docker = engine.docker {
+                ReclaimSpaceSheet(docker: docker, isPresented: $showReclaim) {
+                    model.refreshDiskUsage()
+                }
+            }
+        }
     }
 
     // MARK: Hero
@@ -181,6 +197,86 @@ private struct LiveMetricCard: View {
                 SparklineView(values: history, maxValue: ceiling, tint: tint)
                     .frame(height: 46)
             }
+        }
+    }
+}
+
+/// "Reclaim Space" — the four prune levers in one dialog, with the freed total shown
+/// after. Velox can make a promise Docker Desktop can't: the guest's periodic TRIM
+/// hole-punches the raw data disk, so reclaimed bytes return to macOS by themselves.
+private struct ReclaimSpaceSheet: View {
+    let docker: any DockerClientProtocol
+    @Binding var isPresented: Bool
+    /// Called after a successful run so the disk gauge refreshes.
+    var onReclaimed: () -> Void = {}
+
+    @State private var stoppedContainers = true
+    @State private var unusedImages = true
+    @State private var buildCache = true
+    @State private var unusedVolumes = false
+    @State private var running = false
+    @State private var reclaimed: UInt64?
+    @State private var failure: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    Toggle("Stopped containers", isOn: $stoppedContainers)
+                    Toggle("Unused images", isOn: $unusedImages)
+                    Toggle("Build cache", isOn: $buildCache)
+                    Toggle("Unused volumes", isOn: $unusedVolumes)
+                        .tint(.red)
+                } header: {
+                    Text("Reclaim Space")
+                } footer: {
+                    Text("Removes Docker data nothing references. Volumes hold real data — leave them off unless you're sure. Freed space returns to macOS automatically (the data disk is TRIMmed).")
+                }
+                if let reclaimed {
+                    Section {
+                        Label("Reclaimed \(Format.bytes(reclaimed))", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                }
+                if let failure {
+                    Section { Text(failure).foregroundStyle(.red).font(.caption) }
+                }
+            }
+            .formStyle(.grouped)
+            Divider()
+            HStack {
+                Button(reclaimed == nil ? "Cancel" : "Done") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                if running { ProgressView().controlSize(.small) }
+                Button("Reclaim", role: .destructive) { run() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(running ||
+                              !(stoppedContainers || unusedImages || buildCache || unusedVolumes))
+            }
+            .padding(12)
+        }
+        .frame(width: 400, height: 360)
+    }
+
+    private func run() {
+        running = true
+        failure = nil
+        let (c, i, b, v) = (stoppedContainers, unusedImages, buildCache, unusedVolumes)
+        let docker = docker
+        Task {
+            var total: UInt64 = 0
+            do {
+                if c { total += try await docker.pruneContainers() }
+                if i { total += try await docker.pruneImages(all: true) }
+                if b { total += try await docker.pruneBuildCache() }
+                if v { total += try await docker.pruneVolumes() }
+                reclaimed = total
+                onReclaimed()
+            } catch {
+                failure = "\(error)"
+            }
+            running = false
         }
     }
 }

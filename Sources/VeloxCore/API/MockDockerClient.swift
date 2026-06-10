@@ -76,6 +76,14 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
     public func restartContainer(_ id: String) async throws {}
     public func pauseContainer(_ id: String) async throws {}
     public func unpauseContainer(_ id: String) async throws {}
+    public func inspectContainer(_ id: String) async throws -> ContainerInspect {
+        ContainerInspect(name: "/web",
+                         config: .init(image: "nginx:latest", env: ["FOO=bar"]),
+                         hostConfig: .init(binds: ["pgdata:/var/lib/data"],
+                                           portBindings: ["80/tcp": [.init(hostPort: "8080")]]))
+    }
+    public func pruneContainers() async throws -> UInt64 { 0 }
+    public func pruneBuildCache() async throws -> UInt64 { 0 }
     public func removeContainer(_ id: String, force: Bool) async throws {}
     public func removeImage(_ id: String, force: Bool) async throws {}
     public func pruneImages(all: Bool) async throws -> UInt64 { 5_300_000 }

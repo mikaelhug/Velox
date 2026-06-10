@@ -171,10 +171,14 @@ struct ContainersView: View {
     @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
+    /// Published ports whose localhost bind failed — their links render red.
+    private let issues: PortIssues
+
     init(docker: any DockerClientProtocol, store: DockerResourceStore, stats: StatsStore,
-         ui: PaneUIState) {
+         ui: PaneUIState, issues: PortIssues) {
         self.stats = stats
         self.ui = ui
+        self.issues = issues
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("containers2"))
     }
@@ -223,11 +227,15 @@ struct ContainersView: View {
                         HStack(spacing: 8) {
                             ForEach(bindings, id: \.self) { p in
                                 if let pub = p.publicPort {
+                                    let blocked = issues.blocked.contains(UInt16(pub))
                                     Button(p.label) { WorkspaceActions.openPort(pub) }
                                         .buttonStyle(.plain)
                                         .font(.caption.monospaced())
-                                        .foregroundStyle(.link)
-                                        .help("Open http://localhost:\(pub)/")
+                                        .foregroundStyle(blocked ? AnyShapeStyle(.red)
+                                                                 : AnyShapeStyle(.link))
+                                        .help(blocked
+                                              ? "localhost:\(pub) couldn't bind — another app holds it"
+                                              : "Open http://localhost:\(pub)/")
                                 }
                             }
                         }
@@ -511,6 +519,9 @@ struct ContainersView: View {
         Button("View Logs") { openLogs(c) }
         if c.isRunning {
             Button("Open in Terminal") { WorkspaceActions.openShell(containerID: c.shortID) }
+            if WorkspaceActions.vsCodeAvailable {
+                Button("Open in VS Code") { WorkspaceActions.openInVSCode(containerName: c.displayName) }
+            }
         }
         if let domain = c.namedAccessDomain {
             Button("Open \(domain)") { WorkspaceActions.openDomain(domain) }
@@ -518,6 +529,14 @@ struct ContainersView: View {
         Menu("Copy") {
             Button("Name") { WorkspaceActions.copy(c.displayName) }
             Button("Container ID") { WorkspaceActions.copy(c.id) }
+            Button("As docker run Command") {
+                let docker = model.docker
+                Task {
+                    if let inspect = try? await docker.inspectContainer(c.id) {
+                        WorkspaceActions.copy(DockerRunCommand.build(from: inspect))
+                    }
+                }
+            }
             if let ip = c.directIP { Button("IP (\(ip))") { WorkspaceActions.copy(ip) } }
             if let domain = c.namedAccessDomain { Button("Domain") { WorkspaceActions.copy(domain) } }
             ForEach(c.publishedBindings, id: \.self) { p in
@@ -684,7 +703,7 @@ struct ContainersView_Previews: PreviewProvider {
                        store: DockerResourceStore(docker: MockDockerClient()),
                        stats: StatsStore(docker: MockDockerClient(),
                                          resources: DockerResourceStore(docker: MockDockerClient())),
-                       ui: PaneUIState())
+                       ui: PaneUIState(), issues: PortIssues())
             .frame(width: 860, height: 420)
     }
 }

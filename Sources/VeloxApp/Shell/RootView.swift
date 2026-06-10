@@ -6,6 +6,7 @@ import SwiftUI
 struct RootView: View {
     @Environment(EngineController.self) private var engine
     @State private var selection: SidebarItem? = .overview
+    @State private var showPalette = false
 
     var body: some View {
         @Bindable var engine = engine
@@ -33,6 +34,19 @@ struct RootView: View {
         }
         .toolbar(removing: .sidebarToggle)
         .navigationTitle(selection?.title ?? "Velox")
+        // ⌘K command palette — type-to-find anything, act inline.
+        .background(
+            Button("") { if engine.state.isRunning { showPalette = true } }
+                .keyboardShortcut("k")
+                .hidden()
+        )
+        .sheet(isPresented: $showPalette) {
+            CommandPalette(isPresented: $showPalette) { id in
+                selection = .containers
+                engine.paneUI.containerSelection = [id]
+            }
+            .environment(engine)
+        }
         .alert("Switch Docker context to Velox?", isPresented: $engine.showContextPrompt) {
             Button("Switch") { engine.adoptVeloxContext() }
             Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
@@ -58,7 +72,7 @@ struct RootView: View {
                 switch item {
                 case .overview:   OverviewView(store: store, stats: stats)
                 case .containers: ContainersView(docker: docker, store: store, stats: stats,
-                                                 ui: engine.paneUI)
+                                                 ui: engine.paneUI, issues: engine.portIssues)
                 case .images:     ImagesView(docker: docker, store: store, ui: engine.paneUI)
                 case .volumes:    VolumesView(docker: docker, store: store, ui: engine.paneUI)
                 default:          NetworksView(docker: docker, store: store)

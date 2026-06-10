@@ -58,6 +58,7 @@ struct ImagesView: View {
     @State private var pruneConfirm = false
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<ImageSummary>
+    @State private var loadMessage: String?
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore, ui: PaneUIState) {
         self.ui = ui
@@ -116,6 +117,21 @@ struct ImagesView: View {
                 }
             }
         }
+        // Drag an image tarball (`docker save` output) from Finder onto the table →
+        // `docker load`. The events stream refreshes the list when it lands.
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let tar = urls.first(where: {
+                ["tar", "tgz", "gz"].contains($0.pathExtension.lowercased())
+            }) else { return false }
+            WorkspaceActions.loadImageTar(tar) { failure in
+                loadMessage = failure.map { "Load failed: \($0)" }
+                    ?? "Loaded \(tar.lastPathComponent)"
+            }
+            return true
+        }
+        .alert("Load Image", isPresented: Binding(
+            get: { loadMessage != nil }, set: { if !$0 { loadMessage = nil } })
+        ) { Button("OK", role: .cancel) {} } message: { Text(loadMessage ?? "") }
         .safeAreaInset(edge: .top) { pullBar }
         .searchable(text: $ui.imageSearch, placement: .toolbar, prompt: "Filter images")
         .toolbar {

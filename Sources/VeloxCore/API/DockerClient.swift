@@ -142,6 +142,16 @@ public actor DockerClient: DockerClientProtocol {
     public func pauseContainer(_ id: String) async throws {
         _ = try await send("POST", Self.path("/containers/\(id)/pause"))
     }
+    public func inspectContainer(_ id: String) async throws -> ContainerInspect {
+        try decode(ContainerInspect.self,
+                   from: await send("GET", Self.path("/containers/\(id)/json"), readTimeout: 30))
+    }
+    public func pruneContainers() async throws -> UInt64 {
+        Self.spaceReclaimed(try await send("POST", Self.path("/containers/prune")))
+    }
+    public func pruneBuildCache() async throws -> UInt64 {
+        Self.spaceReclaimed(try await send("POST", Self.path("/build/prune")))
+    }
     public func unpauseContainer(_ id: String) async throws {
         _ = try await send("POST", Self.path("/containers/\(id)/unpause"))
     }
