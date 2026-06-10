@@ -12,7 +12,7 @@ public enum Versions {
     public static let porthelperRevision = "3"
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
-    public static let kernelVersion = "6.18.34"
+    public static let kernelVersion = "6.18.35"
     /// Docker Engine version in the guest (Docker's official static release).
     public static let dockerVersion = "29.5.3"
 }

@@ -51,8 +51,10 @@ docker run --rm --platform linux/arm64 -v "$OUT_ABS":/out "${ALPINE_IMAGE}" sh -
     rm -rf /r && mkdir -p /r
     tar -C /r -xf /out/rootfs.tar
     rm -f /out/root.img
-    # lz4hc: erofs default, fast demand-paged decompress, universally supported.
-    mkfs.erofs -zlz4hc -T0 --all-root /out/root.img /r >/dev/null
+    # lz4hc level 12 (max): lz4 decompression speed is independent of the level —
+    # a higher level only costs build time and yields a smaller image that reads
+    # FEWER bytes per demand-page. Strictly better at runtime than the default (9).
+    mkfs.erofs -zlz4hc,12 -T0 --all-root /out/root.img /r >/dev/null
 '
 rm -f "$OUT/rootfs.tar"
 

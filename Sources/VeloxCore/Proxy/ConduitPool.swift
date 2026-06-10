@@ -244,8 +244,11 @@ public final class ConduitPool: @unchecked Sendable {
 
     /// Short keepalive so a silently conntrack-evicted conduit surfaces as an error (→ the
     /// read source prunes it) within ~40s, instead of black-holing a future assignment.
+    /// Also TCP_NODELAY: the guest sets it on its end of every conduit; without it here,
+    /// Nagle can hold back small host→guest writes (request headers) for a delayed ACK.
     private static func setKeepalive(_ fd: Int32) {
         var on: Int32 = 1
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, socklen_t(MemoryLayout<Int32>.size))
         var idle: Int32 = 25 // macOS: TCP_KEEPALIVE is the idle seconds before the first probe
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, socklen_t(MemoryLayout<Int32>.size))

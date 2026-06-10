@@ -113,6 +113,11 @@ public final class PortForwarder: @unchecked Sendable {
         while true {
             let client = Darwin.accept(fd, nil, nil)
             if client < 0 { break }
+            // No Nagle on the client leg: replies are written in protocol-sized pieces
+            // (headers, then body) and a delayed-ACK hold-back here is pure added latency.
+            // The guest/conduit leg sets its own NODELAY.
+            var on: Int32 = 1
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &on, socklen_t(MemoryLayout<Int32>.size))
             // When the conduit pool is up it owns the connection — it splices to a warm conduit,
             // briefly waits for the guest to grow the pool under a burst, and drops to the vsock
             // relay only as a timed last resort. Without a pool, use the vsock relay directly.
