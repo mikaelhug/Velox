@@ -73,12 +73,13 @@ fn main() {
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
-    // Direct-access (named containers) re-asserts its nft rules after every dockerd
-    // (re)spawn — the supervisor signals this channel instead of anything polling.
+    // Direct-access (named containers) re-asserts its nft rules on every dockerd
+    // (re)spawn and on every docker network event — both signal this channel; nothing polls.
     let (nft_tx, nft_rx) = std::sync::mpsc::channel::<()>();
     if data_ok {
         let pid = spawn_dockerd();
         DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+        start_docker_events_informer(nft_tx.clone());
         std::thread::spawn(move || dockerd_supervisor(deaths_rx, nft_tx));
     } else {
         // Persistence was expected (/dev/vdb present) but the data fs didn't mount.
@@ -1016,21 +1017,49 @@ fn start_fstrim_timer() {
 /// (the vmnet gateway) to reach containers directly past dockerd 29's TWO host→container drops —
 /// the per-bridge "UNPUBLISHED PORT DROP" in `filter-FORWARD` (forward hook) and the per-container
 /// "DROP DIRECT ACCESS" in `raw-PREROUTING` (a separate prerouting hook, so the forward allow alone
-/// doesn't cover it). One `ip saddr <gateway> accept` at the TOP of each chain. Each survives
-/// dockerd's per-network reconciles (it edits per-bridge sub-chains, not these base chains); only
-/// a dockerd *restart* rebuilds the whole table — and the supervisor signals `restarts` on every
-/// respawn, so the rules are re-asserted event-driven (CLAUDE.md §8), no standing poll. Inert
-/// until the host adds a route to the container subnets, so it exposes nothing on its own — and a
-/// container cannot spoof the gateway IP (it lives on eth0, not docker0). Verified by spike + e2e
-/// (curl → 200 by name).
-fn start_direct_access(restarts: std::sync::mpsc::Receiver<()>) {
+/// doesn't cover it). One `ip saddr <gateway> accept` at the TOP of each chain. The allow can be
+/// flushed out from under us — a dockerd *restart* rebuilds the whole table, and dockerd rewrites
+/// `raw-PREROUTING`'s per-container drops on every network endpoint change (measured: the first
+/// `docker run` after boot wipes the allow from that chain). Both have events (CLAUDE.md §8): the
+/// supervisor signals `triggers` on every respawn, and the `/events` informer signals it on every
+/// network event; the idempotent assert below is the reconcile. Inert until the host adds a route
+/// to the container subnets, so it exposes nothing on its own — and a container cannot spoof the
+/// gateway IP (it lives on eth0, not docker0). Verified by spike + e2e (curl → 200 by name).
+fn start_direct_access(triggers: std::sync::mpsc::Receiver<()>) {
     std::thread::spawn(move || loop {
         assert_direct_access_rules();
-        // Block until the supervisor respawns dockerd — pure event, no timer. Senders
-        // live in main (never returns) and the supervisor, so Err is unreachable; treat
-        // it as terminal anyway rather than spinning.
-        if restarts.recv().is_err() { return }
-        while restarts.try_recv().is_ok() {} // coalesce a respawn burst into one assert
+        // Block until a respawn/network event — pure event wait, no timer. Senders live
+        // in main (never returns), the supervisor, and the events informer, so Err is
+        // unreachable; treat it as terminal anyway rather than spinning.
+        if triggers.recv().is_err() { return }
+        while triggers.try_recv().is_ok() {} // coalesce a burst into one assert
+    });
+}
+
+/// Docker `/events` informer for direct access. dockerd rewrites its per-container drop
+/// rules (flushing our gateway allow from `raw-PREROUTING`) whenever a container joins or
+/// leaves a bridge — which surfaces as a `network` event on the local docker socket. Each
+/// burst of stream bytes just pings `trigger` (the event is only the trigger; the assert
+/// re-checks both chains — the informer rule). Reconnects with a short backoff: the socket
+/// vanishes across a dockerd restart, and the supervisor's respawn signal covers that gap.
+fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || loop {
+        if let Ok(mut s) = std::os::unix::net::UnixStream::connect(DOCKER_SOCK) {
+            // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly
+            // when dockerd rebuilds the drop chains. Headers/chunk framing aren't parsed:
+            // any traffic (including the response head) is a harmless idempotent re-assert.
+            let req = "GET /events?filters=%7B%22type%22%3A%5B%22network%22%5D%7D HTTP/1.1\r\nHost: docker\r\n\r\n";
+            if s.write_all(req.as_bytes()).is_ok() {
+                log!("direct-access: events informer connected");
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 { break }
+                    let _ = trigger.send(());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2)); // socket gone — dockerd down; retry
     });
 }
 
@@ -1045,24 +1074,34 @@ fn assert_direct_access_rules() {
         let gw = GATEWAY_IP.load(Relaxed);
         if gw != 0 {
             let gws = ipstr(gw);
-            let mut settled = true;
-            for chain in ["filter-FORWARD", "raw-PREROUTING"] {
-                match nft(&["list", "chain", "ip", "docker-bridges", chain]) {
-                    Ok(out) if out.status.success() => {
-                        if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
-                            continue; // rule already in place
+            // The whole table appears only once dockerd's nft init has run — before
+            // that there is nothing to assert into; keep waiting.
+            let table_up = nft(&["list", "table", "ip", "docker-bridges"])
+                .map(|o| o.status.success()).unwrap_or(false);
+            if table_up {
+                let mut settled = true;
+                for chain in ["filter-FORWARD", "raw-PREROUTING"] {
+                    match nft(&["list", "chain", "ip", "docker-bridges", chain]) {
+                        Ok(out) if out.status.success() => {
+                            if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
+                                continue; // rule already in place
+                            }
+                            match nft(&["insert", "rule", "ip", "docker-bridges", chain,
+                                        "ip", "saddr", &gws, "counter", "accept"]) {
+                                Ok(ins) if ins.status.success() =>
+                                    log!("direct-access: allowed {gws} → containers ({chain})"),
+                                _ => settled = false,
+                            }
                         }
-                        match nft(&["insert", "rule", "ip", "docker-bridges", chain,
-                                    "ip", "saddr", &gws, "counter", "accept"]) {
-                            Ok(ins) if ins.status.success() =>
-                                log!("direct-access: allowed {gws} → containers ({chain})"),
-                            _ => settled = false,
-                        }
+                        // Chain absent: dockerd creates the drop chains lazily (e.g.
+                        // raw-PREROUTING exists only while a container is attached), and
+                        // an absent chain has no drops to bypass — nothing to do until
+                        // the informer re-triggers on the event that creates it.
+                        _ => {}
                     }
-                    _ => settled = false, // table/chain not built yet
                 }
+                if settled { return }
             }
-            if settled { return }
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }

@@ -24,7 +24,10 @@ pillars that deliver it:
    (`NameRegistry`, filled by `DockerEventsWatcher`); a porthelper-installed host route
    (`NamedAccessRouter`) carries the Mac to the container subnet over VZNAT; and `vinit`
    adds one `nft` allow for the gateway IP in **both** dockerd-29 host→container drop
-   chains (`filter-FORWARD` *and* `raw-PREROUTING`), re-asserted after a dockerd restart.
+   chains (`filter-FORWARD` *and* `raw-PREROUTING`), re-asserted event-driven: the
+   dockerd supervisor signals on respawn, and a guest-local docker `/events` network
+   informer signals on endpoint changes (dockerd rewrites `raw-PREROUTING`'s
+   per-container drops on every `docker run`, flushing the allow — measured).
    No entitlement, no ongoing root (one-time grant only — folded into the porthelper).
    Don't replace this with a reverse proxy or re-add `trusted_host_interfaces` (it doesn't
    apply to `docker0`).
@@ -238,8 +241,9 @@ connections stall and serialize on the VM queue.
   view's while-visible re-list (daemon-computed "Up X minutes" status strings have no
   event to ride; it reuses the persistent `DockerClient`, no per-poll connections) —
   never a status poll. (Even the guest's named-access `nft` re-assert is event-driven:
-  the dockerd supervisor signals it on every respawn.) If you find yourself adding a
-  repeating timer to *check* something, find the event instead.
+  the dockerd supervisor signals it on respawn and a local `/events` network informer
+  on endpoint changes.) If you find yourself adding a repeating timer to *check*
+  something, find the event instead.
 - Do NOT hand-roll raw-socket HTTP against the docker socket for streaming; use
   `DockerClient` (it handles persistent streams + cancellation correctly). A
   raw-socket `/events` reader through the proxy churns connections and breaks it.
