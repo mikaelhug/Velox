@@ -140,10 +140,32 @@ private struct GeneralPane: View {
                 LabeledContent("Velox", value: Versions.velox)
                 LabeledContent("Kernel", value: Versions.kernelVersion)
                 LabeledContent("Docker Engine", value: Versions.dockerVersion)
+                LabeledContent("Diagnostics") {
+                    Button("Copy") { copyDiagnostics() }
+                        .help("Copies versions, engine state, config, and the engine-log tail — paste into a bug report")
+                }
             }
         }
         .formStyle(.grouped)
         .task { activeContext = await engine.activeDockerContext() }
+    }
+
+    /// Everything a useful bug report needs, one paste: versions, host, engine
+    /// state + allocation, and the last 40 engine-log lines.
+    private func copyDiagnostics() {
+        var lines = [
+            "Velox \(Versions.velox) — kernel \(Versions.kernelVersion), docker \(Versions.dockerVersion)",
+            "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "Engine: \(engine.state.label)"
+                + (engine.startedAt.map { " (started \($0.formatted(date: .abbreviated, time: .standard)))" } ?? ""),
+            "Config: \(engine.config.cpuCount) CPU · \(engine.config.memoryGiB) GiB RAM · "
+                + "\(engine.config.diskGiB) GiB disk · \(engine.config.swapGiB) GiB swap · "
+                + "saver \(engine.config.resourceSaverEnabled ? "on" : "off")",
+            "",
+            "— engine log (last 40 lines) —",
+        ]
+        lines += engine.engineLog.lines.suffix(40).map(\.text)
+        WorkspaceActions.copy(lines.joined(separator: "\n"))
     }
 
     /// The right-hand control of the "Status" row: either an up-to-date / check

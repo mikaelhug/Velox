@@ -14,12 +14,19 @@ struct MenuBarLabel: View {
     /// Running-container count, shown beside the icon when non-zero — the
     /// zero-click glance ("anything running?") before even opening the panel.
     var count: Int = 0
+    /// A newer Velox exists — a small up-arrow next to the icon (install in the panel).
+    var updateAvailable: Bool = false
 
     var body: some View {
         HStack(spacing: 2) {
             icon
             if count > 0 {
                 Text("\(count)").font(.system(size: 11, weight: .medium))
+            }
+            if updateAvailable {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 9))
+                    .accessibilityLabel("Update available")
             }
         }
     }

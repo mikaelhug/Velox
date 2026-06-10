@@ -34,6 +34,7 @@ struct VeloxApp: App {
         let saverActive = engine.isResourceSaving && engine.state.isRunning
         let runningCount = engine.state.isRunning
             ? (engine.resources?.containers.filter(\.isRunning).count ?? 0) : 0
+        let updateAvailable = engine.availableUpdate?.isUpdateAvailable == true
 
         Window("Velox", id: WindowID.dashboard) {
             RootView()
@@ -57,7 +58,8 @@ struct VeloxApp: App {
             // and tints identically to the original menu-bar icon), with a moon badge
             // knocked in only while Resource Saver is idling the VM, and the running-
             // container count beside it (only when non-zero).
-            MenuBarLabel(symbol: menuSymbol, saving: saverActive, count: runningCount)
+            MenuBarLabel(symbol: menuSymbol, saving: saverActive, count: runningCount,
+                         updateAvailable: updateAvailable)
         }
         .menuBarExtraStyle(.window)
 

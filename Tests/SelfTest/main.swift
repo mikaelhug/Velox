@@ -310,6 +310,31 @@ do {
     equal(DockerRunCommand.build(from: bare), "docker run -d --name x alpine", "minimal container")
 }
 
+// MARK: DiskUsage (/system/df) category math
+
+section("DiskUsage")
+do {
+    let json = #"""
+    {"LayersSize": 1000,
+     "Images": [{"Size": 600, "SharedSize": 100, "Containers": 0},
+                {"Size": 400, "SharedSize": 0, "Containers": 2}],
+     "Containers": [{"SizeRw": 50, "State": "running"}, {"SizeRw": 30, "State": "exited"}],
+     "Volumes": [{"UsageData": {"Size": 200, "RefCount": 1}},
+                 {"UsageData": {"Size": 70, "RefCount": 0}}],
+     "BuildCache": [{"Size": 90, "InUse": true}, {"Size": 25, "InUse": false}]}
+    """#
+    if let df = try? JSONDecoder().decode(DiskUsage.self, from: Data(json.utf8)) {
+        equal(df.imagesTotal, 1000, "images total = LayersSize")
+        equal(df.imagesReclaimable, 500, "unused image minus shared layers")
+        equal(df.containersTotal, 80, "container rw layers summed")
+        equal(df.containersReclaimable, 30, "only stopped containers reclaimable")
+        equal(df.volumesTotal, 270, "volume sizes summed")
+        equal(df.volumesReclaimable, 70, "only refcount-0 volumes reclaimable")
+        equal(df.buildCacheTotal, 115, "build cache summed")
+        equal(df.buildCacheReclaimable, 25, "only not-in-use cache reclaimable")
+    } else { failures += 1; print("FAIL  DiskUsage decode") }
+}
+
 // MARK: ChurnBreaker state machine
 
 section("ChurnBreaker")

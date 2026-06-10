@@ -20,6 +20,7 @@ public protocol DockerClientProtocol: Sendable {
     func inspectContainer(_ id: String) async throws -> ContainerInspect
     func pruneContainers() async throws -> UInt64
     func pruneBuildCache() async throws -> UInt64
+    func systemDiskUsage() async throws -> DiskUsage
 
     // Image actions
     func pullImage(_ reference: String) -> AsyncThrowingStream<String, Error>

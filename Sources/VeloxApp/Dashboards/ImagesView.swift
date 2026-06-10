@@ -59,6 +59,7 @@ struct ImagesView: View {
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<ImageSummary>
     @State private var loadMessage: String?
+    @State private var runTarget: ImageSummary?
 
     init(docker: any DockerClientProtocol, store: DockerResourceStore, ui: PaneUIState) {
         self.ui = ui
@@ -107,6 +108,8 @@ struct ImagesView: View {
         }
         .contextMenu(forSelectionType: ImageSummary.ID.self) { ids in
             if ids.count == 1, let img = model.images.first(where: { ids.contains($0.id) }) {
+                Button("Run…") { runTarget = img }
+                Divider()
                 Button("Copy Reference") { WorkspaceActions.copy("\(img.repository):\(img.tag)") }
                 Button("Copy Image ID") { WorkspaceActions.copy(img.id) }
                 Divider()
@@ -129,9 +132,12 @@ struct ImagesView: View {
             }
             return true
         }
-        .alert("Load Image", isPresented: Binding(
+        .alert("Image", isPresented: Binding(
             get: { loadMessage != nil }, set: { if !$0 { loadMessage = nil } })
         ) { Button("OK", role: .cancel) {} } message: { Text(loadMessage ?? "") }
+        .sheet(item: $runTarget) { img in
+            RunImageSheet(image: img) { message in loadMessage = message }
+        }
         .safeAreaInset(edge: .top) { pullBar }
         .searchable(text: $ui.imageSearch, placement: .toolbar, prompt: "Filter images")
         .toolbar {
@@ -201,6 +207,63 @@ struct ImagesView: View {
     }
 }
 
+/// Minimal quick-run: name, published ports, --rm. Deliberately not a docker-run
+/// builder — anything beyond a one-off belongs in the terminal (or compose).
+private struct RunImageSheet: View {
+    let image: ImageSummary
+    var onDone: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var name = ""
+    @State private var ports = ""
+    @State private var removeOnExit = false
+    @State private var starting = false
+
+    private var reference: String {
+        image.repository == "<none>" ? image.id : "\(image.repository):\(image.tag)"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Form {
+                Section {
+                    TextField("Name (optional)", text: $name)
+                    TextField("Publish ports — e.g. 8080:80, 5432:5432", text: $ports)
+                    Toggle("Remove when it exits (--rm)", isOn: $removeOnExit)
+                } header: {
+                    Text(verbatim: "Run \(reference)")
+                } footer: {
+                    Text("Starts detached. The new container appears in Containers the moment it's created.")
+                }
+            }
+            .formStyle(.grouped)
+            Divider()
+            HStack {
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Spacer()
+                if starting { ProgressView().controlSize(.small) }
+                Button("Run") { run() }.keyboardShortcut(.defaultAction).disabled(starting)
+            }
+            .padding(12)
+        }
+        .frame(width: 400)
+    }
+
+    private func run() {
+        starting = true
+        let publishes = ports.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        WorkspaceActions.runImage(reference: reference,
+                                  name: name.isEmpty ? nil : name,
+                                  publishes: publishes, removeOnExit: removeOnExit) { failure in
+            starting = false
+            dismiss()
+            onDone(failure.map { "Run failed: \($0)" } ?? "Started \(reference)")
+        }
+    }
+}
+
 /// A compact capsule for an image's architecture ("arm64" / "amd64" / "multi"),
 /// or a dash when the daemon doesn't report one.
 private struct ArchBadge: View {
@@ -208,11 +271,17 @@ private struct ArchBadge: View {
 
     var body: some View {
         if let arch {
+            // amd64 on an Apple-silicon host runs through Rosetta translation —
+            // tint it amber so "why is this one slower" answers itself.
+            let foreign = arch == "amd64"
             Text(arch)
                 .font(.caption.monospaced())
                 .lineLimit(1)
                 .padding(.horizontal, 6).padding(.vertical, 1)
-                .background(.quaternary, in: Capsule())
+                .background(foreign ? AnyShapeStyle(.orange.opacity(0.2))
+                                    : AnyShapeStyle(.quaternary), in: Capsule())
+                .foregroundStyle(foreign ? .orange : .primary)
+                .help(foreign ? "x86-64 image — runs via Rosetta translation" : "Native arm64")
         } else {
             Text("—").foregroundStyle(.secondary)
         }

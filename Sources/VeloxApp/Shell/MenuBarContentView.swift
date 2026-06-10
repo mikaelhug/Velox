@@ -16,6 +16,19 @@ struct MenuBarContentView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
+            if engine.availableUpdate?.isUpdateAvailable == true {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.up.circle.fill").foregroundStyle(.tint)
+                    Text(verbatim: "Velox \(engine.availableUpdate?.latestVersion ?? "update") available")
+                        .font(.caption)
+                    Spacer()
+                    Button(engine.updateInProgress ? "Installing…" : "Install") {
+                        engine.applyUpdate()
+                    }
+                    .controlSize(.small)
+                    .disabled(engine.updateInProgress)
+                }
+            }
             if engine.state.isRunning, let store = engine.resources {
                 let running = store.containers.filter(\.isRunning)
                 Divider()
@@ -25,17 +38,32 @@ struct MenuBarContentView: View {
                         .padding(.vertical, 2)
                         .padding(.horizontal, 24)
                 } else {
-                    // Up to 7 rows render inline; beyond that the full list scrolls in
-                    // a fixed-height viewport (like the Wi-Fi menu) — every container
-                    // stays reachable, the panel never grows past the screen.
+                    // Compose projects group under a small header with a stop-project
+                    // button; standalone containers list first. Up to 7 rows render
+                    // inline; beyond that the full list scrolls in a fixed-height
+                    // viewport (like the Wi-Fi menu) — every container stays reachable.
+                    let standalone = running.filter { $0.composeProject == nil }
+                    let projects = Dictionary(grouping: running.filter { $0.composeProject != nil },
+                                              by: { $0.composeProject ?? "" })
+                        .sorted { $0.key < $1.key }
                     let rows = VStack(alignment: .leading, spacing: 7) {
-                        ForEach(running) { c in
-                            ContainerQuickRow(container: c) {
-                                Task { try? await engine.docker?.stopContainer(c.id) }
+                        ForEach(standalone) { c in quickRow(c) }
+                        ForEach(projects, id: \.key) { name, members in
+                            HStack(spacing: 5) {
+                                Image(systemName: "square.stack.3d.up.fill")
+                                    .font(.caption2).foregroundStyle(.blue)
+                                Text(name).font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary).lineLimit(1)
+                                Spacer()
+                                Button { stop(members) } label: { Image(systemName: "stop.fill") }
+                                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                                    .help("Stop project “\(name)”")
                             }
+                            ForEach(members) { c in quickRow(c).padding(.leading, 10) }
                         }
                     }
-                    if running.count <= Self.maxRows {
+                    let headerRows = projects.count
+                    if running.count + headerRows <= Self.maxRows {
                         rows
                     } else {
                         ScrollView { rows }.frame(height: 280)
@@ -53,6 +81,22 @@ struct MenuBarContentView: View {
         // the rows (230pt text cap) rather than widening the panel.
         .frame(width:270, alignment: .leading)
         .modifier(RetainStatsIfPresent(stats: engine.state.isRunning ? engine.stats : nil))
+    }
+
+    private func quickRow(_ c: ContainerSummary) -> some View {
+        ContainerQuickRow(container: c) { stop([c]) }
+    }
+
+    /// Stop one or many containers concurrently (a project header stops its members).
+    private func stop(_ containers: [ContainerSummary]) {
+        guard let docker = engine.docker else { return }
+        Task {
+            await withTaskGroup(of: Void.self) { group in
+                for c in containers {
+                    group.addTask { try? await docker.stopContainer(c.id) }
+                }
+            }
+        }
     }
 
     // MARK: header / footer
@@ -147,7 +191,9 @@ private struct ContainerQuickRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Circle().fill(.green).frame(width: 6, height: 6)
+            Circle().fill(container.isUnhealthy ? Color.orange : .green)
+                .frame(width: 6, height: 6)
+                .help(container.isUnhealthy ? "Healthcheck failing" : "Running")
             // Cap the text column so one long name/domain can't widen the whole
             // panel — it truncates in the middle instead (the click still works).
             VStack(alignment: .leading, spacing: 1) {

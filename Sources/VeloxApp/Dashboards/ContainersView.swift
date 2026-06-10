@@ -215,27 +215,7 @@ struct ContainersView: View {
             TableColumn("Status") { row in statusCell(row) }
                 .customizationID("status")
 
-            TableColumn("Ports") { row in
-                if case .container(let c) = row {
-                    // Only published ports (host bindings) — not Dockerfile EXPOSE
-                    // metadata, which isn't reachable from the host. Each is a
-                    // launchpad: click → default browser at localhost:<port>.
-                    let bindings = c.publishedBindings
-                    if bindings.isEmpty {
-                        Text("—").font(.caption.monospaced()).foregroundStyle(.secondary)
-                    } else {
-                        HStack(spacing: 8) {
-                            ForEach(bindings, id: \.self) { p in
-                                if let pub = p.publicPort {
-                                    PortLink(label: p.label, port: pub,
-                                             blocked: issues.blocked.contains(UInt16(pub)))
-                                }
-                            }
-                        }
-                        .lineLimit(1)
-                    }
-                }
-            }
+            TableColumn("Ports") { row in portsCell(row) }
                 .customizationID("ports")
 
             TableColumn("CPU / MEM") { row in
@@ -262,6 +242,15 @@ struct ContainersView: View {
             contextMenu(for: ids)
         }
         .searchable(text: $ui.containerSearch, placement: .toolbar, prompt: "Filter containers")
+        // Keyboard-first: ⌘L logs, ⌘I inspector, ⌘⌫ delete — for the selection.
+        .background(Group {
+            Button("") { if let c = selectedContainers.first { openLogs(c) } }
+                .keyboardShortcut("l").hidden()
+            Button("") { ui.containerInspector.toggle() }
+                .keyboardShortcut("i").hidden()
+            Button("") { if !selectedContainers.isEmpty { pendingBulkDelete = selectedContainers } }
+                .keyboardShortcut(.delete, modifiers: .command).hidden()
+        })
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 ControlGroup {
@@ -303,7 +292,7 @@ struct ContainersView: View {
             }
         }
         .inspector(isPresented: $ui.containerInspector) {
-            ContainerInspector(container: inspected)
+            ContainerInspector(container: inspected, docker: model.docker, stats: stats)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay {
@@ -409,8 +398,34 @@ struct ContainersView: View {
 
     /// Name-dot tint: transitional (orange) while an action is in flight,
     /// otherwise the container's real-state color.
+    /// Only published ports (host bindings) — not Dockerfile EXPOSE metadata, which
+    /// isn't reachable from the host. Each is a launchpad: click → localhost:<port>.
+    /// (Extracted from the column builder — inline it grows the Table expression past
+    /// what the type-checker will chew.)
+    @ViewBuilder
+    private func portsCell(_ row: ContainerRow) -> some View {
+        if case .container(let c) = row {
+            let bindings = c.publishedBindings
+            if bindings.isEmpty {
+                Text("—").font(.caption.monospaced()).foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    ForEach(bindings, id: \.self) { p in
+                        if let pub = p.publicPort {
+                            PortLink(label: p.label, port: pub,
+                                     blocked: issues.blocked.contains(UInt16(pub)))
+                        }
+                    }
+                }
+                .lineLimit(1)
+            }
+        }
+    }
+
     private func dotColor(for c: ContainerSummary) -> Color {
-        model.pending[c.id]?.tint ?? color(for: c.state)
+        if let pending = model.pending[c.id] { return pending.tint }
+        if c.isUnhealthy { return .orange }
+        return color(for: c.state)
     }
 
     private func projectStatus(_ g: ProjectGroup) -> String {
@@ -569,10 +584,17 @@ struct ContainersView: View {
 }
 
 /// The right-hand inspector for a single selected container: identity, network
-/// reachability (clickable domain + ports), mounts, and labels — the data the list
-/// endpoint already carries but the table deliberately doesn't column-ize.
+/// reachability (clickable domain + ports), live usage sparklines, lifecycle
+/// (restart count = the crash-loop tell), process, env, mounts, and labels. List
+/// data renders instantly; one `inspect` call per selection enriches the rest.
 private struct ContainerInspector: View {
     let container: ContainerSummary?
+    let docker: any DockerClientProtocol
+    let stats: StatsStore
+
+    @State private var inspect: ContainerInspect?
+    @State private var cpuHistory: [Double] = []
+    @State private var memHistory: [Double] = []
 
     var body: some View {
         if let c = container {
@@ -588,6 +610,33 @@ private struct ContainerInspector: View {
                     if let project = c.composeProject {
                         LabeledContent("Compose", value: project)
                     }
+                }
+                if c.isRunning, cpuHistory.count > 1 {
+                    Section("Live") {
+                        LabeledContent("CPU") {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(verbatim: "\(Int(cpuHistory.last ?? 0))%")
+                                    .font(.caption.monospacedDigit())
+                                SparklineView(values: cpuHistory, tint: .blue)
+                                    .frame(width: 120, height: 22)
+                            }
+                        }
+                        LabeledContent("Memory") {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(verbatim: Format.bytes(UInt64(memHistory.last ?? 0)))
+                                    .font(.caption.monospacedDigit())
+                                SparklineView(values: memHistory, tint: .purple)
+                                    .frame(width: 120, height: 22)
+                            }
+                        }
+                    }
+                }
+                if inspect != nil || c.isRunning {
+                    lifecycleSection(c)
+                }
+                if let cfg = inspect?.config {
+                    processSection(cfg)
+                    if let env = cfg.env, !env.isEmpty { environmentSection(env) }
                 }
                 Section("Network") {
                     if let domain = c.namedAccessDomain {
@@ -643,9 +692,73 @@ private struct ContainerInspector: View {
                 }
             }
             .formStyle(.grouped)
+            // One enrich call per selection; histories restart with the new container.
+            .task(id: c.id) {
+                inspect = nil
+                cpuHistory = []; memHistory = []
+                inspect = try? await docker.inspectContainer(c.id)
+            }
+            .onChange(of: stats.latest[c.id]) { _, sample in
+                guard let sample else { return }
+                cpuHistory.append(sample.cpuPercent)
+                memHistory.append(Double(sample.memoryBytes))
+                if cpuHistory.count > 60 { cpuHistory.removeFirst(cpuHistory.count - 60) }
+                if memHistory.count > 60 { memHistory.removeFirst(memHistory.count - 60) }
+            }
         } else {
             ContentUnavailableView("No Selection", systemImage: "shippingbox",
                                    description: Text("Select a container to inspect."))
+        }
+    }
+
+    @ViewBuilder
+    private func lifecycleSection(_ c: ContainerSummary) -> some View {
+        Section("Lifecycle") {
+            if let started = inspect?.state?.startedAt, c.isRunning {
+                LabeledContent("Started", value: Format.age(iso: started))
+            }
+            if let restarts = inspect?.restartCount {
+                LabeledContent("Restarts") {
+                    Text(verbatim: String(restarts))
+                        .foregroundStyle(restarts > 0 ? .orange : .secondary)
+                        .help(restarts > 0
+                              ? "The engine restarted this container — repeated exits may mean a crash loop"
+                              : "Never restarted by the engine")
+                }
+            }
+            if let health = inspect?.state?.health?.status, !health.isEmpty {
+                LabeledContent("Health") {
+                    Text(health)
+                        .foregroundStyle(health == "healthy" ? .green
+                                         : health == "unhealthy" ? .red : .secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func processSection(_ cfg: ContainerInspect.Config) -> some View {
+        let command = ((cfg.entrypoint ?? []) + (cfg.cmd ?? [])).joined(separator: " ")
+        if !command.isEmpty || cfg.workingDir?.isEmpty == false {
+            Section("Process") {
+                if !command.isEmpty {
+                    Text(command).font(.caption.monospaced()).lineLimit(3)
+                        .textSelection(.enabled)
+                }
+                if let wd = cfg.workingDir, !wd.isEmpty {
+                    LabeledContent("Workdir") { Text(wd).font(.caption.monospaced()) }
+                }
+            }
+        }
+    }
+
+    private func environmentSection(_ env: [String]) -> some View {
+        Section("Environment (\(env.count))") {
+            ForEach(env.sorted(), id: \.self) { line in
+                Text(line).font(.caption.monospaced()).lineLimit(1)
+                    .truncationMode(.middle).textSelection(.enabled)
+                    .help(line)
+            }
         }
     }
 }
@@ -686,6 +799,8 @@ struct StatusBadge: View {
     }
 
     private var tint: Color {
+        // A failing healthcheck outranks "running" — the row should look wrong.
+        if status.localizedCaseInsensitiveContains("(unhealthy)") { return .orange }
         switch state {
         case "running": return .green
         case "paused":  return .yellow

@@ -84,6 +84,16 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
     }
     public func pruneContainers() async throws -> UInt64 { 0 }
     public func pruneBuildCache() async throws -> UInt64 { 0 }
+    public func systemDiskUsage() async throws -> DiskUsage {
+        let json = #"""
+        {"LayersSize": 420000000,
+         "Images": [{"Size": 100000000, "SharedSize": 20000000, "Containers": 0}],
+         "Containers": [{"SizeRw": 5000000, "State": "exited"}],
+         "Volumes": [{"UsageData": {"Size": 50000000, "RefCount": 0}}],
+         "BuildCache": [{"Size": 30000000, "InUse": false}]}
+        """#
+        return try JSONDecoder().decode(DiskUsage.self, from: Data(json.utf8))
+    }
     public func removeContainer(_ id: String, force: Bool) async throws {}
     public func removeImage(_ id: String, force: Bool) async throws {}
     public func pruneImages(all: Bool) async throws -> UInt64 { 5_300_000 }

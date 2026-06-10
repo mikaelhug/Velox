@@ -75,6 +75,9 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public var shortID: String { String(id.prefix(12)) }
     public var isRunning: Bool { state == "running" }
     public var isPaused: Bool { state == "paused" }
+    /// Docker's list status string carries health when the image defines a
+    /// healthcheck — e.g. "Up 2 minutes (unhealthy)".
+    public var isUnhealthy: Bool { status.localizedCaseInsensitiveContains("(unhealthy)") }
 
     /// Only ports actually published to the host (a `-p` / compose `ports:` host
     /// binding). Excludes Dockerfile `EXPOSE`-only ports — Docker reports those
@@ -355,6 +358,26 @@ public struct ContainerInspect: Decodable, Sendable {
     public let name: String
     public let config: Config
     public let hostConfig: HostConfig
+    /// Lifecycle details for the inspector (restart count is how a crash loop shows).
+    public let state: StateInfo?
+    public let restartCount: Int?
+
+    public struct StateInfo: Decodable, Sendable {
+        public let status: String?
+        public let startedAt: String?
+        public let health: Health?
+        public struct Health: Decodable, Sendable {
+            public let status: String?
+            enum CodingKeys: String, CodingKey { case status = "Status" }
+            public init(status: String?) { self.status = status }
+        }
+        enum CodingKeys: String, CodingKey {
+            case status = "Status", startedAt = "StartedAt", health = "Health"
+        }
+        public init(status: String? = nil, startedAt: String? = nil, health: Health? = nil) {
+            self.status = status; self.startedAt = startedAt; self.health = health
+        }
+    }
 
     public struct Config: Decodable, Sendable {
         public let image: String
@@ -396,10 +419,87 @@ public struct ContainerInspect: Decodable, Sendable {
             self.binds = binds; self.portBindings = portBindings; self.restartPolicy = restartPolicy
         }
     }
-    enum CodingKeys: String, CodingKey { case name = "Name", config = "Config", hostConfig = "HostConfig" }
+    enum CodingKeys: String, CodingKey {
+        case name = "Name", config = "Config", hostConfig = "HostConfig"
+        case state = "State", restartCount = "RestartCount"
+    }
 
-    public init(name: String, config: Config, hostConfig: HostConfig) {
+    public init(name: String, config: Config, hostConfig: HostConfig,
+                state: StateInfo? = nil, restartCount: Int? = nil) {
         self.name = name; self.config = config; self.hostConfig = hostConfig
+        self.state = state; self.restartCount = restartCount
+    }
+}
+
+/// The subset of `GET /system/df` the Reclaim Space dialog and the Overview
+/// breakdown bar need: per-category totals and how much of each is reclaimable.
+/// Reclaimable image bytes are an estimate (shared layers blur exact attribution),
+/// matching `docker system df`'s own approximation.
+public struct DiskUsage: Decodable, Sendable {
+    public struct ImageEntry: Decodable, Sendable {
+        public let size: Int64
+        public let sharedSize: Int64?
+        public let containers: Int64?
+        enum CodingKeys: String, CodingKey {
+            case size = "Size", sharedSize = "SharedSize", containers = "Containers"
+        }
+    }
+    public struct ContainerEntry: Decodable, Sendable {
+        public let sizeRw: Int64?
+        public let state: String?
+        enum CodingKeys: String, CodingKey { case sizeRw = "SizeRw", state = "State" }
+    }
+    public struct VolumeEntry: Decodable, Sendable {
+        public struct Usage: Decodable, Sendable {
+            public let size: Int64
+            public let refCount: Int64
+            enum CodingKeys: String, CodingKey { case size = "Size", refCount = "RefCount" }
+        }
+        public let usageData: Usage?
+        enum CodingKeys: String, CodingKey { case usageData = "UsageData" }
+    }
+    public struct BuildCacheEntry: Decodable, Sendable {
+        public let size: Int64?
+        public let inUse: Bool?
+        enum CodingKeys: String, CodingKey { case size = "Size", inUse = "InUse" }
+    }
+
+    public let layersSize: Int64?
+    public let images: [ImageEntry]?
+    public let containers: [ContainerEntry]?
+    public let volumes: [VolumeEntry]?
+    public let buildCache: [BuildCacheEntry]?
+    enum CodingKeys: String, CodingKey {
+        case layersSize = "LayersSize", images = "Images", containers = "Containers"
+        case volumes = "Volumes", buildCache = "BuildCache"
+    }
+
+    public var imagesTotal: UInt64 { UInt64(max(0, layersSize ?? 0)) }
+    /// Images no container references — what "prune unused images" would free (≈).
+    public var imagesReclaimable: UInt64 {
+        UInt64(max(0, (images ?? []).filter { ($0.containers ?? 0) == 0 }
+            .reduce(0) { $0 + max(0, $1.size - ($1.sharedSize ?? 0)) }))
+    }
+    public var containersTotal: UInt64 {
+        UInt64(max(0, (containers ?? []).reduce(0) { $0 + max(0, $1.sizeRw ?? 0) }))
+    }
+    public var containersReclaimable: UInt64 {
+        UInt64(max(0, (containers ?? []).filter { $0.state != "running" }
+            .reduce(0) { $0 + max(0, $1.sizeRw ?? 0) }))
+    }
+    public var volumesTotal: UInt64 {
+        UInt64(max(0, (volumes ?? []).reduce(0) { $0 + max(0, $1.usageData?.size ?? 0) }))
+    }
+    public var volumesReclaimable: UInt64 {
+        UInt64(max(0, (volumes ?? []).filter { ($0.usageData?.refCount ?? 0) == 0 }
+            .reduce(0) { $0 + max(0, $1.usageData?.size ?? 0) }))
+    }
+    public var buildCacheTotal: UInt64 {
+        UInt64(max(0, (buildCache ?? []).reduce(0) { $0 + max(0, $1.size ?? 0) }))
+    }
+    public var buildCacheReclaimable: UInt64 {
+        UInt64(max(0, (buildCache ?? []).filter { $0.inUse != true }
+            .reduce(0) { $0 + max(0, $1.size ?? 0) }))
     }
 }
 

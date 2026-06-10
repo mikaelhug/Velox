@@ -132,4 +132,17 @@ enum WorkspaceActions {
     static func loadImageTar(_ tar: URL, completion: @escaping @MainActor (String?) -> Void) {
         runDocker(["load", "-i", tar.path], completion: completion)
     }
+
+    /// `docker run -d` an image with the minimal quick-run options (the Images pane's
+    /// Run… dialog). Anything fancier belongs in the terminal.
+    static func runImage(reference: String, name: String?, publishes: [String],
+                         removeOnExit: Bool,
+                         completion: @escaping @MainActor (String?) -> Void) {
+        var args = ["run", "-d"]
+        if removeOnExit { args.append("--rm") }
+        if let name, !name.isEmpty { args += ["--name", name] }
+        for p in publishes { args += ["-p", p] }
+        args.append(reference)
+        runDocker(args, completion: completion)
+    }
 }

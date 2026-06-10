@@ -39,6 +39,9 @@ struct OverviewView: View {
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
     @State private var showReclaim = false
+    /// `/system/df` snapshot for the breakdown card — refreshed with the disk gauge
+    /// (on appear + when the container set changes; no timer).
+    @State private var dockerDF: DiskUsage?
 
     init(store: DockerResourceStore, stats: StatsStore) {
         self.stats = stats
@@ -54,6 +57,7 @@ struct OverviewView: View {
                 hero
                 if let error = model.loadError { errorBanner(error) }
                 statGrid
+                if let df = dockerDF { DiskBreakdownCard(usage: df) }
                 // A separate view so its per-sample stats reads don't re-evaluate the
                 // whole Overview body (and its O(N) stat-card reductions) every tick.
                 LiveUsageSection(stats: stats)
@@ -62,7 +66,10 @@ struct OverviewView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .retainingStats(stats)
-        .task(id: model.containers.count) { model.refreshDiskUsage() }
+        .task(id: model.containers.count) {
+            model.refreshDiskUsage()
+            dockerDF = try? await engine.docker?.systemDiskUsage()
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { showReclaim = true } label: {
@@ -75,6 +82,7 @@ struct OverviewView: View {
             if let docker = engine.docker {
                 ReclaimSpaceSheet(docker: docker, isPresented: $showReclaim) {
                     model.refreshDiskUsage()
+                    Task { dockerDF = try? await docker.systemDiskUsage() }
                 }
             }
         }
@@ -201,6 +209,51 @@ private struct LiveMetricCard: View {
     }
 }
 
+/// What's on the data disk, by category — a stacked proportion bar + legend. Data
+/// from the same `/system/df` snapshot that prices the Reclaim Space toggles.
+private struct DiskBreakdownCard: View {
+    let usage: DiskUsage
+
+    private var segments: [(String, UInt64, Color)] {
+        [("Images", usage.imagesTotal, .blue),
+         ("Containers", usage.containersTotal, .green),
+         ("Volumes", usage.volumesTotal, .purple),
+         ("Build cache", usage.buildCacheTotal, .orange)].filter { $0.1 > 0 }
+    }
+
+    var body: some View {
+        let total = segments.reduce(UInt64(0)) { $0 + $1.1 }
+        if total > 0 {
+            DashboardCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Disk Breakdown").font(.headline)
+                    GeometryReader { geo in
+                        HStack(spacing: 1) {
+                            ForEach(segments, id: \.0) { seg in
+                                seg.2.opacity(0.75)
+                                    .frame(width: max(2, geo.size.width
+                                        * CGFloat(seg.1) / CGFloat(total)))
+                            }
+                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                    .frame(height: 8)
+                    HStack(spacing: 14) {
+                        ForEach(segments, id: \.0) { seg in
+                            HStack(spacing: 4) {
+                                Circle().fill(seg.2.opacity(0.75)).frame(width: 7, height: 7)
+                                Text(verbatim: "\(seg.0) \(Format.bytes(seg.1))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+}
+
 /// "Reclaim Space" — the four prune levers in one dialog, with the freed total shown
 /// after. Velox can make a promise Docker Desktop can't: the guest's periodic TRIM
 /// hole-punches the raw data disk, so reclaimed bytes return to macOS by themselves.
@@ -217,16 +270,26 @@ private struct ReclaimSpaceSheet: View {
     @State private var running = false
     @State private var reclaimed: UInt64?
     @State private var failure: String?
+    /// One `/system/df` fetch when the sheet opens — each toggle shows what it frees.
+    @State private var usage: DiskUsage?
 
     var body: some View {
         VStack(spacing: 0) {
             Form {
                 Section {
-                    Toggle("Stopped containers", isOn: $stoppedContainers)
-                    Toggle("Unused images", isOn: $unusedImages)
-                    Toggle("Build cache", isOn: $buildCache)
-                    Toggle("Unused volumes", isOn: $unusedVolumes)
-                        .tint(.red)
+                    Toggle(isOn: $stoppedContainers) {
+                        sized("Stopped containers", usage?.containersReclaimable)
+                    }
+                    Toggle(isOn: $unusedImages) {
+                        sized("Unused images", usage?.imagesReclaimable)
+                    }
+                    Toggle(isOn: $buildCache) {
+                        sized("Build cache", usage?.buildCacheReclaimable)
+                    }
+                    Toggle(isOn: $unusedVolumes) {
+                        sized("Unused volumes", usage?.volumesReclaimable)
+                    }
+                    .tint(.red)
                 } header: {
                     Text("Reclaim Space")
                 } footer: {
@@ -256,7 +319,20 @@ private struct ReclaimSpaceSheet: View {
             }
             .padding(12)
         }
-        .frame(width: 400, height: 360)
+        .frame(width: 400, height: 380)
+        .task { usage = try? await docker.systemDiskUsage() }
+    }
+
+    /// Toggle label with the category's reclaimable size beside it ("— 1.2 GB").
+    private func sized(_ title: String, _ bytes: UInt64?) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let bytes {
+                Text(verbatim: bytes == 0 ? "—" : "≈ " + Format.bytes(bytes))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+        }
     }
 
     private func run() {

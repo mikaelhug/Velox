@@ -152,6 +152,11 @@ public actor DockerClient: DockerClientProtocol {
     public func pruneBuildCache() async throws -> UInt64 {
         Self.spaceReclaimed(try await send("POST", Self.path("/build/prune")))
     }
+    public func systemDiskUsage() async throws -> DiskUsage {
+        // Volume sizing makes this endpoint slow on big stores — generous timeout.
+        try decode(DiskUsage.self,
+                   from: await send("GET", Self.path("/system/df"), readTimeout: 60))
+    }
     public func unpauseContainer(_ id: String) async throws {
         _ = try await send("POST", Self.path("/containers/\(id)/unpause"))
     }
