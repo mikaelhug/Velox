@@ -71,17 +71,19 @@ final class ContainersModel {
 
     // Memoized grouping/sort. The interleave does an O(N log N) ICU-collation sort, and
     // the Containers `body` re-evaluates on selection/badge changes (not just data
-    // changes), so cache the result and recompute only when the container set or the
-    // search text actually changes. The signature hashes only the fields grouping/sort
-    // depend on (id, name, project) — a status flip doesn't reshuffle rows. Ignored by
-    // Observation so updating the cache during `body` doesn't invalidate the view.
+    // changes), so cache the result and recompute only when the data or the search text
+    // actually changed. The signature must hash the FULL container value: the cache
+    // stores the values themselves, so hashing only the sort keys (id/name/project)
+    // served stale rows after a state flip — a stopped container kept showing "Up …"
+    // until a pane switch rebuilt the view. Ignored by Observation so updating the
+    // cache during `body` doesn't invalidate the view.
     @ObservationIgnored private var topLevelSig: Int?
     @ObservationIgnored private var topLevelCache: [TopLevelEntry] = []
 
     fileprivate func topLevel(searchText: String) -> [TopLevelEntry] {
         let cs = store.containers
         var hasher = Hasher()
-        for c in cs { hasher.combine(c.id); hasher.combine(c.displayName); hasher.combine(c.composeProject) }
+        for c in cs { hasher.combine(c) }
         hasher.combine(searchText)
         let sig = hasher.finalize()
         if topLevelSig == sig { return topLevelCache }
