@@ -52,28 +52,29 @@ final class ImagesModel {
 
 struct ImagesView: View {
     @State private var model: ImagesModel
-    @State private var selection = Set<ImageSummary.ID>()
-    @State private var searchText = ""
+    /// Search + selection survive pane switches (see PaneUIState).
+    @Bindable private var ui: PaneUIState
     @State private var pullReference = ""
     @State private var pruneConfirm = false
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<ImageSummary>
 
-    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore, ui: PaneUIState) {
+        self.ui = ui
         _model = State(initialValue: ImagesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("images"))
     }
 
     private var filtered: [ImageSummary] {
-        guard !searchText.isEmpty else { return model.images }
+        guard !ui.imageSearch.isEmpty else { return model.images }
         return model.images.filter {
-            $0.repository.localizedCaseInsensitiveContains(searchText)
-                || $0.tag.localizedCaseInsensitiveContains(searchText)
+            $0.repository.localizedCaseInsensitiveContains(ui.imageSearch)
+                || $0.tag.localizedCaseInsensitiveContains(ui.imageSearch)
         }
     }
 
     var body: some View {
-        Table(filtered, selection: $selection, columnCustomization: $tableLayout) {
+        Table(filtered, selection: $ui.imageSelection, columnCustomization: $tableLayout) {
             TableColumn("Repository") { img in
                 Text(img.repository).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
             }
@@ -106,7 +107,7 @@ struct ImagesView: View {
             }
         }
         .safeAreaInset(edge: .top) { pullBar }
-        .searchable(text: $searchText, placement: .toolbar, prompt: "Filter images")
+        .searchable(text: $ui.imageSearch, placement: .toolbar, prompt: "Filter images")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { pruneConfirm = true } label: {
@@ -118,21 +119,21 @@ struct ImagesView: View {
                 Button(role: .destructive) { removeConfirm = true } label: {
                     Label("Remove Selected", systemImage: "trash")
                 }
-                .disabled(selection.isEmpty)
-                .help(selection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
+                .disabled(ui.imageSelection.isEmpty)
+                .help(ui.imageSelection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
             }
         }
         .persistTableLayout(tableLayout, "images")
         .confirmationDialog(
-            "Remove \(selection.count) selected image\(selection.count == 1 ? "" : "s")?",
+            "Remove \(ui.imageSelection.count) selected image\(ui.imageSelection.count == 1 ? "" : "s")?",
             isPresented: $removeConfirm
         ) {
             Button("Remove", role: .destructive) {
-                let ids = selection
-                Task { await model.removeImages(ids, force: false); selection.removeAll() }
+                let ids = ui.imageSelection
+                Task { await model.removeImages(ids, force: false); ui.imageSelection.removeAll() }
             }
         } message: {
-            Text("This removes the selected image\(selection.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
+            Text("This removes the selected image\(ui.imageSelection.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
         }
         .confirmationDialog("Prune unused images?", isPresented: $pruneConfirm) {
             Button("Prune Unused Images", role: .destructive) {
@@ -195,7 +196,7 @@ private struct ArchBadge: View {
 #if DEBUG
 struct ImagesView_Previews: PreviewProvider {
     static var previews: some View {
-        ImagesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
+        ImagesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()), ui: PaneUIState())
             .frame(width: 820, height: 420)
     }
 }

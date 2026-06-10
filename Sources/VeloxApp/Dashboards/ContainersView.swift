@@ -163,34 +163,37 @@ struct ContainersView: View {
     let stats: StatsStore
     @Environment(\.openWindow) private var openWindow
     @State private var model: ContainersModel
-    @State private var selection: Set<ContainerRow.ID> = []
-    @State private var searchText = ""
-    /// Project names the user has collapsed. Absence ⇒ expanded, so groups open
-    /// by default (matching Docker Desktop).
-    @State private var collapsed: Set<String> = []
+    /// Search/selection/expansion live in `PaneUIState` (owned by EngineController) so
+    /// they survive pane switches — this view is recreated on every switch by design
+    /// (its on-screen-scoped tasks must stop when hidden).
+    @Bindable private var ui: PaneUIState
     @State private var pendingDelete: ContainerSummary?
     @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
 
-    init(docker: any DockerClientProtocol, store: DockerResourceStore, stats: StatsStore) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore, stats: StatsStore,
+         ui: PaneUIState) {
         self.stats = stats
+        self.ui = ui
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("containers"))
     }
 
     /// Standalone containers and Compose project groups, interleaved alphabetically —
     /// memoized in the model (recomputed only when the set or search text changes).
-    private var topLevel: [TopLevelEntry] { model.topLevel(searchText: searchText) }
+    private var topLevel: [TopLevelEntry] { model.topLevel(searchText: ui.containerSearch) }
 
     private func expansion(_ name: String) -> Binding<Bool> {
-        Binding(get: { !collapsed.contains(name) },
-                set: { isExpanded in
-                    if isExpanded { collapsed.remove(name) } else { collapsed.insert(name) }
+        Binding(get: { [ui] in !ui.containerCollapsed.contains(name) },
+                set: { [ui] isExpanded in
+                    if isExpanded { ui.containerCollapsed.remove(name) }
+                    else { ui.containerCollapsed.insert(name) }
                 })
     }
 
     var body: some View {
-        Table(of: ContainerRow.self, selection: $selection, columnCustomization: $tableLayout) {
+        Table(of: ContainerRow.self, selection: $ui.containerSelection,
+              columnCustomization: $tableLayout) {
             TableColumn("Name") { row in nameCell(row) }
                 .customizationID("name")
 
@@ -238,7 +241,7 @@ struct ContainersView: View {
         .contextMenu(forSelectionType: ContainerRow.ID.self) { ids in
             contextMenu(for: ids)
         }
-        .searchable(text: $searchText, placement: .toolbar, prompt: "Filter containers")
+        .searchable(text: $ui.containerSearch, placement: .toolbar, prompt: "Filter containers")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 ControlGroup {
@@ -316,7 +319,7 @@ struct ContainersView: View {
                 pendingBulkDelete = []
                 Task {
                     await model.performAll(ids) { try await $0.removeContainer($1, force: true) }
-                    selection.removeAll()
+                    ui.containerSelection.removeAll()
                 }
             }
         } message: {
@@ -400,7 +403,7 @@ struct ContainersView: View {
         return Array(byID.values)
     }
 
-    private var selectedContainers: [ContainerSummary] { containers(for: selection) }
+    private var selectedContainers: [ContainerSummary] { containers(for: ui.containerSelection) }
 
     private func start(_ cs: [ContainerSummary]) {
         runPending(cs.filter { !$0.isRunning }.map(\.id), .starting) { try await $0.startContainer($1) }
@@ -531,7 +534,8 @@ struct ContainersView_Previews: PreviewProvider {
         ContainersView(docker: MockDockerClient(),
                        store: DockerResourceStore(docker: MockDockerClient()),
                        stats: StatsStore(docker: MockDockerClient(),
-                                         resources: DockerResourceStore(docker: MockDockerClient())))
+                                         resources: DockerResourceStore(docker: MockDockerClient())),
+                       ui: PaneUIState())
             .frame(width: 860, height: 420)
     }
 }

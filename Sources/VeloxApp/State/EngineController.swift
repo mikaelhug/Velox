@@ -78,6 +78,10 @@ final class EngineController {
     /// stats view is on screen). Created with the engine, torn down on stop.
     private(set) var stats: StatsStore?
 
+    /// Per-pane UI state (search/selection/expansion), lifted here so it survives
+    /// pane switches (the dashboard views themselves are recreated per switch).
+    let paneUI = PaneUIState()
+
     /// Set true when the engine is running and the `velox` Docker context exists
     /// but isn't the active one — the shell shows a one-time prompt offering to
     /// switch, so a plain `docker ps` in the terminal targets Velox.

@@ -34,21 +34,22 @@ final class VolumesModel {
 
 struct VolumesView: View {
     @State private var model: VolumesModel
-    @State private var selection = Set<Volume.ID>()
-    @State private var showInspector = true
+    /// Selection + inspector visibility survive pane switches (see PaneUIState).
+    @Bindable private var ui: PaneUIState
     @State private var pruneConfirm = false
     @State private var removeConfirm = false
     @State private var tableLayout: TableColumnCustomization<Volume>
 
-    init(docker: any DockerClientProtocol, store: DockerResourceStore) {
+    init(docker: any DockerClientProtocol, store: DockerResourceStore, ui: PaneUIState) {
+        self.ui = ui
         _model = State(initialValue: VolumesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("volumes"))
     }
 
-    private var selected: Volume? { model.volumes.first { selection.contains($0.id) } }
+    private var selected: Volume? { model.volumes.first { ui.volumeSelection.contains($0.id) } }
 
     var body: some View {
-        Table(model.volumes, selection: $selection, columnCustomization: $tableLayout) {
+        Table(model.volumes, selection: $ui.volumeSelection, columnCustomization: $tableLayout) {
             TableColumn("Name") { v in Text(v.name).fontWeight(.medium).lineLimit(1) }
                 .customizationID("name")
             TableColumn("Driver") { v in Text(v.driver).foregroundStyle(.secondary) }
@@ -79,15 +80,15 @@ struct VolumesView: View {
                 Button(role: .destructive) { removeConfirm = true } label: {
                     Label("Remove Selected", systemImage: "trash")
                 }
-                .disabled(selection.isEmpty)
-                .help(selection.isEmpty ? "Select volumes to remove" : "Remove the selected volume(s)")
+                .disabled(ui.volumeSelection.isEmpty)
+                .help(ui.volumeSelection.isEmpty ? "Select volumes to remove" : "Remove the selected volume(s)")
             }
             ToolbarItem(placement: .automatic) {
-                Button { showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
+                Button { ui.volumeInspector.toggle() } label: { Image(systemName: "sidebar.right") }
                     .help("Toggle inspector")
             }
         }
-        .inspector(isPresented: $showInspector) {
+        .inspector(isPresented: $ui.volumeInspector) {
             VolumeInspector(volume: selected)
                 .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
         }
@@ -100,18 +101,18 @@ struct VolumesView: View {
             Text("Removes every volume not used by at least one container. Data is deleted permanently.")
         }
         .confirmationDialog(
-            "Remove \(selection.count) selected volume\(selection.count == 1 ? "" : "s")?",
+            "Remove \(ui.volumeSelection.count) selected volume\(ui.volumeSelection.count == 1 ? "" : "s")?",
             isPresented: $removeConfirm
         ) {
             Button("Remove", role: .destructive) {
-                let ids = selection
+                let ids = ui.volumeSelection
                 Task {
                     await model.removeVolumes(ids, force: false)
-                    selection.removeAll()
+                    ui.volumeSelection.removeAll()
                 }
             }
         } message: {
-            Text("This removes the selected volume\(selection.count == 1 ? "" : "s"). A volume still used by a container can't be removed.")
+            Text("This removes the selected volume\(ui.volumeSelection.count == 1 ? "" : "s"). A volume still used by a container can't be removed.")
         }
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
@@ -147,7 +148,7 @@ private struct VolumeInspector: View {
 #if DEBUG
 struct VolumesView_Previews: PreviewProvider {
     static var previews: some View {
-        VolumesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()))
+        VolumesView(docker: MockDockerClient(), store: DockerResourceStore(docker: MockDockerClient()), ui: PaneUIState())
             .frame(width: 820, height: 420)
     }
 }

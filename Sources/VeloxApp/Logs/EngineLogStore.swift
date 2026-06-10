@@ -15,6 +15,8 @@ final class EngineLogStore {
     private(set) var lines: [Line] = []
     var autoScroll = true
     var filter = ""
+    /// Bumped on `clear()` so the text view knows to rebuild rather than append.
+    private(set) var generation = 0
 
     private let capacity = 10_000
     private var nextID = 0
@@ -57,6 +59,7 @@ final class EngineLogStore {
     func clear() {
         lines.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
+        generation += 1
     }
 
     // MARK: - Ingest

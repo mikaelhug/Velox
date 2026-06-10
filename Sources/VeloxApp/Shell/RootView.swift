@@ -57,9 +57,10 @@ struct RootView: View {
                let stats = engine.stats {
                 switch item {
                 case .overview:   OverviewView(store: store, stats: stats)
-                case .containers: ContainersView(docker: docker, store: store, stats: stats)
-                case .images:     ImagesView(docker: docker, store: store)
-                case .volumes:    VolumesView(docker: docker, store: store)
+                case .containers: ContainersView(docker: docker, store: store, stats: stats,
+                                                 ui: engine.paneUI)
+                case .images:     ImagesView(docker: docker, store: store, ui: engine.paneUI)
+                case .volumes:    VolumesView(docker: docker, store: store, ui: engine.paneUI)
                 default:          NetworksView(docker: docker, store: store)
                 }
             } else {
