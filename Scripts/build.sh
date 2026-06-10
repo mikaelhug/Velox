@@ -15,10 +15,15 @@ echo "==> regenerate Versions.swift from versions.env"
 echo "==> swift build -c $CONFIG (all products)"
 swift build -c "$CONFIG"
 
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/velox"
+BINDIR="$(swift build -c "$CONFIG" --show-bin-path)"
+BIN="$BINDIR/velox"
 
-echo "==> codesign (ad-hoc) $BIN"
+# Sign BOTH VM-hosting executables: the CLI and the bare dev GUI binary. Without the
+# virtualization entitlement, a dev-run VeloxApp fails VM-config validation with an
+# opaque configurationInvalid — only the packaged .app (build-app.sh) was signed before.
+echo "==> codesign (ad-hoc) $BIN + VeloxApp"
 codesign --force --sign - --entitlements "$ENTITLEMENTS" "$BIN"
+codesign --force --sign - --entitlements "$ENTITLEMENTS" "$BINDIR/VeloxApp"
 
 echo "==> Signed: $BIN"
 echo "==> Embedded entitlements:"
