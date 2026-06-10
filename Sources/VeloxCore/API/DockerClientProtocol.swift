@@ -14,6 +14,8 @@ public protocol DockerClientProtocol: Sendable {
     func startContainer(_ id: String) async throws
     func stopContainer(_ id: String) async throws
     func restartContainer(_ id: String) async throws
+    func pauseContainer(_ id: String) async throws
+    func unpauseContainer(_ id: String) async throws
     func removeContainer(_ id: String, force: Bool) async throws
 
     // Image actions

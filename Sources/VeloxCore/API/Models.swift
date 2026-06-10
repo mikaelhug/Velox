@@ -20,10 +20,14 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     /// (bypassing docker-proxy). See `directIP`.
     public let networkIPs: [String]
 
+    /// Bind/volume mounts as the list endpoint reports them — shown in the
+    /// Containers inspector (no extra inspect round-trip needed).
+    public let mounts: [MountPoint]
+
     enum CodingKeys: String, CodingKey {
         case id = "Id", names = "Names", image = "Image"
         case state = "State", status = "Status", ports = "Ports"
-        case labels = "Labels", networkSettings = "NetworkSettings"
+        case labels = "Labels", networkSettings = "NetworkSettings", mounts = "Mounts"
     }
 
     private struct NetworkSettings: Decodable {
@@ -49,15 +53,17 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         let ns = try c.decodeIfPresent(NetworkSettings.self, forKey: .networkSettings)
         networkIPs = (ns?.networks?.values.compactMap { $0.ipAddress } ?? [])
             .filter { !$0.isEmpty }
+        mounts = try c.decodeIfPresent([MountPoint].self, forKey: .mounts) ?? []
     }
 
     /// Memberwise init for mock fixtures and tests.
     public init(id: String, names: [String], image: String,
                 state: String, status: String, ports: [PortMapping] = [],
-                labels: [String: String] = [:], networkIPs: [String] = []) {
+                labels: [String: String] = [:], networkIPs: [String] = [],
+                mounts: [MountPoint] = []) {
         self.id = id; self.names = names; self.image = image
         self.state = state; self.status = status; self.ports = ports
-        self.labels = labels; self.networkIPs = networkIPs
+        self.labels = labels; self.networkIPs = networkIPs; self.mounts = mounts
     }
 
     /// The container's IP for direct-dial — only when unambiguous (exactly one attached
@@ -75,11 +81,23 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     /// with no `publicPort`, and they aren't reachable from the host, so they
     /// shouldn't show up as if they were forwarded. Deduplicated (Docker lists the
     /// IPv4 and IPv6 binding of the same publish separately).
-    public var publishedPortLabels: [String] {
+    public var publishedPortLabels: [String] { publishedBindings.map(\.label) }
+
+    /// The deduplicated published bindings themselves — for UI affordances that need
+    /// the host port (clickable `localhost:<port>` links), not just the label.
+    public var publishedBindings: [PortMapping] {
         var seen = Set<String>()
         return ports.filter { $0.publicPort != nil }
-            .map(\.label)
-            .filter { seen.insert($0).inserted }
+            .filter { seen.insert($0.label).inserted }
+    }
+
+    /// The direct named-access hostname (`<name>.velox.local` → the container's real
+    /// IP, any protocol, no `-p`) — present only when the engine can actually serve
+    /// it: container running, with an unambiguous single-network IP (mirrors the
+    /// `NameRegistry` rule in DockerEventsWatcher).
+    public var namedAccessDomain: String? {
+        guard isRunning, directIP != nil else { return nil }
+        return "\(displayName.lowercased()).\(NamedAccess.domain)"
     }
 
     /// Compose project this container belongs to, if any (the standard
@@ -87,6 +105,22 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
     public var composeProject: String? {
         let p = labels["com.docker.compose.project"]
         return (p?.isEmpty == false) ? p : nil
+    }
+}
+
+/// One mount from the container list endpoint (`Mounts`): a named volume or a
+/// host bind, with where it lands in the container.
+public struct MountPoint: Decodable, Sendable, Hashable {
+    public let type: String        // "volume" | "bind" | "tmpfs"
+    public let source: String      // volume name's host path, or the bind source
+    public let destination: String // path inside the container
+
+    enum CodingKeys: String, CodingKey {
+        case type = "Type", source = "Source", destination = "Destination"
+    }
+
+    public init(type: String, source: String, destination: String) {
+        self.type = type; self.source = source; self.destination = destination
     }
 }
 

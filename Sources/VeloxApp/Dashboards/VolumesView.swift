@@ -52,8 +52,8 @@ struct VolumesView: View {
         Table(model.volumes, selection: $ui.volumeSelection, columnCustomization: $tableLayout) {
             TableColumn("Name") { v in Text(v.name).fontWeight(.medium).lineLimit(1) }
                 .customizationID("name")
-            TableColumn("Driver") { v in Text(v.driver).foregroundStyle(.secondary) }
-                .customizationID("driver")
+            // No "Driver" column — it's "local" for effectively every volume; the
+            // inspector still shows it for the exceptions.
             TableColumn("Size") { v in
                 Text(v.size.map(Format.bytes) ?? "—").font(.callout.monospacedDigit())
             }
@@ -67,6 +67,18 @@ struct VolumesView: View {
             if model.hasLoaded && model.volumes.isEmpty {
                 ContentUnavailableView("No Volumes", systemImage: SidebarItem.volumes.systemImage,
                                        description: Text(model.loadError ?? "Named volumes appear here."))
+            }
+        }
+        .contextMenu(forSelectionType: Volume.ID.self) { ids in
+            if ids.count == 1, let v = model.volumes.first(where: { ids.contains($0.id) }) {
+                Button("Copy Name") { WorkspaceActions.copy(v.name) }
+                Button("Copy Mountpoint") { WorkspaceActions.copy(v.mountpoint) }
+                Divider()
+                Button("Remove", role: .destructive) { ui.volumeSelection = ids; removeConfirm = true }
+            } else if !ids.isEmpty {
+                Button("Remove \(ids.count) Volumes", role: .destructive) {
+                    ui.volumeSelection = ids; removeConfirm = true
+                }
             }
         }
         .toolbar {

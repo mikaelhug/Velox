@@ -210,10 +210,25 @@ struct ContainersView: View {
             TableColumn("Ports") { row in
                 if case .container(let c) = row {
                     // Only published ports (host bindings) — not Dockerfile EXPOSE
-                    // metadata, which isn't reachable from the host.
-                    let labels = c.publishedPortLabels
-                    Text(labels.isEmpty ? "—" : labels.joined(separator: ", "))
-                        .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
+                    // metadata, which isn't reachable from the host. Each is a
+                    // launchpad: click → default browser at localhost:<port>.
+                    let bindings = c.publishedBindings
+                    if bindings.isEmpty {
+                        Text("—").font(.caption.monospaced()).foregroundStyle(.secondary)
+                    } else {
+                        HStack(spacing: 8) {
+                            ForEach(bindings, id: \.self) { p in
+                                if let pub = p.publicPort {
+                                    Button(p.label) { WorkspaceActions.openPort(pub) }
+                                        .buttonStyle(.plain)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.link)
+                                        .help("Open http://localhost:\(pub)/")
+                                }
+                            }
+                        }
+                        .lineLimit(1)
+                    }
                 }
             }
                 .customizationID("ports")
@@ -277,6 +292,14 @@ struct ContainersView: View {
                 .help("Delete selected")
                 .disabled(selectedContainers.isEmpty)
             }
+            ToolbarItem(placement: .automatic) {
+                Button { ui.containerInspector.toggle() } label: { Image(systemName: "sidebar.right") }
+                    .help("Toggle inspector")
+            }
+        }
+        .inspector(isPresented: $ui.containerInspector) {
+            ContainerInspector(container: inspected)
+                .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay {
             if model.hasLoaded && model.containers.isEmpty {
@@ -344,7 +367,18 @@ struct ContainersView: View {
         case .container(let c):
             HStack(spacing: 6) {
                 Circle().fill(dotColor(for: c)).frame(width: 7, height: 7)
-                Text(c.displayName).fontWeight(.medium)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(c.displayName).fontWeight(.medium)
+                    // Named access — the engine's flagship: the container's real IP by
+                    // name, any protocol, no -p. Click → browser; copy lives in the menu.
+                    if let domain = c.namedAccessDomain {
+                        Button(domain) { WorkspaceActions.openDomain(domain) }
+                            .buttonStyle(.plain)
+                            .font(.caption2)
+                            .foregroundStyle(.link)
+                            .help("Open http://\(domain)/")
+                    }
+                }
             }
         case .project(let g):
             HStack(spacing: 6) {
@@ -405,6 +439,12 @@ struct ContainersView: View {
 
     private var selectedContainers: [ContainerSummary] { containers(for: ui.containerSelection) }
 
+    /// The single selected container, for the inspector (a project row never matches).
+    private var inspected: ContainerSummary? {
+        guard ui.containerSelection.count == 1, let id = ui.containerSelection.first else { return nil }
+        return model.containers.first { $0.id == id }
+    }
+
     private func start(_ cs: [ContainerSummary]) {
         runPending(cs.filter { !$0.isRunning }.map(\.id), .starting) { try await $0.startContainer($1) }
     }
@@ -455,10 +495,33 @@ struct ContainersView: View {
         if c.isRunning || c.isPaused {
             Button("Stop") { runPending([c.id], .stopping) { try await $0.stopContainer($1) } }
             Button("Restart") { runPending([c.id], .restarting) { try await $0.restartContainer($1) } }
+            if c.isPaused {
+                Button("Resume") { Task { await model.perform { try await $0.unpauseContainer(c.id) } } }
+            } else {
+                Button("Pause") { Task { await model.perform { try await $0.pauseContainer(c.id) } } }
+            }
         } else {
             Button("Start") { runPending([c.id], .starting) { try await $0.startContainer($1) } }
         }
+        Divider()
         Button("View Logs") { openLogs(c) }
+        if c.isRunning {
+            Button("Open in Terminal") { WorkspaceActions.openShell(containerID: c.shortID) }
+        }
+        if let domain = c.namedAccessDomain {
+            Button("Open \(domain)") { WorkspaceActions.openDomain(domain) }
+        }
+        Menu("Copy") {
+            Button("Name") { WorkspaceActions.copy(c.displayName) }
+            Button("Container ID") { WorkspaceActions.copy(c.id) }
+            if let ip = c.directIP { Button("IP (\(ip))") { WorkspaceActions.copy(ip) } }
+            if let domain = c.namedAccessDomain { Button("Domain") { WorkspaceActions.copy(domain) } }
+            ForEach(c.publishedBindings, id: \.self) { p in
+                if let pub = p.publicPort {
+                    Button("URL (localhost:\(pub))") { WorkspaceActions.copy("http://localhost:\(pub)/") }
+                }
+            }
+        }
         Divider()
         Button("Delete", role: .destructive) { pendingDelete = c }
     }
@@ -483,6 +546,87 @@ struct ContainersView: View {
         case "paused":  return .yellow
         case "restarting": return .orange
         default:        return .secondary
+        }
+    }
+}
+
+/// The right-hand inspector for a single selected container: identity, network
+/// reachability (clickable domain + ports), mounts, and labels — the data the list
+/// endpoint already carries but the table deliberately doesn't column-ize.
+private struct ContainerInspector: View {
+    let container: ContainerSummary?
+
+    var body: some View {
+        if let c = container {
+            Form {
+                Section("Container") {
+                    LabeledContent("Name", value: c.displayName)
+                    LabeledContent("ID", value: c.shortID)
+                    LabeledContent("Image") {
+                        Text(c.image).lineLimit(1).truncationMode(.middle)
+                    }
+                    LabeledContent("Status", value: c.status.isEmpty ? c.state.capitalized : c.status)
+                    if let project = c.composeProject {
+                        LabeledContent("Compose", value: project)
+                    }
+                }
+                Section("Network") {
+                    if let domain = c.namedAccessDomain {
+                        LabeledContent("Domain") {
+                            Button(domain) { WorkspaceActions.openDomain(domain) }
+                                .buttonStyle(.plain).foregroundStyle(.link)
+                        }
+                    }
+                    if !c.networkIPs.isEmpty {
+                        LabeledContent(c.networkIPs.count == 1 ? "IP" : "IPs",
+                                       value: c.networkIPs.joined(separator: ", "))
+                    }
+                    if c.publishedBindings.isEmpty {
+                        LabeledContent("Ports", value: "none published")
+                    } else {
+                        LabeledContent("Ports") {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                ForEach(c.publishedBindings, id: \.self) { p in
+                                    if let pub = p.publicPort {
+                                        Button(p.label) { WorkspaceActions.openPort(pub) }
+                                            .buttonStyle(.plain).foregroundStyle(.link)
+                                            .font(.callout.monospaced())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !c.mounts.isEmpty {
+                    Section("Mounts") {
+                        ForEach(c.mounts, id: \.self) { m in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(m.destination).font(.caption.monospaced())
+                                Text("\(m.type) · \(m.source)")
+                                    .font(.caption2).foregroundStyle(.secondary)
+                                    .lineLimit(1).truncationMode(.middle)
+                            }
+                            .textSelection(.enabled)
+                        }
+                    }
+                }
+                let labels = c.labels.filter { !$0.key.hasPrefix("com.docker.compose") }
+                if !labels.isEmpty {
+                    Section("Labels") {
+                        ForEach(labels.keys.sorted(), id: \.self) { key in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(key).font(.caption2).foregroundStyle(.secondary)
+                                Text(labels[key] ?? "").font(.caption.monospaced()).lineLimit(2)
+                            }
+                            .textSelection(.enabled)
+                        }
+                    }
+                }
+            }
+            .formStyle(.grouped)
+        } else {
+            ContentUnavailableView("No Selection", systemImage: "shippingbox",
+                                   description: Text("Select a container to inspect."))
         }
     }
 }

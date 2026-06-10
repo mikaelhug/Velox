@@ -87,10 +87,8 @@ struct ImagesView: View {
                 ArchBadge(arch: img.architecture)
             }
                 .customizationID("arch")
-            TableColumn("Image ID") { img in
-                Text(img.shortID).font(.caption.monospaced()).foregroundStyle(.secondary)
-            }
-                .customizationID("imageID")
+            // No "Image ID" column — noise at a glance, and it can't show the full
+            // SHA anyway; the full ID is one right-click → Copy away.
             TableColumn("Created") { img in
                 Text(Format.age(epoch: img.created)).foregroundStyle(.secondary).lineLimit(1)
             }
@@ -104,6 +102,18 @@ struct ImagesView: View {
             if model.hasLoaded && model.images.isEmpty {
                 ContentUnavailableView("No Images", systemImage: SidebarItem.images.systemImage,
                                        description: Text(model.loadError ?? "Pull one to get started."))
+            }
+        }
+        .contextMenu(forSelectionType: ImageSummary.ID.self) { ids in
+            if ids.count == 1, let img = model.images.first(where: { ids.contains($0.id) }) {
+                Button("Copy Reference") { WorkspaceActions.copy("\(img.repository):\(img.tag)") }
+                Button("Copy Image ID") { WorkspaceActions.copy(img.id) }
+                Divider()
+                Button("Remove", role: .destructive) { ui.imageSelection = ids; removeConfirm = true }
+            } else if !ids.isEmpty {
+                Button("Remove \(ids.count) Images", role: .destructive) {
+                    ui.imageSelection = ids; removeConfirm = true
+                }
             }
         }
         .safeAreaInset(edge: .top) { pullBar }

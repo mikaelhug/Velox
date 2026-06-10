@@ -16,6 +16,7 @@ final class PaneUIState {
     var containerSelection: Set<String> = []
     /// Compose project names the user collapsed (absence ⇒ expanded).
     var containerCollapsed: Set<String> = []
+    var containerInspector = false
     // Images
     var imageSearch = ""
     var imageSelection: Set<String> = []

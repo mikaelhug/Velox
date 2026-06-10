@@ -266,6 +266,28 @@ do {
     equal(Int(foreign[3] & 0x0F), 3, "non-velox.local suffix → NXDOMAIN")
 }
 
+// MARK: Named-access domain + published bindings (UI affordances)
+
+section("ContainerSummary affordances")
+do {
+    let running = ContainerSummary(id: "aaa", names: ["Web"], image: "nginx", state: "running",
+                                   status: "Up 1 minute",
+                                   ports: [PortMapping(ip: "0.0.0.0", privatePort: 80, publicPort: 8080),
+                                           PortMapping(ip: "::", privatePort: 80, publicPort: 8080)],
+                                   networkIPs: ["172.17.0.2"])
+    equal(running.namedAccessDomain ?? "nil", "web.velox.local", "domain lowercased + suffixed")
+    equal(running.publishedBindings.count, 1, "v4+v6 of the same publish dedup to one binding")
+    equal(running.publishedBindings.first?.publicPort ?? 0, 8080, "binding carries the host port")
+
+    let stopped = ContainerSummary(id: "bbb", names: ["web"], image: "nginx", state: "exited",
+                                   status: "", networkIPs: ["172.17.0.2"])
+    check(stopped.namedAccessDomain == nil, "stopped container → no domain")
+
+    let multi = ContainerSummary(id: "ccc", names: ["web"], image: "nginx", state: "running",
+                                 status: "", networkIPs: ["172.17.0.2", "172.18.0.2"])
+    check(multi.namedAccessDomain == nil, "multi-network (ambiguous IP) → no domain")
+}
+
 // MARK: ChurnBreaker state machine
 
 section("ChurnBreaker")

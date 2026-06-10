@@ -139,6 +139,12 @@ public actor DockerClient: DockerClientProtocol {
     public func restartContainer(_ id: String) async throws {
         _ = try await send("POST", Self.path("/containers/\(id)/restart"))
     }
+    public func pauseContainer(_ id: String) async throws {
+        _ = try await send("POST", Self.path("/containers/\(id)/pause"))
+    }
+    public func unpauseContainer(_ id: String) async throws {
+        _ = try await send("POST", Self.path("/containers/\(id)/unpause"))
+    }
     public func removeContainer(_ id: String, force: Bool) async throws {
         _ = try await send("DELETE", Self.path("/containers/\(id)?force=\(force ? 1 : 0)&v=1"))
     }
