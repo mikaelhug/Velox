@@ -596,10 +596,19 @@ private struct ContainerInspector: View {
                     LabeledContent("Image") {
                         Text(c.image).lineLimit(1).truncationMode(.middle)
                     }
-                    // No Status here — the row's badge already shows it; the inspector
-                    // holds what the table deliberately doesn't.
+                    // No Status/Started/Health here — the row's ticking badge already
+                    // carries all three; the inspector holds what the table doesn't.
                     if let project = c.composeProject {
                         LabeledContent("Compose", value: project)
+                    }
+                    // Restarts is the one lifecycle datum NOT in the badge (the
+                    // crash-loop tell) — shown only when it's actually signal.
+                    if let restarts = inspect?.restartCount, restarts > 0 {
+                        LabeledContent("Restarts") {
+                            Text(verbatim: String(restarts))
+                                .foregroundStyle(.orange)
+                                .help("The engine restarted this container — repeated exits may mean a crash loop")
+                        }
                     }
                 }
                 if c.isRunning, cpuHistory.count > 1 {
@@ -621,9 +630,6 @@ private struct ContainerInspector: View {
                             }
                         }
                     }
-                }
-                if inspect != nil || c.isRunning {
-                    lifecycleSection(c)
                 }
                 if let cfg = inspect?.config {
                     processSection(cfg)
@@ -699,36 +705,6 @@ private struct ContainerInspector: View {
         } else {
             ContentUnavailableView("No Selection", systemImage: "shippingbox",
                                    description: Text("Select a container to inspect."))
-        }
-    }
-
-    @ViewBuilder
-    private func lifecycleSection(_ c: ContainerSummary) -> some View {
-        Section("Lifecycle") {
-            if c.isRunning, let date = DockerDates.parse(inspect?.state?.startedAt) {
-                LabeledContent("Started") {
-                    HStack(spacing: 3) {
-                        Text(date, style: .relative) // self-ticking, no timer
-                        Text("ago")
-                    }
-                }
-            }
-            if let restarts = inspect?.restartCount {
-                LabeledContent("Restarts") {
-                    Text(verbatim: String(restarts))
-                        .foregroundStyle(restarts > 0 ? .orange : .secondary)
-                        .help(restarts > 0
-                              ? "The engine restarted this container — repeated exits may mean a crash loop"
-                              : "Never restarted by the engine")
-                }
-            }
-            if let health = inspect?.state?.health?.status, !health.isEmpty {
-                LabeledContent("Health") {
-                    Text(health)
-                        .foregroundStyle(health == "healthy" ? .green
-                                         : health == "unhealthy" ? .red : .secondary)
-                }
-            }
         }
     }
 
