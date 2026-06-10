@@ -7,7 +7,7 @@ is pure Swift on `Virtualization.framework`; the guest is a minimal custom Linux
 `dockerd`. You drive it with the **stock `docker` CLI** — Velox ships no wrapper
 command. Apple Silicon (arm64) first.
 
-## Design — four pillars
+## Design — five pillars
 
 - **Apple's kernel networking (VZNAT)** — the fastest container datapath on
   `Virtualization.framework` (measured ~14 Gbit/s down / ~80 Gbit/s up). No userspace
@@ -18,6 +18,10 @@ command. Apple Silicon (arm64) first.
   and entire userland orchestration.
 - **A custom, minimal kernel** — built from kernel.org source, only what the VM needs
   (`tinyconfig` + a curated fragment), tuned for fast container launch.
+- **Native-first; if we must build, it's Rust** — prefer what `dockerd` or the kernel
+  already provide natively (e.g. dockerd 29's built-in nftables firewall backend, which
+  let the legacy `iptables` packages be dropped from the guest) over extra userland —
+  and when something genuinely must be custom, it's focused Rust like `vinit`, never Go.
 
 The Docker API socket is bridged Mac↔guest over **VSOCK**; directories are shared via
 **VirtioFS**; the container network is Apple's in-kernel **VZNAT** (outbound + NAT in
@@ -159,6 +163,29 @@ A full, daily-driver Docker engine plus a native menu-bar app:
   (CPU/RAM/disk/swap/file-sharing); a self-contained, self-updating bundle.
 
 End-to-end: open Velox → `docker run -d -p 8080:80 nginx` → `curl localhost:8080`.
+
+## vs Apple's `container`
+
+Apple's open-source [`container`](https://github.com/apple/container) (the
+[Containerization](https://github.com/apple/containerization) framework, macOS 26+)
+independently validates Velox's architecture — it too builds a kernel.org kernel, boots a
+tiny purpose-built init, and drives `Virtualization.framework` from Swift. The engine
+model is where they diverge:
+
+- **Velox is a Docker engine.** Stock `dockerd` behind the real Docker Engine API — so
+  `docker`, compose, buildx, Testcontainers, and every Docker SDK just work. `container`
+  is OCI-compatible but speaks no Docker API: compose and API-based tooling don't work
+  with it ([docker/compose#12934](https://github.com/docker/compose/issues/12934), closed
+  as not planned).
+- **One shared VM vs a VM per container.** A compose stack on Velox shares one kernel and
+  one ballooned memory pool; `container` pays a kernel + VM boot per container and —
+  architecturally, not incidentally — cannot mount a named volume into two containers at
+  once. Velox serves shared volumes from ext4 on the data disk at near-native speed.
+- **macOS support.** `container` requires macOS 26 on Apple silicon; Velox runs on
+  earlier macOS too.
+
+`container`'s per-container VM buys hardware isolation — the right trade for untrusted
+workloads, the wrong one for lean everyday development. Different tools, different jobs.
 
 ## Performance
 

@@ -286,6 +286,18 @@ CONFIG_BPF_SYSCALL=y
 # (smaller attack surface). arm64 has a mature eBPF JIT.
 CONFIG_BPF_JIT=y
 CONFIG_BPF_JIT_ALWAYS_ON=y
+# Loop devices for *container workloads* (same policy as keeping xt for in-container
+# iptables): privileged CI jobs build/mount disk images with `mount -o loop`/losetup,
+# and Docker Desktop's kernel carries this. MIN_COUNT=0 = no devices pre-created;
+# everything is on demand via /dev/loop-control, so it costs nothing until used.
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_LOOP_MIN_COUNT=0
+# /proc/config.gz — the running guest's exact kernel config, introspectable via a
+# privileged container (`nsenter -t1 -m -- zcat /proc/config.gz`). The built .config
+# never leaves the build container, so without this, runtime config questions mean
+# grepping binaries (it cost a debug cycle). ~30 KiB compressed; pure diagnosability.
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
 
 # --- Hardening (near-zero-cost, expert-expected; defense-in-depth for a container
 # escape that reaches the guest kernel) ---
