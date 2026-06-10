@@ -228,9 +228,12 @@ connections stall and serialize on the VM queue.
   missed event or a daemon restart self-heals. Never trust event deltas alone.
 - Clock sync pushes on `NSWorkspace.didWake`. The **only** timers that remain are
   genuine *delays / corrections with no event source* — DHCP lease renewal, periodic
-  `fstrim`, the Resource-Saver idle countdown, clock drift re-push — never a status
-  poll. If you find yourself adding a repeating timer to *check* something, find the
-  event instead.
+  `fstrim`, the Resource-Saver idle countdown, clock drift re-push, the Containers
+  view's while-visible re-list (daemon-computed "Up X minutes" status strings have no
+  event to ride; it reuses the persistent `DockerClient`, no per-poll connections),
+  and vinit's 15 s named-access `nft` re-assert (no guest event yet for "dockerd
+  rebuilt its ruleset") — never a status poll. If you find yourself adding a
+  repeating timer to *check* something, find the event instead.
 - Do NOT hand-roll raw-socket HTTP against the docker socket for streaming; use
   `DockerClient` (it handles persistent streams + cancellation correctly). A
   raw-socket `/events` reader through the proxy churns connections and breaks it.
