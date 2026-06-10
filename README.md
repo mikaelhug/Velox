@@ -90,23 +90,30 @@ data); decline it and everything else still works.
 
 ## Performance
 
-Measured on an Apple M-series Mac (8 vCPU, idle baseline). Methodology,
-fairness controls and the harness to reproduce every number:
-[docs/benchmarks.md](docs/benchmarks.md).
+Full head-to-head against Docker Desktop on the same Mac, measured the same
+way: both engines on `Virtualization.framework`, identically configured
+(8 vCPU), one engine under load at a time. Methodology, fairness controls and
+the harness to reproduce every number: [docs/benchmarks.md](docs/benchmarks.md).
 
-| Metric | Measured |
-| --- | --- |
-| Install footprint (self-contained app) | **226 MB** |
-| Idle host footprint, engine empty (Resource Saver) | **~70 MB** |
-| Startup (restart → API-ready, warm) | **1.74 s** |
-| Container launch (`run --rm alpine true`) | **104 ms** |
-| Network — container → host (iperf3) | **88.8 Gbit/s** |
-| Published port — host → container (4 streams) | **59.2 Gbit/s** |
-| VirtioFS bind-mount write / read (`dd` 1 GiB) | **2,951 / 3,861 MB/s** |
-| Small-file extract (4,000 files → bind mount) | **0.21 s** |
-| Durable commit latency (`fio --fsync`, 4 K) | **0.31 ms** |
-| Container-overlay write | **1,695 MB/s** |
-| Postgres `pgbench` TPS (8 clients, 30 s) | **13,318** |
+| Metric | Velox | Docker Desktop | Result |
+| --- | --- | --- | --- |
+| Install footprint | **226 MB** | 2,328 MB | 🟢 **10× smaller** |
+| Idle RAM (host RSS, all processes) | **~0.9 GB** | ~3.3 GB | 🟢 **3.7× less** |
+| Startup (restart → API-ready, warm) | **1.74 s** | 2.55 s | 🟢 **1.5× faster** |
+| Container launch (`run --rm alpine true`) | **104 ms** | 160 ms | 🟢 **1.5× faster** |
+| Network — container → host (iperf3) | **88.8 Gbit/s** | 27.0 Gbit/s | 🟢 **3.3× faster** |
+| Published port — host → container (4 streams) | **59.2 Gbit/s** | 18.0 Gbit/s | 🟢 **3.3× faster** |
+| VirtioFS bind-mount write (`dd` 1 GiB) | **2,951 MB/s** | 956 MB/s | 🟢 **3.1× faster** |
+| Small-file extract (4,000 files → bind) | **0.21 s** | 3.43 s | 🟢 **16× faster** |
+| Durable commit latency (`fio --fsync`, 4 K) | **0.31 ms** | 0.47 ms | 🟢 **1.5× faster** |
+| Container-overlay write | **1,695 MB/s** | 1,217 MB/s | 🟢 **1.4× faster** |
+| Postgres `pgbench` TPS (8 clients, 30 s) | **13,318** | 11,690 | 🟢 **1.14× faster** |
+| Cold image pull (381 MB on disk) | 19.1 s | 17.3 s | 🔴 ~0.9× (trails) |
+
+The idle-RAM row is the loaded benchmark baseline; an **empty** idle engine
+balloons further down, to a ~70 MB host footprint. Cold pull is the one path
+that trails (~10%) — fsync-heavy layer extraction, the visible cost of the
+durability below.
 
 The data disk is **durable by default**: a raw image attached with
 `synchronizationMode: .fsync` and guest barriers on, so every committed write
