@@ -47,11 +47,11 @@ struct MenuBarContentView: View {
             footer
         }
         .padding(12)
-        // Hug the content: the panel is exactly as wide as its widest row needs
-        // (footer ≈ the floor; a long domain the ceiling — rows cap their own text
-        // width below, so this stays in [230, ~330] instead of a fixed worst-case).
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(minWidth: 230, alignment: .leading)
+        // Compact fixed width: MenuBarExtra's window doesn't reliably honor a
+        // fixedSize content hug (it proposes its own width), so size explicitly to
+        // the footer row — the widest fixed content. Long names/domains truncate in
+        // the rows (200pt text cap) rather than widening the panel.
+        .frame(width: 260, alignment: .leading)
         .modifier(RetainStatsIfPresent(stats: engine.state.isRunning ? engine.stats : nil))
     }
 
@@ -192,7 +192,7 @@ private struct ContainerQuickRow: View {
                     }
                 }
             }
-            .frame(maxWidth: 260, alignment: .leading)
+            .frame(maxWidth: 200, alignment: .leading)
             Spacer(minLength: 8)
             Button(action: stop) {
                 Image(systemName: "stop.fill")
