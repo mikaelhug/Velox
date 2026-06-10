@@ -11,7 +11,7 @@
 //!
 //! Protocol (one request per connection, on `/var/run/velox-porthelper.sock`):
 //!   client → "tcp <port>\n" | "udp <port>\n"          (1 ≤ port < 1024)
-//!          | "route add <cidr> <ipv4>\n" | "route del <cidr>\n"  (strictly validated)
+//!          | "route add <cidr> <ipv4>\n" | "route del <cidr>\n"  (RFC-1918 only, strictly validated)
 //!   helper → 1 status byte (0 = ok, else errno) + on a port bind the fd via SCM_RIGHTS
 //! Only the uid passed as `--uid` (the installing user) is served; everything else is
 //! rejected. The control socket lives in root-only-writable /var/run, so no other
@@ -114,22 +114,39 @@ enum Req {
     case route(add: Bool, subnet: String, gateway: String)
 }
 
-@inline(__always) func validIPv4(_ s: String) -> Bool {
+/// Parse a dotted-quad to a host-order UInt32, or nil.
+@inline(__always) func parseIPv4(_ s: String) -> UInt32? {
     var a = in_addr()
-    return s.withCString { inet_pton(AF_INET, $0, &a) } == 1
+    guard s.withCString({ inet_pton(AF_INET, $0, &a) }) == 1 else { return nil }
+    return UInt32(bigEndian: a.s_addr)
 }
-/// A dotted-quad CIDR like `172.18.0.0/16`, prefix 0…32.
+/// True when `ip/prefix` lies wholly inside RFC-1918 private space (10/8, 172.16/12,
+/// 192.168/16). Routes are system-wide state, so the helper only ever touches
+/// container-side private subnets — never public space, never a default route — no
+/// matter who asks. Docker subnets (`default-address-pools`) and the vmnet guest IP
+/// are always private, so nothing real is lost.
+@inline(__always) func privateIPv4Net(_ ip: UInt32, _ prefix: Int) -> Bool {
+    let blocks: [(net: UInt32, plen: Int)] = [(0x0A00_0000, 8), (0xAC10_0000, 12), (0xC0A8_0000, 16)]
+    return blocks.contains { prefix >= $0.plen && (ip ^ $0.net) >> (32 - $0.plen) == 0 }
+}
+/// The route's next hop (the guest VM IP) — a private dotted-quad.
+@inline(__always) func validGateway(_ s: String) -> Bool {
+    guard let ip = parseIPv4(s) else { return false }
+    return privateIPv4Net(ip, 32)
+}
+/// A private dotted-quad CIDR like `172.18.0.0/16` (within one RFC-1918 block).
 @inline(__always) func validCIDR(_ s: String) -> Bool {
     let p = s.split(separator: "/")
-    guard p.count == 2, validIPv4(String(p[0])), let n = Int(p[1]), n >= 0, n <= 32 else { return false }
-    return true
+    guard p.count == 2, let ip = parseIPv4(String(p[0])), let n = Int(p[1]), n <= 32 else { return false }
+    return privateIPv4Net(ip, n)
 }
 
 /// Add or delete a route to a container subnet via the guest. The daemon never sees connection
 /// data — a route is pure control plane — so this keeps root out of the datapath (CLAUDE.md §2).
-/// `posix_spawn` (no shell) + strict CIDR/IPv4 validation means no argument injection is possible.
+/// `posix_spawn` (no shell) + strict RFC-1918 CIDR/IPv4 validation means no argument injection
+/// and no routing of public space is possible.
 func runRoute(add: Bool, subnet: String, gateway: String) -> Int32 {
-    guard validCIDR(subnet), add ? validIPv4(gateway) : true else { return EINVAL }
+    guard validCIDR(subnet), add ? validGateway(gateway) : true else { return EINVAL }
     var pid: pid_t = 0
     // add needs the gateway; delete by subnet alone (robust even if the guest IP changed).
     let args = add ? ["/sbin/route", "-n", "add", "-net", subnet, gateway]
