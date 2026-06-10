@@ -266,6 +266,53 @@ do {
     equal(Int(foreign[3] & 0x0F), 3, "non-velox.local suffix → NXDOMAIN")
 }
 
+// MARK: ChurnBreaker state machine
+
+section("ChurnBreaker")
+do {
+    /// Synthetic clock: milliseconds from an arbitrary base.
+    func at(_ ms: UInt64) -> DispatchTime { DispatchTime(uptimeNanoseconds: 1_000_000_000 + ms * 1_000_000) }
+
+    // A continuous empty streak must be sustained ≤100ms apart; brief bursts queue.
+    var b = ChurnBreaker()
+    equal(b.emptySubmit(now: at(0)), .queue, "first empty submit queues")
+    equal(b.emptySubmit(now: at(80)), .queue, "empty at 80ms still queues")
+    equal(b.emptySubmit(now: at(160)), .queue, "empty at 160ms still queues")
+    equal(b.emptySubmit(now: at(240)), .queue, "empty at 240ms still queues (< 300ms trip)")
+    check(!b.isOpen(now: at(250)), "not open before tripping")
+
+    // Sustained continuous emptiness (> 300ms) trips → bypass + 2s cooldown.
+    equal(b.emptySubmit(now: at(320)), .bypass, "continuous emptiness past 300ms trips")
+    check(b.isOpen(now: at(400)), "open during the 2s cooldown")
+    check(b.isOpen(now: at(2300)), "still open at 2.3s (cooldown ends at 2.32s)")
+    check(!b.isOpen(now: at(2400)), "closed after the cooldown")
+
+    // Persisting churn backs off: the next trip opens for 4s.
+    equal(b.emptySubmit(now: at(2400)), .queue, "post-cooldown empty restarts the streak")
+    equal(b.emptySubmit(now: at(2480)), .queue, "still within the streak window")
+    equal(b.emptySubmit(now: at(2560)), .queue, "streak building")
+    equal(b.emptySubmit(now: at(2640)), .queue, "streak building")
+    equal(b.emptySubmit(now: at(2720)), .bypass, "second trip after another 300ms continuous")
+    check(b.isOpen(now: at(6600)), "second cooldown backed off to 4s (ends at 6.72s)")
+    check(!b.isOpen(now: at(6800)), "second cooldown over")
+
+    // A served submit resets streak AND backoff: the next trip cools down 2s again.
+    b.served()
+    equal(b.emptySubmit(now: at(7000)), .queue, "served() restarted the streak")
+    equal(b.emptySubmit(now: at(7080)), .queue, "streak building")
+    equal(b.emptySubmit(now: at(7160)), .queue, "streak building")
+    equal(b.emptySubmit(now: at(7240)), .queue, "streak building")
+    equal(b.emptySubmit(now: at(7320)), .bypass, "trips again after 300ms continuous")
+    check(b.isOpen(now: at(9300)), "cooldown is back to 2s after served() (ends at 9.32s)")
+    check(!b.isOpen(now: at(9400)), "and closed after it")
+
+    // A quiet gap (> 100ms with no empty submit) restarts the streak — no trip.
+    var g = ChurnBreaker()
+    equal(g.emptySubmit(now: at(0)), .queue, "gap test: streak starts")
+    equal(g.emptySubmit(now: at(200)), .queue, "150ms+ quiet gap restarted the streak")
+    equal(g.emptySubmit(now: at(450)), .queue, "another gap — 450ms total but never 300ms continuous")
+}
+
 // MARK: Summary
 
 print("\n----------------------------------------")

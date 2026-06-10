@@ -49,20 +49,9 @@ public final class ConduitPool: @unchecked Sendable {
     private var sweepArmed = false     // at most one pending timeout sweep (all access on `queue`)
     private var fallbackHandler: (@Sendable (Int32, UInt16) -> Void)?
     private let endpoints: PublishedEndpoints?
-    // Churn circuit breaker. A flood of *non-keep-alive* connections (a new connection per request)
-    // drains the pool faster than the guest can redial — each request would otherwise wait out the
-    // timeout and force a conduit redial, which under sustained churn buries the guest in TIME_WAIT
-    // sockets and collapses the whole published-port path. So when the pool stays *continuously*
-    // empty longer than any keep-alive establishment burst lasts, we declare churn and bypass the
-    // pool: connections go straight to the vsock relay (no wait), and with nothing consuming
-    // conduits the guest stops redialing (no TIME_WAIT storm). It auto-recovers after a cooldown.
-    private var emptySince: DispatchTime?        // start of the current continuously-empty streak
-    private var lastEmptyAt: DispatchTime?       // last empty-on-submit (to detect a gap → restart)
-    private var breakerOpenUntil: DispatchTime?  // while set & future, bypass the pool entirely
-    private var breakerBypassSecs = 2.0          // current bypass duration; backs off under sustained churn
-    private let breakerTripAfter: DispatchTimeInterval = .milliseconds(300) // > a keep-alive burst
-    private let breakerBypassMax = 16.0          // cap on the backed-off bypass duration
-    private let breakerGap: DispatchTimeInterval = .milliseconds(100)       // quiet gap restarts the streak
+    // Churn circuit breaker (see ChurnBreaker — a pure state machine, self-tested
+    // with synthetic clocks). All access on `queue`.
+    private var breaker = ChurnBreaker()
     /// How long a client waits for a fresh conduit (while the guest's adaptive pool grows to meet
     /// a burst) before dropping to the vsock relay. Long enough to absorb a persistent-connection
     /// burst (which then reuses its fast conduit for the rest of its life); the adaptive pool keeps
@@ -173,34 +162,26 @@ public final class ConduitPool: @unchecked Sendable {
         queue.async {
             let now = DispatchTime.now()
             // Breaker open (churn) → bypass the pool entirely; straight to vsock, no wait.
-            if let until = self.breakerOpenUntil, now < until {
+            if self.breaker.isOpen(now: now) {
                 self.fallbackHandler?(clientFd, port)
                 return
             }
             if let p = self.ready.popLast() {
-                p.source.cancel() // stop monitoring; we own the fd now
-                self.emptySince = nil       // a spare conduit was waiting → pool is healthy
-                self.breakerBypassSecs = 2.0 // real traffic served → reset the churn backoff
+                p.source.cancel()     // stop monitoring; we own the fd now
+                self.breaker.served() // pool is healthy → reset streak + backoff
                 self.assign(conduit: p.fd, clientFd: clientFd, port: port)
             } else {
-                // Pool empty. Track how long it's been *continuously* empty-on-submit; a quiet gap
-                // (or a served submit above) restarts the streak, so only sustained emptiness —
-                // churn, not a keep-alive establishment burst — trips the breaker.
-                if let last = self.lastEmptyAt, now > last + self.breakerGap { self.emptySince = now }
-                else if self.emptySince == nil { self.emptySince = now }
-                self.lastEmptyAt = now
-                if let since = self.emptySince, now > since + self.breakerTripAfter {
-                    self.breakerOpenUntil = now + .milliseconds(Int(self.breakerBypassSecs * 1000))
-                    self.breakerBypassSecs = min(self.breakerBypassMax, self.breakerBypassSecs * 2) // back off if churn persists
-                    self.emptySince = nil
+                switch self.breaker.emptySubmit(now: now) {
+                case .bypass:
                     self.fallbackHandler?(clientFd, port) // sustained churn → straight to vsock
-                    return
+                case .queue:
+                    // Queue the client and let one shared sweep enforce the timeout. A per-client
+                    // asyncAfter here would flood the serial queue under churn (thousands/s) and
+                    // starve the conduit-accept handler that refills the pool — so the pool would
+                    // never recover.
+                    self.waiting.append((fd: clientFd, port: port, deadline: now + self.waitTimeout))
+                    self.armSweep()
                 }
-                // Queue the client and let one shared sweep enforce the timeout. A per-client
-                // asyncAfter here would flood the serial queue under churn (thousands/s) and starve
-                // the conduit-accept handler that refills the pool — so the pool would never recover.
-                self.waiting.append((fd: clientFd, port: port, deadline: now + self.waitTimeout))
-                self.armSweep()
             }
         }
     }
