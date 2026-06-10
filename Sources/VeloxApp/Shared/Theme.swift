@@ -90,8 +90,8 @@ private struct HorizontalScrollerSuppressor: NSViewRepresentable {
         }
 
         /// Climb from the probe until an ancestor's subtree contains a table scroll
-        /// view, then stop — never wander up to the window (the sidebar List is
-        /// also an NSTableView and isn't ours to touch).
+        /// view, then stop — never wander up to the window, where we'd grab some
+        /// OTHER component's scroll view (each table/list opts in with its own probe).
         private static func find(around probe: NSView) -> NSScrollView? {
             var node = probe.superview
             for _ in 0..<6 {

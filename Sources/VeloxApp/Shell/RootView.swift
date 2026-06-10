@@ -24,6 +24,10 @@ struct RootView: View {
                 }
             }
             .navigationSplitViewColumnWidth(min: 160, ideal: 160, max: 270)
+            // The sidebar List is an AppKit table too: while the sidebar slides,
+            // its rows are briefly wider than the shrinking clip and AppKit
+            // flashes a horizontal scroller — same glitch the dashboards had.
+            .suppressHorizontalScroller()
             .safeAreaInset(edge: .bottom) {
                 EngineStatusBar()
                     .padding(10)
