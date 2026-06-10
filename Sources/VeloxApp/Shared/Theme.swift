@@ -36,13 +36,16 @@ extension View {
 }
 
 private struct HorizontalScrollerSuppressor: NSViewRepresentable {
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeNSView(context: Context) -> NSView {
         let probe = NSView()
         // The AppKit table materializes a beat after this background lands — retry
         // on a short ladder. Pane switches recreate the view, re-running this.
         for delay: TimeInterval in [0, 0.25, 1.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak probe] in
-                if let probe { Self.apply(around: probe) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                [weak probe, coordinator = context.coordinator] in
+                if let probe { coordinator.attach(around: probe) }
             }
         }
         return probe
@@ -50,29 +53,65 @@ private struct HorizontalScrollerSuppressor: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSView, context: Context) {}
 
-    /// Climb from the probe until an ancestor's subtree contains a table scroll
-    /// view, then stop — never wander up to the window (the sidebar List is also
-    /// an NSTableView and isn't ours to touch).
-    private static func apply(around probe: NSView) {
-        var node = probe.superview
-        for _ in 0..<6 {
-            guard let host = node else { return }
-            if disable(in: host) { return }
-            node = host.superview
-        }
-    }
+    /// Holds the found scroll view and KEEPS the horizontal scroller off. A
+    /// one-shot set isn't enough: SwiftUI re-asserts its scroller configuration
+    /// when it updates the table — exactly when an inspector toggle resizes it —
+    /// so re-apply on every frame change of the scroll view.
+    @MainActor
+    final class Coordinator {
+        private weak var scrollView: NSScrollView?
+        // nonisolated(unsafe): deinit is nonisolated and removeObserver is
+        // thread-safe; the token is written once from the main actor.
+        nonisolated(unsafe) private var observer: NSObjectProtocol?
 
-    @discardableResult
-    private static func disable(in root: NSView, depth: Int = 0) -> Bool {
-        if depth > 12 { return false }
-        var found = false
-        if let scroll = root as? NSScrollView, scroll.documentView is NSTableView {
-            scroll.hasHorizontalScroller = false
-            scroll.horizontalScrollElasticity = .none
-            found = true
+        func attach(around probe: NSView) {
+            guard scrollView == nil else { return }
+            guard let sv = Self.find(around: probe) else { return }
+            scrollView = sv
+            apply()
+            sv.postsFrameChangedNotifications = true
+            observer = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification, object: sv, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.apply() }
+            }
         }
-        for sub in root.subviews { found = disable(in: sub, depth: depth + 1) || found }
-        return found
+
+        private func apply() {
+            guard let sv = scrollView else { return }
+            // Measured: SwiftUI does re-enable the scroller (the attach-time log
+            // caught it re-asserting) — both checks must stay cheap and idempotent.
+            if sv.hasHorizontalScroller { sv.hasHorizontalScroller = false }
+            if sv.horizontalScrollElasticity != .none { sv.horizontalScrollElasticity = .none }
+        }
+
+        deinit {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+        }
+
+        /// Climb from the probe until an ancestor's subtree contains a table scroll
+        /// view, then stop — never wander up to the window (the sidebar List is
+        /// also an NSTableView and isn't ours to touch).
+        private static func find(around probe: NSView) -> NSScrollView? {
+            var node = probe.superview
+            for _ in 0..<6 {
+                guard let host = node else { return nil }
+                if let found = tableScrollView(in: host) { return found }
+                node = host.superview
+            }
+            return nil
+        }
+
+        private static func tableScrollView(in root: NSView, depth: Int = 0) -> NSScrollView? {
+            if depth > 12 { return nil }
+            if let scroll = root as? NSScrollView, scroll.documentView is NSTableView {
+                return scroll
+            }
+            for sub in root.subviews {
+                if let found = tableScrollView(in: sub, depth: depth + 1) { return found }
+            }
+            return nil
+        }
     }
 }
 

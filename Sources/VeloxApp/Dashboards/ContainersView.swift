@@ -298,13 +298,7 @@ struct ContainersView: View {
             }
         }
         .inspector(isPresented: $ui.containerInspector) {
-            // .id ties the inspector's identity to the selection: switching rows
-            // discards the old view (and its @State inspect enrichment) in the same
-            // frame — without it, the first frame after a switch shows the previous
-            // container's process/env under the new container's name, then blanks,
-            // then fills: a three-step flicker on every selection change.
             ContainerInspector(container: inspected, docker: model.docker)
-                .id(inspected?.id)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay {
@@ -594,11 +588,43 @@ private struct ContainerInspector: View {
     let container: ContainerSummary?
     let docker: any DockerClientProtocol
 
-    @State private var inspect: ContainerInspect?
+    /// What the panel renders: a summary plus its enrichment, swapped in together.
+    /// Rendering `container` directly while its inspect loads mixes generations —
+    /// the new row's header over the previous row's process/env, then a blank,
+    /// then the fill: three flickers per selection change (and recreating the view
+    /// with `.id` instead re-hosts the whole AppKit form, which flashes a partial
+    /// layout). Holding the last coherent snapshot until the next one is ready
+    /// makes a selection change exactly ONE in-place update.
+    private struct Snapshot {
+        let c: ContainerSummary
+        let inspect: ContainerInspect?
+    }
+    @State private var shown: Snapshot?
 
     var body: some View {
-        if let c = container {
-            Form {
+        Group {
+            // Until the first snapshot lands, render the bare summary — its list
+            // data is already on hand; afterwards always the last full snapshot.
+            if let s = shown ?? container.map({ Snapshot(c: $0, inspect: nil) }) {
+                form(s)
+            } else {
+                ContentUnavailableView("No Selection", systemImage: "shippingbox",
+                                       description: Text("Select a container to inspect."))
+            }
+        }
+        .task(id: container) {
+            guard let c = container else { shown = nil; return }
+            let info = try? await docker.inspectContainer(c.id)
+            // The selection may have moved on mid-fetch; that id's run updates.
+            guard container?.id == c.id else { return }
+            shown = Snapshot(c: c, inspect: info)
+        }
+    }
+
+    private func form(_ s: Snapshot) -> some View {
+        let c = s.c
+        let inspect = s.inspect
+        return Form {
                 Section("Container") {
                     LabeledContent("Name", value: c.displayName)
                     LabeledContent("ID", value: c.shortID)
@@ -678,15 +704,6 @@ private struct ContainerInspector: View {
                 }
             }
             .formStyle(.grouped)
-            // One enrich call per selection.
-            .task(id: c.id) {
-                inspect = nil
-                inspect = try? await docker.inspectContainer(c.id)
-            }
-        } else {
-            ContentUnavailableView("No Selection", systemImage: "shippingbox",
-                                   description: Text("Select a container to inspect."))
-        }
     }
 
     @ViewBuilder
