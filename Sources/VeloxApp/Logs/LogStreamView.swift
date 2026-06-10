@@ -248,7 +248,11 @@ private struct LogTextView: NSViewRepresentable {
             if let fg = span.foreground {
                 attrs[.foregroundColor] = ANSIPalette.color(fg)
             } else {
-                attrs[.foregroundColor] = line.isStderr ? NSColor.systemRed : NSColor.labelColor
+                // Deliberately NOT red for stderr: Docker's stderr stream is where many
+                // daemons (nginx, postgres…) write perfectly normal logs — the fd says
+                // nothing about severity. Apps that mean "error" color it themselves
+                // via ANSI, which the branch above honors.
+                attrs[.foregroundColor] = NSColor.labelColor
             }
             if let bg = span.background { attrs[.backgroundColor] = ANSIPalette.color(bg) }
             if span.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }

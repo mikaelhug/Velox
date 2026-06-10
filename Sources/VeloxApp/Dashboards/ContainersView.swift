@@ -523,9 +523,8 @@ struct ContainersView: View {
                 Button("Open in VS Code") { WorkspaceActions.openInVSCode(containerName: c.displayName) }
             }
         }
-        if let domain = c.namedAccessDomain {
-            Button("Open \(domain)") { WorkspaceActions.openDomain(domain) }
-        }
+        // No "Open <domain>" here — the clickable domain link under the name IS that
+        // affordance; duplicating it in the menu just lengthens it.
         Menu("Copy") {
             Button("Name") { WorkspaceActions.copy(c.displayName) }
             Button("Container ID") { WorkspaceActions.copy(c.id) }
