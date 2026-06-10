@@ -164,26 +164,26 @@ final class DockerResourceStore {
 
     // MARK: - Lifecycle anchors (native uptime, no polling)
 
-    /// A container's lifecycle anchor: when it started (running) or finished (exited)
-    /// per dockerd's own RFC3339 timestamps, plus the exit code. The UI renders
-    /// uptime from these with self-ticking relative date text — replacing the old
-    /// re-list of Docker's pre-rendered "Up 3 minutes" strings (the last GUI timer).
+    /// A running container's lifecycle anchor: when it started, per dockerd's own
+    /// RFC3339 StartedAt. The UI renders uptime from it with self-ticking relative
+    /// date text — replacing the old re-list of Docker's pre-rendered "Up 3 minutes"
+    /// strings (the last GUI timer). Stopped containers don't get one — the UI shows
+    /// a plain "Stopped", so inspecting them would be a wasted round-trip.
     struct LifeAnchor: Equatable {
         let state: String
         let date: Date?
-        let exitCode: Int?
     }
 
     private(set) var anchors: [String: LifeAnchor] = [:]
 
-    /// Fetch anchors for containers whose (id, state) we haven't inspected yet, and
-    /// drop anchors for containers that are gone. One inspect per lifecycle
+    /// Fetch anchors for running containers whose (id, state) we haven't inspected
+    /// yet, and drop anchors for containers that are gone. One inspect per lifecycle
     /// transition — never per render, never on a timer. Bounded parallel.
     private func refreshAnchors() async {
         let current = containers
         let ids = Set(current.map(\.id))
         anchors = anchors.filter { ids.contains($0.key) }
-        let missing = current.filter { anchors[$0.id]?.state != $0.state }
+        let missing = current.filter { $0.isRunning && anchors[$0.id]?.state != $0.state }
         guard !missing.isEmpty else { return }
         let docker = self.docker
         let fetched: [(String, LifeAnchor)] = await withTaskGroup(
@@ -192,11 +192,8 @@ final class DockerResourceStore {
             for c in missing.prefix(32) {
                 group.addTask {
                     guard let info = try? await docker.inspectContainer(c.id) else { return nil }
-                    let date = c.isRunning
-                        ? DockerDates.parse(info.state?.startedAt)
-                        : DockerDates.parse(info.state?.finishedAt)
-                    return (c.id, LifeAnchor(state: c.state, date: date,
-                                             exitCode: info.state?.exitCode))
+                    return (c.id, LifeAnchor(state: c.state,
+                                             date: DockerDates.parse(info.state?.startedAt)))
                 }
             }
             var out: [(String, LifeAnchor)] = []

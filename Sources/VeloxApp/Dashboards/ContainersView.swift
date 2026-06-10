@@ -69,7 +69,7 @@ final class ContainersModel {
         await store.refreshContainers()
     }
 
-    // Memoized grouping/sort. The interleave does an O(N log N) ICU-collation sort, and
+    // Memoized grouping/sort. The grouping does an O(N log N) ICU-collation sort, and
     // the Containers `body` re-evaluates on selection/badge changes (not just data
     // changes), so cache the result and recompute only when the data or the search text
     // actually changed. The signature must hash the FULL container value: the cache
@@ -93,7 +93,8 @@ final class ContainersModel {
         return result
     }
 
-    /// Standalone containers and Compose project groups, interleaved alphabetically.
+    /// Standalone containers first (alphabetical), then Compose project groups
+    /// (alphabetical) — two stable bands, not an interleave.
     private static func computeTopLevel(_ containers: [ContainerSummary], searchText: String) -> [TopLevelEntry] {
         let filtered = searchText.isEmpty ? containers : containers.filter {
             $0.displayName.localizedCaseInsensitiveContains(searchText)
@@ -106,16 +107,18 @@ final class ContainersModel {
             if let project = c.composeProject { groups[project, default: []].append(c) }
             else { standalone.append(c) }
         }
-        var entries = standalone.map(TopLevelEntry.standalone)
-        for (name, members) in groups {
-            let sorted = members.sorted {
-                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        let standaloneEntries = standalone
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            .map(TopLevelEntry.standalone)
+        let groupEntries = groups
+            .map { name, members in
+                ProjectGroup(name: name, containers: members.sorted {
+                    $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+                })
             }
-            entries.append(.group(ProjectGroup(name: name, containers: sorted)))
-        }
-        return entries.sorted {
-            $0.sortKey.localizedCaseInsensitiveCompare($1.sortKey) == .orderedAscending
-        }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .map(TopLevelEntry.group)
+        return standaloneEntries + groupEntries
     }
 }
 
@@ -142,8 +145,8 @@ enum ContainerRow: Identifiable, Hashable {
     }
 }
 
-/// A top-level table entry, used to interleave standalone containers and project
-/// groups into one alphabetical order before the table renders them.
+/// A top-level table entry: standalone containers band first, project groups band
+/// below, each alphabetical.
 private enum TopLevelEntry: Identifiable {
     case standalone(ContainerSummary)
     case group(ProjectGroup)
@@ -152,12 +155,6 @@ private enum TopLevelEntry: Identifiable {
         switch self {
         case .standalone(let c): return c.id
         case .group(let g):      return "project:\(g.name)"
-        }
-    }
-    var sortKey: String {
-        switch self {
-        case .standalone(let c): return c.displayName
-        case .group(let g):      return g.name
         }
     }
 }
@@ -183,11 +180,13 @@ struct ContainersView: View {
         self.ui = ui
         self.issues = issues
         _model = State(initialValue: ContainersModel(docker: docker, store: store))
-        _tableLayout = State(initialValue: TableLayout.load("containers2"))
+        // v3: Ports column became hidden-by-default — bump the key so an existing
+        // persisted layout doesn't pin the old visibility.
+        _tableLayout = State(initialValue: TableLayout.load("containers3"))
     }
 
-    /// Standalone containers and Compose project groups, interleaved alphabetically —
-    /// memoized in the model (recomputed only when the set or search text changes).
+    /// Standalone containers (alphabetical) above Compose project groups (alphabetical) —
+    /// memoized in the model (recomputed only when the data or search text changes).
     private var topLevel: [TopLevelEntry] { model.topLevel(searchText: ui.containerSearch) }
 
     private func expansion(_ name: String) -> Binding<Bool> {
@@ -218,8 +217,11 @@ struct ContainersView: View {
             TableColumn("Status") { row in statusCell(row) }
                 .customizationID("status")
 
+            // Hidden by default, like Image: port launchpads live in the inspector and
+            // the name cell's named-access link; right-click the header to re-enable.
             TableColumn("Ports") { row in portsCell(row) }
                 .customizationID("ports")
+                .defaultVisibility(.hidden)
 
             TableColumn("CPU / MEM") { row in
                 if case .container(let c) = row {
@@ -304,7 +306,7 @@ struct ContainersView: View {
                                        description: Text(model.loadError ?? "Run one with `docker run`."))
             }
         }
-        .persistTableLayout(tableLayout, "containers2")
+        .persistTableLayout(tableLayout, "containers3")
         .retainingStats(stats)
         // No uptime re-list: rows render "Up …" from each container's lifecycle anchor
         // (dockerd's StartedAt/FinishedAt, fetched once per transition) with
@@ -758,11 +760,12 @@ private struct PortLink: View {
     }
 }
 
-/// Status capsule with NATIVE uptime: the state plus a self-ticking relative time
-/// from the container's lifecycle anchor (dockerd's own StartedAt/FinishedAt +
-/// ExitCode). SwiftUI's `Text(_, style: .relative)` updates itself — no timer, no
-/// re-list; the anchor refreshes only on lifecycle events. Until the anchor lands
-/// (a beat after a transition), Docker's pre-rendered status string fills in.
+/// Status capsule with NATIVE uptime: a self-ticking relative time from the
+/// container's lifecycle anchor (dockerd's own StartedAt). SwiftUI's
+/// `Text(_, style: .relative)` updates itself — no timer, no re-list; the anchor
+/// refreshes only on lifecycle events. Until the anchor lands (a beat after a
+/// transition), Docker's pre-rendered status string fills in. Stopped containers
+/// just say "Stopped" — the exit code + when live in the hover tooltip.
 struct UptimeBadge: View {
     let container: ContainerSummary
     let anchor: DockerResourceStore.LifeAnchor?
@@ -774,6 +777,7 @@ struct UptimeBadge: View {
             .padding(.horizontal, 7).padding(.vertical, 2)
             .background(tint.opacity(0.16), in: Capsule())
             .foregroundStyle(tint)
+            .help(container.status)
     }
 
     /// The anchor only speaks for the state it was fetched for.
@@ -789,12 +793,8 @@ struct UptimeBadge: View {
                 Text(date, style: .relative)
                 if container.isUnhealthy { Text("· unhealthy") }
             }
-        } else if container.state == "exited", let a = validAnchor, let date = a.date {
-            HStack(spacing: 3) {
-                Text(verbatim: "Exited (\(a.exitCode ?? 0))")
-                Text(date, style: .relative)
-                Text("ago")
-            }
+        } else if container.state == "exited" {
+            Text("Stopped")
         } else {
             Text(container.status.isEmpty ? container.state.capitalized : container.status)
         }
