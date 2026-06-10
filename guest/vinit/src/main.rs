@@ -1618,10 +1618,15 @@ fn conduit_slot() {
             Some(fd) => fd,
             None => { std::thread::sleep(std::time::Duration::from_millis(250)); continue; }
         };
-        // Park on this conduit; re-park on idle (at floor) so we don't churn it needlessly.
+        // Park on this conduit. At (or below) the floor, park INDEFINITELY: a timeout
+        // has nothing to do there (reaping only applies over the target, and a dead
+        // conduit surfaces as EOF via TCP keepalive) — the old unconditional 10s poll
+        // had the 16 floor slots collectively waking every ~0.6s at idle for nothing.
+        // Over the floor, keep the timeout so excess slots reap once the burst passes.
         loop {
+            let timeout = if CONDUIT_SLOTS.load(Relaxed) > CONDUIT_FLOOR { CONDUIT_REAP_MS } else { -1 };
             CONDUIT_IDLE.fetch_add(1, Relaxed);
-            let res = read_assignment_timed(fd, CONDUIT_REAP_MS);
+            let res = read_assignment_timed(fd, timeout);
             CONDUIT_IDLE.fetch_sub(1, Relaxed);
             match res {
                 Assignment::Got(target) => {
