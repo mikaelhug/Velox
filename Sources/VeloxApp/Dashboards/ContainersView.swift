@@ -298,7 +298,13 @@ struct ContainersView: View {
             }
         }
         .inspector(isPresented: $ui.containerInspector) {
+            // .id ties the inspector's identity to the selection: switching rows
+            // discards the old view (and its @State inspect enrichment) in the same
+            // frame — without it, the first frame after a switch shows the previous
+            // container's process/env under the new container's name, then blanks,
+            // then fills: a three-step flicker on every selection change.
             ContainerInspector(container: inspected, docker: model.docker)
+                .id(inspected?.id)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay {
