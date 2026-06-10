@@ -12,6 +12,14 @@ enum Theme {
     /// Content background that sits one step above the window — the card fill.
     static var cardFill: Color { Color(nsColor: .controlBackgroundColor) }
     static var hairline: Color { Color(nsColor: .separatorColor) }
+
+    /// Terminal-style console surface for the log views: a FIXED dark background
+    /// (like Terminal/iTerm, regardless of system appearance) with fixed light
+    /// default text — logs read the way developers expect, and ANSI colors sit on
+    /// the background they were designed for. Never use adaptive label colors on
+    /// this surface: in light mode they'd render black-on-dark.
+    static let consoleBackground = NSColor(srgbRed: 0.075, green: 0.078, blue: 0.089, alpha: 1)
+    static let consoleText = NSColor(calibratedWhite: 0.88, alpha: 1)
 }
 
 @MainActor

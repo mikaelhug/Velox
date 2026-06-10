@@ -43,7 +43,7 @@ private struct EngineLogText: NSViewRepresentable {
 
     private static let font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
     private static let attrs: [NSAttributedString.Key: Any] =
-        [.font: font, .foregroundColor: NSColor.labelColor]
+        [.font: font, .foregroundColor: Theme.consoleText]
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -57,7 +57,8 @@ private struct EngineLogText: NSViewRepresentable {
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = true
-        textView.backgroundColor = .textBackgroundColor
+        textView.backgroundColor = Theme.consoleBackground // terminal-style console
+        scroll.scrollerKnobStyle = .light
         textView.textContainerInset = NSSize(width: 10, height: 6)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false

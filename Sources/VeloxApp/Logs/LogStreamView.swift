@@ -170,9 +170,10 @@ private struct LogTextView: NSViewRepresentable {
         textView.isEditable = false
         textView.isSelectable = true
         textView.drawsBackground = true
-        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.backgroundColor = Theme.consoleBackground // terminal-style console
         textView.textContainerInset = NSSize(width: 10, height: 10)
         textView.isVerticallyResizable = true
+        scroll.scrollerKnobStyle = .light
 
         scroll.documentView = textView
         context.coordinator.textView = textView
@@ -251,8 +252,9 @@ private struct LogTextView: NSViewRepresentable {
                 // Deliberately NOT red for stderr: Docker's stderr stream is where many
                 // daemons (nginx, postgres…) write perfectly normal logs — the fd says
                 // nothing about severity. Apps that mean "error" color it themselves
-                // via ANSI, which the branch above honors.
-                attrs[.foregroundColor] = NSColor.labelColor
+                // via ANSI, which the branch above honors. Fixed light text on the
+                // fixed-dark console (adaptive label colors would invert in light mode).
+                attrs[.foregroundColor] = Theme.consoleText
             }
             if let bg = span.background { attrs[.backgroundColor] = ANSIPalette.color(bg) }
             if span.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
