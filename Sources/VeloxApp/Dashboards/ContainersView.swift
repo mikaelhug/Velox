@@ -297,7 +297,7 @@ struct ContainersView: View {
             }
         }
         .inspector(isPresented: $ui.containerInspector) {
-            ContainerInspector(container: inspected, docker: model.docker, stats: stats)
+            ContainerInspector(container: inspected, docker: model.docker)
                 .inspectorColumnWidth(min: 240, ideal: 280, max: 400)
         }
         .overlay {
@@ -579,17 +579,15 @@ struct ContainersView: View {
 }
 
 /// The right-hand inspector for a single selected container: identity, network
-/// reachability (clickable domain + ports), live usage sparklines, lifecycle
-/// (restart count = the crash-loop tell), process, env, mounts, and labels. List
-/// data renders instantly; one `inspect` call per selection enriches the rest.
+/// reachability (clickable domain + ports), lifecycle (restart count = the
+/// crash-loop tell), process, env, mounts, and labels. No CPU/MEM here — the
+/// table column already shows live usage. List data renders instantly; one
+/// `inspect` call per selection enriches the rest.
 private struct ContainerInspector: View {
     let container: ContainerSummary?
     let docker: any DockerClientProtocol
-    let stats: StatsStore
 
     @State private var inspect: ContainerInspect?
-    @State private var cpuHistory: [Double] = []
-    @State private var memHistory: [Double] = []
 
     var body: some View {
         if let c = container {
@@ -612,26 +610,6 @@ private struct ContainerInspector: View {
                             Text(verbatim: String(restarts))
                                 .foregroundStyle(.orange)
                                 .help("The engine restarted this container — repeated exits may mean a crash loop")
-                        }
-                    }
-                }
-                if c.isRunning, cpuHistory.count > 1 {
-                    Section("Live") {
-                        LabeledContent("CPU") {
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(verbatim: "\(Int(cpuHistory.last ?? 0))%")
-                                    .font(.caption.monospacedDigit())
-                                SparklineView(values: cpuHistory, tint: .blue)
-                                    .frame(width: 120, height: 22)
-                            }
-                        }
-                        LabeledContent("Memory") {
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(verbatim: Format.bytes(UInt64(memHistory.last ?? 0)))
-                                    .font(.caption.monospacedDigit())
-                                SparklineView(values: memHistory, tint: .purple)
-                                    .frame(width: 120, height: 22)
-                            }
                         }
                     }
                 }
@@ -693,18 +671,10 @@ private struct ContainerInspector: View {
                 }
             }
             .formStyle(.grouped)
-            // One enrich call per selection; histories restart with the new container.
+            // One enrich call per selection.
             .task(id: c.id) {
                 inspect = nil
-                cpuHistory = []; memHistory = []
                 inspect = try? await docker.inspectContainer(c.id)
-            }
-            .onChange(of: stats.latest[c.id]) { _, sample in
-                guard let sample else { return }
-                cpuHistory.append(sample.cpuPercent)
-                memHistory.append(Double(sample.memoryBytes))
-                if cpuHistory.count > 60 { cpuHistory.removeFirst(cpuHistory.count - 60) }
-                if memHistory.count > 60 { memHistory.removeFirst(memHistory.count - 60) }
             }
         } else {
             ContentUnavailableView("No Selection", systemImage: "shippingbox",
