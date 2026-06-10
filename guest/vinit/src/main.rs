@@ -244,8 +244,9 @@ fn setup_network() -> std::io::Result<()> {
 
     let mac = get_mac(s)?;
     let lease = dhcp::acquire(IFNAME, mac)?;
-    log!("DHCP lease: ip={} mask={} gw={} dns={:?}",
-        ipstr(lease.ip), ipstr(lease.mask), ipstr(lease.router), lease.dns.iter().map(|d| ipstr(*d)).collect::<Vec<_>>());
+    log!("DHCP lease: ip={} mask={} gw={} dns={:?} lease={}s",
+        ipstr(lease.ip), ipstr(lease.mask), ipstr(lease.router),
+        lease.dns.iter().map(|d| ipstr(*d)).collect::<Vec<_>>(), lease.lease_secs);
 
     // address
     let mut ra = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(lease.ip) };
@@ -285,9 +286,12 @@ fn setup_network() -> std::io::Result<()> {
 
     // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
     // a long-running VM would eventually lose its address. Renew in the
-    // background at ~half the lease interval (best-effort).
+    // background at ~half the lease interval (best-effort). `velox.dhcprenew=<secs>`
+    // on the cmdline (via VELOX_KCMDLINE_EXTRA) forces the interval — a test/ops
+    // knob to exercise renewal without waiting out a long vmnet lease.
     let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
-    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs));
+    let force = cmdline_value("velox.dhcprenew").and_then(|v| v.parse::<u64>().ok());
+    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs, force));
     Ok(())
 }
 
@@ -725,8 +729,11 @@ mod dhcp {
 
     /// Background renewal loop: re-request the lease at ~half its lifetime (or
     /// every 30 min if the server gave no lease time). Runs for the life of the VM.
-    pub fn renew_loop(ifname: &'static str, mac: [u8; 6], ip: u32, server: u32, lease_secs: u32) {
-        let interval = if lease_secs >= 120 { (lease_secs / 2) as u64 } else { 1800 };
+    /// `force_interval` (from `velox.dhcprenew`) overrides the cadence for testing.
+    pub fn renew_loop(ifname: &'static str, mac: [u8; 6], ip: u32, server: u32,
+                      lease_secs: u32, force_interval: Option<u64>) {
+        let interval = force_interval
+            .unwrap_or(if lease_secs >= 120 { (lease_secs / 2) as u64 } else { 1800 });
         loop {
             std::thread::sleep(std::time::Duration::from_secs(interval));
             match renew(ifname, mac, ip, server) {
@@ -1052,6 +1059,10 @@ fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
             let req = "GET /events?filters=%7B%22type%22%3A%5B%22network%22%5D%7D HTTP/1.1\r\nHost: docker\r\n\r\n";
             if s.write_all(req.as_bytes()).is_ok() {
                 log!("direct-access: events informer connected");
+                // Informer rule: reconcile unconditionally on (re)connect — an event
+                // emitted before this subscription existed is lost forever (no replay),
+                // and dockerd may not flush response bytes until the next event.
+                let _ = trigger.send(());
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = s.read(&mut buf) {
                     if n == 0 { break }
@@ -1059,7 +1070,10 @@ fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
                 }
             }
         }
-        std::thread::sleep(std::time::Duration::from_secs(2)); // socket gone — dockerd down; retry
+        // Quick retry: the subscription must be live before any API client can start a
+        // container (events from before it are unrecoverable). Cheap — this only spins
+        // while dockerd's socket is down (boot / restart), then blocks in read above.
+        std::thread::sleep(std::time::Duration::from_millis(250));
     });
 }
 
@@ -1093,11 +1107,15 @@ fn assert_direct_access_rules() {
                                 _ => settled = false,
                             }
                         }
-                        // Chain absent: dockerd creates the drop chains lazily (e.g.
-                        // raw-PREROUTING exists only while a container is attached), and
+                        // Genuinely-absent chain: dockerd creates the drop chains lazily
+                        // (raw-PREROUTING exists only while a container is attached), and
                         // an absent chain has no drops to bypass — nothing to do until
-                        // the informer re-triggers on the event that creates it.
-                        _ => {}
+                        // the informer re-triggers on the event that creates it. Any OTHER
+                        // failure (e.g. a transient error while dockerd is mid-rebuild)
+                        // must retry, or a rebuilt chain slips through unallowed.
+                        Ok(out) if String::from_utf8_lossy(&out.stderr)
+                                       .contains("No such file or directory") => {}
+                        _ => settled = false,
                     }
                 }
                 if settled { return }
