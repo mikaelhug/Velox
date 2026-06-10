@@ -162,6 +162,26 @@ final class DockerResourceStore {
     func refreshVolumes() async { await refresh(.volumes) }
     func refreshNetworks() async { await refresh(.networks) }
 
+    // MARK: - Disk usage (/system/df)
+
+    /// Last `/system/df` snapshot — sizes by category for the Overview breakdown and
+    /// the Reclaim sheet. Fetched on demand (df walks every image/container/volume in
+    /// the engine — too heavy to refresh per event), but cached HERE so those views
+    /// render the last snapshot instantly on every appearance and update in place;
+    /// view-local state made the breakdown card pop in on each pane switch. A failed
+    /// refresh keeps the snapshot and surfaces the error.
+    private(set) var diskUsage: DiskUsage?
+    private(set) var diskUsageError: String?
+
+    func refreshDiskUsage() async {
+        do {
+            diskUsage = try await docker.systemDiskUsage()
+            diskUsageError = nil
+        } catch {
+            diskUsageError = "\(error)"
+        }
+    }
+
     // MARK: - Lifecycle anchors (native uptime, no polling)
 
     /// A running container's lifecycle anchor: when it started, per dockerd's own

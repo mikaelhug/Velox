@@ -10,7 +10,13 @@ final class OverviewModel {
     let store: DockerResourceStore
     private(set) var diskUsedBytes: Int64?
 
-    init(store: DockerResourceStore) { self.store = store }
+    init(store: DockerResourceStore) {
+        self.store = store
+        // Synchronous metadata read — fill the disk gauge BEFORE the first frame so
+        // it never renders "—" and flips a beat later (the model is recreated on
+        // every pane switch, so this covers each appearance).
+        refreshDiskUsage()
+    }
 
     // List data is read from the shared store (persistent across pane switches); the
     // live CPU/memory aggregate below stays Overview-scoped (it streams 18 stats only
@@ -39,13 +45,10 @@ struct OverviewView: View {
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
     @State private var showReclaim = false
-    /// `/system/df` snapshot for the breakdown card — refreshed with the disk gauge
-    /// (on appear + when the container set changes; no timer). A failure keeps the
-    /// last snapshot and surfaces the error in the banner — never a silent vanish
-    /// (df 500s when the engine's stores are inconsistent, which is exactly when
-    /// the user needs to see why).
-    @State private var dockerDF: DiskUsage?
-    @State private var dfError: String?
+    // The /system/df snapshot lives in the STORE (not view state): it survives pane
+    // switches, so the breakdown card renders instantly on return instead of popping
+    // in. Refreshed with the disk gauge (on appear + when the container set changes;
+    // no timer); a failure keeps the snapshot and surfaces the error in the banner.
 
     init(store: DockerResourceStore, stats: StatsStore) {
         self.stats = stats
@@ -61,7 +64,7 @@ struct OverviewView: View {
                 hero
                 if let error = model.loadError ?? dfError { errorBanner(error) }
                 statGrid
-                if let df = dockerDF { DiskBreakdownCard(usage: df) }
+                if let df = model.store.diskUsage { DiskBreakdownCard(usage: df) }
                 // A separate view so its per-sample stats reads don't re-evaluate the
                 // whole Overview body (and its O(N) stat-card reductions) every tick.
                 LiveUsageSection(stats: stats)
@@ -72,7 +75,7 @@ struct OverviewView: View {
         .retainingStats(stats)
         .task(id: model.containers.count) {
             model.refreshDiskUsage()
-            await refreshDF()
+            await model.store.refreshDiskUsage()
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
@@ -84,9 +87,10 @@ struct OverviewView: View {
         }
         .sheet(isPresented: $showReclaim) {
             if let docker = engine.docker {
-                ReclaimSpaceSheet(docker: docker, isPresented: $showReclaim) {
+                ReclaimSpaceSheet(docker: docker, seed: model.store.diskUsage,
+                                  isPresented: $showReclaim) {
                     model.refreshDiskUsage()
-                    Task { await refreshDF() }
+                    Task { await model.store.refreshDiskUsage() }
                 }
             }
         }
@@ -124,16 +128,8 @@ struct OverviewView: View {
         }
     }
 
-    /// Refresh the `/system/df` snapshot. On failure the previous snapshot stays on
-    /// screen and the error is shown in the banner.
-    private func refreshDF() async {
-        guard let docker = engine.docker else { return }
-        do {
-            dockerDF = try await docker.systemDiskUsage()
-            dfError = nil
-        } catch {
-            dfError = "Disk breakdown unavailable: \(error)"
-        }
+    private var dfError: String? {
+        model.store.diskUsageError.map { "Disk breakdown unavailable: \($0)" }
     }
 
     private var allocationSummary: String {
@@ -286,8 +282,18 @@ private struct ReclaimSpaceSheet: View {
     @State private var running = false
     @State private var reclaimed: UInt64?
     @State private var failure: String?
-    /// One `/system/df` fetch when the sheet opens — each toggle shows what it frees.
+    /// Each toggle shows what it frees. Seeded with the store's last snapshot so the
+    /// sheet opens with sizes already in place (no pop-in); a fresh fetch on open —
+    /// and after a run — updates them.
     @State private var usage: DiskUsage?
+
+    init(docker: any DockerClientProtocol, seed: DiskUsage?, isPresented: Binding<Bool>,
+         onReclaimed: @escaping () -> Void = {}) {
+        self.docker = docker
+        self.onReclaimed = onReclaimed
+        _isPresented = isPresented
+        _usage = State(initialValue: seed)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -365,6 +371,8 @@ private struct ReclaimSpaceSheet: View {
                 if v { total += try await docker.pruneVolumes() }
                 reclaimed = total
                 onReclaimed()
+                // Re-fetch so the per-toggle sizes reflect what's left after the run.
+                usage = try? await docker.systemDiskUsage()
             } catch {
                 failure = "\(error)"
             }
