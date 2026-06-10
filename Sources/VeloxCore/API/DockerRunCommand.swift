@@ -19,7 +19,7 @@ public enum DockerRunCommand {
                 let pieces = containerPort.split(separator: "/")
                 let cport = pieces.first.map(String.init) ?? containerPort
                 let proto = pieces.count > 1 ? String(pieces[1]) : "tcp"
-                for h in hosts ?? [] {
+                for h in hosts {
                     guard let host = h.hostPort, !host.isEmpty else { continue }
                     parts += ["-p", proto == "tcp" ? "\(host):\(cport)" : "\(host):\(cport)/\(proto)"]
                 }
