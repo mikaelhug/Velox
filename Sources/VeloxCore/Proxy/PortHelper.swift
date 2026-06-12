@@ -50,6 +50,15 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
         PortHelperClient.route(add: add, subnet: subnet, gateway: gateway)
     }
 
+    /// Switch `net.inet.ip.forwarding` back on via the helper (restore-only — the
+    /// helper cannot turn it off). It's the kernel switch Apple's vmnet NAT (the whole
+    /// container datapath) rides on; some VPN clients zero it on connect. Best-effort;
+    /// requires the helper to be installed (the same one-time grant).
+    @discardableResult
+    public func restoreIPForwarding() -> Bool {
+        PortHelperClient.restoreIPForwarding()
+    }
+
     /// Ensure the helper is installed and running, prompting for admin authorization
     /// once if needed. Single-flight; never re-prompts after a decline.
     public func ensureInstalled() async -> Bool {
@@ -164,6 +173,15 @@ enum PortHelperClient {
         defer { close(fd) }
         let req = add ? "route add \(subnet) \(gateway)\n" : "route del \(subnet)\n"
         guard writeAll(fd, Array(req.utf8)) else { return false }
+        var status: UInt8 = 0xFF
+        return recv(fd, &status, 1, 0) == 1 && status == 0
+    }
+
+    /// Ask the helper to restore `net.inet.ip.forwarding=1` (it can never set 0).
+    static func restoreIPForwarding() -> Bool {
+        guard let fd = connectToDaemon() else { return false }
+        defer { close(fd) }
+        guard writeAll(fd, Array("ipfwd\n".utf8)) else { return false }
         var status: UInt8 = 0xFF
         return recv(fd, &status, 1, 0) == 1 && status == 0
     }
@@ -294,8 +312,9 @@ enum PortHelperInstaller {
         let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: requiredRevision)
         Log.info("port-helper: requesting authorization to install the privileged port helper")
         let prompt = "Velox needs administrator access once to enable direct container access — "
-            + "reaching containers by name (like web.velox.local) and publishing ports below 1024 "
-            + "(such as 80 and 443). This is a one-time setup — you won't be asked again."
+            + "reaching containers by name (like web.velox.local), publishing ports below 1024 "
+            + "(such as 80 and 443), and keeping container networking alive alongside VPN clients. "
+            + "This is a one-time setup — you won't be asked again."
         guard await runAsAdmin(script, prompt: prompt) else {
             Log.warn("port-helper: installation was not authorized")
             return false

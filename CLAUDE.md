@@ -35,12 +35,19 @@ pillars that deliver it:
    proxy, port forwarding, clock sync, the SwiftUI GUI — is pure Swift on
    `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons** — with
    **one sanctioned exception**: `velox-porthelper`, a tiny root LaunchDaemon (still
-   Swift, `Sources/velox-porthelper/`) that exists *only* for the two things macOS gives
-   an unprivileged process no other way to do, both **control-plane**: (a) bind a loopback
-   port `<1024` and pass the listening socket fd back over a unix socket, and (b) add/remove
+   Swift, `Sources/velox-porthelper/`) that exists *only* for the things macOS gives
+   an unprivileged process no other way to do, all **control-plane**: (a) bind a loopback
+   port `<1024` and pass the listening socket fd back over a unix socket, (b) add/remove
    a host route to a container subnet (for direct **named-container access** — `<name>.velox.local`
-   → the container's real IP). It never touches connection data, so **root stays out of the
-   datapath**. It is installed on first use with a single admin prompt (no Developer ID ⇒ no
+   → the container's real IP), and (c) restore `net.inet.ip.forwarding=1` — **restore-only,
+   it can never switch forwarding off**. (c) exists because some VPN clients (measured:
+   the OpenVPN-based AWS VPN Client) zero that sysctl on connect, killing the entire
+   vmnet NAT datapath for every container while the routing table stays clean; the
+   `ForwardingGuard` (event-driven: NWPathMonitor push → unprivileged sysctl re-read →
+   helper restore) heals it instantly, no engine restart. A VPN merely holding the
+   default route — e.g. full-tunnel WireGuard — does NOT break vmnet and needs no
+   handling (measured); don't add default-route-based VPN gates. It never touches
+   connection data, so **root stays out of the datapath**. It is installed on first use with a single admin prompt (no Developer ID ⇒ no
    `SMAppService`; a manual `osascript`-authorized LaunchDaemon install that *also* writes
    `/etc/resolver/velox.local`), and the host degrades gracefully (skip privileged ports / no
    named access) if the user declines. Keep it minimal: this is the *only* privileged component,

@@ -142,6 +142,19 @@ macOS automatically.
 Every version is pinned in one file (`versions.env`); CI builds a release on
 every `v*` tag.
 
+## VPNs
+
+Velox coexists with VPNs — including full-tunnel WireGuard — with one known
+interaction: some VPN clients (notably the OpenVPN-based **AWS VPN Client**)
+silently switch off macOS's kernel packet forwarding when they connect, which
+kills NAT egress for **every** VM on the Mac (vmnet-based Docker engines, UTM,
+Internet Sharing…), not just Velox. The symptom is DNS resolving but every
+container connection timing out. Velox detects the flip the moment it happens
+(event-driven, no polling) and restores forwarding through its privileged
+helper, so container networking keeps working with the VPN connected. If the
+helper grant was declined, the engine log names the cause and the one-line
+manual fix (`sudo sysctl -w net.inet.ip.forwarding=1`).
+
 ## vs Apple's `container`
 
 Apple's [`container`](https://github.com/apple/container) validates the same

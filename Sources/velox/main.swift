@@ -64,6 +64,11 @@ func runStatus() {
     let config = VZVirtualMachineConfiguration()
     _ = config // proves Virtualization.framework links
     print("Virtualization.framework: linked")
+    if ForwardingGuard.forwardingEnabled() == false {
+        print("warning: net.inet.ip.forwarding is OFF (a VPN client likely disabled "
+              + "it) — containers have no internet until a running engine restores it, "
+              + "or: sudo sysctl -w net.inet.ip.forwarding=1")
+    }
     #if !arch(arm64)
     print("warning: Velox targets Apple Silicon (arm64) first.")
     #endif

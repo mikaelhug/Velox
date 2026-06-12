@@ -29,6 +29,7 @@ public final class EngineRuntime: @unchecked Sendable {
     private let nameDNS: NameDNSResponder
     private let watcher: DockerEventsWatcher
     private let clockSync: ClockSync
+    private let forwardingGuard: ForwardingGuard
     /// Set by the async gateway-probe task once the fast path is up; guarded by `lock`
     /// because `stop()` can race the probe.
     private var conduitPool: ConduitPool?
@@ -69,6 +70,9 @@ public final class EngineRuntime: @unchecked Sendable {
             names: registry,
             onSubnets: { router.update(subnets: $0) })
         clockSync = ClockSync(manager: manager)
+        // Some VPN clients zero net.inet.ip.forwarding on connect, which kills the
+        // entire vmnet NAT datapath; the guard restores it through the helper.
+        forwardingGuard = ForwardingGuard(helper: helper)
     }
 
     /// Wire everything up. Throws only if the Docker unix-socket proxy can't bind
@@ -78,6 +82,7 @@ public final class EngineRuntime: @unchecked Sendable {
         try? nameDNS.start()  // loopback-only; named access is off without it
         watcher.start()       // event-driven -p port forwarding + name registry
         clockSync.start()     // keep the guest clock aligned across host sleep
+        forwardingGuard.start() // keep vmnet NAT alive alongside VPN clients
         // Fast published-port datapath: learn the (Swift-opaque) VZNAT gateway from the
         // guest, then bind a warm conduit pool so published ports ride VZNAT instead of
         // the vsock relay. Best-effort and async (the probe waits on guest DHCP): on
@@ -118,6 +123,7 @@ public final class EngineRuntime: @unchecked Sendable {
         let pool = conduitPool
         conduitPool = nil
         lock.unlock()
+        forwardingGuard.stop()
         watcher.stop()
         nameDNS.stop()
         namedRouter.stop()  // remove host routes so none dangle once the VM is gone

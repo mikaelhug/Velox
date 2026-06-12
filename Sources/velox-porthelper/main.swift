@@ -12,6 +12,7 @@
 //! Protocol (one request per connection, on `/var/run/velox-porthelper.sock`):
 //!   client → "tcp <port>\n" | "udp <port>\n"          (1 ≤ port < 1024)
 //!          | "route add <cidr> <ipv4>\n" | "route del <cidr>\n"  (RFC-1918 only, strictly validated)
+//!          | "ipfwd\n"                                (restore net.inet.ip.forwarding=1; never 0)
 //!   helper → 1 status byte (0 = ok, else errno) + on a port bind the fd via SCM_RIGHTS
 //! Only the uid passed as `--uid` (the installing user) is served; everything else is
 //! rejected. The control socket lives in root-only-writable /var/run, so no other
@@ -108,10 +109,12 @@ func reply(_ conn: Int32, fd: Int32, status: UInt8) {
     }
 }
 
-/// One parsed request: bind a privileged loopback port, or add/remove a host route.
+/// One parsed request: bind a privileged loopback port, add/remove a host route, or
+/// restore IP forwarding.
 enum Req {
     case bind(type: Int32, port: UInt16)
     case route(add: Bool, subnet: String, gateway: String)
+    case ipForward
 }
 
 /// Parse a dotted-quad to a host-order UInt32, or nil.
@@ -160,9 +163,21 @@ func runRoute(add: Bool, subnet: String, gateway: String) -> Int32 {
     return 0   // best-effort: a delete of a missing route or add of an existing one is fine
 }
 
+/// Restore the kernel IP-forwarding switch that Apple's vmnet NAT (the whole container
+/// datapath) requires. Some VPN clients set `net.inet.ip.forwarding=0` system-wide on
+/// connect (measured: AWS VPN Client), instantly killing every container's egress.
+/// Restore-only by design: this helper can switch forwarding ON, never off — the
+/// smallest possible capability, pure control plane.
+func restoreIPForwarding() -> Int32 {
+    var one: Int32 = 1
+    let rc = sysctlbyname("net.inet.ip.forwarding", nil, nil, &one, MemoryLayout<Int32>.size)
+    return rc == 0 ? 0 : errno
+}
+
 /// Read one bounded request line, parse + validate it.
 ///   "tcp <port>" | "udp <port>"                 (1 ≤ port < 1024) → bind
 ///   "route add <cidr> <ipv4>" | "route del <cidr>" (validated)    → route
+///   "ipfwd"                                                       → ipForward
 func readRequest(_ conn: Int32, max: Int = 96) -> Req? {
     var bytes = [UInt8](); bytes.reserveCapacity(max)
     var b: UInt8 = 0
@@ -185,6 +200,9 @@ func readRequest(_ conn: Int32, max: Int = 96) -> Req? {
         case "del": return .route(add: false, subnet: parts[2], gateway: parts.count > 3 ? parts[3] : "0.0.0.0")
         default: return nil
         }
+    case "ipfwd":
+        guard parts.count == 1 else { return nil }
+        return .ipForward
     default: return nil
     }
 }
@@ -226,6 +244,10 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
         let rc = runRoute(add: add, subnet: subnet, gateway: gateway)
         reply(conn, fd: -1, status: UInt8(truncatingIfNeeded: rc))
         log("route \(add ? "add" : "del") \(subnet)\(add ? " → \(gateway)" : "") (rc \(rc))")
+    case .ipForward:
+        let rc = restoreIPForwarding()
+        reply(conn, fd: -1, status: UInt8(truncatingIfNeeded: rc))
+        log("ipfwd: net.inet.ip.forwarding restored to 1 (rc \(rc))")
     }
 }
 
