@@ -68,10 +68,18 @@ struct ImagesView: View {
     }
 
     private var filtered: [ImageSummary] {
-        guard !ui.imageSearch.isEmpty else { return model.images }
-        return model.images.filter {
+        let base = ui.imageSearch.isEmpty ? model.images : model.images.filter {
             $0.repository.localizedCaseInsensitiveContains(ui.imageSearch)
                 || $0.tag.localizedCaseInsensitiveContains(ui.imageSearch)
+        }
+        // Alphabetical by repository, then tag — with dangling `<none>` images sunk to
+        // the bottom (punctuation would otherwise collate them above real repos).
+        return base.sorted { a, b in
+            let aNone = a.repository == "<none>", bNone = b.repository == "<none>"
+            if aNone != bNone { return bNone }
+            let r = a.repository.localizedCaseInsensitiveCompare(b.repository)
+            if r != .orderedSame { return r == .orderedAscending }
+            return a.tag.localizedCaseInsensitiveCompare(b.tag) == .orderedAscending
         }
     }
 
