@@ -115,15 +115,16 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
 /// host bind, with where it lands in the container.
 public struct MountPoint: Decodable, Sendable, Hashable {
     public let type: String        // "volume" | "bind" | "tmpfs"
+    public let name: String?       // the named volume's name (volume mounts only)
     public let source: String      // volume name's host path, or the bind source
     public let destination: String // path inside the container
 
     enum CodingKeys: String, CodingKey {
-        case type = "Type", source = "Source", destination = "Destination"
+        case type = "Type", name = "Name", source = "Source", destination = "Destination"
     }
 
-    public init(type: String, source: String, destination: String) {
-        self.type = type; self.source = source; self.destination = destination
+    public init(type: String, name: String? = nil, source: String, destination: String) {
+        self.type = type; self.name = name; self.source = source; self.destination = destination
     }
 }
 
@@ -243,12 +244,15 @@ public struct Volume: Decodable, Sendable, Identifiable, Hashable {
     public let mountpoint: String
     public let createdAt: String?
     public let size: Int64?
+    /// Volume labels as `/volumes` reports them — carries the Compose metadata
+    /// (`com.docker.compose.project`) the Volumes pane groups by.
+    public let labels: [String: String]
 
     public var id: String { name }
 
     enum CodingKeys: String, CodingKey {
         case name = "Name", driver = "Driver", mountpoint = "Mountpoint"
-        case createdAt = "CreatedAt", usageData = "UsageData"
+        case createdAt = "CreatedAt", labels = "Labels", usageData = "UsageData"
     }
     enum UsageKeys: String, CodingKey { case size = "Size" }
 
@@ -258,6 +262,7 @@ public struct Volume: Decodable, Sendable, Identifiable, Hashable {
         driver = try c.decodeIfPresent(String.self, forKey: .driver) ?? "local"
         mountpoint = try c.decodeIfPresent(String.self, forKey: .mountpoint) ?? ""
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+        labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
         if let usage = try? c.nestedContainer(keyedBy: UsageKeys.self, forKey: .usageData) {
             let s = try usage.decodeIfPresent(Int64.self, forKey: .size) ?? -1
             size = s >= 0 ? s : nil
@@ -267,9 +272,16 @@ public struct Volume: Decodable, Sendable, Identifiable, Hashable {
     }
 
     public init(name: String, driver: String = "local", mountpoint: String,
-                createdAt: String? = nil, size: Int64? = nil) {
+                createdAt: String? = nil, size: Int64? = nil, labels: [String: String] = [:]) {
         self.name = name; self.driver = driver; self.mountpoint = mountpoint
-        self.createdAt = createdAt; self.size = size
+        self.createdAt = createdAt; self.size = size; self.labels = labels
+    }
+
+    /// Compose project this volume belongs to, if any (the standard
+    /// `com.docker.compose.project` label set by `docker compose`).
+    public var composeProject: String? {
+        let p = labels["com.docker.compose.project"]
+        return (p?.isEmpty == false) ? p : nil
     }
 }
 

@@ -11,12 +11,18 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
         ContainerSummary(id: "a1b2c3d4e5f60000000000000000000000000000000000000000000000000000",
                          names: ["web"], image: "nginx:latest", state: "running",
                          status: "Up 12 minutes",
-                         ports: [PortMapping(privatePort: 80, publicPort: 8080)]),
+                         ports: [PortMapping(privatePort: 80, publicPort: 8080)],
+                         mounts: [MountPoint(type: "volume", name: "pgdata",
+                                             source: "/var/lib/docker/volumes/pgdata/_data",
+                                             destination: "/data")]),
         ContainerSummary(id: "b2c3d4e5f6a70000000000000000000000000000000000000000000000000000",
                          names: ["acme-api-1"], image: "ghcr.io/acme/api:2.3", state: "running",
                          status: "Up 3 hours",
                          ports: [PortMapping(privatePort: 3000, publicPort: 3000)],
-                         labels: ["com.docker.compose.project": "acme", "com.docker.compose.service": "api"]),
+                         labels: ["com.docker.compose.project": "acme", "com.docker.compose.service": "api"],
+                         mounts: [MountPoint(type: "volume", name: "acme_dbdata",
+                                             source: "/var/lib/docker/volumes/acme_dbdata/_data",
+                                             destination: "/var/lib/postgresql/data")]),
         ContainerSummary(id: "c3d4e5f6a7b80000000000000000000000000000000000000000000000000000",
                          names: ["acme-cache-1"], image: "redis:7", state: "paused",
                          status: "Up 1 hour (Paused)",
@@ -40,12 +46,27 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
     ]
 
     public static let sampleVolumes: [Volume] = [
+        // Standalone, referenced by `web` → live.
         Volume(name: "pgdata", mountpoint: "/var/lib/docker/volumes/pgdata/_data",
                createdAt: "2026-05-30T10:00:00Z", size: 412_000_000),
+        // Standalone, no container references these → dangling.
         Volume(name: "redis-cache", mountpoint: "/var/lib/docker/volumes/redis-cache/_data",
                createdAt: "2026-06-01T08:30:00Z", size: 24_000_000),
         Volume(name: "build-cache", driver: "local",
                mountpoint: "/var/lib/docker/volumes/build-cache/_data", size: nil),
+        // Compose project "acme" — its containers still exist → live group.
+        Volume(name: "acme_dbdata", mountpoint: "/var/lib/docker/volumes/acme_dbdata/_data",
+               createdAt: "2026-05-28T09:00:00Z", size: 631_000_000,
+               labels: ["com.docker.compose.project": "acme", "com.docker.compose.volume": "dbdata"]),
+        // Same live project, but no container mounts this one (its container was removed)
+        // → dangling inside a live group.
+        Volume(name: "acme_uploads", mountpoint: "/var/lib/docker/volumes/acme_uploads/_data",
+               createdAt: "2026-05-28T09:05:00Z", size: 12_000_000,
+               labels: ["com.docker.compose.project": "acme", "com.docker.compose.volume": "uploads"]),
+        // Compose project "oldstack" — no containers remain → orphaned group.
+        Volume(name: "oldstack_data", mountpoint: "/var/lib/docker/volumes/oldstack_data/_data",
+               createdAt: "2026-04-15T12:00:00Z", size: 88_000_000,
+               labels: ["com.docker.compose.project": "oldstack", "com.docker.compose.volume": "data"]),
     ]
 
     public static let sampleNetworks: [NetworkSummary] = [

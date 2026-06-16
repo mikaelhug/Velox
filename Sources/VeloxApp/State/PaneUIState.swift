@@ -22,5 +22,7 @@ final class PaneUIState {
     var imageSelection: Set<String> = []
     // Volumes
     var volumeSelection: Set<String> = []
+    /// Compose project names the user collapsed in the Volumes pane (absence ⇒ expanded).
+    var volumeCollapsed: Set<String> = []
     var volumeInspector = true
 }

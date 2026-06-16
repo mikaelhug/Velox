@@ -89,7 +89,8 @@ public actor DockerClient: DockerClientProtocol {
                           driver: volume.driver,
                           mountpoint: volume.mountpoint,
                           createdAt: volume.createdAt,
-                          size: size)
+                          size: size,
+                          labels: volume.labels)
         }
     }
 
