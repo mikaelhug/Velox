@@ -14,17 +14,47 @@ import VeloxCore
 @MainActor
 @Observable
 final class StatsStore {
-    /// Latest sample per running container — table cells read this by id.
+    /// Latest sample per running container — the Containers table reads this by id.
+    /// Published as a ~1 Hz **snapshot** (see `recompute`), not per raw sample: Swift
+    /// Observation tracks a dictionary at whole-property granularity, so updating it on
+    /// every sample would re-evaluate *every* visible usage cell on *every* sample (≈N²).
     private(set) var latest: [String: ContainerStatsSample] = [:]
     /// Live aggregate across running containers — the Overview reads these.
     private(set) var totalCPU: Double = 0
     private(set) var totalMemBytes: UInt64 = 0
     private(set) var cpuHistory: [Double] = []
     private(set) var memHistory: [Double] = []
+    // Disk/network are throughput (bytes/sec), derived per-container from successive
+    // samples and SUMMED — the Overview's mirrored I/O graphs read these directional
+    // totals + their 90-sample histories. (Read/In above the baseline, Write/Out below.)
+    private(set) var totalDiskRead: Double = 0
+    private(set) var totalDiskWrite: Double = 0
+    private(set) var totalNetRx: Double = 0
+    private(set) var totalNetTx: Double = 0
+    private(set) var diskReadHistory: [Double] = []
+    private(set) var diskWriteHistory: [Double] = []
+    private(set) var netRxHistory: [Double] = []
+    private(set) var netTxHistory: [Double] = []
 
     private let docker: any DockerClientProtocol
     private let resources: DockerResourceStore
     private let historyCap = 90
+
+    /// Per-container I/O throughput (bytes/sec), the delta of each container's cumulative
+    /// counters between its last two samples. Summed across containers in `recompute()`.
+    private struct IORates { var diskRead = 0.0, diskWrite = 0.0, netRx = 0.0, netTx = 0.0 }
+    private var rates: [String: IORates] = [:]
+
+    /// Per-sample raw samples (NOT observed by any view) — the live source the deltas and
+    /// the throttled `latest` snapshot are built from. Mutating this per sample is free:
+    /// no view reads it, so it triggers no re-render.
+    private var raw: [String: ContainerStatsSample] = [:]
+
+    /// Timestamp of the last aggregate publish, so we refresh the Overview at ~1 Hz no
+    /// matter how many containers stream (each emits ~1 Hz, out of phase). Driven by the
+    /// sample's own clock — still event-driven, no timer — and it keeps the graphs from
+    /// re-rendering N×/sec (lean: idle/off-screen ⇒ no work; active ⇒ one redraw/sec).
+    private var lastTick: Date?
 
     // Streams run only while a stats view is retained. A short grace on the last
     // release means a Containers↔Overview switch (release-then-retain) doesn't tear
@@ -97,22 +127,64 @@ final class StatsStore {
         for (id, task) in streams where !running.contains(id) {
             task.cancel()              // cancel unwinds an idle stats read promptly on shutdown
             streams[id] = nil
-            latest[id] = nil
+            raw[id] = nil
+            rates[id] = nil            // drop its throughput so it leaves the sum cleanly
         }
-        recompute()
+        recompute(force: true)         // a container appeared/vanished — reflect it now
     }
 
     private func ingest(_ id: String, _ sample: ContainerStatsSample) {
         guard streams[id] != nil else { return } // late sample for a just-removed id
-        latest[id] = sample
-        recompute()
+        // Derive throughput against THIS container's previous sample, before it's replaced.
+        rates[id] = Self.rate(prev: raw[id], now: sample)
+        raw[id] = sample
+        recompute(now: sample.read)
     }
 
-    private func recompute() {
-        totalCPU = latest.values.reduce(0) { $0 + $1.cpuPercent }
-        totalMemBytes = latest.values.reduce(0) { $0 + $1.memoryBytes }
-        push(&cpuHistory, totalCPU)
-        push(&memHistory, Double(totalMemBytes))
+    /// Per-second I/O throughput from one container's two latest samples. The first sample
+    /// (no `prev`) yields zero; a counter reset on container restart clamps to zero; dt comes
+    /// from the samples' own `read` timestamps, floored to avoid div-by-zero / false spikes.
+    private static func rate(prev: ContainerStatsSample?, now: ContainerStatsSample) -> IORates {
+        guard let prev else { return IORates() }
+        let dt: Double
+        if let a = prev.read, let b = now.read { dt = max(b.timeIntervalSince(a), 0.5) }
+        else { dt = 1.0 }
+        func r(_ new: UInt64, _ old: UInt64) -> Double { new >= old ? Double(new - old) / dt : 0 }
+        return IORates(diskRead: r(now.blkReadBytes, prev.blkReadBytes),
+                       diskWrite: r(now.blkWriteBytes, prev.blkWriteBytes),
+                       netRx: r(now.netRxBytes, prev.netRxBytes),
+                       netTx: r(now.netTxBytes, prev.netTxBytes))
+    }
+
+    /// Recompute the aggregates and advance the histories. Throttled to ~1 Hz by the
+    /// sample clock (unless `force`d by a container add/remove) so a fleet of containers
+    /// can't drive the Overview to re-render many times a second. `latest`/`rates` are
+    /// already updated per-sample by the caller; this only governs the *published* state.
+    private func recompute(now: Date? = nil, force: Bool = false) {
+        if !force, let last = lastTick {
+            let dt = (now ?? Date()).timeIntervalSince(last)
+            if dt >= 0 && dt < 0.9 { return }   // <0 ⇒ guest clock stepped back: let it through
+        }
+        lastTick = now ?? Date()
+        // One pass over the running set: CPU/mem from the raw samples, disk/net from each
+        // container's per-second rate. Aggregate-of-per-container-deltas (NOT delta-of-
+        // aggregate): a container starting/stopping would otherwise inject its whole
+        // lifetime counter as a one-tick spike.
+        var cpu = 0.0, mem: UInt64 = 0, dRead = 0.0, dWrite = 0.0, nRx = 0.0, nTx = 0.0
+        for (id, sample) in raw {
+            cpu += sample.cpuPercent
+            mem += sample.memoryBytes
+            if let r = rates[id] { dRead += r.diskRead; dWrite += r.diskWrite; nRx += r.netRx; nTx += r.netTx }
+        }
+        totalCPU = cpu; totalMemBytes = mem
+        totalDiskRead = dRead; totalDiskWrite = dWrite; totalNetRx = nRx; totalNetTx = nTx
+        latest = raw   // publish the per-container snapshot the Containers table reads (1 Hz)
+        push(&cpuHistory, cpu)
+        push(&memHistory, Double(mem))
+        push(&diskReadHistory, dRead)
+        push(&diskWriteHistory, dWrite)
+        push(&netRxHistory, nRx)
+        push(&netTxHistory, nTx)
     }
 
     private func push(_ array: inout [Double], _ value: Double) {
@@ -125,7 +197,13 @@ final class StatsStore {
         for task in streams.values { task.cancel() }
         streams.removeAll()
         latest.removeAll()
+        raw.removeAll()
+        rates.removeAll()
+        lastTick = nil
         totalCPU = 0; totalMemBytes = 0
+        totalDiskRead = 0; totalDiskWrite = 0; totalNetRx = 0; totalNetTx = 0
         cpuHistory.removeAll(); memHistory.removeAll()
+        diskReadHistory.removeAll(); diskWriteHistory.removeAll()
+        netRxHistory.removeAll(); netTxHistory.removeAll()
     }
 }

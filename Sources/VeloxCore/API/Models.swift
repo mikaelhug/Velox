@@ -550,9 +550,25 @@ public struct ContainerStatsSample: Sendable, Hashable {
     public let cpuPercent: Double      // 0…(100 * cores)
     public let memoryBytes: UInt64
     public let memoryLimit: UInt64
+    // Cumulative network/block-I/O counters straight from the same payload. They're
+    // monotonic totals, not rates — and unlike CPU the payload ships no "previous"
+    // value for them — so the Overview derives per-second throughput from the delta
+    // against the prior sample in `StatsStore`. The model just carries the raw counters
+    // plus `read` (the sample's own timestamp) for that delta's dt.
+    public let netRxBytes: UInt64
+    public let netTxBytes: UInt64
+    public let blkReadBytes: UInt64
+    public let blkWriteBytes: UInt64
+    public let read: Date?
 
-    public init(cpuPercent: Double, memoryBytes: UInt64, memoryLimit: UInt64) {
+    public init(cpuPercent: Double, memoryBytes: UInt64, memoryLimit: UInt64,
+                netRxBytes: UInt64 = 0, netTxBytes: UInt64 = 0,
+                blkReadBytes: UInt64 = 0, blkWriteBytes: UInt64 = 0,
+                read: Date? = nil) {
         self.cpuPercent = cpuPercent; self.memoryBytes = memoryBytes; self.memoryLimit = memoryLimit
+        self.netRxBytes = netRxBytes; self.netTxBytes = netTxBytes
+        self.blkReadBytes = blkReadBytes; self.blkWriteBytes = blkWriteBytes
+        self.read = read
     }
 }
 
@@ -569,11 +585,23 @@ struct RawStats: Codable {
         let limit: UInt64?
         let stats: [String: UInt64]?
     }
+    // Per-interface network counters. Absent for host-network containers.
+    struct Net: Codable { let rx_bytes: UInt64?; let tx_bytes: UInt64? }
+    // Block-I/O counters. `io_service_bytes_recursive` is a list of {op, value} where op
+    // is "read"/"write" (newer daemons) or "Read"/"Write" (older) — match case-insensitively.
+    struct Blkio: Codable {
+        struct Entry: Codable { let op: String; let value: UInt64? }
+        let io_service_bytes_recursive: [Entry]?
+    }
     let cpu_stats: CPU
     let precpu_stats: CPU
     let memory_stats: Memory
+    let networks: [String: Net]?
+    let blkio_stats: Blkio?
+    let read: String?       // RFC3339Nano timestamp of this sample (drives the rate's dt)
 
-    /// Docker's documented CPU% formula.
+    /// Docker's documented CPU% formula, plus the cumulative net/disk counters the
+    /// Overview turns into throughput.
     func sample() -> ContainerStatsSample {
         let cpuDelta = Double(cpu_stats.cpu_usage.total_usage) - Double(precpu_stats.cpu_usage.total_usage)
         let sysDelta = Double(cpu_stats.system_cpu_usage ?? 0) - Double(precpu_stats.system_cpu_usage ?? 0)
@@ -582,9 +610,18 @@ struct RawStats: Codable {
         // Subtract cache so memory usage matches `docker stats`.
         let cache = memory_stats.stats?["inactive_file"] ?? memory_stats.stats?["cache"] ?? 0
         let usage = (memory_stats.usage ?? 0) >= cache ? (memory_stats.usage ?? 0) - cache : (memory_stats.usage ?? 0)
+        // Sum network across every interface, block I/O across every device.
+        let rx = (networks ?? [:]).values.reduce(UInt64(0)) { $0 + ($1.rx_bytes ?? 0) }
+        let tx = (networks ?? [:]).values.reduce(UInt64(0)) { $0 + ($1.tx_bytes ?? 0) }
+        let blk = blkio_stats?.io_service_bytes_recursive ?? []
+        let rd = blk.reduce(UInt64(0)) { $0 + ($1.op.lowercased() == "read"  ? ($1.value ?? 0) : 0) }
+        let wr = blk.reduce(UInt64(0)) { $0 + ($1.op.lowercased() == "write" ? ($1.value ?? 0) : 0) }
         return ContainerStatsSample(cpuPercent: cpuPercent,
                                     memoryBytes: usage,
-                                    memoryLimit: memory_stats.limit ?? 0)
+                                    memoryLimit: memory_stats.limit ?? 0,
+                                    netRxBytes: rx, netTxBytes: tx,
+                                    blkReadBytes: rd, blkWriteBytes: wr,
+                                    read: DockerDates.parse(read))
     }
 }
 

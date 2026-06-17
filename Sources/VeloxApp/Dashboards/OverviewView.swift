@@ -175,13 +175,25 @@ private struct LiveUsageSection: View {
                 Text("Aggregate across running containers")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            HStack(spacing: Theme.gridSpacing) {
-                LiveMetricCard(title: "CPU", tint: .green,
-                               value: String(format: "%.0f%%", stats.totalCPU),
-                               history: stats.cpuHistory)
-                LiveMetricCard(title: "Memory", tint: .blue,
-                               value: Format.bytes(stats.totalMemBytes),
-                               history: stats.memHistory)
+            VStack(spacing: Theme.gridSpacing) {
+                HStack(spacing: Theme.gridSpacing) {
+                    LiveMetricCard(title: "CPU", tint: .green,
+                                   value: String(format: "%.0f%%", stats.totalCPU),
+                                   history: stats.cpuHistory)
+                    LiveMetricCard(title: "Memory", tint: .blue,
+                                   value: Format.bytes(stats.totalMemBytes),
+                                   history: stats.memHistory)
+                }
+                // Disk and Network are bidirectional, so they get the mirrored macOS-style
+                // graph — Read/In above the baseline, Write/Out below — not a single line.
+                HStack(spacing: Theme.gridSpacing) {
+                    LiveIOCard(title: "Disk I/O", upLabel: "Read", downLabel: "Write",
+                               upValue: stats.totalDiskRead, downValue: stats.totalDiskWrite,
+                               upHistory: stats.diskReadHistory, downHistory: stats.diskWriteHistory)
+                    LiveIOCard(title: "Network", upLabel: "In", downLabel: "Out",
+                               upValue: stats.totalNetRx, downValue: stats.totalNetTx,
+                               upHistory: stats.netRxHistory, downHistory: stats.netTxHistory)
+                }
             }
         }
     }
@@ -218,6 +230,48 @@ private struct LiveMetricCard: View {
                     .frame(height: 46)
             }
         }
+    }
+}
+
+/// A live bidirectional-I/O tile (macOS Activity Monitor style): two mirrored throughput
+/// series over a center baseline, with the up/down rates shown as colored readouts that
+/// double as the legend. Used for Disk (Read up / Write down) and Network (In up / Out down).
+private struct LiveIOCard: View {
+    let title: String
+    let upLabel: String
+    let downLabel: String
+    let upValue: Double      // bytes/sec
+    let downValue: Double
+    let upHistory: [Double]
+    let downHistory: [Double]
+    var upTint: Color = .blue
+    var downTint: Color = .red
+
+    var body: some View {
+        DashboardCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(title).font(.subheadline).foregroundStyle(.secondary)
+                    Spacer()
+                    readout(upLabel, upValue, upTint)
+                    readout(downLabel, downValue, downTint)
+                }
+                .lineLimit(1)
+                MirroredSparklineView(up: upHistory, down: downHistory,
+                                      upTint: upTint, downTint: downTint)
+                    .frame(height: 54)
+            }
+        }
+    }
+
+    private func readout(_ label: String, _ value: Double, _ tint: Color) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.caption2.weight(.semibold))
+            Text(Format.bytes(UInt64(max(0, value))) + "/s")
+                .font(.callout.monospacedDigit())
+                .contentTransition(.numericText())
+        }
+        .foregroundStyle(tint)
     }
 }
 

@@ -16,26 +16,78 @@ struct SparklineView: View {
             let stepX = size.width / CGFloat(values.count - 1)
 
             var line = Path()
+            var minY = size.height
             for (i, v) in values.enumerated() {
                 let x = CGFloat(i) * stepX
                 let y = size.height * (1 - CGFloat(min(v, ceiling) / ceiling))
+                minY = min(minY, y)
                 if i == 0 { line.move(to: CGPoint(x: x, y: y)) }
                 else { line.addLine(to: CGPoint(x: x, y: y)) }
             }
 
-            // Soft fill under the line.
+            // Soft fill under the line, anchored at the line's highest point (minY) rather
+            // than the canvas top — so a low line (idle CPU, a small I/O rate) still shows a
+            // visible fill instead of fading to almost nothing.
             var fill = line
             fill.addLine(to: CGPoint(x: size.width, y: size.height))
             fill.addLine(to: CGPoint(x: 0, y: size.height))
             fill.closeSubpath()
             context.fill(fill, with: .linearGradient(
-                Gradient(colors: [tint.opacity(0.25), tint.opacity(0.0)]),
-                startPoint: CGPoint(x: 0, y: 0),
+                Gradient(colors: [tint.opacity(0.30), tint.opacity(0.0)]),
+                startPoint: CGPoint(x: 0, y: minY),
                 endPoint: CGPoint(x: 0, y: size.height)))
 
             context.stroke(line, with: .color(tint), lineWidth: 1.5)
         }
-        .drawingGroup()
+    }
+}
+
+/// A macOS Activity Monitor–style I/O graph: two series mirrored about a horizontal
+/// center baseline — `up` (In / Read) fills upward, `down` (Out / Write) fills downward —
+/// each a line over a soft gradient. Both halves share one ceiling so their magnitudes are
+/// directly comparable. Cheap `Canvas`, same as `SparklineView`.
+struct MirroredSparklineView: View {
+    let up: [Double]
+    let down: [Double]
+    var upTint: Color = .blue
+    var downTint: Color = .red
+
+    var body: some View {
+        Canvas { context, size in
+            let midY = size.height / 2
+            let peak = max(up.max() ?? 0, down.max() ?? 0)
+            let ceiling = max(peak * 1.3, 0.0001)
+
+            // One series' line + fill, mapped from the midline (upward or downward).
+            func draw(_ values: [Double], goingUp: Bool, tint: Color) {
+                guard values.count > 1 else { return }
+                let stepX = size.width / CGFloat(values.count - 1)
+                var line = Path()
+                var extremeY = midY     // the point furthest from the baseline (the peak)
+                for (i, v) in values.enumerated() {
+                    let x = CGFloat(i) * stepX
+                    let frac = CGFloat(min(v, ceiling) / ceiling)
+                    let y = goingUp ? midY * (1 - frac) : midY + midY * frac
+                    extremeY = goingUp ? min(extremeY, y) : max(extremeY, y)
+                    if i == 0 { line.move(to: CGPoint(x: x, y: y)) }
+                    else { line.addLine(to: CGPoint(x: x, y: y)) }
+                }
+                var fill = line
+                fill.addLine(to: CGPoint(x: size.width, y: midY))
+                fill.addLine(to: CGPoint(x: 0, y: midY))
+                fill.closeSubpath()
+                // Anchor the gradient at the series' peak (not the card edge) so even small
+                // throughput still shows a visible fill under the line.
+                context.fill(fill, with: .linearGradient(
+                    Gradient(colors: [tint.opacity(0.30), tint.opacity(0.03)]),
+                    startPoint: CGPoint(x: 0, y: extremeY),
+                    endPoint: CGPoint(x: 0, y: midY)))
+                context.stroke(line, with: .color(tint), lineWidth: 1.5)
+            }
+
+            draw(up, goingUp: true, tint: upTint)
+            draw(down, goingUp: false, tint: downTint)
+        }
     }
 }
 

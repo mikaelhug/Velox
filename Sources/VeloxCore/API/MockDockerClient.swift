@@ -143,11 +143,21 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
         AsyncStream { continuation in
             Task {
                 var t = 0.0
+                // Cumulative counters (the store deltas them into throughput) — accumulate a
+                // sinusoidal amount each tick so the mirrored I/O graphs wave in previews.
+                var rx: UInt64 = 0, tx: UInt64 = 0, rd: UInt64 = 0, wr: UInt64 = 0
                 while !Task.isCancelled {
                     let cpu = 20 + 18 * (1 + sin(t)) + 6 * (1 + sin(t * 3.3))
                     let mem = UInt64(120_000_000 + 40_000_000 * (1 + sin(t * 0.7)))
+                    rx += UInt64(2_000_000 * (1 + sin(t * 0.9)))
+                    tx += UInt64(600_000 * (1 + sin(t * 1.4)))
+                    rd += UInt64(1_500_000 * (1 + sin(t * 0.5)))
+                    wr += UInt64(800_000 * (1 + sin(t * 1.1)))
                     continuation.yield(ContainerStatsSample(cpuPercent: cpu, memoryBytes: mem,
-                                                            memoryLimit: 512_000_000))
+                                                            memoryLimit: 512_000_000,
+                                                            netRxBytes: rx, netTxBytes: tx,
+                                                            blkReadBytes: rd, blkWriteBytes: wr,
+                                                            read: Date()))
                     t += 0.4
                     try? await Task.sleep(for: .milliseconds(500))
                 }

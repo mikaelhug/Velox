@@ -255,11 +255,11 @@ private struct UsageLine: View {
     let stats: StatsStore
 
     var body: some View {
-        let samples = stats.latest.values
-        let cpu = samples.reduce(0.0) { $0 + $1.cpuPercent }
-        let mem = samples.reduce(UInt64(0)) { $0 + $1.memoryBytes }
+        // Read the store's published aggregates (already summed, refreshed at ~1 Hz) rather
+        // than re-reducing `latest` here — which would also re-render this line on every raw
+        // per-container sample.
         // Verbatim: Int interpolation in a Text literal is locale-formatted.
-        Text(verbatim: "\(Int(cpu))% CPU · \(Format.bytes(mem)) RAM")
+        Text(verbatim: "\(Int(stats.totalCPU))% CPU · \(Format.bytes(stats.totalMemBytes)) RAM")
             .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
     }
 }
