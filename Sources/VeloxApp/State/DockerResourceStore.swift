@@ -134,7 +134,11 @@ final class DockerResourceStore {
     /// Re-read one resource list. Errors are surfaced per-resource (not thrown) so one
     /// failing list never blanks the others. `…Loaded` flips only on the first *success*
     /// (not a failed attempt), so the startup race — store starting before dockerd
-    /// answers — shows nothing rather than a false "No X".
+    /// answers — shows nothing rather than a false "No X". For the same reason an error
+    /// is recorded only *after* that first successful load: a pre-ready failure while
+    /// dockerd is still coming up (e.g. ECONNRESET / "Connection reset by peer") is
+    /// expected and stays silent, so the Overview never flashes it on launch. A genuine
+    /// mid-session failure — after the list has loaded once — still surfaces.
     func refresh(_ resource: Resource) async {
         switch resource {
         case .containers:
@@ -143,16 +147,16 @@ final class DockerResourceStore {
                 containersError = nil; containersLoaded = true
                 await refreshAnchors()
             }
-            catch { containersError = "\(error)" }
+            catch { if containersLoaded { containersError = "\(error)" } }
         case .images:
             do { images = try await docker.images(); imagesError = nil; imagesLoaded = true }
-            catch { imagesError = "\(error)" }
+            catch { if imagesLoaded { imagesError = "\(error)" } }
         case .volumes:
             do { volumes = try await docker.volumes(); volumesError = nil; volumesLoaded = true }
-            catch { volumesError = "\(error)" }
+            catch { if volumesLoaded { volumesError = "\(error)" } }
         case .networks:
             do { networks = try await docker.networks(); networksError = nil; networksLoaded = true }
-            catch { networksError = "\(error)" }
+            catch { if networksLoaded { networksError = "\(error)" } }
         }
     }
 
