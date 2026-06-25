@@ -10,6 +10,10 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-blue)
 ![Swift](https://img.shields.io/badge/host-100%25%20Swift-orange)
 
+[Website](https://mikaelhug.github.io/Velox/) ·
+[Benchmarks](docs/benchmarks.md) ·
+[Releases](https://github.com/mikaelhug/Velox/releases)
+
 <img src="docs/images/dashboard.png" width="820" alt="Velox dashboard — engine status, resource cards, disk breakdown, live usage" />
 
 </div>

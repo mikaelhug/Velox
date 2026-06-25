@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Velox - fast Docker on Apple Silicon Macs</title>
+    <meta
+      name="description"
+      content="Velox is a fast, lean, open-source Docker Desktop alternative for Apple Silicon Macs. It runs a real Docker Engine with the stock Docker CLI, a native Mac app, and reproducible benchmarks."
+    >
+    <meta name="theme-color" content="#111827">
+    <link rel="canonical" href="https://mikaelhug.github.io/Velox/">
+    <meta property="og:title" content="Velox - fast Docker on Apple Silicon Macs">
+    <meta
+      property="og:description"
+      content="A lightweight Docker Desktop alternative for macOS: stock Docker Engine, native Swift host, direct container names, and a small idle footprint."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://mikaelhug.github.io/Velox/">
+    <meta property="og:image" content="https://mikaelhug.github.io/Velox/images/dashboard.png">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Velox - fast Docker on Apple Silicon Macs">
+    <meta
+      name="twitter:description"
+      content="A fast, lean, open-source way to run Docker on Apple Silicon Macs."
+    >
+    <meta name="twitter:image" content="https://mikaelhug.github.io/Velox/images/dashboard.png">
+    <link rel="stylesheet" href="styles.css">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Velox",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "macOS 15+ on Apple Silicon",
+        "description": "A fast, lean, open-source Docker Desktop alternative for Apple Silicon Macs.",
+        "softwareVersion": "0.2.1",
+        "url": "https://mikaelhug.github.io/Velox/",
+        "downloadUrl": "https://github.com/mikaelhug/Velox/releases",
+        "codeRepository": "https://github.com/mikaelhug/Velox",
+        "programmingLanguage": ["Swift", "Rust", "Shell"],
+        "screenshot": "https://mikaelhug.github.io/Velox/images/dashboard.png"
+      }
+    </script>
+  </head>
+  <body>
+    <header class="hero">
+      <nav class="topbar" aria-label="Main navigation">
+        <a class="brand" href="#top" aria-label="Velox home">Velox</a>
+        <div class="nav-links">
+          <a href="#features">Features</a>
+          <a href="#benchmarks">Benchmarks</a>
+          <a href="#install">Install</a>
+          <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+        </div>
+      </nav>
+
+      <div class="hero-copy" id="top">
+        <p class="eyebrow">Docker Desktop alternative for Apple Silicon Macs</p>
+        <h1>Velox</h1>
+        <p class="lede">
+          A fast, lean way to run a real Docker Engine on macOS with the stock
+          Docker CLI, a native Swift host, and a self-contained app that gets
+          out of your way.
+        </p>
+        <div class="actions" aria-label="Primary actions">
+          <a class="button primary" href="#install">Install</a>
+          <a class="button secondary" href="benchmarks.html">Read benchmarks</a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="metric-band" aria-label="Velox performance summary">
+        <div class="metric">
+          <span class="metric-value">226 MB</span>
+          <span class="metric-label">self-contained app</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">1.74 s</span>
+          <span class="metric-label">warm restart to API-ready</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">~70 MB</span>
+          <span class="metric-label">empty idle host footprint</span>
+        </div>
+        <div class="metric">
+          <span class="metric-value">16x</span>
+          <span class="metric-label">faster small-file bind extract</span>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <div class="section-heading">
+          <p class="eyebrow">Native where it matters</p>
+          <h2>Docker workflows without the heavy desktop stack</h2>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <h3>Stock Docker CLI</h3>
+            <p>
+              Velox registers a Docker context named <code>velox</code>, so
+              Compose, Buildx, Testcontainers, SDKs, and existing scripts can
+              talk to the real Docker API.
+            </p>
+          </article>
+          <article class="feature">
+            <h3>Native Mac app</h3>
+            <p>
+              Inspect compose groups, containers, images, volumes, networks,
+              logs, resources, and disk usage from a SwiftUI app and menu-bar
+              quick panel.
+            </p>
+          </article>
+          <article class="feature">
+            <h3>Names that resolve</h3>
+            <p>
+              Reach containers from macOS at <code>&lt;name&gt;.velox.local</code>
+              with their real IPs, any protocol, and no published port required.
+            </p>
+          </article>
+          <article class="feature">
+            <h3>Small by design</h3>
+            <p>
+              One Swift host process manages the VM, Docker API proxy, port
+              forwarding, DNS, resource saver, and app UI without Electron or
+              always-on background daemons.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="split section">
+        <div>
+          <p class="eyebrow">Use Docker as Docker</p>
+          <h2>No wrapper command. No workflow migration.</h2>
+          <p>
+            Keep the Docker tooling you already use and point it at the Velox
+            context. The app can stay open for a full desktop experience, or
+            the CLI can run the engine headless.
+          </p>
+        </div>
+        <pre class="terminal"><code>curl -fsSL https://raw.githubusercontent.com/mikaelhug/Velox/main/install.sh | bash
+
+docker context use velox
+docker run --rm hello-world
+
+docker run -d --name web nginx
+curl http://web.velox.local</code></pre>
+      </section>
+
+      <section class="screens section" aria-label="Velox screenshots">
+        <img
+          src="images/containers.png"
+          alt="Velox containers dashboard showing compose groups, container names, local domains, CPU, and memory"
+          loading="lazy"
+        >
+      </section>
+
+      <section class="section" id="benchmarks">
+        <div class="section-heading">
+          <p class="eyebrow">Measured against Docker Desktop</p>
+          <h2>Reproducible numbers, including where Velox trails</h2>
+        </div>
+        <div class="comparison">
+          <div class="comparison-row">
+            <span>Install footprint</span>
+            <strong>10x smaller</strong>
+          </div>
+          <div class="comparison-row">
+            <span>Idle RAM, loaded benchmark baseline</span>
+            <strong>3.7x less</strong>
+          </div>
+          <div class="comparison-row">
+            <span>Container launch</span>
+            <strong>1.5x faster</strong>
+          </div>
+          <div class="comparison-row">
+            <span>Published port throughput</span>
+            <strong>3.3x faster</strong>
+          </div>
+          <div class="comparison-row">
+            <span>Cold image pull</span>
+            <strong>~0.9x, trails</strong>
+          </div>
+        </div>
+        <p class="note">
+          Full methodology, fairness controls, caveats, and the runnable
+          benchmark harness live on the <a href="benchmarks.html">benchmark page</a>.
+        </p>
+      </section>
+
+      <section class="architecture section">
+        <div class="section-heading">
+          <p class="eyebrow">How it is built</p>
+          <h2>A thin host, a minimal guest, and the real Docker Engine</h2>
+        </div>
+        <div class="architecture-list">
+          <p>
+            The host is Swift on Apple's <code>Virtualization.framework</code>.
+            Networking uses Apple's in-kernel VZNAT datapath.
+          </p>
+          <p>
+            The guest uses a kernel.org kernel, a static Rust init process, a
+            read-only erofs root filesystem, and stock <code>dockerd</code>.
+          </p>
+          <p>
+            The data disk is durable by default, with guest barriers and a raw
+            sparse image that can return freed space to macOS.
+          </p>
+        </div>
+      </section>
+
+      <section class="install section" id="install">
+        <div>
+          <p class="eyebrow">Try Velox</p>
+          <h2>Install the current release</h2>
+          <p>
+            Velox requires macOS 15 or newer on Apple Silicon. The app is signed
+            but not yet notarized, so manual installs need the quarantine step
+            shown in the README.
+          </p>
+        </div>
+        <div class="install-actions">
+          <a class="button primary" href="https://github.com/mikaelhug/Velox/releases">Download release</a>
+          <a class="button secondary" href="https://github.com/mikaelhug/Velox">View source</a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Velox</span>
+      <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="https://github.com/mikaelhug/Velox/issues">Issues</a>
+    </footer>
+  </body>
+</html>

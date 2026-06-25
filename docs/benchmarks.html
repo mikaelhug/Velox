@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Velox benchmarks - Docker Desktop comparison</title>
+    <meta
+      name="description"
+      content="Reproducible Velox benchmark results against Docker Desktop on Apple Silicon, including startup, memory, networking, filesystem, and cold pull measurements."
+    >
+    <meta name="theme-color" content="#111827">
+    <link rel="canonical" href="https://mikaelhug.github.io/Velox/benchmarks.html">
+    <meta property="og:title" content="Velox benchmarks">
+    <meta
+      property="og:description"
+      content="A reproducible head-to-head benchmark suite comparing Velox and Docker Desktop on Apple Silicon Macs."
+    >
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="https://mikaelhug.github.io/Velox/benchmarks.html">
+    <meta property="og:image" content="https://mikaelhug.github.io/Velox/images/dashboard.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="page-header">
+      <nav class="topbar" aria-label="Main navigation">
+        <a class="brand" href="./" aria-label="Velox home">Velox</a>
+        <div class="nav-links">
+          <a href="./#features">Features</a>
+          <a href="./#benchmarks">Benchmarks</a>
+          <a href="./#install">Install</a>
+          <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+        </div>
+      </nav>
+      <div class="page-title">
+        <p class="eyebrow">Reproducible benchmark suite</p>
+        <h1>Velox vs Docker Desktop</h1>
+        <p>
+          Same Mac, same resource caps, same pinned images, one engine under
+          load at a time. The harness and full methodology live in the repo.
+        </p>
+      </div>
+    </header>
+
+    <main>
+      <section class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Recorded run</p>
+          <h2>Apple M4 Pro, macOS 26.5.1, 8 vCPU / 8 GB</h2>
+          <p class="note">
+            These are the current published numbers from the benchmark docs.
+            See the source document for caveats, fairness controls, and the
+            runnable scripts.
+          </p>
+        </div>
+
+        <table class="benchmark-table">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Velox</th>
+              <th>Docker Desktop</th>
+              <th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Install footprint</td>
+              <td>226 MB</td>
+              <td>2,328 MB</td>
+              <td class="status-win">10.3x smaller</td>
+            </tr>
+            <tr>
+              <td>Idle RAM, host RSS</td>
+              <td>~0.9 GB</td>
+              <td>~3.3 GB</td>
+              <td class="status-win">3.7x less</td>
+            </tr>
+            <tr>
+              <td>Startup, restart to API-ready</td>
+              <td>1.74 s</td>
+              <td>2.55 s</td>
+              <td class="status-win">1.5x faster</td>
+            </tr>
+            <tr>
+              <td>Container launch</td>
+              <td>104 ms</td>
+              <td>160 ms</td>
+              <td class="status-win">1.5x faster</td>
+            </tr>
+            <tr>
+              <td>Network, container to host</td>
+              <td>88.8 Gbit/s</td>
+              <td>27.0 Gbit/s</td>
+              <td class="status-win">3.3x faster</td>
+            </tr>
+            <tr>
+              <td>Published port, 4 streams</td>
+              <td>59.2 Gbit/s</td>
+              <td>18.0 Gbit/s</td>
+              <td class="status-win">3.3x faster</td>
+            </tr>
+            <tr>
+              <td>VirtioFS bind-mount write</td>
+              <td>2,951 MB/s</td>
+              <td>956 MB/s</td>
+              <td class="status-win">3.1x faster</td>
+            </tr>
+            <tr>
+              <td>Small-file extract to bind mount</td>
+              <td>0.21 s</td>
+              <td>3.43 s</td>
+              <td class="status-win">16x faster</td>
+            </tr>
+            <tr>
+              <td>Durable commit latency, fio fsync 4K</td>
+              <td>0.31 ms</td>
+              <td>0.47 ms</td>
+              <td class="status-win">1.5x faster</td>
+            </tr>
+            <tr>
+              <td>Postgres pgbench TPS</td>
+              <td>13,318</td>
+              <td>11,690</td>
+              <td class="status-win">1.14x faster</td>
+            </tr>
+            <tr>
+              <td>Cold image pull</td>
+              <td>19.1 s</td>
+              <td>17.3 s</td>
+              <td class="status-trail">~0.9x, trails</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <p class="note">
+          Read the full markdown benchmark document on
+          <a href="https://github.com/mikaelhug/Velox/blob/main/docs/benchmarks.md">GitHub</a>
+          or inspect the runnable harness in
+          <a href="https://github.com/mikaelhug/Velox/tree/main/docs/bench">docs/bench</a>.
+        </p>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Velox</span>
+      <a href="./">Home</a>
+      <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+      <a href="https://github.com/mikaelhug/Velox/releases">Releases</a>
+    </footer>
+  </body>
+</html>
