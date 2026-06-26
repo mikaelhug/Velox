@@ -12,13 +12,21 @@ public enum Log {
     public static func error(_ message: String) { emit("error: ", message) }
 }
 
-/// Errors surfaced to the user with a readable description.
-public enum VeloxError: Error, CustomStringConvertible {
+/// Errors surfaced to the user with a readable description. `LocalizedError` so the
+/// message also rides `localizedDescription` — that's what the GUI stores in
+/// `EngineState.failed` and shows; without it macOS substitutes the generic
+/// "operation couldn't be completed."
+public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
     case guestArtifactMissing(URL)
     case configurationInvalid(String)
     case vmNotRunning
     case noSocketDevice
     case socketSetupFailed(String, Int32)
+    /// A configured non-default data disk is gone (e.g. its external drive is unplugged).
+    /// We refuse to boot rather than silently create a fresh empty one in its place.
+    case dataDiskMissing(URL)
+    /// A data-disk move couldn't proceed; the string is the user-facing reason.
+    case diskMove(String)
 
     public var description: String {
         switch self {
@@ -35,6 +43,13 @@ public enum VeloxError: Error, CustomStringConvertible {
         case .socketSetupFailed(let op, let err):
             let detail = err == 0 ? "" : ": \(String(cString: strerror(err))) (errno \(err))"
             return "socket setup failed at \(op)\(detail)"
+        case .dataDiskMissing(let url):
+            return "Velox data disk not found at \(url.path). The drive holding it may be "
+                + "disconnected — reconnect it, or move the disk in Settings › Resources."
+        case .diskMove(let message):
+            return message
         }
     }
+
+    public var errorDescription: String? { description }
 }

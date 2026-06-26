@@ -80,4 +80,191 @@ public enum Storage {
         defer { try? fh.close() }
         return (try? fh.read(upToCount: 4)) == Data("shdw".utf8)
     }
+
+    // MARK: - Move
+
+    /// Relocate `data.img` from `src` to `dst`, preserving sparseness. **The caller MUST have
+    /// stopped the engine first** (the VM holds the file open + the guest must have flushed) —
+    /// moving a live/torn image corrupts ext4.
+    ///
+    /// Same APFS volume → an atomic `rename` (instant, keeps the sparse extents exactly).
+    /// Different volume → a hole-aware streaming copy so a mostly-empty 128 GiB disk copies its
+    /// *used* bytes, not its full logical size, then an fsync + atomic publish; the source is
+    /// removed only after the destination is verified. Any failure leaves the source intact.
+    public static func moveDataDisk(from src: URL, to dst: URL,
+                                    progress: (@Sendable (Double) -> Void)? = nil) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: src.path) else {
+            throw VeloxError.diskMove("Source data disk not found at \(src.path).")
+        }
+        guard !fm.fileExists(atPath: dst.path) else {
+            throw VeloxError.diskMove("A data.img already exists in \(dst.deletingLastPathComponent().path).")
+        }
+        try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        if sameVolume(src, dst) {
+            try fm.moveItem(at: src, to: dst)   // rename(2): atomic, instant, sparse-preserving
+            progress?(1.0)
+            return
+        }
+        try sparseCopyAcrossVolumes(src: src, dst: dst, progress: progress)
+    }
+
+    /// Whether `src` and `dst`'s parent folder live on the same volume (so a rename suffices).
+    private static func sameVolume(_ src: URL, _ dst: URL) -> Bool {
+        func volID(_ url: URL) -> (NSCopying & NSSecureCoding & NSObjectProtocol)? {
+            (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier
+        }
+        guard let a = volID(src), let b = volID(dst.deletingLastPathComponent()) else { return false }
+        return (a as AnyObject).isEqual(b)
+    }
+
+    /// Hole-aware copy to `dst.tmp` (only real data extents are read/written; the gaps stay
+    /// holes), fsynced and atomically published, then the source is removed. Throws leave the
+    /// source untouched and clean up the partial destination.
+    private static func sparseCopyAcrossVolumes(src: URL, dst: URL,
+                                                progress: (@Sendable (Double) -> Void)?) throws {
+        let fm = FileManager.default
+        let tmp = dst.appendingPathExtension("tmp")
+        try? fm.removeItem(at: tmp)
+
+        let srcFD = open(src.path, O_RDONLY)
+        guard srcFD >= 0 else { throw VeloxError.diskMove("Couldn't open the data disk: \(errnoText()).") }
+        defer { close(srcFD) }
+        let dstFD = open(tmp.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        guard dstFD >= 0 else { throw VeloxError.diskMove("Couldn't create the destination: \(errnoText()).") }
+        var dstOpen = true
+        func closeDst() { if dstOpen { close(dstFD); dstOpen = false } }
+        defer { closeDst() }
+
+        let length = lseek(srcFD, 0, SEEK_END)
+        guard length >= 0 else { throw VeloxError.diskMove("Couldn't size the data disk: \(errnoText()).") }
+        // Progress against the *used* (allocated) bytes — the real work for a sparse image.
+        let allocated = (try? src.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+            .totalFileAllocatedSize.map(Int64.init) ?? Int64(length)
+
+        do {
+            try copyDataExtents(srcFD: srcFD, dstFD: dstFD, length: length,
+                                denom: Double(max(allocated, 1)), progress: progress)
+            guard ftruncate(dstFD, length) == 0 else {
+                throw VeloxError.diskMove("Couldn't finalize the destination size: \(errnoText()).")
+            }
+            guard fsync(dstFD) == 0 else {
+                throw VeloxError.diskMove("Couldn't flush the destination: \(errnoText()).")
+            }
+            closeDst()
+            fsyncDirectory(dst.deletingLastPathComponent())   // make the rename durable
+        } catch {
+            closeDst(); try? fm.removeItem(at: tmp)
+            throw error
+        }
+
+        // Atomic publish on the destination volume; verify; only then drop the source.
+        do {
+            try fm.moveItem(at: tmp, to: dst)
+            let moved = Int64((try dst.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? -1)
+            guard moved == Int64(length) else {
+                throw VeloxError.diskMove("Moved disk failed verification (size mismatch).")
+            }
+        } catch {
+            try? fm.removeItem(at: tmp); try? fm.removeItem(at: dst)
+            throw error
+        }
+        try fm.removeItem(at: src)   // final step: original gone only after a verified publish
+        progress?(1.0)
+    }
+
+    /// Walk `src`'s data extents via `SEEK_DATA`/`SEEK_HOLE`, copying each to the same offset in
+    /// `dst` (gaps remain holes). Falls back to a full byte copy on a filesystem that can't report
+    /// holes (the destination simply won't be sparse there — inherent).
+    private static func copyDataExtents(srcFD: Int32, dstFD: Int32, length: off_t,
+                                        denom: Double, progress: (@Sendable (Double) -> Void)?) throws {
+        let chunk = 8 * 1024 * 1024
+        var buf = [UInt8](repeating: 0, count: chunk)
+        var copied: Int64 = 0
+        var lastPct = -1
+        func report() {
+            let pct = Int((min(1.0, Double(copied) / denom) * 100).rounded(.down))
+            if pct != lastPct { lastPct = pct; progress?(Double(pct) / 100) }
+        }
+        var off: off_t = 0
+        while off < length {
+            let dataStart = lseek(srcFD, off, SEEK_DATA)
+            if dataStart == -1 {
+                if errno == ENXIO { break }                       // only holes remain
+                if (errno == EINVAL || errno == ENOTSUP) && off == 0 {
+                    try fullCopy(srcFD: srcFD, dstFD: dstFD, length: length, progress: progress)
+                    return
+                }
+                throw VeloxError.diskMove("Error scanning the data disk: \(errnoText()).")
+            }
+            var holeStart = lseek(srcFD, dataStart, SEEK_HOLE)
+            if holeStart == -1 { holeStart = length }             // data runs to EOF
+            try buf.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!
+                var pos = dataStart
+                while pos < holeStart {
+                    let want = Int(min(off_t(chunk), holeStart - pos))
+                    let got = try readFully(srcFD, base, want, at: pos)
+                    // 0 inside a known data extent means the file was truncated under us — fail
+                    // rather than spin (the source is never touched until a verified publish).
+                    guard got > 0 else { throw VeloxError.diskMove("Unexpected end of data while copying the disk.") }
+                    try writeFully(dstFD, base, got, at: pos)
+                    pos += off_t(got); copied += Int64(got); report()
+                }
+            }
+            off = holeStart
+        }
+    }
+
+    /// Plain full-length copy (non-sparse fallback).
+    private static func fullCopy(srcFD: Int32, dstFD: Int32, length: off_t,
+                                 progress: (@Sendable (Double) -> Void)?) throws {
+        let chunk = 8 * 1024 * 1024
+        var buf = [UInt8](repeating: 0, count: chunk)
+        let denom = Double(max(length, 1))
+        var pos: off_t = 0
+        var lastPct = -1
+        try buf.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!
+            while pos < length {
+                let want = Int(min(off_t(chunk), length - pos))
+                let got = try readFully(srcFD, base, want, at: pos)
+                if got == 0 { break }
+                try writeFully(dstFD, base, got, at: pos)
+                pos += off_t(got)
+                let pct = Int((Double(pos) / denom * 100).rounded(.down))
+                if pct != lastPct { lastPct = pct; progress?(Double(pct) / 100) }
+            }
+        }
+    }
+
+    private static func readFully(_ fd: Int32, _ base: UnsafeMutableRawPointer, _ want: Int, at off: off_t) throws -> Int {
+        var got = 0
+        while got < want {
+            let n = pread(fd, base + got, want - got, off + off_t(got))
+            if n < 0 { if errno == EINTR { continue }; throw VeloxError.diskMove("Read error: \(errnoText()).") }
+            if n == 0 { break }   // EOF (only legitimate at end of file)
+            got += n
+        }
+        return got
+    }
+
+    private static func writeFully(_ fd: Int32, _ base: UnsafeRawPointer, _ count: Int, at off: off_t) throws {
+        var done = 0
+        while done < count {
+            let n = pwrite(fd, base + done, count - done, off + off_t(done))
+            if n < 0 { if errno == EINTR { continue }; throw VeloxError.diskMove("Write error: \(errnoText()).") }
+            done += n
+        }
+    }
+
+    private static func fsyncDirectory(_ dir: URL) {
+        let fd = open(dir.path, O_RDONLY)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        _ = fsync(fd)
+    }
+
+    private static func errnoText() -> String { String(cString: strerror(errno)) }
 }

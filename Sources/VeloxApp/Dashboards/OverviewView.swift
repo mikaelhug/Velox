@@ -8,10 +8,14 @@ import VeloxCore
 @Observable
 final class OverviewModel {
     let store: DockerResourceStore
+    /// Resolved location of `data.img` (honors a relocated data disk). The model is recreated
+    /// on every pane switch, so capturing it at init stays correct after a move.
+    private let dataDiskURL: URL
     private(set) var diskUsedBytes: Int64?
 
-    init(store: DockerResourceStore) {
+    init(store: DockerResourceStore, dataDiskURL: URL) {
         self.store = store
+        self.dataDiskURL = dataDiskURL
         // Synchronous metadata read — fill the disk gauge BEFORE the first frame so
         // it never renders "—" and flips a beat later (the model is recreated on
         // every pane switch, so this covers each appearance).
@@ -33,7 +37,7 @@ final class OverviewModel {
     /// Host-side read of the data disk's actual (sparse) footprint. Cheap; refreshed
     /// on appear and when the container set changes.
     func refreshDiskUsage() {
-        let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+        let vals = try? dataDiskURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         diskUsedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
     }
 }
@@ -50,9 +54,9 @@ struct OverviewView: View {
     // in. Refreshed with the disk gauge (on appear + when the container set changes;
     // no timer); a failure keeps the snapshot and surfaces the error in the banner.
 
-    init(store: DockerResourceStore, stats: StatsStore) {
+    init(store: DockerResourceStore, stats: StatsStore, dataDiskURL: URL) {
         self.stats = stats
-        _model = State(initialValue: OverviewModel(store: store))
+        _model = State(initialValue: OverviewModel(store: store, dataDiskURL: dataDiskURL))
     }
 
     private let columns = Array(repeating: GridItem(.flexible(minimum: 136), spacing: Theme.gridSpacing),
@@ -440,7 +444,8 @@ struct OverviewView_Previews: PreviewProvider {
     static var previews: some View {
         OverviewView(store: DockerResourceStore(docker: MockDockerClient()),
                      stats: StatsStore(docker: MockDockerClient(),
-                                       resources: DockerResourceStore(docker: MockDockerClient())))
+                                       resources: DockerResourceStore(docker: MockDockerClient())),
+                     dataDiskURL: Paths.dataDisk)
             .environment(EngineController())
             .frame(width: 820, height: 560)
     }

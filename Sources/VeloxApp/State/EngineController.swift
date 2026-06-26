@@ -16,6 +16,11 @@ final class EngineController {
     /// Current engine lifecycle, driven onto the main actor from the VM queue.
     private(set) var state: EngineState = .stopped
 
+    /// True while a data-disk relocation is in flight (stop → move → restart). Gates the UI so
+    /// Start/Restart/Move can't interleave; `moveProgress` (0…1) drives the move sheet.
+    private(set) var isRelocatingDisk = false
+    private(set) var moveProgress: Double = 0
+
     /// Wall-clock time the engine reached `.running`, for the Overview uptime
     /// readout. Cleared whenever the engine stops or fails.
     private(set) var startedAt: Date?
@@ -175,14 +180,21 @@ final class EngineController {
 
     // MARK: - Lifecycle
 
-    func start() async {
+    private func performStart() async {
         guard state.isStopped || state.failureMessage != nil else { return }
         state = .starting
         do {
             let resources = config.resources
             let shareURLs = config.shareURLs
             try Paths.ensureRoot()
-            try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: resources.diskGiB)
+            let dataDisk = config.dataDiskURL
+            // A missing disk is a legitimate first-run create only at the DEFAULT location. At a
+            // user-chosen location it means the drive is unplugged / the file is gone — fail loudly
+            // rather than silently format a fresh empty disk (which would look like total data loss).
+            if config.dataDirectory != nil && !FileManager.default.fileExists(atPath: dataDisk.path) {
+                throw VeloxError.dataDiskMissing(dataDisk)
+            }
+            try Storage.ensureDataDisk(at: dataDisk, sizeGiB: resources.diskGiB)
             // After an app update, refresh the installed guest from the (newer) bundled copy so we
             // never boot a stale ~/.velox kernel/rootfs against a new host.
             GuestInstall.refreshFromBundleIfNeeded()
@@ -197,7 +209,7 @@ final class EngineController {
             engineLog.attach(pipe.fileHandleForReading)
             let vmConfig = try VMConfiguration.build(
                 image: image,
-                dataDisk: Paths.dataDisk,
+                dataDisk: dataDisk,
                 resources: resources,
                 extraShares: shareURLs,
                 consoleOutput: pipe.fileHandleForWriting,
@@ -265,7 +277,7 @@ final class EngineController {
         }
     }
 
-    func stop() async {
+    private func performStop() async {
         guard state.isRunning || state.isBusy else { return }
         state = .stopping
         // Tear the plumbing down first (stop accepting docker CLI connections, remove
@@ -279,9 +291,62 @@ final class EngineController {
         if state == .stopping { handleGuestStopped(nil) }
     }
 
+    // Public lifecycle controls. While a data-disk relocation owns the engine
+    // (`isRelocatingDisk`) these are no-ops: booting a VM mid-move would attach the data disk
+    // that's being copied out from under it (corruption). The move drives the engine itself via
+    // `performStart`/`performStop`.
+    func start() async { guard !isRelocatingDisk else { return }; await performStart() }
+    func stop() async { guard !isRelocatingDisk else { return }; await performStop() }
     func restart() async {
-        await stop()
-        await start()
+        guard !isRelocatingDisk else { return }
+        await performStop()
+        await performStart()
+    }
+
+    /// Relocate `data.img` into `destinationDir`. Stops the engine first (so the image is flushed
+    /// and its VZ file handle released), moves it sparse-preserving, repoints the config, and
+    /// restarts if it was running. On any failure the original is left intact and the engine is
+    /// restarted at the OLD location, then the error is rethrown. `moveProgress` tracks 0…1.
+    func moveDataDisk(to destinationDir: URL) async throws {
+        let src = config.dataDiskURL
+        let dst = destinationDir.appendingPathComponent("data.img")
+        guard dst.standardizedFileURL != src.standardizedFileURL else {
+            throw VeloxError.diskMove("The data disk is already in that folder.")
+        }
+        guard !FileManager.default.fileExists(atPath: dst.path) else {
+            throw VeloxError.diskMove("A data.img already exists in \(destinationDir.path).")
+        }
+        // Free-space preflight (a same-volume rename needs ~none, but the check is cheap and safe).
+        let srcAllocated = (try? src.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+            .totalFileAllocatedSize.map(Int64.init) ?? 0
+        if let free = (try? destinationDir.resourceValues(
+                forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+           free > 0, srcAllocated > free {
+            throw VeloxError.diskMove("Not enough free space at the destination "
+                + "(need \(Format.bytes(srcAllocated)), \(Format.bytes(free)) available).")
+        }
+
+        let wasRunning = state.isRunning || state.isBusy
+        isRelocatingDisk = true; moveProgress = 0
+        defer { isRelocatingDisk = false }
+        if wasRunning { await performStop() }   // flush + release the VZ file handle
+
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try Storage.moveDataDisk(from: src, to: dst) { [weak self] frac in
+                    Task { @MainActor in self?.moveProgress = frac }
+                }
+            }.value
+        } catch {
+            if wasRunning { await performStart() }   // restore at the OLD location; config unchanged
+            throw error
+        }
+
+        // Point config at the new folder (nil if it's the default ~/.velox), persist, then restart.
+        config.dataDirectory = (destinationDir.standardizedFileURL == Paths.root.standardizedFileURL)
+            ? nil : destinationDir.standardizedFileURL.path
+        saveConfig()
+        if wasRunning { await performStart() }
     }
 
     // MARK: - Internals

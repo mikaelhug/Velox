@@ -201,6 +201,11 @@ private struct ResourcesPane: View {
     @Binding var config: VeloxConfig
     @Environment(EngineController.self) private var engine
 
+    // Data-disk move flow.
+    @State private var pendingDestination: URL?   // chosen folder awaiting confirmation
+    @State private var moving = false             // progress sheet shown
+    @State private var moveError: String?
+
     private var maxCores: Int { ProcessInfo.processInfo.activeProcessorCount }
     private var maxMemory: Int { max(2, Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024))) }
 
@@ -231,7 +236,8 @@ private struct ResourcesPane: View {
             }
             Section {
                 IntSlider(value: $config.diskGiB, range: 8...256, step: 8, unit: "GB")
-                DiskUsageRow(allocatedGiB: config.diskGiB)
+                DiskUsageRow(allocatedGiB: config.diskGiB, dataDiskURL: config.dataDiskURL)
+                diskLocationRow
             } header: {
                 Text("Disk")
             } footer: {
@@ -253,6 +259,80 @@ private struct ResourcesPane: View {
                     .overlay(alignment: .top) { Divider() }
             }
         }
+        .confirmationDialog(
+            "Move the data disk?",
+            isPresented: Binding(get: { pendingDestination != nil },
+                                 set: { if !$0 { pendingDestination = nil } }),
+            presenting: pendingDestination
+        ) { dir in
+            Button("Move") { startMove(to: dir) }
+            Button("Cancel", role: .cancel) { pendingDestination = nil }
+        } message: { dir in
+            Text("The engine will stop, the data disk (\(usedSizeText)) will move to “\(dir.path)”, "
+                + "then the engine restarts. Containers and images are preserved.")
+        }
+        .sheet(isPresented: $moving) {
+            VStack(spacing: 16) {
+                Text("Moving data disk…").font(.headline)
+                ProgressView(value: engine.moveProgress).progressViewStyle(.linear)
+                Text("\(Int(engine.moveProgress * 100))%")
+                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            .padding(28).frame(width: 340)
+            .interactiveDismissDisabled(true)
+        }
+        .alert("Move failed", isPresented: Binding(
+            get: { moveError != nil }, set: { if !$0 { moveError = nil } })
+        ) { Button("OK", role: .cancel) {} } message: { Text(moveError ?? "") }
+    }
+
+    /// Current data-disk folder + a Move… control (and Reset to Default when relocated).
+    private var diskLocationRow: some View {
+        let busy = moving || engine.isRelocatingDisk || engine.state.isBusy
+        return LabeledContent("Location") {
+            HStack(spacing: 10) {
+                Text(locationDisplay)
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Button("Move…") { pickDestination() }.disabled(busy)
+                if config.dataDirectory != nil {
+                    Button("Reset to Default") { pendingDestination = Paths.root }.disabled(busy)
+                }
+            }
+        }
+    }
+
+    private var locationDisplay: String {
+        let dir = config.dataDiskURL.deletingLastPathComponent().path
+        return (dir as NSString).abbreviatingWithTildeInPath
+    }
+
+    /// On-disk (sparse) footprint of the current data disk, for the confirmation message.
+    private var usedSizeText: String {
+        let bytes = (try? config.dataDiskURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+            .totalFileAllocatedSize
+        return bytes.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
+            ?? "its used space"
+    }
+
+    private func pickDestination() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose a folder to hold the Velox data disk (data.img)"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        pendingDestination = dir
+    }
+
+    private func startMove(to dir: URL) {
+        pendingDestination = nil
+        moving = true; moveError = nil
+        Task {
+            do { try await engine.moveDataDisk(to: dir) }
+            catch { moveError = (error as? LocalizedError)?.errorDescription ?? "\(error)" }
+            moving = false   // dismiss the sheet; Location row auto-updates from config
+        }
     }
 }
 
@@ -262,6 +342,7 @@ private struct ResourcesPane: View {
 /// via the file's allocated-size resource value; refreshed on appear and on demand.
 private struct DiskUsageRow: View {
     let allocatedGiB: Int
+    let dataDiskURL: URL
     @State private var usedBytes: Int64?
 
     var body: some View {
@@ -296,7 +377,7 @@ private struct DiskUsageRow: View {
     }
 
     private func refresh() {
-        let vals = try? Paths.dataDisk.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
+        let vals = try? dataDiskURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         usedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
     }
 }

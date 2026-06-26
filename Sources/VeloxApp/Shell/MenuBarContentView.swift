@@ -113,7 +113,9 @@ struct MenuBarContentView: View {
 
     @ViewBuilder
     private var engineControl: some View {
-        if engine.needsOnboarding {
+        if engine.isRelocatingDisk {
+            ProgressView().controlSize(.small)   // a data-disk move owns the engine
+        } else if engine.needsOnboarding {
             Button("Finish Setup…") { openDashboard() }.controlSize(.small)
         } else if engine.state.isRunning {
             Button("Stop") { Task { await engine.stop() } }.controlSize(.small)

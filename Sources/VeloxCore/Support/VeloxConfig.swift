@@ -30,12 +30,17 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// Expose KVM inside the guest (VZ nested virtualization — M3+/macOS 15).
     /// Opt-in, default off: off means the VZ flag is never set and nothing changes.
     public var nestedVirtualization: Bool
+    /// Folder holding the data disk (`data.img`), if the user relocated it off the default
+    /// `~/.velox`. `nil` = default location. Set by Settings › Resources › Move…; resolve via
+    /// `dataDiskURL`. Deliberately NOT in `bootSignature` — the move restarts the engine itself.
+    public var dataDirectory: String?
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
                 launchAtLogin: Bool,
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
                 dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true,
-                notifyOnCrash: Bool = false, nestedVirtualization: Bool = false) {
+                notifyOnCrash: Bool = false, nestedVirtualization: Bool = false,
+                dataDirectory: String? = nil) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
         self.fileShares = fileShares; self.launchAtLogin = launchAtLogin
@@ -45,6 +50,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         self.checkUpdatesOnStartup = checkUpdatesOnStartup
         self.notifyOnCrash = notifyOnCrash
         self.nestedVirtualization = nestedVirtualization
+        self.dataDirectory = dataDirectory
     }
 
     public static var `default`: VeloxConfig {
@@ -78,6 +84,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         notifyOnCrash = try c.decodeIfPresent(Bool.self, forKey: .notifyOnCrash) ?? d.notifyOnCrash
         nestedVirtualization = try c.decodeIfPresent(Bool.self, forKey: .nestedVirtualization)
             ?? d.nestedVirtualization
+        dataDirectory = try c.decodeIfPresent(String.self, forKey: .dataDirectory) ?? d.dataDirectory
     }
 
     // MARK: - Derived
@@ -93,6 +100,13 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
 
     public var shareURLs: [URL] {
         fileShares.map { URL(fileURLWithPath: $0, isDirectory: true) }
+    }
+
+    /// Where `data.img` actually lives — the configured `dataDirectory`, or the default
+    /// `~/.velox`. The single resolver used by start, the CLI, and the disk gauges.
+    public var dataDiskURL: URL {
+        let dir = dataDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Paths.root
+        return dir.appendingPathComponent("data.img")
     }
 
     /// Floor of guest memory while in Resource Saver mode (bytes). We never

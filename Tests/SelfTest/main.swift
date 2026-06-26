@@ -396,6 +396,84 @@ do {
     equal(g.emptySubmit(now: at(450)), .queue, "another gap — 450ms total but never 300ms continuous")
 }
 
+// MARK: Storage — data-disk move (sparse-preserving)
+
+/// Write a sparse file: 1 MiB of real data at each given offset, then truncate to `logical`.
+func mkSparse(at url: URL, logical: off_t, dataAt offsets: [off_t]) {
+    FileManager.default.createFile(atPath: url.path, contents: nil)
+    let fd = open(url.path, O_WRONLY)
+    guard fd >= 0 else { return }
+    let block = [UInt8](repeating: 0xAB, count: 1 << 20)
+    for off in offsets { block.withUnsafeBytes { _ = pwrite(fd, $0.baseAddress, $0.count, off) } }
+    _ = ftruncate(fd, logical)
+    close(fd)
+}
+func allocBytes(_ url: URL) -> Int { (try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? -1 }
+func logicalBytes(_ url: URL) -> Int { (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? -1 }
+@discardableResult func runTool(_ path: String, _ args: [String]) -> Int32 {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+    p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+    do { try p.run(); p.waitUntilExit(); return p.terminationStatus } catch { return -1 }
+}
+
+section("VeloxConfig.dataDiskURL")
+do {
+    var cfg = VeloxConfig.default
+    equal(cfg.dataDiskURL.path, Paths.dataDisk.path, "nil dataDirectory → ~/.velox/data.img")
+    cfg.dataDirectory = "/Volumes/Ext/Velox"
+    equal(cfg.dataDiskURL.path, "/Volumes/Ext/Velox/data.img", "custom dataDirectory resolves under it")
+}
+
+section("Storage.moveDataDisk")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-move-\(getpid())")
+    let srcDir = base.appendingPathComponent("a"); let dstDir = base.appendingPathComponent("b")
+    try? fm.createDirectory(at: srcDir, withIntermediateDirectories: true)
+    try? fm.createDirectory(at: dstDir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+
+    // Same volume → rename: instant, preserves the (sparse) file exactly.
+    let src = srcDir.appendingPathComponent("data.img")
+    mkSparse(at: src, logical: 256 << 20, dataAt: [0, 64 << 20, 200 << 20])
+    check(allocBytes(src) < 16 << 20, "source is sparse (alloc \(allocBytes(src)) « 256 MiB)")
+    let dst = dstDir.appendingPathComponent("data.img")
+    do {
+        try Storage.moveDataDisk(from: src, to: dst)
+        check(!fm.fileExists(atPath: src.path), "same-vol: source removed")
+        equal(logicalBytes(dst), 256 << 20, "same-vol: logical size preserved")
+    } catch { check(false, "same-vol move threw: \(error)") }
+
+    // Refuse to clobber an existing destination (source left intact).
+    let src2 = srcDir.appendingPathComponent("again.img")
+    mkSparse(at: src2, logical: 8 << 20, dataAt: [0])
+    var refused = false
+    do { try Storage.moveDataDisk(from: src2, to: dst) } catch { refused = true }
+    check(refused && fm.fileExists(atPath: src2.path), "refuses existing dst, leaves source intact")
+
+    // Cross volume → sparse-preserving copy onto a real second APFS volume.
+    let dmg = base.appendingPathComponent("vol.dmg")
+    let vol = "VeloxMove\(getpid())"
+    if runTool("/usr/bin/hdiutil", ["create", "-size", "512m", "-fs", "APFS", "-volname", vol, "-quiet", dmg.path]) == 0,
+       runTool("/usr/bin/hdiutil", ["attach", "-quiet", dmg.path]) == 0 {
+        let volDir = URL(fileURLWithPath: "/Volumes/\(vol)")
+        let xsrc = srcDir.appendingPathComponent("cross.img")
+        mkSparse(at: xsrc, logical: 256 << 20, dataAt: [0, 100 << 20, 255 << 20])
+        let xAlloc = allocBytes(xsrc)
+        let xdst = volDir.appendingPathComponent("data.img")
+        do {
+            try Storage.moveDataDisk(from: xsrc, to: xdst)
+            equal(logicalBytes(xdst), 256 << 20, "cross-vol: logical size preserved")
+            check(allocBytes(xdst) <= xAlloc + (4 << 20),
+                  "cross-vol: SPARSE preserved (dst alloc \(allocBytes(xdst)) ≈ src \(xAlloc), not 256 MiB)")
+            check(!fm.fileExists(atPath: xsrc.path), "cross-vol: source removed")
+        } catch { check(false, "cross-vol move threw: \(error)") }
+        runTool("/usr/bin/hdiutil", ["detach", "-quiet", volDir.path])
+    } else {
+        print("  skip  cross-volume sparse test (hdiutil unavailable)")
+    }
+}
+
 // MARK: Summary
 
 print("\n----------------------------------------")

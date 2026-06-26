@@ -80,14 +80,20 @@ func runStart(bind: BindMode) -> Never {
         // resources, swap, and file shares are consistent across both front ends.
         let prefs = VeloxConfig.load()
         try Paths.ensureRoot()
-        try Storage.ensureDataDisk(at: Paths.dataDisk, sizeGiB: prefs.resources.diskGiB)
+        let dataDisk = prefs.dataDiskURL
+        // A relocated data disk that's gone (drive unplugged / deleted) must fail loudly, not be
+        // silently recreated empty. A missing disk at the DEFAULT location is a legit first run.
+        if prefs.dataDirectory != nil && !FileManager.default.fileExists(atPath: dataDisk.path) {
+            throw VeloxError.dataDiskMissing(dataDisk)
+        }
+        try Storage.ensureDataDisk(at: dataDisk, sizeGiB: prefs.resources.diskGiB)
         // After an app update, refresh the installed guest from the (newer) bundled copy so we
         // never boot a stale ~/.velox kernel/rootfs against a new host.
         GuestInstall.refreshFromBundleIfNeeded()
 
         let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
         let config = try VMConfiguration.build(
-            image: image, dataDisk: Paths.dataDisk,
+            image: image, dataDisk: dataDisk,
             resources: prefs.resources, extraShares: prefs.shareURLs,
             nestedVirtualization: prefs.nestedVirtualization)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "

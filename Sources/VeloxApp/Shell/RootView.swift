@@ -74,7 +74,8 @@ struct RootView: View {
             if engine.state.isRunning, let docker = engine.docker, let store = engine.resources,
                let stats = engine.stats {
                 switch item {
-                case .overview:   OverviewView(store: store, stats: stats)
+                case .overview:   OverviewView(store: store, stats: stats,
+                                               dataDiskURL: engine.config.dataDiskURL)
                 case .containers: ContainersView(docker: docker, store: store, stats: stats,
                                                  ui: engine.paneUI, issues: engine.portIssues)
                 case .images:     ImagesView(docker: docker, store: store, ui: engine.paneUI)
@@ -98,9 +99,9 @@ struct EngineStatusBar: View {
                 .fill(engine.state.tint)
                 .frame(width: 8, height: 8)
                 .shadow(color: engine.state.tint.opacity(0.6), radius: engine.state.isRunning ? 2.5 : 0)
-            Text(engine.state.label)
+            Text(engine.isRelocatingDisk ? "Moving disk…" : engine.state.label)
                 .font(.callout.weight(.medium))
-            if engine.state.isBusy {
+            if engine.isRelocatingDisk || engine.state.isBusy {
                 ProgressView().controlSize(.small)
             } else if engine.state.isRunning {
                 Button("Stop") { Task { await engine.stop() } }
@@ -130,7 +131,9 @@ struct EngineDownView: View {
         ContentUnavailableView {
             Label(item.title, systemImage: item.systemImage)
         } description: {
-            if let failure = engine.state.failureMessage {
+            if engine.isRelocatingDisk {
+                Text("Moving the data disk… the engine will restart when it's done.")
+            } else if let failure = engine.state.failureMessage {
                 Text(failure)
             } else if engine.needsOnboarding {
                 Text("Finish setup to boot the Velox engine.")
@@ -138,7 +141,7 @@ struct EngineDownView: View {
                 Text("The Velox engine is \(engine.state.label.lowercased()). Start it to see \(item.title.lowercased()).")
             }
         } actions: {
-            if !engine.needsOnboarding {
+            if !engine.needsOnboarding && !engine.isRelocatingDisk {
                 Button(engine.state.isBusy ? "Starting…" : "Start Engine") {
                     Task { await engine.start() }
                 }
