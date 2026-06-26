@@ -8,7 +8,7 @@
       name="description"
       content="Reproducible Velox benchmark results against Docker Desktop on Apple Silicon, including startup, memory, networking, filesystem, and cold pull measurements."
     >
-    <meta name="theme-color" content="#111827">
+    <meta name="theme-color" content="#090a0d">
     <link rel="canonical" href="https://mikaelhug.github.io/Velox/benchmarks.html">
     <meta property="og:title" content="Velox benchmarks">
     <meta
@@ -21,16 +21,31 @@
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
-    <header class="page-header">
-      <nav class="topbar" aria-label="Main navigation">
-        <a class="brand" href="./" aria-label="Velox home">Velox</a>
+    <nav class="nav" aria-label="Main navigation">
+      <div class="nav-inner">
+        <a class="brand" href="./" aria-label="Velox home">
+          <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+            <rect x="1" y="1" width="26" height="26" rx="8" fill="url(#mark)" stroke="rgba(255,255,255,0.14)"></rect>
+            <path d="M15.6 6 L9 15.6 h4 l-1.4 6.4 L19 12.4 h-4 z" fill="#03130c"></path>
+            <defs>
+              <linearGradient id="mark" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#5ef0bb"></stop>
+                <stop offset="1" stop-color="#34d39a"></stop>
+              </linearGradient>
+            </defs>
+          </svg>
+          <span>Velox</span>
+        </a>
         <div class="nav-links">
           <a href="./#features">Features</a>
           <a href="./#benchmarks">Benchmarks</a>
           <a href="./#install">Install</a>
-          <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+          <a class="nav-cta" href="https://github.com/mikaelhug/Velox">GitHub</a>
         </div>
-      </nav>
+      </div>
+    </nav>
+
+    <header class="page-header">
       <div class="page-title">
         <p class="eyebrow">Reproducible benchmark suite</p>
         <h1>Velox vs Docker Desktop</h1>
@@ -43,10 +58,10 @@
 
     <main>
       <section class="section">
-        <div class="section-heading">
+        <div class="section-heading" style="text-align: left; max-width: none; margin-bottom: 28px;">
           <p class="eyebrow">Recorded run</p>
           <h2>Apple M4 Pro, macOS 26.5.1, 8 vCPU / 8 GB</h2>
-          <p class="note">
+          <p class="note" style="text-align: left; margin: 12px 0 0;">
             These are the current published numbers from the benchmark docs.
             See the source document for caveats, fairness controls, and the
             runnable scripts.
@@ -59,7 +74,7 @@
               <th>Metric</th>
               <th>Velox</th>
               <th>Docker Desktop</th>
-              <th>Result</th>
+              <th>vs Docker Desktop</th>
             </tr>
           </thead>
           <tbody>
@@ -127,12 +142,12 @@
               <td>Cold image pull</td>
               <td>19.1 s</td>
               <td>17.3 s</td>
-              <td class="status-trail">~0.9x, trails</td>
+              <td class="status-trail">~10% slower</td>
             </tr>
           </tbody>
         </table>
 
-        <p class="note">
+        <p class="note" style="text-align: left;">
           Read the full markdown benchmark document on
           <a href="https://github.com/mikaelhug/Velox/blob/main/docs/benchmarks.md">GitHub</a>
           or inspect the runnable harness in
@@ -142,7 +157,19 @@
     </main>
 
     <footer class="footer">
-      <span>Velox</span>
+      <a class="brand" href="./" aria-label="Velox home">
+        <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+          <rect x="1" y="1" width="26" height="26" rx="8" fill="url(#markf)" stroke="rgba(255,255,255,0.14)"></rect>
+          <path d="M15.6 6 L9 15.6 h4 l-1.4 6.4 L19 12.4 h-4 z" fill="#03130c"></path>
+          <defs>
+            <linearGradient id="markf" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#5ef0bb"></stop>
+              <stop offset="1" stop-color="#34d39a"></stop>
+            </linearGradient>
+          </defs>
+        </svg>
+        <span>Velox</span>
+      </a>
       <a href="./">Home</a>
       <a href="https://github.com/mikaelhug/Velox">GitHub</a>
       <a href="https://github.com/mikaelhug/Velox/releases">Releases</a>

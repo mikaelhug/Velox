@@ -8,7 +8,7 @@
       name="description"
       content="Velox is a fast, lean, open-source Docker Desktop alternative for Apple Silicon Macs. It runs a real Docker Engine with the stock Docker CLI, a native Mac app, and reproducible benchmarks."
     >
-    <meta name="theme-color" content="#111827">
+    <meta name="theme-color" content="#090a0d">
     <link rel="canonical" href="https://mikaelhug.github.io/Velox/">
     <meta property="og:title" content="Velox - fast Docker on Apple Silicon Macs">
     <meta
@@ -34,7 +34,7 @@
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "macOS 15+ on Apple Silicon",
         "description": "A fast, lean, open-source Docker Desktop alternative for Apple Silicon Macs.",
-        "softwareVersion": "0.2.1",
+        "softwareVersion": "0.2.2",
         "url": "https://mikaelhug.github.io/Velox/",
         "downloadUrl": "https://github.com/mikaelhug/Velox/releases",
         "codeRepository": "https://github.com/mikaelhug/Velox",
@@ -44,19 +44,33 @@
     </script>
   </head>
   <body>
-    <header class="hero">
-      <nav class="topbar" aria-label="Main navigation">
-        <a class="brand" href="#top" aria-label="Velox home">Velox</a>
+    <nav class="nav" aria-label="Main navigation">
+      <div class="nav-inner">
+        <a class="brand" href="#top" aria-label="Velox home">
+          <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+            <rect x="1" y="1" width="26" height="26" rx="8" fill="url(#mark)" stroke="rgba(255,255,255,0.14)"></rect>
+            <path d="M15.6 6 L9 15.6 h4 l-1.4 6.4 L19 12.4 h-4 z" fill="#03130c"></path>
+            <defs>
+              <linearGradient id="mark" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#5ef0bb"></stop>
+                <stop offset="1" stop-color="#34d39a"></stop>
+              </linearGradient>
+            </defs>
+          </svg>
+          <span>Velox</span>
+        </a>
         <div class="nav-links">
           <a href="#features">Features</a>
           <a href="#benchmarks">Benchmarks</a>
           <a href="#install">Install</a>
-          <a href="https://github.com/mikaelhug/Velox">GitHub</a>
+          <a class="nav-cta" href="https://github.com/mikaelhug/Velox">GitHub</a>
         </div>
-      </nav>
+      </div>
+    </nav>
 
-      <div class="hero-copy" id="top">
-        <p class="eyebrow">Docker Desktop alternative for Apple Silicon Macs</p>
+    <header class="hero" id="top">
+      <div class="hero-inner">
+        <p class="badge">Open source · Docker Desktop alternative for Apple Silicon</p>
         <h1>Velox</h1>
         <p class="lede">
           A fast, lean way to run a real Docker Engine on macOS with the stock
@@ -64,39 +78,55 @@
           out of your way.
         </p>
         <div class="actions" aria-label="Primary actions">
-          <a class="button primary" href="#install">Install</a>
-          <a class="button secondary" href="benchmarks.html">Read benchmarks</a>
+          <a class="button primary" href="#install">Install Velox</a>
+          <a class="button secondary" href="benchmarks.html">Read the benchmarks</a>
         </div>
+      </div>
+      <div class="hero-shot">
+        <img
+          src="images/dashboard.png"
+          alt="Velox dashboard showing engine status, resource cards, disk breakdown, and live CPU and memory usage"
+          width="1180"
+        >
       </div>
     </header>
 
     <main>
-      <section class="metric-band" aria-label="Velox performance summary">
-        <div class="metric">
-          <span class="metric-value">226 MB</span>
-          <span class="metric-label">self-contained app</span>
-        </div>
-        <div class="metric">
-          <span class="metric-value">1.74 s</span>
-          <span class="metric-label">warm restart to API-ready</span>
-        </div>
-        <div class="metric">
-          <span class="metric-value">~70 MB</span>
-          <span class="metric-label">empty idle host footprint</span>
-        </div>
-        <div class="metric">
-          <span class="metric-value">16x</span>
-          <span class="metric-label">faster small-file bind extract</span>
+      <section class="section" style="padding-top: clamp(48px, 7vw, 84px)">
+        <div class="metric-band" aria-label="Velox performance summary">
+          <div class="metric">
+            <span class="metric-value">226 MB</span>
+            <span class="metric-label">self-contained app</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value">1.74 s</span>
+            <span class="metric-label">warm restart to API-ready</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value">~70 MB</span>
+            <span class="metric-label">empty idle host footprint</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value">88 Gbit/s</span>
+            <span class="metric-label">container network throughput</span>
+          </div>
         </div>
       </section>
 
       <section class="section" id="features">
         <div class="section-heading">
           <p class="eyebrow">Native where it matters</p>
-          <h2>Docker workflows without the heavy desktop stack</h2>
+          <h2>The Docker tools you already use, in a lean Mac app</h2>
         </div>
         <div class="feature-grid">
           <article class="feature">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="2.5"></rect>
+                <path d="M7 9l3 3-3 3"></path>
+                <path d="M13 15h4"></path>
+              </svg>
+            </div>
             <h3>Stock Docker CLI</h3>
             <p>
               Velox registers a Docker context named <code>velox</code>, so
@@ -105,6 +135,13 @@
             </p>
           </article>
           <article class="feature">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="2.5"></rect>
+                <path d="M3 9h18"></path>
+                <path d="M6.5 6.6h.01"></path>
+              </svg>
+            </div>
             <h3>Native Mac app</h3>
             <p>
               Inspect compose groups, containers, images, volumes, networks,
@@ -113,6 +150,14 @@
             </p>
           </article>
           <article class="feature">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9"></circle>
+                <path d="M3 12h18"></path>
+                <path d="M12 3c2.6 2.6 2.6 15.4 0 18"></path>
+                <path d="M12 3c-2.6 2.6-2.6 15.4 0 18"></path>
+              </svg>
+            </div>
             <h3>Names that resolve</h3>
             <p>
               Reach containers from macOS at <code>&lt;name&gt;.velox.local</code>
@@ -120,6 +165,13 @@
             </p>
           </article>
           <article class="feature">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 16a8 8 0 1 1 16 0"></path>
+                <path d="M12 16l4-5"></path>
+                <circle cx="12" cy="16" r="1.1" fill="currentColor" stroke="none"></circle>
+              </svg>
+            </div>
             <h3>Small by design</h3>
             <p>
               One Swift host process manages the VM, Docker API proxy, port
@@ -130,7 +182,7 @@
         </div>
       </section>
 
-      <section class="split section">
+      <section class="split">
         <div>
           <p class="eyebrow">Use Docker as Docker</p>
           <h2>No wrapper command. No workflow migration.</h2>
@@ -140,21 +192,31 @@
             the CLI can run the engine headless.
           </p>
         </div>
-        <pre class="terminal"><code>curl -fsSL https://raw.githubusercontent.com/mikaelhug/Velox/main/install.sh | bash
+        <div class="terminal">
+          <div class="term-head" aria-hidden="true">
+            <i></i><i></i><i></i>
+            <em>zsh</em>
+          </div>
+          <pre><code><span class="tok-cmt"># install, then point the stock CLI at Velox</span>
+curl -fsSL https://raw.githubusercontent.com/mikaelhug/Velox/main/install.sh | bash
 
-docker context use velox
-docker run --rm hello-world
+<span class="tok-cmd">docker</span> context use velox
+<span class="tok-cmd">docker</span> run --rm hello-world
 
-docker run -d --name web nginx
+<span class="tok-cmt"># reach a container by name — no -p needed</span>
+<span class="tok-cmd">docker</span> run -d --name web nginx
 curl http://web.velox.local</code></pre>
+        </div>
       </section>
 
-      <section class="screens section" aria-label="Velox screenshots">
-        <img
-          src="images/containers.png"
-          alt="Velox containers dashboard showing compose groups, container names, local domains, CPU, and memory"
-          loading="lazy"
-        >
+      <section class="screens" aria-label="Velox screenshots">
+        <div class="shot">
+          <img
+            src="images/containers.png"
+            alt="Velox containers view showing compose groups, container names, local domains, CPU, and memory"
+            loading="lazy"
+          >
+        </div>
       </section>
 
       <section class="section" id="benchmarks">
@@ -181,7 +243,7 @@ curl http://web.velox.local</code></pre>
           </div>
           <div class="comparison-row">
             <span>Cold image pull</span>
-            <strong>~0.9x, trails</strong>
+            <strong>~10% slower</strong>
           </div>
         </div>
         <p class="note">
@@ -190,7 +252,7 @@ curl http://web.velox.local</code></pre>
         </p>
       </section>
 
-      <section class="architecture section">
+      <section class="section architecture">
         <div class="section-heading">
           <p class="eyebrow">How it is built</p>
           <h2>A thin host, a minimal guest, and the real Docker Engine</h2>
@@ -211,7 +273,7 @@ curl http://web.velox.local</code></pre>
         </div>
       </section>
 
-      <section class="install section" id="install">
+      <section class="install" id="install">
         <div>
           <p class="eyebrow">Try Velox</p>
           <h2>Install the current release</h2>
@@ -229,7 +291,19 @@ curl http://web.velox.local</code></pre>
     </main>
 
     <footer class="footer">
-      <span>Velox</span>
+      <a class="brand" href="#top" aria-label="Velox home">
+        <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+          <rect x="1" y="1" width="26" height="26" rx="8" fill="url(#markf)" stroke="rgba(255,255,255,0.14)"></rect>
+          <path d="M15.6 6 L9 15.6 h4 l-1.4 6.4 L19 12.4 h-4 z" fill="#03130c"></path>
+          <defs>
+            <linearGradient id="markf" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#5ef0bb"></stop>
+              <stop offset="1" stop-color="#34d39a"></stop>
+            </linearGradient>
+          </defs>
+        </svg>
+        <span>Velox</span>
+      </a>
       <a href="https://github.com/mikaelhug/Velox">GitHub</a>
       <a href="benchmarks.html">Benchmarks</a>
       <a href="https://github.com/mikaelhug/Velox/issues">Issues</a>
