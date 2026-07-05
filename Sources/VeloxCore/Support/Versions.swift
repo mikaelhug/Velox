@@ -15,4 +15,7 @@ public enum Versions {
     public static let kernelVersion = "6.18.35"
     /// Docker Engine version in the guest (Docker's official static release).
     public static let dockerVersion = "29.5.3"
+    /// Ed25519 public key (base64) release .zips are signed with; empty = dev build,
+    /// updater signature verification skipped. See VELOX_RELEASE_PUBKEY in versions.env.
+    public static let releasePubkey = ""
 }

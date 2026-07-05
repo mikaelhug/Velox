@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Checks GitHub Releases for a newer Velox build and (optionally) downloads it.
@@ -157,6 +158,12 @@ public enum Updater {
 
         // Only a .zip can be applied in place; a .dmg is revealed for manual install.
         guard asset.name.hasSuffix(".zip") else { reveal(dest); return }
+        // Integrity gate: the CI signs each release .zip with Ed25519 (release-sign.swift);
+        // the matching public key is baked into this build (versions.env → Versions.swift).
+        // No/invalid signature ⇒ never auto-install — reveal the download for a manual call.
+        guard verifyReleaseSignature(of: dest, assetName: asset.name, in: release) else {
+            reveal(dest); return
+        }
         guard let target = runningAppBundle() else {
             print("Could not locate the installed Velox.app — open \(dest.path) to install."); reveal(dest); return
         }
@@ -183,13 +190,73 @@ public enum Updater {
             _ = run([lsregister, "-f", target.path])
             print("Updated \(target.lastPathComponent) → \(release.tag). Relaunching…")
             let open = Process(); open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            open.arguments = ["-n", target.path]; try? open.run()
+            open.arguments = ["-n", target.path]
+            do { try open.run() } catch {
+                // The swap already succeeded — don't die silently with the old build running.
+                Log.error("update: relaunch failed (\(error.localizedDescription)) — open \(target.path) manually")
+                reveal(target)
+            }
             exit(0)
         } catch {
             Log.error("update: could not replace \(target.path): \(error.localizedDescription)")
             print("Open \(dest.path) to install the update manually.")
             try? fm.removeItem(at: staging); reveal(dest)
         }
+    }
+
+    // MARK: Release signature verification
+
+    /// Verify the downloaded release archive against its Ed25519 `.sig` asset.
+    /// - A build without a baked-in public key (dev builds) skips the check with a log line.
+    /// - A keyed build REFUSES to auto-install when the sig asset is missing or invalid;
+    ///   the caller reveals the download so the user can decide manually.
+    private static func verifyReleaseSignature(of file: URL, assetName: String, in release: Release) -> Bool {
+        let pubB64 = Versions.releasePubkey
+        guard !pubB64.isEmpty else {
+            Log.warn("update: this build has no release public key — skipping signature verification")
+            return true
+        }
+        guard let sigAsset = release.assets.first(where: { $0.name == assetName + ".sig" }),
+              let sigURL = URL(string: sigAsset.url) else {
+            Log.error("update: release \(release.tag) has no \(assetName).sig — refusing to auto-install")
+            return false
+        }
+        guard let sigText = fetchData(sigURL).flatMap({ String(data: $0, encoding: .utf8) }),
+              let data = try? Data(contentsOf: file),
+              ed25519Verify(data: data,
+                            signatureB64: sigText.trimmingCharacters(in: .whitespacesAndNewlines),
+                            publicKeyB64: pubB64) else {
+            Log.error("update: Ed25519 signature check FAILED for \(assetName) — refusing to install")
+            return false
+        }
+        print("Signature verified (\(sigAsset.name)).")
+        return true
+    }
+
+    /// Raw Ed25519 verify over base64 key + signature. `package` so the selftest can
+    /// round-trip it without exporting it as public API.
+    package static func ed25519Verify(data: Data, signatureB64: String, publicKeyB64: String) -> Bool {
+        guard let sig = Data(base64Encoded: signatureB64),
+              let raw = Data(base64Encoded: publicKeyB64),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
+        return key.isValidSignature(sig, for: data)
+    }
+
+    /// Small synchronous GET (release `.sig` assets are ~90 bytes).
+    private static func fetchData(_ url: URL) -> Data? {
+        var request = URLRequest(url: url)
+        request.setValue("velox-updater", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        let sem = DispatchSemaphore(value: 0)
+        // Synchronized by the semaphore (the closure signals; we read only after wait()).
+        nonisolated(unsafe) var body: Data?
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { sem.signal() }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return }
+            body = data
+        }.resume()
+        _ = sem.wait(timeout: .now() + 60)
+        return body
     }
 
     /// The enclosing `.app` of the running executable (GUI: Velox.app; a CLI shipped
@@ -214,7 +281,8 @@ public enum Updater {
     }
 
     /// Returns >0 if a>b, <0 if a<b, 0 if equal (dotted-integer semver).
-    private static func compareSemver(_ a: String, _ b: String) -> Int {
+    /// `package` (not private) so the selftest can exercise the ordering.
+    package static func compareSemver(_ a: String, _ b: String) -> Int {
         let pa = a.split(separator: ".").map { Int($0) ?? 0 }
         let pb = b.split(separator: ".").map { Int($0) ?? 0 }
         for i in 0..<max(pa.count, pb.count) {
