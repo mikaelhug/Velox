@@ -4,7 +4,7 @@
 /// Version numbers surfaced to the host (CLI, status, updater).
 public enum Versions {
     /// Velox release version.
-    public static let velox = "0.2.2"
+    public static let velox = "0.2.3"
     /// GitHub repo (owner/name) the updater checks for new releases.
     public static let githubRepo = "mikaelhug/Velox"
     /// Privileged-port-helper revision. The helper is (re)installed (one admin prompt) only when
@@ -17,5 +17,5 @@ public enum Versions {
     public static let dockerVersion = "29.5.3"
     /// Ed25519 public key (base64) release .zips are signed with; empty = dev build,
     /// updater signature verification skipped. See VELOX_RELEASE_PUBKEY in versions.env.
-    public static let releasePubkey = ""
+    public static let releasePubkey = "uu477O7tlHtYMJfbmBMFJmBFwgE+s+6VsSWbgUPhFK4="
 }
