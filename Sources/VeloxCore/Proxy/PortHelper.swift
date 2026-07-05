@@ -128,11 +128,14 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
 
 // MARK: - Client (request a listener fd over the unix socket)
 
-enum PortHelperClient {
+package enum PortHelperClient {
     /// MUST match `SOCKET_PATH` in Sources/velox-porthelper/main.swift.
-    static let socketPath = "/var/run/velox-porthelper.sock"
+    package static let productionSocketPath = "/var/run/velox-porthelper.sock"
+    /// Overridable seam so the selftest can stand up a fake daemon on a temp socket.
+    /// Production never touches it. (Written once by the test before any use.)
+    package nonisolated(unsafe) static var socketPath = productionSocketPath
 
-    static func requestListener(port: UInt16, proto: PortHelperProto) -> Int32? {
+    package static func requestListener(port: UInt16, proto: PortHelperProto) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -157,7 +160,7 @@ enum PortHelperClient {
         }
         guard connected == 0 else { return nil }
         let request = "\(proto == .tcp ? "tcp" : "udp") \(port)\n"
-        guard writeAll(fd, Array(request.utf8)) else { return nil }
+        guard FDIO.writeAll(fd, Array(request.utf8)) else { return nil }
         let (status, received) = receiveFD(fd)
         guard status == 0, let received else {
             if let received { close(received) }
@@ -168,20 +171,20 @@ enum PortHelperClient {
 
     /// Ask the helper to add/remove a host route to a container subnet (named-access routing).
     /// The helper strictly validates the CIDR/IPv4. Returns true on status 0.
-    static func route(add: Bool, subnet: String, gateway: String) -> Bool {
+    package static func route(add: Bool, subnet: String, gateway: String) -> Bool {
         guard let fd = connectToDaemon() else { return false }
         defer { close(fd) }
         let req = add ? "route add \(subnet) \(gateway)\n" : "route del \(subnet)\n"
-        guard writeAll(fd, Array(req.utf8)) else { return false }
+        guard FDIO.writeAll(fd, Array(req.utf8)) else { return false }
         var status: UInt8 = 0xFF
         return recv(fd, &status, 1, 0) == 1 && status == 0
     }
 
     /// Ask the helper to restore `net.inet.ip.forwarding=1` (it can never set 0).
-    static func restoreIPForwarding() -> Bool {
+    package static func restoreIPForwarding() -> Bool {
         guard let fd = connectToDaemon() else { return false }
         defer { close(fd) }
-        guard writeAll(fd, Array("ipfwd\n".utf8)) else { return false }
+        guard FDIO.writeAll(fd, Array("ipfwd\n".utf8)) else { return false }
         var status: UInt8 = 0xFF
         return recv(fd, &status, 1, 0) == 1 && status == 0
     }
@@ -209,18 +212,6 @@ enum PortHelperClient {
         }
         guard connected == 0 else { close(fd); return nil }
         return fd
-    }
-
-    private static func writeAll(_ fd: Int32, _ buf: [UInt8]) -> Bool {
-        var off = 0
-        return buf.withUnsafeBytes { raw in
-            while off < buf.count {
-                let n = write(fd, raw.baseAddress!.advanced(by: off), buf.count - off)
-                if n <= 0 { if n < 0 && errno == EINTR { continue }; return false }
-                off += n
-            }
-            return true
-        }
     }
 
     // Single-fd ancillary-message layout (Darwin aligns to 4 bytes); mirrors the daemon.
@@ -265,7 +256,7 @@ enum PortHelperInstaller {
     static let installedBinary = "/Library/PrivilegedHelperTools/dev.velox.porthelper"
     static let plistPath = "/Library/LaunchDaemons/dev.velox.porthelper.plist"
     static let versionMarker = "/Library/Application Support/Velox/porthelper.version"
-    static let socketPath = PortHelperClient.socketPath
+    static let socketPath = PortHelperClient.productionSocketPath
 
     /// The helper revision that must be installed, from versions.env (`Versions.porthelperRevision`).
     /// The install (one admin prompt) is repeated ONLY when this changes — i.e. only when the

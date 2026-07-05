@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import VeloxCore
 
@@ -471,6 +472,210 @@ do {
         runTool("/usr/bin/hdiutil", ["detach", "-quiet", volDir.path])
     } else {
         print("  skip  cross-volume sparse test (hdiutil unavailable)")
+    }
+}
+
+// MARK: Updater semver ordering
+
+section("Updater.compareSemver")
+do {
+    check(Updater.compareSemver("1.2.3", "1.2.3") == 0, "equal versions")
+    check(Updater.compareSemver("1.2.10", "1.2.9") > 0, "numeric (not lexical) compare")
+    check(Updater.compareSemver("0.3", "0.2.9") > 0, "shorter version padded with zeros")
+    check(Updater.compareSemver("1.0.0", "1.0") == 0, "trailing zero segments equal")
+    check(Updater.compareSemver("0.9.9", "1.0.0") < 0, "major bump wins")
+}
+
+// MARK: Ed25519 release-signature verification
+
+section("Updater.ed25519Verify")
+do {
+    let key = Curve25519.Signing.PrivateKey()
+    let pubB64 = key.publicKey.rawRepresentation.base64EncodedString()
+    let payload = Data("velox release bytes".utf8)
+    let sigB64 = try key.signature(for: payload).base64EncodedString()
+
+    check(Updater.ed25519Verify(data: payload, signatureB64: sigB64, publicKeyB64: pubB64),
+          "valid signature verifies")
+    check(!Updater.ed25519Verify(data: payload + Data([0]), signatureB64: sigB64, publicKeyB64: pubB64),
+          "tampered payload rejected")
+    let otherPub = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
+    check(!Updater.ed25519Verify(data: payload, signatureB64: sigB64, publicKeyB64: otherPub),
+          "wrong public key rejected")
+    check(!Updater.ed25519Verify(data: payload, signatureB64: "not-base64!", publicKeyB64: pubB64),
+          "garbage signature rejected")
+    check(!Updater.ed25519Verify(data: payload, signatureB64: sigB64, publicKeyB64: ""),
+          "empty public key rejected")
+}
+
+// MARK: Coalescer (leading-edge schedule, trailing fire)
+
+section("Coalescer")
+do {
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func bump() { lock.lock(); n += 1; lock.unlock() }
+        var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+    }
+    let runs = Counter()
+    let coalescer = Coalescer(delay: .milliseconds(50)) { runs.bump() }
+    for _ in 0..<10 { coalescer.trigger() }
+    try? await Task.sleep(for: .milliseconds(300))
+    equal(runs.value, 1, "burst of 10 triggers coalesces to one run")
+    coalescer.trigger()
+    coalescer.trigger()
+    try? await Task.sleep(for: .milliseconds(300))
+    equal(runs.value, 2, "a later burst fires exactly once more")
+    coalescer.trigger()
+    coalescer.cancel()
+    try? await Task.sleep(for: .milliseconds(150))
+    equal(runs.value, 2, "cancel() suppresses the pending run")
+}
+
+// MARK: NameRegistry
+
+section("NameRegistry")
+do {
+    let reg = NameRegistry()
+    check(reg.address(for: "web") == nil, "empty registry resolves nothing")
+    reg.update(["web": inet_addr("172.17.0.2"), "db": inet_addr("172.17.0.3")])
+    check(reg.address(for: "web") == inet_addr("172.17.0.2"), "lookup returns the stored address")
+    check(reg.address(for: "WEB") == inet_addr("172.17.0.2"), "lookup is case-insensitive")
+    check(reg.address(for: "ghost") == nil, "unknown name is nil")
+    reg.update(["db": inet_addr("172.17.0.9")])
+    check(reg.address(for: "web") == nil, "update replaces (not merges) the map")
+    check(reg.address(for: "db") == inet_addr("172.17.0.9"), "replaced entry has the new address")
+}
+
+// MARK: PortHelperClient wire protocol (against an in-process fake daemon)
+
+section("PortHelperClient protocol")
+do {
+    // A fake velox-porthelper: accepts one connection per scripted step, records the
+    // request line, replies with a status byte (and an SCM_RIGHTS fd when scripted) —
+    // byte-for-byte the daemon's `reply()` layout.
+    final class FakeDaemon: @unchecked Sendable {
+        let path: String
+        private let fd: Int32
+        private let lock = NSLock()
+        private var received: [String] = []
+        /// (status, fd-to-pass or -1) per accepted connection, consumed in order.
+        private var script: [(UInt8, Int32)]
+
+        init?(script: [(UInt8, Int32)]) {
+            // sockaddr_un paths are capped at 104 bytes — keep it short.
+            path = FileManager.default.temporaryDirectory.path + "/velox-selftest-\(getpid()).sock"
+            unlink(path)
+            self.script = script
+            fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { return nil }
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            let bytes = Array(path.utf8)
+            guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { close(fd); return nil }
+            withUnsafeMutablePointer(to: &addr.sun_path) { p in
+                p.withMemoryRebound(to: CChar.self, capacity: bytes.count + 1) { dst in
+                    for (i, b) in bytes.enumerated() { dst[i] = CChar(bitPattern: b) }
+                    dst[bytes.count] = 0
+                }
+            }
+            let bound = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            guard bound == 0, listen(fd, 4) == 0 else { close(fd); return nil }
+            let steps = script.count
+            Thread.detachNewThread { [self] in
+                for _ in 0..<steps {
+                    let conn = accept(fd, nil, nil)
+                    guard conn >= 0 else { return }
+                    var line = [UInt8]()
+                    var byte: UInt8 = 0
+                    while read(conn, &byte, 1) == 1, byte != UInt8(ascii: "\n") { line.append(byte) }
+                    lock.lock()
+                    received.append(String(decoding: line, as: UTF8.self))
+                    let (status, passFd) = self.script.isEmpty ? (UInt8(1), Int32(-1)) : self.script.removeFirst()
+                    lock.unlock()
+                    reply(conn, status: status, passFd: passFd)
+                    close(conn)
+                }
+            }
+        }
+
+        var requests: [String] { lock.lock(); defer { lock.unlock() }; return received }
+        func stop() { close(fd); unlink(path) }
+
+        // Mirrors velox-porthelper's reply(): 1 status byte, optional SCM_RIGHTS fd.
+        private func reply(_ conn: Int32, status: UInt8, passFd: Int32) {
+            let hdrLen = (MemoryLayout<cmsghdr>.size + 3) & ~3
+            let cmsgLen = hdrLen + MemoryLayout<Int32>.size
+            let space = hdrLen + ((MemoryLayout<Int32>.size + 3) & ~3)
+            var statusByte = status
+            withUnsafeMutablePointer(to: &statusByte) { sp in
+                var iov = iovec(iov_base: UnsafeMutableRawPointer(sp), iov_len: 1)
+                withUnsafeMutablePointer(to: &iov) { iovp in
+                    var msg = msghdr()
+                    msg.msg_iov = iovp
+                    msg.msg_iovlen = 1
+                    guard passFd >= 0 else { _ = sendmsg(conn, &msg, 0); return }
+                    let control = UnsafeMutableRawPointer.allocate(byteCount: space,
+                                                                   alignment: MemoryLayout<cmsghdr>.alignment)
+                    defer { control.deallocate() }
+                    memset(control, 0, space)
+                    msg.msg_control = control
+                    msg.msg_controllen = socklen_t(space)
+                    let cmsg = control.assumingMemoryBound(to: cmsghdr.self)
+                    cmsg.pointee.cmsg_len = socklen_t(cmsgLen)
+                    cmsg.pointee.cmsg_level = SOL_SOCKET
+                    cmsg.pointee.cmsg_type = SCM_RIGHTS
+                    (control + hdrLen).assumingMemoryBound(to: Int32.self).pointee = passFd
+                    _ = sendmsg(conn, &msg, 0)
+                }
+            }
+        }
+    }
+
+    // An fd with a known payload to pass through SCM_RIGHTS (proves real fd passage).
+    var pipeFds = [Int32](repeating: 0, count: 2)
+    _ = pipe(&pipeFds)
+    var marker: UInt8 = 0x42
+    _ = write(pipeFds[1], &marker, 1)
+    close(pipeFds[1])
+
+    let script: [(UInt8, Int32)] = [
+        (0, pipeFds[0]),   // tcp bind → ok + fd
+        (2, -1),           // udp bind → EACCES-style failure, no fd
+        (0, -1),           // route add → ok
+        (1, -1),           // route del → failure
+        (0, -1),           // ipfwd → ok
+    ]
+    if let daemon = FakeDaemon(script: script) {
+        PortHelperClient.socketPath = daemon.path
+
+        let got = PortHelperClient.requestListener(port: 80, proto: .tcp)
+        check(got != nil, "bind ok+fd → a descriptor is returned")
+        if let got {
+            var readBack: UInt8 = 0
+            check(read(got, &readBack, 1) == 1 && readBack == 0x42, "passed fd is the real one (payload survives)")
+            close(got)
+        }
+        check(PortHelperClient.requestListener(port: 81, proto: .udp) == nil, "non-zero status → nil, no fd")
+        check(PortHelperClient.route(add: true, subnet: "172.18.0.0/16", gateway: "192.168.64.2"), "route add status 0 → true")
+        check(!PortHelperClient.route(add: false, subnet: "172.18.0.0/16", gateway: ""), "route del status 1 → false")
+        check(PortHelperClient.restoreIPForwarding(), "ipfwd status 0 → true")
+
+        // The wire format is the contract with the root daemon — assert it verbatim.
+        equal(daemon.requests, ["tcp 80", "udp 81",
+                                "route add 172.18.0.0/16 192.168.64.2",
+                                "route del 172.18.0.0/16", "ipfwd"],
+              "request lines match the daemon protocol")
+        daemon.stop()
+        close(pipeFds[0])
+        PortHelperClient.socketPath = PortHelperClient.productionSocketPath
+    } else {
+        check(false, "fake daemon failed to start")
     }
 }
 

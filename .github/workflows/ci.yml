@@ -1,0 +1,43 @@
+# Velox CI — every push/PR builds the host and lints the guest; nothing is released
+# here (releases are the tag-triggered release.yml, and cutting one is opt-in per
+# CLAUDE.md). Two jobs:
+#   swift: build all host targets + run the dependency-free selftest runner.
+#   vinit: type-check + clippy the guest PID 1 against its real target
+#          (aarch64-unknown-linux-musl — vinit does not compile for the host).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - run: swift --version
+      - name: Build (all targets)
+        run: |
+          ./Scripts/gen-versions.sh
+          swift build
+      - name: Selftest
+        run: swift run velox-selftest
+
+  vinit:
+    runs-on: ubuntu-24.04-arm      # native arm64 — the same label release.yml uses
+    defaults:
+      run: { working-directory: guest/vinit }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Clippy (deny warnings)
+        run: cargo clippy --target aarch64-unknown-linux-musl -- -D warnings
+      - name: Check (release profile)
+        run: cargo check --release --target aarch64-unknown-linux-musl
