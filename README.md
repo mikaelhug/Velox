@@ -71,7 +71,8 @@ docker context use velox
 docker run --rm hello-world
 ```
 
-The app keeps the engine running while open; `velox start` runs it headless.
+The app boots the engine automatically on launch and keeps it running while
+open; `velox start` runs the same engine headless (no GUI needed).
 
 ## Reach containers by name
 
