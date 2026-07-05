@@ -12,6 +12,9 @@
 ARG RUST_BUILD_IMAGE=rust:1-alpine
 ARG ALPINE_IMAGE=alpine:3.23
 ARG DOCKER_VERSION=29.5.3
+# SHA-256 of the docker tgz below — pinned in versions.env (DOCKER_STATIC_SHA256) and
+# passed through by make-guest.sh; the default is a fallback for bare `docker build`.
+ARG DOCKER_SHA256=02eea44490f1f39ce340fe0bc74124002d957bacaa574d66345fbb353381362d
 
 # --- vinit: static musl PID1 (init + supervisor + vsock agent) ---
 FROM ${RUST_BUILD_IMAGE} AS vinit
@@ -25,7 +28,9 @@ RUN cargo build --release && strip target/release/vinit && cp target/release/vin
 # --- Docker static server binaries ---
 FROM ${ALPINE_IMAGE} AS docker
 ARG DOCKER_VERSION
+ARG DOCKER_SHA256
 RUN wget -qO docker.tgz "https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz" \
+ && echo "${DOCKER_SHA256}  docker.tgz" | sha256sum -c - \
  && tar xf docker.tgz \
  && mkdir -p /out/bin \
  && cp docker/dockerd docker/containerd docker/containerd-shim-runc-v2 docker/runc \

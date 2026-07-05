@@ -47,9 +47,15 @@ ARCH="$(uname -m)"; case "$ARCH" in arm64) DARCH=aarch64;; x86_64) DARCH=x86_64;
 DOCKER_CLI="$DIST/docker-cli/docker"
 if [ ! -x "$DOCKER_CLI" ]; then
     echo "==> download stock docker client $DOCKER_VERSION ($DARCH) for macOS"
+    # Docker ships no checksum sidecar for the static tarballs, so the SHA-256 is
+    # pinned in versions.env (bumped together with DOCKER_VERSION). arm64-only:
+    # Velox needs Virtualization.framework on Apple Silicon, so no other host arch.
+    [ "$DARCH" = "aarch64" ] || { echo "error: no pinned docker-cli SHA-256 for $DARCH (add DOCKER_CLI_MAC_${DARCH}_SHA256 to versions.env)" >&2; exit 1; }
     mkdir -p "$DIST/docker-cli"
     curl -fSL "https://download.docker.com/mac/static/stable/${DARCH}/docker-${DOCKER_VERSION}.tgz" \
         -o "$DIST/docker-cli.tgz"
+    echo "${DOCKER_CLI_MAC_ARM64_SHA256}  $DIST/docker-cli.tgz" | shasum -a 256 -c - >/dev/null \
+        || { echo "error: docker-cli.tgz SHA-256 mismatch — expected ${DOCKER_CLI_MAC_ARM64_SHA256} (versions.env)" >&2; exit 1; }
     tar -xzf "$DIST/docker-cli.tgz" -C "$DIST/docker-cli" --strip-components=1 docker/docker
 fi
 
