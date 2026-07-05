@@ -102,6 +102,13 @@ fn main() {
 
 // =================== filesystems ===================
 
+/// CString from a KNOWN-CONSTANT (or fully vinit-computed) path — never call this on
+/// host-supplied input. With `panic = "abort"` a panic in PID 1 is a kernel panic, so
+/// anything that can carry outside bytes must handle the NUL error instead (do_mount).
+fn cstr(s: &str) -> CString {
+    CString::new(s).expect("BUG: NUL in constant path")
+}
+
 /// Returns true on success. Most callers ignore the result (best-effort pseudo-fs
 /// mounts); the data-disk mount checks it so a failure can refuse to start dockerd.
 fn do_mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong, data: Option<&str>) -> bool {
@@ -171,7 +178,9 @@ fn set_clock() {
         log!("no velox.epoch on cmdline — clock stays at boot value");
         return;
     };
-    let tv = libc::timeval { tv_sec: epoch as libc::time_t, tv_usec: 0 };
+    // Not libc::time_t: that alias is deprecated pending musl's 64-bit switch; on
+    // aarch64-musl the field already IS 64-bit, so name the concrete width.
+    let tv = libc::timeval { tv_sec: epoch, tv_usec: 0 };
     if unsafe { libc::settimeofday(&tv, std::ptr::null()) } == 0 {
         log!("clock set from host: epoch {epoch}");
     } else {
@@ -353,7 +362,8 @@ fn get_mac(s: RawFd) -> std::io::Result<[u8; 6]> {
         return Err(std::io::Error::last_os_error());
     }
     let mut mac = [0u8; 6];
-    for i in 0..6 { mac[i] = rh.hw.sa_data[i] as u8; }
+    // c_char IS u8 on aarch64 (the only target vinit builds for), so no cast.
+    for (m, b) in mac.iter_mut().zip(rh.hw.sa_data.iter()) { *m = *b; }
     Ok(mac)
 }
 
@@ -384,8 +394,8 @@ fn write_resolv_conf(dns: &[u32]) {
     }
     // The root is read-only erofs, so bind-mount the tmpfs copy over the real
     // (empty) /etc/resolv.conf file so dockerd + containers resolve DNS.
-    let src = CString::new("/run/resolv.conf").unwrap();
-    let tgt = CString::new("/etc/resolv.conf").unwrap();
+    let src = cstr("/run/resolv.conf");
+    let tgt = cstr("/etc/resolv.conf");
     let r = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) };
     if r != 0 { log!("bind /etc/resolv.conf failed: {}", std::io::Error::last_os_error()); }
 }
@@ -409,6 +419,7 @@ const DOCKER_INTERNAL_NAMES: [&str; 2] = ["host.docker.internal", "gateway.docke
 /// thread-per-datagram model lets a flood exhaust PID 1. Over the cap, queries are
 /// dropped (the resolver retries). 64 is far above any real per-VM query concurrency.
 static DNS_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DNS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const DNS_MAX_INFLIGHT: usize = 64;
 
 fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
@@ -431,6 +442,12 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
             // threads on the forward recv) can't exhaust PID 1's threads/fds.
             if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
                 DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // Rate-limited visibility (1st, 101st, …): silent drops read as a
+                // network partition from inside a container — leave a trace instead.
+                let dropped = DNS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if dropped % 100 == 1 {
+                    log!("dns: dropped {dropped} queries so far (inflight cap {DNS_MAX_INFLIGHT})");
+                }
                 continue; // drop; the stub resolver retries
             }
             let query = buf[..n].to_vec();
@@ -1215,7 +1232,7 @@ fn setup_swap() {
     let path = "/var/lib/docker/.velox-swapfile";
     match make_swapfile(path, mib * 1024 * 1024) {
         Ok(()) => {
-            let cpath = CString::new(path).unwrap();
+            let cpath = cstr(path);
             if unsafe { libc::swapon(cpath.as_ptr(), 0) } == 0 {
                 log!("swap enabled: {mib} MiB at {path}");
             } else {
@@ -1289,9 +1306,9 @@ fn setup_virtiofs() {
 
     // Rosetta x86-64 translation (optional — only if the host attached the share).
     let _ = std::fs::create_dir_all("/run/rosetta");
-    let csrc = CString::new("rosetta").unwrap();
-    let ctgt = CString::new("/run/rosetta").unwrap();
-    let cfs = CString::new("virtiofs").unwrap();
+    let csrc = cstr("rosetta");
+    let ctgt = cstr("/run/rosetta");
+    let cfs = cstr("virtiofs");
     let r = unsafe { libc::mount(csrc.as_ptr(), ctgt.as_ptr(), cfs.as_ptr(), 0, std::ptr::null()) };
     if r == 0 {
         // The kernel hex-unescapes the magic/mask itself (string_unescape_inplace,
@@ -1310,7 +1327,7 @@ fn setup_virtiofs() {
 }
 
 fn make_rshared(target: &str) {
-    let ctgt = CString::new(target).unwrap();
+    let ctgt = cstr(target);
     unsafe {
         libc::mount(std::ptr::null(), ctgt.as_ptr(), std::ptr::null(),
             libc::MS_SHARED | libc::MS_REC, std::ptr::null());
@@ -1481,7 +1498,7 @@ fn handle_clock(fd: RawFd) {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     if (epoch - now).abs() <= 2 { return; } // already aligned
-    let tv = libc::timeval { tv_sec: epoch as libc::time_t, tv_usec: 0 };
+    let tv = libc::timeval { tv_sec: epoch, tv_usec: 0 };
     if unsafe { libc::settimeofday(&tv, std::ptr::null()) } == 0 {
         log!("clock re-synced from host: {now} -> {epoch}");
     } else {
@@ -1795,8 +1812,7 @@ fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
     loop {
         let n = unsafe { libc::epoll_wait(w.epfd, events.as_mut_ptr(), 512, -1) };
         if n < 0 { continue; }
-        for i in 0..n as usize {
-            let ev = events[i];
+        for ev in events.iter().copied().take(n as usize) {
             let fd = ev.u64 as RawFd;
             let mask = ev.events;
             if fd == w.evfd {
@@ -1824,7 +1840,7 @@ fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
                     if fd == c.b && !c.ba.eof { c.ba.eof = true; unsafe { libc::shutdown(c.ba.dst, libc::SHUT_WR); } }
                 }
                 let done = c.ab.finished() && c.ba.finished();
-                if !done { relay_update(w.epfd, &*c, c.a); relay_update(w.epfd, &*c, c.b); }
+                if !done { relay_update(w.epfd, &c, c.a); relay_update(w.epfd, &c, c.b); }
                 done
             };
             if finished {
@@ -2035,13 +2051,31 @@ fn nix_write(fd: RawFd, data: &[u8]) -> std::io::Result<()> {
 /// daemon that crashes on startup doesn't spin the CPU. Each successful respawn pings
 /// `nft_restarted` so direct-access re-asserts its rules in the rebuilt nft table.
 fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>, nft_restarted: std::sync::mpsc::Sender<()>) {
+    let mut spawned_at = std::time::Instant::now();
+    let mut fast_deaths: u32 = 0;
     while deaths.recv().is_ok() {
-        log!("dockerd exited — restarting");
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Crash-loop backoff: a dockerd that dies within 10s of spawning doubles the
+        // respawn delay (1,2,4,…,30s cap); one that ran ≥60s resets it (10–60s keeps
+        // the current level). Never gives up — an appliance must keep self-healing —
+        // but a wedged engine can't respawn-storm the CPU at 1 Hz forever.
+        let uptime = spawned_at.elapsed();
+        if uptime < std::time::Duration::from_secs(10) {
+            fast_deaths = (fast_deaths + 1).min(5);
+        } else if uptime >= std::time::Duration::from_secs(60) {
+            fast_deaths = 0;
+        }
+        let delay = (1u64 << fast_deaths).min(30);
+        if fast_deaths > 0 {
+            log!("dockerd exited after {}s — restarting in {delay}s (crash loop #{fast_deaths})", uptime.as_secs());
+        } else {
+            log!("dockerd exited — restarting");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(delay));
         loop {
             let pid = spawn_dockerd();
             if pid >= 0 {
                 DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+                spawned_at = std::time::Instant::now();
                 let _ = nft_restarted.send(());
                 break;
             }
