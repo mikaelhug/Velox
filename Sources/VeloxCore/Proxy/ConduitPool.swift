@@ -211,7 +211,7 @@ public final class ConduitPool: @unchecked Sendable {
     /// and splice `clientFd` ↔ `conduit` via the event-loop relay. Stale conduit → vsock fallback.
     private func assign(conduit: Int32, clientFd: Int32, port: UInt16) {
         let target = endpoints?.endpoint(for: port) ?? "\(port)"
-        guard Self.writeAll(conduit, Array("\(target)\n".utf8)) else {
+        guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
             close(conduit)
             fallbackHandler?(clientFd, port)
             return
@@ -237,18 +237,6 @@ public final class ConduitPool: @unchecked Sendable {
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, socklen_t(MemoryLayout<Int32>.size))
         var cnt: Int32 = 3
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, socklen_t(MemoryLayout<Int32>.size))
-    }
-
-    private static func writeAll(_ fd: Int32, _ buf: [UInt8]) -> Bool {
-        var off = 0
-        return buf.withUnsafeBytes { raw in
-            while off < buf.count {
-                let n = write(fd, raw.baseAddress!.advanced(by: off), buf.count - off)
-                if n <= 0 { if n < 0 && errno == EINTR { continue }; return false }
-                off += n
-            }
-            return true
-        }
     }
 
     private static func ipString(_ be: in_addr_t) -> String {

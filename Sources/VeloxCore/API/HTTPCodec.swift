@@ -92,16 +92,11 @@ public enum HTTPCodec {
 
     // MARK: Low-level write
 
+    /// Throwing wrapper over the shared `FDIO.writeAll` (the API layer reports transport
+    /// failures as `DockerError`; the proxy layers use the Bool form directly).
     static func writeAll(_ fd: Int32, _ data: Data) throws {
-        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-            var offset = 0
-            let base = raw.bindMemory(to: UInt8.self).baseAddress!
-            while offset < data.count {
-                let n = write(fd, base + offset, data.count - offset)
-                if n > 0 { offset += n; continue }
-                if n < 0 && errno == EINTR { continue }
-                throw DockerError.transport("write failed (errno \(errno))")
-            }
+        guard FDIO.writeAll(fd, data) else {
+            throw DockerError.transport("write failed (errno \(errno))")
         }
     }
 }
