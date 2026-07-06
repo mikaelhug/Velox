@@ -34,5 +34,8 @@ public protocol DockerClientProtocol: Sendable {
     // Streams
     func events() -> AsyncStream<DockerEvent>
     func stats(container id: String) -> AsyncStream<ContainerStatsSample>
-    func logs(container id: String, tail: Int) -> AsyncStream<LogFrame>
+    /// Follow a container's logs. `tail` bounds the initial backlog; `since` (a Unix
+    /// timestamp, fractional seconds allowed) returns only logs newer than that moment
+    /// — used to reattach after a restart without re-printing the persisted history.
+    func logs(container id: String, tail: Int, since: Double?) -> AsyncStream<LogFrame>
 }

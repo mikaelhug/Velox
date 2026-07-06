@@ -52,20 +52,65 @@ final class LogStore {
 
     func start() {
         guard task == nil else { return }
-        isStreaming = true
-        let stream = docker.logs(container: containerID, tail: 1000)
-        task = Task { [weak self] in
-            for await frame in stream {
-                self?.ingest(frame)
-            }
-            self?.isStreaming = false       // follow stream ended
-        }
+        task = Task { [weak self] in await self?.supervise() }
     }
 
     func stop() {
         task?.cancel()
         task = nil
         isStreaming = false
+    }
+
+    /// Follow the container's logs, **reattaching across restarts**. A `docker logs -f`
+    /// stream ends the instant the container stops (or the connection drops); rather than
+    /// dead-ending on "Stream ended", wait — event-driven, never polling (CLAUDE.md §8)
+    /// — for the container to be running again, then reconnect. On reattach we pull only
+    /// logs newer than the moment we detached (`since`), so a restart doesn't re-print the
+    /// persisted pre-restart history that's already in the buffer.
+    private func supervise() async {
+        var since: Double?              // nil on first attach → tail the backlog
+        while !Task.isCancelled {
+            await follow(since: since)
+            if Task.isCancelled { return }
+            since = Date().timeIntervalSince1970   // reattach shows only new output
+            guard await waitUntilRunning() else { return }
+        }
+    }
+
+    /// Stream the follow output until it ends (container stopped or connection dropped).
+    private func follow(since: Double?) async {
+        isStreaming = true
+        defer { isStreaming = false }
+        for await frame in docker.logs(container: containerID, tail: 1000, since: since) {
+            if Task.isCancelled { return }
+            ingest(frame)
+        }
+    }
+
+    /// Park until this container is running again, so a stopped window springs back to
+    /// life the instant the container (re)starts — no status poll. Subscribes to the
+    /// `/events` stream *first*, then reconciles via one inspect (CLAUDE.md §8: the event
+    /// is the trigger, the reconcile is the truth), so a `start` firing in the gap isn't
+    /// missed. Returns false when we should give up: task cancelled, container removed,
+    /// or the engine (events stream) went away.
+    private func waitUntilRunning() async -> Bool {
+        let events = docker.events()
+        if await isRunning() { return true }
+        for await event in events {
+            if Task.isCancelled { return false }
+            guard event.containerID == containerID else { continue }
+            switch event.action {
+            case "start", "restart", "unpause": return true
+            case "destroy":                     return false
+            default:                            continue
+            }
+        }
+        return false
+    }
+
+    private func isRunning() async -> Bool {
+        guard let info = try? await docker.inspectContainer(containerID) else { return false }
+        return info.state?.status == "running"
     }
 
     /// All buffered lines as plain text — for the "Copy" button.

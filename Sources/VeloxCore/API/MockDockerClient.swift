@@ -166,7 +166,7 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
         }
     }
 
-    public func logs(container id: String, tail: Int) -> AsyncStream<LogFrame> {
+    public func logs(container id: String, tail: Int, since: Double?) -> AsyncStream<LogFrame> {
         AsyncStream { continuation in
             Task {
                 let lines = [

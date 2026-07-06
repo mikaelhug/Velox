@@ -352,10 +352,16 @@ public struct DockerEvent: Codable, Sendable {
     public let actor: Actor?
 
     public struct Actor: Codable, Sendable {
+        public let id: String?
         public let attributes: [String: String]?
-        enum CodingKeys: String, CodingKey { case attributes = "Attributes" }
+        enum CodingKeys: String, CodingKey { case id = "ID", attributes = "Attributes" }
     }
     enum CodingKeys: String, CodingKey { case type = "Type", action = "Action", actor = "Actor" }
+
+    /// The full id of the object the event is about — for a container event, the
+    /// container id. Used to filter the stream to one container (e.g. a log window
+    /// reattaching across a restart).
+    public var containerID: String? { actor?.id }
 
     /// Convenience for the crash notifier: `die` events carry the container name
     /// and exit code in the actor attributes.

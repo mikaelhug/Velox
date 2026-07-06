@@ -270,9 +270,11 @@ public actor DockerClient: DockerClientProtocol {
         }
     }
 
-    public nonisolated func logs(container id: String, tail: Int) -> AsyncStream<LogFrame> {
+    public nonisolated func logs(container id: String, tail: Int, since: Double?) -> AsyncStream<LogFrame> {
         let tailParam = tail > 0 ? "\(tail)" : "all"
-        let path = Self.path("/containers/\(id)/logs?follow=1&stdout=1&stderr=1&tail=\(tailParam)")
+        // Fixed C-locale format (period decimal) — dockerd parses `<sec>.<frac>`.
+        let sinceParam = since.map { "&since=\(String(format: "%.6f", $0))" } ?? ""
+        let path = Self.path("/containers/\(id)/logs?follow=1&stdout=1&stderr=1&tail=\(tailParam)\(sinceParam)")
         let parser = LogFrameParser()
         return makeStream(method: "GET", path: path) { bytes, acc, yield in
             acc.append(bytes)
