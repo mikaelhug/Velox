@@ -1,0 +1,43 @@
+# GitHub Pages — publishes the static project site in docs/ (landing page +
+# benchmarks) to https://mikaelhug.github.io/Velox/.
+#
+# Replaces the legacy "deploy from a branch" source, which redeployed on EVERY push
+# to main — including code-only pushes and every release commit — and produced
+# transient "Deployment failed, try again later." races when pushes landed close
+# together. This custom workflow deploys ONLY when docs/ actually changes (the paths
+# filter) and serialises deploys through the `pages` concurrency group, so a code
+# release never triggers a Pages build and back-to-back docs edits can't race.
+#
+# Requires repo Settings → Pages → Source = "GitHub Actions" (build_type=workflow);
+# without that flip GitHub keeps running the legacy builder instead of this file.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/**']
+  workflow_dispatch: {}          # manual redeploy (e.g. first cutover) with no docs change
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false      # let an in-flight deploy finish rather than cancel it
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04-arm    # native arm64 — same label the other guest jobs use
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll)
+      - id: deployment
+        uses: actions/deploy-pages@v4
