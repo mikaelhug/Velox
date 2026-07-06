@@ -4,6 +4,12 @@
 #   swift: build all host targets + run the dependency-free selftest runner.
 #   vinit: type-check + clippy the guest PID 1 against its real target
 #          (aarch64-unknown-linux-musl — vinit does not compile for the host).
+#
+# A release pushes the `release: vX.Y.Z` commit to main AND the vX.Y.Z tag. The tag
+# fires release.yml, which already runs this exact build + selftest before packaging.
+# So both jobs skip the release commit (the `if:` guard below) to avoid burning runner
+# minutes twice on the same commit — the guard only matches a `release:`-prefixed commit
+# pushed to a branch; PRs and manual runs (no head_commit) always run.
 name: ci
 
 on:
@@ -18,6 +24,7 @@ concurrency:
 
 jobs:
   swift:
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release:') }}
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
@@ -30,6 +37,7 @@ jobs:
         run: swift run velox-selftest
 
   vinit:
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release:') }}
     runs-on: ubuntu-24.04-arm      # native arm64 — the same label release.yml uses
     defaults:
       run: { working-directory: guest/vinit }
