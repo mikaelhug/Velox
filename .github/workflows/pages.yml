@@ -59,7 +59,10 @@ jobs:
           tmp="$(mktemp)"
           sed "s/__VELOX_VERSION__/${VELOX_VERSION}/g" docs/index.html > "$tmp" && mv "$tmp" docs/index.html
           echo "Injected VELOX_VERSION=${VELOX_VERSION} into docs/index.html"
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@v3   # NOT v5: v5 wraps upload-artifact@v7, whose artifact
+                                                 # deploy-pages@v5 can't read ("Fetching artifact metadata
+                                                 # failed"). GitHub's own Pages starter pairs v3 with
+                                                 # deploy-pages@v5, so keep v3 here (its node20 notice is harmless).
         with:
           path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll, stats.json)
       - id: deployment
