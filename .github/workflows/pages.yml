@@ -43,7 +43,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/configure-pages@v5
+      - uses: actions/configure-pages@v6
       - name: Generate download stats (docs/stats.json)
         continue-on-error: true  # a stats hiccup must never block a docs deploy; the page hides the band if the file is missing
         env:
@@ -59,8 +59,8 @@ jobs:
           tmp="$(mktemp)"
           sed "s/__VELOX_VERSION__/${VELOX_VERSION}/g" docs/index.html > "$tmp" && mv "$tmp" docs/index.html
           echo "Injected VELOX_VERSION=${VELOX_VERSION} into docs/index.html"
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll, stats.json)
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
