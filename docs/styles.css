@@ -177,6 +177,26 @@ h3 {
   background: var(--surface-2);
 }
 
+.nav-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+  transition: color 0.15s ease;
+}
+
+.nav-stat:hover {
+  color: var(--text);
+}
+
+.nav-stat-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
 /* ---------- hero ---------- */
 
 .hero {
@@ -625,32 +645,6 @@ h3 {
   content: "";
 }
 
-/* ---------- adoption / downloads ---------- */
-
-.stats-section {
-  border-top: 1px solid var(--border);
-}
-
-.stats-band {
-  display: grid;
-  width: min(680px, 100%);
-  margin: 0 auto;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 1px;
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  background: var(--border);
-  overflow: hidden;
-}
-
-.stats-band .metric {
-  text-align: center;
-}
-
-.stats-section .note {
-  margin-top: 18px;
-}
-
 /* ---------- install CTA ---------- */
 
 .install {
@@ -828,14 +822,13 @@ h3 {
     font-size: 0.86rem;
   }
 
-  .nav-links a:not(.nav-cta) {
+  .nav-links a:not(.nav-cta):not(.nav-stat) {
     display: none;
   }
 
   .metric-band,
   .feature-grid,
-  .architecture-list,
-  .stats-band {
+  .architecture-list {
     grid-template-columns: 1fr;
   }
 

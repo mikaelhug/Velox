@@ -66,6 +66,15 @@
           <a href="#features">Features</a>
           <a href="#benchmarks">Benchmarks</a>
           <a href="#install">Install</a>
+          <!-- Total release downloads, filled from stats.json at runtime; hidden until it loads. -->
+          <a class="nav-stat" id="nav-stat" href="https://github.com/mikaelhug/Velox/releases" aria-label="Total downloads" hidden>
+            <svg class="nav-stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v12"></path>
+              <path d="M7 10l5 5 5-5"></path>
+              <path d="M5 21h14"></path>
+            </svg>
+            <span id="nav-stat-total">—</span>
+          </a>
           <a class="nav-cta" href="https://github.com/mikaelhug/Velox">GitHub</a>
         </div>
       </div>
@@ -276,28 +285,6 @@ curl http://web.velox.local</code></pre>
         </div>
       </section>
 
-      <section class="section stats-section" aria-label="Adoption">
-        <div class="section-heading">
-          <p class="eyebrow">Adoption</p>
-          <h2>Counted the honest way</h2>
-          <p>
-            Straight from GitHub's own release download counts — no telemetry,
-            no phone-home, no per-machine tracking.
-          </p>
-        </div>
-        <div class="stats-band" id="stats-band" hidden>
-          <div class="metric">
-            <span class="metric-value" id="stat-total">—</span>
-            <span class="metric-label">total downloads, all releases</span>
-          </div>
-          <div class="metric">
-            <span class="metric-value" id="stat-latest">—</span>
-            <span class="metric-label" id="stat-latest-label">on the latest release</span>
-          </div>
-        </div>
-        <p class="note" id="stats-note" hidden></p>
-      </section>
-
       <section class="install" id="install">
         <div>
           <p class="eyebrow">Try Velox</p>
@@ -335,10 +322,10 @@ curl http://web.velox.local</code></pre>
     </footer>
 
     <!--
-      Adoption numbers. stats.json is generated at deploy time from GitHub's
+      Nav download counter. stats.json is generated at deploy time from GitHub's
       release download counts (Scripts/gen-stats.sh, run by the pages workflow) —
-      no client-side tracking. The band stays hidden unless the file loads and has
-      a published release, so the page degrades cleanly with JS off or data absent.
+      no client-side tracking. The counter stays hidden unless the file loads and
+      has a published release, so the nav degrades cleanly with JS off or data absent.
     -->
     <script>
       (function () {
@@ -347,22 +334,14 @@ curl http://web.velox.local</code></pre>
           .then(function (s) {
             if (!s || !s.latest) return;
             var fmt = function (n) { return (n || 0).toLocaleString("en-US"); };
-            document.getElementById("stat-total").textContent = fmt(s.total_downloads);
-            document.getElementById("stat-latest").textContent = fmt(s.latest.downloads);
-            document.getElementById("stat-latest-label").textContent =
-              "downloads of v" + s.latest.version;
-            document.getElementById("stats-band").hidden = false;
-            if (s.generated_at) {
-              var note = document.getElementById("stats-note");
-              note.textContent =
-                "Live from GitHub Releases · updated " +
-                new Date(s.generated_at).toLocaleDateString("en-US", {
-                  year: "numeric", month: "short", day: "numeric",
-                });
-              note.hidden = false;
-            }
+            var el = document.getElementById("nav-stat");
+            document.getElementById("nav-stat-total").textContent = fmt(s.total_downloads);
+            el.title =
+              fmt(s.total_downloads) + " total downloads · " +
+              fmt(s.latest.downloads) + " on v" + s.latest.version;
+            el.hidden = false;
           })
-          .catch(function () { /* leave the band hidden */ });
+          .catch(function () { /* leave the counter hidden */ });
       })();
     </script>
   </body>
