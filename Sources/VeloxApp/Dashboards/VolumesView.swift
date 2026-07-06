@@ -341,6 +341,15 @@ extension VolumesView {
 
 // MARK: - Cells
 
+/// The daemon-reported size, "Empty" when it measured zero bytes, or "N/A" when it
+/// can't provide one (non-local driver, local volume with driver options, or a
+/// failed /system/df).
+@MainActor
+private func volumeSizeText(_ size: Int64?) -> String {
+    guard let size else { return "N/A" }
+    return size == 0 ? "Empty" : Format.bytes(size)
+}
+
 extension VolumesView {
     @ViewBuilder
     fileprivate func nameCell(_ row: VolumeRow) -> some View {
@@ -378,11 +387,12 @@ extension VolumesView {
     fileprivate func sizeCell(_ row: VolumeRow) -> some View {
         switch row {
         case .volume(let v):
-            Text(v.size.map(Format.bytes) ?? "—").font(.callout.monospacedDigit())
+            Text(volumeSizeText(v.size)).font(.callout.monospacedDigit())
+                .foregroundStyle((v.size ?? 0) > 0 ? .primary : .secondary)
         case .project(let g):
-            // Sum the members' known sizes — "—" only when none are known yet.
-            let total = g.volumes.compactMap(\.size).reduce(0, +)
-            Text(g.volumes.contains { $0.size != nil } ? Format.bytes(total) : "—")
+            // Sum the members' known sizes — "N/A" only when none are known yet.
+            let known = g.volumes.compactMap(\.size)
+            Text(volumeSizeText(known.isEmpty ? nil : known.reduce(0, +)))
                 .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
         }
     }
@@ -466,6 +476,8 @@ private struct VolumeBadge: View {
     var body: some View {
         Text(text)
             .font(.caption2)
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 5).padding(.vertical, 1)
             .background(.orange.opacity(0.18), in: Capsule())
             .foregroundStyle(.orange)
@@ -482,7 +494,7 @@ private struct VolumeInspector: View {
                 Section("Volume") {
                     LabeledContent("Name", value: volume.name)
                     LabeledContent("Driver", value: volume.driver)
-                    LabeledContent("Size", value: volume.size.map(Format.bytes) ?? "Unknown")
+                    LabeledContent("Size", value: volumeSizeText(volume.size))
                     LabeledContent("Created", value: Format.age(iso: volume.createdAt))
                 }
                 Section("Mountpoint") {

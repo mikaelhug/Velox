@@ -48,8 +48,6 @@ final class ContainersModel {
         for id in ids { pending.removeValue(forKey: id) }
     }
 
-    func refresh() async { await store.refreshContainers() }
-
     func perform(_ action: @Sendable (any DockerClientProtocol) async throws -> Void) async {
         do { try await action(docker); await store.refreshContainers() }
         catch { actionError = "\(error)" }
@@ -281,12 +279,6 @@ struct ContainersView: View {
                     .help("Restart selected")
                     .disabled(selectedContainers.isEmpty)
                 }
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Button { Task { await model.refresh() } } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                .help("Refresh")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { pendingBulkDelete = selectedContainers } label: {

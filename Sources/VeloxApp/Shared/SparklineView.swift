@@ -57,31 +57,38 @@ struct MirroredSparklineView: View {
             let midY = size.height / 2
             let peak = max(up.max() ?? 0, down.max() ?? 0)
             let ceiling = max(peak * 1.3, 0.0001)
+            // Split the two baselines by a hair so an idle (all-zero) up and down don't
+            // stack onto the exact same row and hide each other — the up line rests just
+            // above center, the down line just below, always both visible (as macOS
+            // Activity Monitor's mirrored graph does).
+            let gap: CGFloat = 1.5
 
-            // One series' line + fill, mapped from the midline (upward or downward).
+            // One series' line + fill, mapped from its baseline (upward or downward).
             func draw(_ values: [Double], goingUp: Bool, tint: Color) {
                 guard values.count > 1 else { return }
                 let stepX = size.width / CGFloat(values.count - 1)
+                let baseY = goingUp ? midY - gap : midY + gap  // this series' baseline
+                let span = midY - gap                          // drawable height per half
                 var line = Path()
-                var extremeY = midY     // the point furthest from the baseline (the peak)
+                var extremeY = baseY    // the point furthest from the baseline (the peak)
                 for (i, v) in values.enumerated() {
                     let x = CGFloat(i) * stepX
                     let frac = CGFloat(min(v, ceiling) / ceiling)
-                    let y = goingUp ? midY * (1 - frac) : midY + midY * frac
+                    let y = goingUp ? baseY - span * frac : baseY + span * frac
                     extremeY = goingUp ? min(extremeY, y) : max(extremeY, y)
                     if i == 0 { line.move(to: CGPoint(x: x, y: y)) }
                     else { line.addLine(to: CGPoint(x: x, y: y)) }
                 }
                 var fill = line
-                fill.addLine(to: CGPoint(x: size.width, y: midY))
-                fill.addLine(to: CGPoint(x: 0, y: midY))
+                fill.addLine(to: CGPoint(x: size.width, y: baseY))
+                fill.addLine(to: CGPoint(x: 0, y: baseY))
                 fill.closeSubpath()
                 // Anchor the gradient at the series' peak (not the card edge) so even small
                 // throughput still shows a visible fill under the line.
                 context.fill(fill, with: .linearGradient(
                     Gradient(colors: [tint.opacity(0.30), tint.opacity(0.03)]),
                     startPoint: CGPoint(x: 0, y: extremeY),
-                    endPoint: CGPoint(x: 0, y: midY)))
+                    endPoint: CGPoint(x: 0, y: baseY)))
                 context.stroke(line, with: .color(tint), lineWidth: 1.5)
             }
 

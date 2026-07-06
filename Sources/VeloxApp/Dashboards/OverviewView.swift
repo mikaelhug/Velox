@@ -172,32 +172,27 @@ struct OverviewView: View {
 private struct LiveUsageSection: View {
     let stats: StatsStore
 
+    // No section header: the live tiles read as one continuous grid with the stat
+    // cards and disk breakdown above, separated only by the parent's uniform spacing.
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Live Usage").font(.headline)
-                Text("Aggregate across running containers")
-                    .font(.caption).foregroundStyle(.secondary)
+        VStack(spacing: Theme.gridSpacing) {
+            HStack(spacing: Theme.gridSpacing) {
+                LiveMetricCard(title: "CPU", tint: .green,
+                               value: String(format: "%.0f%%", stats.totalCPU),
+                               history: stats.cpuHistory)
+                LiveMetricCard(title: "Memory", tint: .blue,
+                               value: Format.bytes(stats.totalMemBytes),
+                               history: stats.memHistory)
             }
-            VStack(spacing: Theme.gridSpacing) {
-                HStack(spacing: Theme.gridSpacing) {
-                    LiveMetricCard(title: "CPU", tint: .green,
-                                   value: String(format: "%.0f%%", stats.totalCPU),
-                                   history: stats.cpuHistory)
-                    LiveMetricCard(title: "Memory", tint: .blue,
-                                   value: Format.bytes(stats.totalMemBytes),
-                                   history: stats.memHistory)
-                }
-                // Disk and Network are bidirectional, so they get the mirrored macOS-style
-                // graph — Read/In above the baseline, Write/Out below — not a single line.
-                HStack(spacing: Theme.gridSpacing) {
-                    LiveIOCard(title: "Disk I/O", upLabel: "Read", downLabel: "Write",
-                               upValue: stats.totalDiskRead, downValue: stats.totalDiskWrite,
-                               upHistory: stats.diskReadHistory, downHistory: stats.diskWriteHistory)
-                    LiveIOCard(title: "Network", upLabel: "In", downLabel: "Out",
-                               upValue: stats.totalNetRx, downValue: stats.totalNetTx,
-                               upHistory: stats.netRxHistory, downHistory: stats.netTxHistory)
-                }
+            // Disk and Network are bidirectional, so they get the mirrored macOS-style
+            // graph — Read/In above the baseline, Write/Out below — not a single line.
+            HStack(spacing: Theme.gridSpacing) {
+                LiveIOCard(title: "Disk I/O", upLabel: "Read", downLabel: "Write",
+                           upValue: stats.totalDiskRead, downValue: stats.totalDiskWrite,
+                           upHistory: stats.diskReadHistory, downHistory: stats.diskWriteHistory)
+                LiveIOCard(title: "Network", upLabel: "In", downLabel: "Out",
+                           upValue: stats.totalNetRx, downValue: stats.totalNetTx,
+                           upHistory: stats.netRxHistory, downHistory: stats.netTxHistory)
             }
         }
     }
@@ -270,12 +265,13 @@ private struct LiveIOCard: View {
 
     private func readout(_ label: String, _ value: Double, _ tint: Color) -> some View {
         HStack(spacing: 4) {
-            Text(label).font(.caption2.weight(.semibold))
+            // Only the label carries the series color; the rate itself stays the default
+            // primary text so it reads clearly against the card in either appearance.
+            Text(label).font(.caption2.weight(.semibold)).foregroundStyle(tint)
             Text(Format.bytes(UInt64(max(0, value))) + "/s")
                 .font(.callout.monospacedDigit())
                 .contentTransition(.numericText())
         }
-        .foregroundStyle(tint)
     }
 }
 

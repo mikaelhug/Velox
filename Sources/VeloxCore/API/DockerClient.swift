@@ -78,10 +78,10 @@ public actor DockerClient: DockerClientProtocol {
                                       from: await send("GET", Self.path("/system/df?type=volume"), readTimeout: 30))
         else { return volumes }
 
-        let sizesByName = Dictionary(uniqueKeysWithValues: usage.volumes.compactMap { volume -> (String, Int64)? in
+        let sizesByName = Dictionary(usage.volumes.compactMap { volume -> (String, Int64)? in
             guard let size = volume.size else { return nil }
             return (volume.name, size)
-        })
+        }, uniquingKeysWith: { first, _ in first })
 
         return volumes.map { volume in
             guard let size = sizesByName[volume.name] else { return volume }
