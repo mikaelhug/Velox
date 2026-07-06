@@ -180,7 +180,7 @@ h3 {
 .nav-stat {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 9px;
   color: var(--muted);
   font-size: 0.9rem;
   font-variant-numeric: tabular-nums;
@@ -189,6 +189,18 @@ h3 {
 
 .nav-stat:hover {
   color: var(--text);
+}
+
+.nav-stat-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.nav-stat-sep {
+  width: 1px;
+  height: 13px;
+  background: var(--border-strong);
 }
 
 .nav-stat-icon {
