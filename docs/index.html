@@ -26,6 +26,9 @@
     >
     <meta name="twitter:image" content="https://mikaelhug.github.io/Velox/images/dashboard.png">
     <link rel="stylesheet" href="styles.css">
+    <!-- softwareVersion below is injected from versions.env (VELOX_VERSION, the
+         single source of truth) at deploy time by the pages workflow — the raw
+         source keeps the __VELOX_VERSION__ placeholder; do not hard-code a number. -->
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
@@ -34,7 +37,7 @@
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "macOS 15+ on Apple Silicon",
         "description": "A fast, lean, open-source Docker Desktop alternative for Apple Silicon Macs.",
-        "softwareVersion": "0.2.2",
+        "softwareVersion": "__VELOX_VERSION__",
         "url": "https://mikaelhug.github.io/Velox/",
         "downloadUrl": "https://github.com/mikaelhug/Velox/releases",
         "codeRepository": "https://github.com/mikaelhug/Velox",
@@ -273,6 +276,28 @@ curl http://web.velox.local</code></pre>
         </div>
       </section>
 
+      <section class="section stats-section" aria-label="Adoption">
+        <div class="section-heading">
+          <p class="eyebrow">Adoption</p>
+          <h2>Counted the honest way</h2>
+          <p>
+            Straight from GitHub's own release download counts — no telemetry,
+            no phone-home, no per-machine tracking.
+          </p>
+        </div>
+        <div class="stats-band" id="stats-band" hidden>
+          <div class="metric">
+            <span class="metric-value" id="stat-total">—</span>
+            <span class="metric-label">total downloads, all releases</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value" id="stat-latest">—</span>
+            <span class="metric-label" id="stat-latest-label">on the latest release</span>
+          </div>
+        </div>
+        <p class="note" id="stats-note" hidden></p>
+      </section>
+
       <section class="install" id="install">
         <div>
           <p class="eyebrow">Try Velox</p>
@@ -308,5 +333,37 @@ curl http://web.velox.local</code></pre>
       <a href="benchmarks.html">Benchmarks</a>
       <a href="https://github.com/mikaelhug/Velox/issues">Issues</a>
     </footer>
+
+    <!--
+      Adoption numbers. stats.json is generated at deploy time from GitHub's
+      release download counts (Scripts/gen-stats.sh, run by the pages workflow) —
+      no client-side tracking. The band stays hidden unless the file loads and has
+      a published release, so the page degrades cleanly with JS off or data absent.
+    -->
+    <script>
+      (function () {
+        fetch("stats.json", { cache: "no-cache" })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (s) {
+            if (!s || !s.latest) return;
+            var fmt = function (n) { return (n || 0).toLocaleString("en-US"); };
+            document.getElementById("stat-total").textContent = fmt(s.total_downloads);
+            document.getElementById("stat-latest").textContent = fmt(s.latest.downloads);
+            document.getElementById("stat-latest-label").textContent =
+              "downloads of v" + s.latest.version;
+            document.getElementById("stats-band").hidden = false;
+            if (s.generated_at) {
+              var note = document.getElementById("stats-note");
+              note.textContent =
+                "Live from GitHub Releases · updated " +
+                new Date(s.generated_at).toLocaleDateString("en-US", {
+                  year: "numeric", month: "short", day: "numeric",
+                });
+              note.hidden = false;
+            }
+          })
+          .catch(function () { /* leave the band hidden */ });
+      })();
+    </script>
   </body>
 </html>

@@ -10,12 +10,20 @@
 #
 # Requires repo Settings → Pages → Source = "GitHub Actions" (build_type=workflow);
 # without that flip GitHub keeps running the legacy builder instead of this file.
+#
+# The deploy also regenerates docs/stats.json from GitHub Releases download counts
+# (Scripts/gen-stats.sh) so the landing page shows live install/update numbers with
+# NO client telemetry. stats.json is generated into the Pages artifact, never
+# committed (see .gitignore) — hence the daily `schedule` here: it refreshes the
+# numbers even when docs/ hasn't changed.
 name: pages
 
 on:
   push:
     branches: [main]
     paths: ['docs/**']
+  schedule:
+    - cron: '17 6 * * *'         # daily 06:17 UTC — refresh download counts (no docs change needed)
   workflow_dispatch: {}          # manual redeploy (e.g. first cutover) with no docs change
 
 permissions:
@@ -36,8 +44,23 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/configure-pages@v5
+      - name: Generate download stats (docs/stats.json)
+        continue-on-error: true  # a stats hiccup must never block a docs deploy; the page hides the band if the file is missing
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # gh api uses this; contents:read is enough to read public releases
+        run: ./Scripts/gen-stats.sh
+      - name: Inject VELOX_VERSION into the page (single source of truth = versions.env)
+        run: |
+          # The committed docs/index.html carries a __VELOX_VERSION__ placeholder in its
+          # JSON-LD softwareVersion; substitute the real version here so the deployed
+          # structured data always matches versions.env (CLAUDE.md §2) with no hard-coding.
+          # Ephemeral: edits the throwaway CI checkout only, never committed.
+          set -a; . ./versions.env; set +a
+          tmp="$(mktemp)"
+          sed "s/__VELOX_VERSION__/${VELOX_VERSION}/g" docs/index.html > "$tmp" && mv "$tmp" docs/index.html
+          echo "Injected VELOX_VERSION=${VELOX_VERSION} into docs/index.html"
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll)
+          path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll, stats.json)
       - id: deployment
         uses: actions/deploy-pages@v4

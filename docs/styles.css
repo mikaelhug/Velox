@@ -625,6 +625,32 @@ h3 {
   content: "";
 }
 
+/* ---------- adoption / downloads ---------- */
+
+.stats-section {
+  border-top: 1px solid var(--border);
+}
+
+.stats-band {
+  display: grid;
+  width: min(680px, 100%);
+  margin: 0 auto;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.stats-band .metric {
+  text-align: center;
+}
+
+.stats-section .note {
+  margin-top: 18px;
+}
+
 /* ---------- install CTA ---------- */
 
 .install {
@@ -808,7 +834,8 @@ h3 {
 
   .metric-band,
   .feature-grid,
-  .architecture-list {
+  .architecture-list,
+  .stats-band {
     grid-template-columns: 1fr;
   }
 
