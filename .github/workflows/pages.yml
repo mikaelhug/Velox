@@ -43,7 +43,13 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/configure-pages@v6
+      # Pinned to GitHub's official Pages combo: configure-pages@v5 + upload-pages-artifact@v3 +
+      # deploy-pages@v5. The node24 majors (configure-pages@v6 / upload-pages-artifact@v5) make
+      # deploy-pages@v5 fail with "Fetching artifact metadata failed" (reproduced across several
+      # deploys with GitHub fully operational), so we keep the tested set. configure-pages@v5 and
+      # upload-pages-artifact@v3 still print a Node-20 deprecation notice, but it's harmless — the
+      # runner force-runs them on Node 24. Revisit when GitHub's node24 Pages majors deploy cleanly.
+      - uses: actions/configure-pages@v5
       - name: Generate download stats (docs/stats.json)
         continue-on-error: true  # a stats hiccup must never block a docs deploy; the page hides the band if the file is missing
         env:
@@ -59,10 +65,7 @@ jobs:
           tmp="$(mktemp)"
           sed "s/__VELOX_VERSION__/${VELOX_VERSION}/g" docs/index.html > "$tmp" && mv "$tmp" docs/index.html
           echo "Injected VELOX_VERSION=${VELOX_VERSION} into docs/index.html"
-      - uses: actions/upload-pages-artifact@v3   # NOT v5: v5 wraps upload-artifact@v7, whose artifact
-                                                 # deploy-pages@v5 can't read ("Fetching artifact metadata
-                                                 # failed"). GitHub's own Pages starter pairs v3 with
-                                                 # deploy-pages@v5, so keep v3 here (its node20 notice is harmless).
+      - uses: actions/upload-pages-artifact@v3   # v5 (wraps upload-artifact@v7) breaks deploy-pages@v5 — see note above
         with:
           path: docs             # the site root (contains index.html, benchmarks.html, .nojekyll, stats.json)
       - id: deployment
