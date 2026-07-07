@@ -54,6 +54,9 @@ final class EngineController {
     private let manager = VMManager()
     private var runtime: EngineRuntime?
     private var resourceSaver: ResourceSaver?
+    /// Single-instance guard: acquired before boot, released on stop. Prevents a
+    /// concurrent `velox start` (or second app) from attaching the same data.img.
+    private var instanceLock: InstanceLock?
     /// Held for the engine's lifetime to keep macOS App Nap from throttling the
     /// embedded VM while Velox is backgrounded (see `start()`).
     private var engineActivity: NSObjectProtocol?
@@ -187,6 +190,10 @@ final class EngineController {
             let resources = config.resources
             let shareURLs = config.shareURLs
             try Paths.ensureRoot()
+            // Refuse to boot if another engine (a `velox start` in a terminal) already
+            // holds the lock — two engines on one data.img would corrupt it. Released in
+            // cleanup(). Acquired before any disk/VM work so a conflict fails fast.
+            instanceLock = try InstanceLock(at: Paths.engineLock)
             let dataDisk = config.dataDiskURL
             // A missing disk is a legitimate first-run create only at the DEFAULT location. At a
             // user-chosen location it means the drive is unplugged / the file is gone — fail loudly
@@ -383,6 +390,10 @@ final class EngineController {
         // Keep the buffered lines so the user can read why the engine stopped.
         engineLog.detach()
         consolePipe = nil
+        // Release the single-instance lock last, so no other engine can grab the disk
+        // until this one has fully torn its plumbing down.
+        instanceLock?.release()
+        instanceLock = nil
     }
 
     /// (Re)arm Resource Saver from the current config. Called on start and again

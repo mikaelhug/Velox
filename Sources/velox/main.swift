@@ -80,6 +80,9 @@ func runStart(bind: BindMode) -> Never {
         // resources, swap, and file shares are consistent across both front ends.
         let prefs = VeloxConfig.load()
         try Paths.ensureRoot()
+        // Refuse to boot a second engine (the app or another `velox start`): two would
+        // attach the same data.img read-write and corrupt it. Held for the whole process.
+        try InstanceLock.acquireForProcess(at: Paths.engineLock)
         let dataDisk = prefs.dataDiskURL
         // A relocated data disk that's gone (drive unplugged / deleted) must fail loudly, not be
         // silently recreated empty. A missing disk at the DEFAULT location is a legit first run.

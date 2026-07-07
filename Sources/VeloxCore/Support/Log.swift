@@ -27,6 +27,8 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
     case dataDiskMissing(URL)
     /// A data-disk move couldn't proceed; the string is the user-facing reason.
     case diskMove(String)
+    /// Another Velox engine already holds the single-instance lock.
+    case engineAlreadyRunning
 
     public var description: String {
         switch self {
@@ -48,6 +50,10 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
                 + "disconnected — reconnect it, or move the disk in Settings › Resources."
         case .diskMove(let message):
             return message
+        case .engineAlreadyRunning:
+            return "Another Velox engine is already running (the Velox app or `velox start`). "
+                + "Stop it before starting a second one — two engines would attach the same "
+                + "data disk and corrupt it."
         }
     }
 

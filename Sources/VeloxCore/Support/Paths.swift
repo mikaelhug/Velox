@@ -16,6 +16,10 @@ public enum Paths {
     public static var rootDisk: URL { root.appendingPathComponent("root.img") }
     public static var dataDisk: URL { root.appendingPathComponent("data.img") }
     public static var dockerSocket: URL { root.appendingPathComponent("docker.sock") }
+    /// Single-instance lock: an exclusive `flock` on this file means an engine is
+    /// running, so a second one (app or `velox start`) refuses to boot rather than
+    /// attach the same data.img and fight over the docker socket / published ports.
+    public static var engineLock: URL { root.appendingPathComponent("engine.lock") }
     /// User preferences persisted by the GUI (resources, file shares, etc.).
     public static var config: URL { root.appendingPathComponent("config.json") }
 
