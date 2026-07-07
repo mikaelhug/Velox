@@ -45,3 +45,4 @@ Icon?
 
 # ---- Adoption stats (generated into the Pages artifact by Scripts/gen-stats.sh) ----
 /docs/stats.json
+.claude/launch.json
