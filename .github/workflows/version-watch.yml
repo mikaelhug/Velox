@@ -8,7 +8,7 @@
 #      release the in-app updater serves. (No PR — the audit trail is the run + commit +
 #      tag + release; GITHUB_TOKEN can't open PRs here anyway.)
 #
-# The CI WORKFLOW does the merge+tag — never the AI agent or a human by hand
+# The CI WORKFLOW does the tag+release — never the AI agent or a human by hand
 # (that stays opt-in). Note the deliberate limitation: GitHub-hosted runners cannot
 # boot a Velox VM (no nested Virtualization.framework), so "green" = compiles +
 # config-symbol gate + SHAs verify + host selftest. It does NOT prove the guest boots
@@ -16,12 +16,12 @@
 # checklist in versions.env). Accepted risk; recover with .github/workflows/rollback.yml.
 #
 # Requires repo secret AUTOMATION_SSH_KEY — the PRIVATE half of a write-enabled deploy
-# key (its public half is registered on the repo). The default GITHUB_TOKEN CANNOT be
-# used for the release tag: a tag pushed with GITHUB_TOKEN does not trigger release.yml
-# (GitHub's recursion guard). A push authenticated by a DEPLOY KEY is treated as a normal
-# actor and DOES trigger it. The GITHUB_TOKEN still drives the PR create/merge (which need
-# no downstream trigger — validation runs inline as this workflow's own jobs). This is why
-# a PAT isn't needed and the whole thing is provisionable with `gh`.
+# key (its public half is registered on the repo). ALL git writes (bump branch, the main
+# fast-forward, the tag) go through it; the GITHUB_TOKEN is read-only here. Why the deploy
+# key: a tag pushed with GITHUB_TOKEN does NOT trigger release.yml (GitHub's recursion
+# guard), whereas a deploy-key push is treated as a normal actor and DOES. That is also
+# why no PAT is needed — a deploy key is fully provisionable with `gh`. There are no PRs;
+# validation runs inline as this workflow's own jobs.
 name: 'Maintenance: upstream auto-update'
 
 on:
@@ -33,8 +33,8 @@ on:
   workflow_dispatch: {}          # manual run (first cutover / testing)
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read                 # GITHUB_TOKEN is read-only (checkout + cache); every write
+                                  # goes through AUTOMATION_SSH_KEY (the deploy key), not the token.
 
 concurrency:
   group: version-watch
@@ -175,7 +175,7 @@ jobs:
           echo "${DOCKER_CLI_MAC_ARM64_SHA256}  /tmp/docker-cli.tgz" | sha256sum -c -
 
   # ---------------------------------------------------------------------------
-  # 2b) Validate the host builds + the selftest passes (same as ci.yml's swift job).
+  # 2b) Validate the host builds + the selftest passes (the host half of "green").
   # ---------------------------------------------------------------------------
   validate-host:
     needs: prepare
@@ -194,9 +194,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 3) Ship: only if prepare + both validations succeeded. Fast-forward main to the
-  #    validated bump commit (its `release:`-prefixed message makes ci.yml/ci-guest.yml
-  #    skip it), then tag vX.Y.Z. Both pushes use the deploy key so the tag fires
-  #    release.yml (a GITHUB_TOKEN tag push would not).
+  #    validated bump commit, then tag vX.Y.Z. Both pushes use the deploy key so the
+  #    tag fires release.yml (a GITHUB_TOKEN tag push would not). Nothing runs on the
+  #    main push itself — there is no per-push CI; release.yml is tag-only.
   # ---------------------------------------------------------------------------
   ship:
     needs: [prepare, validate-guest, validate-host]
@@ -216,9 +216,14 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git fetch origin "$BUMP_BRANCH"
           BUMP_SHA="$(git rev-parse FETCH_HEAD)"
-          # Land the validated commit on main (fast-forward — the branch was cut from main
-          # and nothing else pushes it; the concurrency group serialises version-watch runs).
-          git push origin "${BUMP_SHA}:refs/heads/main"
+          # Fast-forward main to the exact commit that was validated. If main advanced
+          # during the run (a human push in the ~20-min window), this is non-FF and fails
+          # ON PURPOSE — we ship only what was validated, never an unvalidated rebase. The
+          # run self-heals next Monday (or re-run it now); nothing partial is left behind.
+          if ! git push origin "${BUMP_SHA}:refs/heads/main"; then
+            echo "::error::main advanced during the run — fast-forward rejected, so nothing shipped. Re-run version-watch (or wait for next Monday); it will re-bump from the new main."
+            exit 1
+          fi
           git tag "v${NEW}" "${BUMP_SHA}"
           git push origin "v${NEW}"                  # deploy-key push → triggers release.yml
           git push origin --delete "$BUMP_BRANCH" || true

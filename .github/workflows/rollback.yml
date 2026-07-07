@@ -84,5 +84,5 @@ jobs:
           git commit -m "release: v${NEW} — rollback pins to ${FROM} (${REASON})"
           git push origin HEAD:main
           git tag "v${NEW}"
-          git push origin "v${NEW}"          # PAT push → triggers release.yml
+          git push origin "v${NEW}"          # deploy-key push → triggers release.yml
           echo "::notice::Tagged v${NEW}; release.yml will build and publish the corrective release."
