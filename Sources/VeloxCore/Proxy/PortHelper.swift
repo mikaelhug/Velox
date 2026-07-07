@@ -326,7 +326,7 @@ enum PortHelperInstaller {
     static func uninstall() async -> Bool {
         let script = [
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
-            "rm -f \(shq(plistPath)) \(shq(installedBinary)) \(shq(versionMarker)) /etc/resolver/\(NamedAccess.domain)",
+            "rm -f \(shq(plistPath)) \(shq(installedBinary)) \(shq(versionMarker)) /etc/resolver/\(shq(NamedAccess.domain))",
         ].joined(separator: " && ")
         return await runAsAdmin(script, prompt: "Velox needs administrator access to remove its privileged-port helper.")
     }
@@ -358,8 +358,8 @@ enum PortHelperInstaller {
             // responder. Folded into the same one-time grant as the port helper (CLAUDE.md §2) so
             // the user is prompted only once. The responder port is fixed, so the file is static.
             "mkdir -p /etc/resolver",
-            "printf 'nameserver 127.0.0.1\\nport %s\\n' \(shq(String(NamedAccess.dnsPort))) > /etc/resolver/\(NamedAccess.domain)",
-            "chmod 644 /etc/resolver/\(NamedAccess.domain)",
+            "printf 'nameserver 127.0.0.1\\nport %s\\n' \(shq(String(NamedAccess.dnsPort))) > /etc/resolver/\(shq(NamedAccess.domain))",
+            "chmod 644 /etc/resolver/\(shq(NamedAccess.domain))",
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
             "launchctl bootstrap system \(shq(plistPath))",
         ].joined(separator: " && ")

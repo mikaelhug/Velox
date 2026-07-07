@@ -75,6 +75,7 @@ public final class UDPForwarder: @unchecked Sendable {
         queue.async {
             for port in Array(self.listeners.keys) { self.closeListener(port) }
             self.reaper?.cancel(); self.reaper = nil
+            self.relay.stop()   // tear down the shared kqueue loop (thread + kq + wakeup pipe)
         }
     }
 
@@ -361,14 +362,16 @@ private final class RelayLoop: @unchecked Sendable {
     private enum Command {
         case add(Registration)
         case drop(fd: Int32, token: UInt64, done: @Sendable () -> Void)
+        case stop
     }
 
-    private let kq = kqueue()
+    private var kq: Int32 = -1               // created lazily in start(); -1 until a flow appears
     private var pipeR: Int32 = -1
     private var pipeW: Int32 = -1
     private let lock = NSLock()
     private var commands: [Command] = []     // guarded by `lock`
     private var started = false              // guarded by `lock`
+    private var stopped = false              // guarded by `lock`
     private var nextToken: UInt64 = 1        // guarded by `lock`
     private var entries: [Int32: Entry] = [:]   // loop-thread only
 
@@ -378,6 +381,7 @@ private final class RelayLoop: @unchecked Sendable {
              touch: @escaping @Sendable () -> Void,
              onEOF: @escaping @Sendable () -> Void) -> UInt64 {
         lock.lock()
+        if stopped { lock.unlock(); return 0 }   // loop torn down; caller's flow gets closed by the forwarder
         let token = nextToken
         nextToken += 1
         commands.append(.add(Registration(fd: fd, token: token, listenerFd: listenerFd,
@@ -401,7 +405,20 @@ private final class RelayLoop: @unchecked Sendable {
         if running { wake() } else { done() }
     }
 
+    /// Tear down the loop thread and its own fds (kqueue + wakeup pipe). Idempotent, safe
+    /// from the forwarder queue on engine stop. Flow/listener fds stay the forwarder's to
+    /// close. A loop that never started (no UDP flow) opened nothing, so this is a no-op.
+    func stop() {
+        lock.lock()
+        let running = started && !stopped
+        stopped = true
+        if running { commands.append(.stop) }
+        lock.unlock()
+        if running { wake() }
+    }
+
     private func start() {
+        kq = kqueue()
         var fds: [Int32] = [0, 0]
         _ = fds.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
         pipeR = fds[0]; pipeW = fds[1]
@@ -418,16 +435,22 @@ private final class RelayLoop: @unchecked Sendable {
     private func run() {
         setEvent(pipeR, EVFILT_READ, EV_ADD | EV_ENABLE)
         var events = Array<kevent>(repeating: kevent(), count: 128)
-        while true {
+        loop: while true {
             let n = kevent(kq, nil, 0, &events, 128, nil)
             if n < 0 { if errno == EINTR { continue }; break }
             for i in 0..<Int(n) {
                 let fd = Int32(events[i].ident)
-                if fd == pipeR { drainPipe(); runCommands(); continue }
+                if fd == pipeR { drainPipe(); if runCommands() { break loop }; continue }
                 guard let entry = entries[fd] else { continue }   // stale event — ignore
                 handleReadable(fd, entry)
             }
         }
+        // Teardown: close only the loop's OWN fds (kqueue + wakeup pipe). Flow/listener fds
+        // are owned + closed by the forwarder queue, never here.
+        if kq >= 0 { close(kq); kq = -1 }
+        if pipeR >= 0 { close(pipeR); pipeR = -1 }
+        if pipeW >= 0 { close(pipeW); pipeW = -1 }
+        entries.removeAll()
     }
 
     private func drainPipe() {
@@ -435,11 +458,14 @@ private final class RelayLoop: @unchecked Sendable {
         while read(pipeR, &tmp, tmp.count) > 0 {}
     }
 
-    private func runCommands() {
+    /// Apply queued commands (loop thread). Returns true if a stop was requested, so `run()`
+    /// exits and tears the loop down.
+    private func runCommands() -> Bool {
         lock.lock()
         let batch = commands
         commands.removeAll()
         lock.unlock()
+        var shouldStop = false
         for cmd in batch {
             switch cmd {
             case .add(let reg):
@@ -451,8 +477,11 @@ private final class RelayLoop: @unchecked Sendable {
                     setEvent(fd, EVFILT_READ, EV_DELETE)
                 }
                 done()
+            case .stop:
+                shouldStop = true
             }
         }
+        return shouldStop
     }
 
     /// Drain the fd: advance the header/payload state machine across however many

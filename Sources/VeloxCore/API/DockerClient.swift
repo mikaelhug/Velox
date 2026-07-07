@@ -276,7 +276,11 @@ public actor DockerClient: DockerClientProtocol {
         let sinceParam = since.map { "&since=\(String(format: "%.6f", $0))" } ?? ""
         let path = Self.path("/containers/\(id)/logs?follow=1&stdout=1&stderr=1&tail=\(tailParam)\(sinceParam)")
         let parser = LogFrameParser()
-        return makeStream(method: "GET", path: path) { bytes, acc, yield in
+        // Cap the backlog: a container logging faster than a backgrounded log view drains
+        // must not grow host memory without bound. Keep the newest frames (like `tail`) —
+        // the view holds its own scrollback, so dropping the oldest un-drained lines is fine.
+        return makeStream(method: "GET", path: path,
+                          bufferingPolicy: .bufferingNewest(4096)) { bytes, acc, yield in
             acc.append(bytes)
             parser.parse(&acc, yield: yield)
         }
