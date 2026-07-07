@@ -87,12 +87,14 @@ public enum Storage {
     /// stopped the engine first** (the VM holds the file open + the guest must have flushed) —
     /// moving a live/torn image corrupts ext4.
     ///
-    /// Same APFS volume → an atomic `rename` (instant, keeps the sparse extents exactly).
-    /// Different volume → a hole-aware streaming copy so a mostly-empty 128 GiB disk copies its
-    /// *used* bytes, not its full logical size, then an fsync + atomic publish; the source is
-    /// removed only after the destination is verified. Any failure leaves the source intact.
-    public static func moveDataDisk(from src: URL, to dst: URL,
-                                    progress: (@Sendable (Double) -> Void)? = nil) throws {
+    /// Stage a data-disk move: place the data at `dst` while LEAVING `src` intact, so the
+    /// caller can persist the new location *before* the original is dropped — a crash in that
+    /// gap then can't orphan the disk (config still points at a disk that exists). Same volume
+    /// → an instant hard link (same inode, sparse preserved); different volume → a hole-aware
+    /// copy so a mostly-empty 128 GiB disk copies its *used* bytes, fsync'd + atomically
+    /// published. Any failure leaves `src` intact. Call `removeMovedSource` once persisted.
+    public static func stageDataDiskMove(from src: URL, to dst: URL,
+                                         progress: (@Sendable (Double) -> Void)? = nil) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: src.path) else {
             throw VeloxError.diskMove("Source data disk not found at \(src.path).")
@@ -103,11 +105,17 @@ public enum Storage {
         try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
 
         if sameVolume(src, dst) {
-            try fm.moveItem(at: src, to: dst)   // rename(2): atomic, instant, sparse-preserving
+            try fm.linkItem(at: src, to: dst)   // hard link: instant, same inode, keeps src
             progress?(1.0)
             return
         }
         try sparseCopyAcrossVolumes(src: src, dst: dst, progress: progress)
+    }
+
+    /// Drop the original disk after `stageDataDiskMove` and once the new location has been
+    /// persisted. Best-effort: a leftover source only wastes space, it never loses data.
+    public static func removeMovedSource(at src: URL) {
+        try? FileManager.default.removeItem(at: src)
     }
 
     /// Whether `src` and `dst`'s parent folder live on the same volume (so a rename suffices).
@@ -120,8 +128,8 @@ public enum Storage {
     }
 
     /// Hole-aware copy to `dst.tmp` (only real data extents are read/written; the gaps stay
-    /// holes), fsynced and atomically published, then the source is removed. Throws leave the
-    /// source untouched and clean up the partial destination.
+    /// holes), fsynced and atomically published. The source is left intact for the caller to
+    /// remove. Throws leave the source untouched and clean up the partial destination.
     private static func sparseCopyAcrossVolumes(src: URL, dst: URL,
                                                 progress: (@Sendable (Double) -> Void)?) throws {
         let fm = FileManager.default
@@ -159,7 +167,8 @@ public enum Storage {
             throw error
         }
 
-        // Atomic publish on the destination volume; verify; only then drop the source.
+        // Atomic publish on the destination volume; verify. The source is left intact — the
+        // caller drops it (removeMovedSource) only after persisting the new location.
         do {
             try fm.moveItem(at: tmp, to: dst)
             let moved = Int64((try dst.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? -1)
@@ -170,7 +179,6 @@ public enum Storage {
             try? fm.removeItem(at: tmp); try? fm.removeItem(at: dst)
             throw error
         }
-        try fm.removeItem(at: src)   // final step: original gone only after a verified publish
         progress?(1.0)
     }
 

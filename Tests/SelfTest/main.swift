@@ -425,7 +425,7 @@ do {
     equal(cfg.dataDiskURL.path, "/Volumes/Ext/Velox/data.img", "custom dataDirectory resolves under it")
 }
 
-section("Storage.moveDataDisk")
+section("Storage.stageDataDiskMove")
 do {
     let fm = FileManager.default
     let base = fm.temporaryDirectory.appendingPathComponent("velox-move-\(getpid())")
@@ -440,16 +440,18 @@ do {
     check(allocBytes(src) < 16 << 20, "source is sparse (alloc \(allocBytes(src)) « 256 MiB)")
     let dst = dstDir.appendingPathComponent("data.img")
     do {
-        try Storage.moveDataDisk(from: src, to: dst)
-        check(!fm.fileExists(atPath: src.path), "same-vol: source removed")
+        try Storage.stageDataDiskMove(from: src, to: dst)
+        check(fm.fileExists(atPath: src.path), "same-vol: stage leaves source intact (crash-safe)")
         equal(logicalBytes(dst), 256 << 20, "same-vol: logical size preserved")
+        Storage.removeMovedSource(at: src)
+        check(!fm.fileExists(atPath: src.path), "same-vol: source removed after commit")
     } catch { check(false, "same-vol move threw: \(error)") }
 
     // Refuse to clobber an existing destination (source left intact).
     let src2 = srcDir.appendingPathComponent("again.img")
     mkSparse(at: src2, logical: 8 << 20, dataAt: [0])
     var refused = false
-    do { try Storage.moveDataDisk(from: src2, to: dst) } catch { refused = true }
+    do { try Storage.stageDataDiskMove(from: src2, to: dst) } catch { refused = true }
     check(refused && fm.fileExists(atPath: src2.path), "refuses existing dst, leaves source intact")
 
     // Cross volume → sparse-preserving copy onto a real second APFS volume.
@@ -463,11 +465,13 @@ do {
         let xAlloc = allocBytes(xsrc)
         let xdst = volDir.appendingPathComponent("data.img")
         do {
-            try Storage.moveDataDisk(from: xsrc, to: xdst)
+            try Storage.stageDataDiskMove(from: xsrc, to: xdst)
             equal(logicalBytes(xdst), 256 << 20, "cross-vol: logical size preserved")
             check(allocBytes(xdst) <= xAlloc + (4 << 20),
                   "cross-vol: SPARSE preserved (dst alloc \(allocBytes(xdst)) ≈ src \(xAlloc), not 256 MiB)")
-            check(!fm.fileExists(atPath: xsrc.path), "cross-vol: source removed")
+            check(fm.fileExists(atPath: xsrc.path), "cross-vol: stage leaves source intact (crash-safe)")
+            Storage.removeMovedSource(at: xsrc)
+            check(!fm.fileExists(atPath: xsrc.path), "cross-vol: source removed after commit")
         } catch { check(false, "cross-vol move threw: \(error)") }
         runTool("/usr/bin/hdiutil", ["detach", "-quiet", volDir.path])
     } else {

@@ -15,6 +15,11 @@ import VeloxCore
 final class EngineController {
     /// Current engine lifecycle, driven onto the main actor from the VM queue.
     private(set) var state: EngineState = .stopped
+    /// Monotonic lifecycle token. Bumped when a start begins and whenever the engine is
+    /// torn down (stop / guest-stopped). `performStart` captures it and, after each of its
+    /// `await`s, bails if it changed — so a guest that dies mid-boot can't be overwritten by
+    /// the resuming start writing `.running` over a dead engine.
+    private var startGeneration = 0
 
     /// True while a data-disk relocation is in flight (stop → move → restart). Gates the UI so
     /// Start/Restart/Move can't interleave; `moveProgress` (0…1) drives the move sheet.
@@ -186,6 +191,8 @@ final class EngineController {
     private func performStart() async {
         guard state.isStopped || state.failureMessage != nil else { return }
         state = .starting
+        startGeneration &+= 1
+        let gen = startGeneration
         do {
             let resources = config.resources
             let shareURLs = config.shareURLs
@@ -232,6 +239,9 @@ final class EngineController {
                     cont.resume(with: result)
                 }
             }
+            // Stopped/torn down while the VM was starting — don't wire plumbing onto a
+            // dead or stopping VM (the teardown path bumped the generation).
+            guard gen == startGeneration else { return }
 
             // Engine is up: all the shared plumbing (Docker socket proxy, port
             // forwarders, events watcher, named access, clock sync, conduit pool) is
@@ -261,6 +271,10 @@ final class EngineController {
             // events watcher's first successful reconcile — so the dashboards' first
             // load succeeds (no transient "Connection reset by peer", no manual refresh).
             await waitForDockerReady(runtime)
+            // Torn down while we waited for dockerd (e.g. the guest crashed during boot):
+            // stay in whatever state cleanup() already set — never write `.running` over a
+            // dead engine (which would leave the UI "Running" with no docker client).
+            guard gen == startGeneration else { return }
             // Keep macOS App Nap from throttling the embedded VM while Velox is
             // backgrounded (you're working in another app and the engine has real work
             // to do). A napped process has its threads — including the VM's vCPUs —
@@ -286,6 +300,7 @@ final class EngineController {
 
     private func performStop() async {
         guard state.isRunning || state.isBusy else { return }
+        startGeneration &+= 1   // invalidate any in-flight performStart
         state = .stopping
         // Tear the plumbing down first (stop accepting docker CLI connections, remove
         // host routes) — idempotent, so the post-stop cleanup() calling it again is fine.
@@ -340,7 +355,7 @@ final class EngineController {
 
         do {
             try await Task.detached(priority: .userInitiated) {
-                try Storage.moveDataDisk(from: src, to: dst) { [weak self] frac in
+                try Storage.stageDataDiskMove(from: src, to: dst) { [weak self] frac in
                     Task { @MainActor in self?.moveProgress = frac }
                 }
             }.value
@@ -349,16 +364,20 @@ final class EngineController {
             throw error
         }
 
-        // Point config at the new folder (nil if it's the default ~/.velox), persist, then restart.
+        // The data now exists at BOTH src and dst. Persist the new location FIRST — a crash
+        // here leaves config→dst with the data present (src just a harmless leftover), never an
+        // orphaned disk — THEN drop the original.
         config.dataDirectory = (destinationDir.standardizedFileURL == Paths.root.standardizedFileURL)
             ? nil : destinationDir.standardizedFileURL.path
         saveConfig()
+        Storage.removeMovedSource(at: src)
         if wasRunning { await performStart() }
     }
 
     // MARK: - Internals
 
     private func handleGuestStopped(_ error: Error?) {
+        startGeneration &+= 1   // invalidate any in-flight performStart
         cleanup()
         if let error {
             state = .failed(error.localizedDescription)

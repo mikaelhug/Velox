@@ -30,6 +30,13 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
         // and runs) and the caller hands it off without reusing it — safe to carry into the queue.
         nonisolated(unsafe) let configuration = configuration
         queue.async {
+            // Defense-in-depth against a double-start orphaning a live VM onto the same
+            // data disk (the EngineController state machine + the process-wide InstanceLock
+            // are the primary guards; this makes VMManager itself refuse).
+            guard self.vm == nil else {
+                Log.error("VMManager.start called while a VM is already running — refusing")
+                completion(.failure(VeloxError.engineAlreadyRunning)); return
+            }
             let machine = VZVirtualMachine(configuration: configuration, queue: self.queue)
             machine.delegate = self
             self.vm = machine
@@ -129,7 +136,7 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
     private func hardStop(_ completion: @escaping @Sendable () -> Void) {
         queue.async {
             guard let vm = self.vm, vm.canStop else { completion(); return }
-            vm.stop { _ in completion() }
+            vm.stop { _ in self.vm = nil; completion() } // host-initiated stop: clear the ref here
         }
     }
 
@@ -138,10 +145,12 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
     public func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         Log.info("guest stopped")
         stopHandler?(nil)
+        vm = nil // guest-initiated stop: allow a later start() to boot a fresh VM
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         Log.error("guest stopped: \(error.localizedDescription)")
         stopHandler?(error)
+        vm = nil
     }
 }
