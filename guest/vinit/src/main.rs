@@ -519,7 +519,13 @@ fn parse_qname(q: &[u8]) -> Option<(String, u16, usize)> {
         pos += len;
     }
     let qtype = u16::from_be_bytes([*q.get(pos)?, *q.get(pos + 1)?]);
-    Some((name, qtype, pos + 4))
+    let qend = pos + 4; // 2 qtype + 2 qclass bytes
+    // Reject a question truncated before its qclass: build_a_reply/build_empty_reply
+    // slice query[..qend], and the crate is `panic = "abort"`, so an out-of-bounds
+    // slice here would abort PID 1 and take down the whole VM. A malformed query
+    // simply returns None and is forwarded upstream instead of answered locally.
+    if qend > q.len() { return None; }
+    Some((name, qtype, qend))
 }
 
 fn build_a_reply(query: &[u8], qend: usize, addr: u32) -> Vec<u8> {
