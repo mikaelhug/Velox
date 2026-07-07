@@ -1,13 +1,18 @@
-name: Release
+name: 'CI & Release'
 
-# Build + publish a Velox release when a v* tag is pushed.
+# The SINGLE CI + release workflow. There is deliberately NO per-push / per-PR CI —
+# validation runs only here, at release time. On a v* tag it validates the whole build
+# (guest kernel + erofs rootfs, guest PID 1 `vinit` lint, host swift build + selftest)
+# and publishes a signed GitHub Release; a manual workflow_dispatch runs the same
+# validation WITHOUT publishing (use it as pure CI). Automated auto-bumps additionally
+# self-validate before tagging, in version-watch.yml (CLAUDE.md §9).
+#
+# Cut a release:
 #   1. bump VELOX_VERSION in versions.env   (the single source of truth, CLAUDE.md §2)
 #   2. git commit -am "release vX.Y.Z"
 #   3. git tag vX.Y.Z && git push origin vX.Y.Z
-# CI verifies the tag matches VELOX_VERSION, builds a self-contained Velox.app (guest
-# VM + velox + docker CLIs bundled), and attaches Velox-*.zip to a
-# GitHub Release. The updater reads /releases/latest, so the tag MUST equal the
-# VELOX_VERSION you ship — the verify step below fails the build otherwise.
+# The tag MUST equal VELOX_VERSION (the verify step fails the build otherwise); the
+# updater reads /releases/latest.
 #
 # The guest kernel + rootfs are CACHED on their own inputs: a GUI-only change rebuilds
 # neither (both restored from cache); a velox.fragment change rebuilds only the kernel;
@@ -87,11 +92,30 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # 2) Build + package the macOS app (always — it's fast). Bundles the guest from
-  #    job 1, signs ad-hoc by default (Developer ID + notarize when secrets exist).
+  # 1b) Lint the guest PID 1 (vinit) against its real musl target (it doesn't
+  #     compile for the host). Fast; gates the release so a lint regression can't
+  #     ship. This absorbed the old standalone `ci` vinit job.
+  # ---------------------------------------------------------------------------
+  lint-guest:
+    runs-on: ubuntu-24.04-arm
+    defaults:
+      run: { working-directory: guest/vinit }
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl target
+        run: rustup target add aarch64-unknown-linux-musl
+      - name: Clippy (deny warnings)
+        run: cargo clippy --target aarch64-unknown-linux-musl -- -D warnings
+      - name: Check (release profile)
+        run: cargo check --release --target aarch64-unknown-linux-musl
+
+  # ---------------------------------------------------------------------------
+  # 2) Build + package the macOS app (also runs the host selftest — the old `ci`
+  #    swift job). Bundles the guest from job 1; signs ad-hoc by default (Developer
+  #    ID + notarize when secrets exist). Gated on the guest build AND the lint.
   # ---------------------------------------------------------------------------
   app:
-    needs: guest
+    needs: [guest, lint-guest]
     runs-on: macos-26
     # `secrets` can't be referenced in `if:` (it isn't a valid context there), so
     # surface the gating secrets as env and check those instead.
