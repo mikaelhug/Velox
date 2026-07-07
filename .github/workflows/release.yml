@@ -129,7 +129,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
 
-      - name: Build + package (Velox.app, .dmg, .zip)
+      - name: Build + package (Velox.app -> .zip)
         env:
           VELOX_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}   # empty → ad-hoc
         run: ./Scripts/build-app.sh release

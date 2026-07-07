@@ -22,7 +22,7 @@
 # actor and DOES trigger it. The GITHUB_TOKEN still drives the PR create/merge (which need
 # no downstream trigger — validation runs inline as this workflow's own jobs). This is why
 # a PAT isn't needed and the whole thing is provisionable with `gh`.
-name: version-watch
+name: 'Maintenance: upstream auto-update'
 
 on:
   schedule:

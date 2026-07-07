@@ -5,12 +5,13 @@
 #   vinit: type-check + clippy the guest PID 1 against its real target
 #          (aarch64-unknown-linux-musl — vinit does not compile for the host).
 #
-# A release pushes the `release: vX.Y.Z` commit to main AND the vX.Y.Z tag. The tag
-# fires release.yml, which already runs this exact build + selftest before packaging.
-# So both jobs skip the release commit (the `if:` guard below) to avoid burning runner
-# minutes twice on the same commit — the guard only matches a `release:`-prefixed commit
-# pushed to a branch; PRs and manual runs (no head_commit) always run.
-name: ci
+# A release pushes the `release: vX.Y.Z` commit to main AND the vX.Y.Z tag (by hand for a
+# human-cut release, or automatically by the Maintenance: upstream auto-update pipeline —
+# version-watch.yml). The tag fires release.yml, which already runs this exact build +
+# selftest before packaging. So both jobs skip the release commit (the `if:` guard below)
+# to avoid burning runner minutes twice on the same commit — the guard only matches a
+# `release:`-prefixed commit pushed to a branch; PRs and manual runs (no head_commit) run.
+name: 'CI: build & lint'
 
 on:
   push:

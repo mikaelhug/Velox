@@ -6,7 +6,7 @@
 #
 # The automated version-watch bump PR is intentionally SKIPPED here: version-watch.yml
 # already compile-validates that branch inline. This only guards human-authored changes.
-name: ci-guest
+name: 'CI: guest image'
 
 on:
   pull_request:

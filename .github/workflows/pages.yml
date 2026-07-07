@@ -16,7 +16,7 @@
 # NO client telemetry. stats.json is generated into the Pages artifact, never
 # committed (see .gitignore) — hence the daily `schedule` here: it refreshes the
 # numbers even when docs/ hasn't changed.
-name: pages
+name: 'Docs site'
 
 on:
   push:

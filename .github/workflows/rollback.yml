@@ -13,7 +13,7 @@
 #
 # Requires the AUTOMATION_SSH_KEY deploy key (so the pushed tag triggers release.yml;
 # a GITHUB_TOKEN tag push would not).
-name: rollback
+name: 'Maintenance: rollback'
 
 on:
   workflow_dispatch:
