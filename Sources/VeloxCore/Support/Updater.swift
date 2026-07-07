@@ -213,8 +213,17 @@ public enum Updater {
     private static func verifyReleaseSignature(of file: URL, assetName: String, in release: Release) -> Bool {
         let pubB64 = Versions.releasePubkey
         guard !pubB64.isEmpty else {
-            Log.warn("update: this build has no release public key — skipping signature verification")
+            // A dev build (compiled without VELOX_RELEASE_PUBKEY) has nothing to verify against.
+            // A RELEASE build with no key is a build misconfiguration — fail CLOSED rather than
+            // auto-install an unverified archive; the caller reveals the download instead.
+            #if DEBUG
+            Log.warn("update: dev build has no release public key — skipping signature verification")
             return true
+            #else
+            Log.error("update: release build is missing its public key — refusing to auto-install "
+                      + "(rebuild with VELOX_RELEASE_PUBKEY set in versions.env)")
+            return false
+            #endif
         }
         guard let sigAsset = release.assets.first(where: { $0.name == assetName + ".sig" }),
               let sigURL = URL(string: sigAsset.url) else {
