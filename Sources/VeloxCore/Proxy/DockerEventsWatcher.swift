@@ -30,9 +30,16 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// Coalesces event-driven reconciles so a healthcheck / `compose up` storm collapses
     /// to one `containers()` fetch instead of one per event (CLAUDE.md §8).
     private var coalescer: Coalescer?
-    /// Guards `lastTCP`/`lastUDP` — a coalesced reconcile can overlap the immediate one
-    /// done on (re)connect.
+    /// Guards `lastTCP`/`lastUDP`/`lastSubnets`.
     private let stateLock = NSLock()
+    /// Single-flight guard for `reconcile()`. The immediate on-(re)connect reconcile and
+    /// the coalescer's reconcile run from two independent Tasks; without this they could
+    /// interleave (each has `await`s on `containers()`/`networks()`) and the one that read
+    /// dockerd *first* could commit its now-stale port/name maps *last*. `runReconcile`
+    /// serializes the bodies so commits always land in read order.
+    private let reconcileLock = NSLock()
+    private var reconcileRunning = false
+    private var reconcilePending = false
 
     // Readiness: fired once, the first time a reconcile actually reaches dockerd.
     // The GUI awaits this to leave `.starting`, so it never has to poll `/_ping`.
@@ -54,7 +61,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     }
 
     public func start() {
-        let coalescer = Coalescer { [weak self] in await self?.reconcile() }
+        let coalescer = Coalescer { [weak self] in await self?.runReconcile() }
         self.coalescer = coalescer
         task = Task { [weak self] in
             while !Task.isCancelled {
@@ -62,7 +69,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                 // Catch the current state on (re)connect (also picks up restart-policy
                 // containers that were already running) — immediate, not coalesced, so
                 // published ports come up fast and readiness fires promptly.
-                await self.reconcile()
+                await self.runReconcile()
                 for await event in self.docker.events() {
                     if Task.isCancelled { return }
                     // Coalesce: a burst of container events fans into a single
@@ -134,8 +141,33 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         readyLock.unlock()
     }
 
-    /// Re-read the authoritative published-port set; report only on change. Runs
-    /// serially inside the single watcher Task, so `last` needs no extra locking.
+    /// Single-flight entry point — every caller uses this, never `reconcile()` directly.
+    /// Ensures at most one reconcile body runs at a time; a request that arrives mid-run
+    /// triggers exactly one more run afterward, so nothing is missed (informer pattern).
+    /// The lock is only touched in the sync helpers (NSLock can't be used across `await`).
+    private func runReconcile() async {
+        guard beginReconcileRun() else { return }
+        repeat { await reconcile() } while finishReconcileRun()
+    }
+
+    /// Become the sole runner, or mark a pending re-run and bail. Returns whether we run.
+    private func beginReconcileRun() -> Bool {
+        reconcileLock.lock(); defer { reconcileLock.unlock() }
+        if reconcileRunning { reconcilePending = true; return false }
+        reconcileRunning = true
+        return true
+    }
+
+    /// After a run: if a trigger arrived meanwhile, consume it and loop again; else release.
+    private func finishReconcileRun() -> Bool {
+        reconcileLock.lock(); defer { reconcileLock.unlock() }
+        if reconcilePending { reconcilePending = false; return true }
+        reconcileRunning = false
+        return false
+    }
+
+    /// Re-read the authoritative published-port set; report only on change. Serialized
+    /// by `runReconcile()`, so its writes never interleave with another reconcile's.
     private func reconcile() async {
         guard let containers = try? await docker.containers() else { return }
         // A successful list means dockerd is up and answering — release any
