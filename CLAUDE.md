@@ -278,13 +278,14 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
   later). Each qualifying batch bumps `VELOX_VERSION` one **minor** (`0.3.1→0.4.0`),
   derived from `main` so re-runs are idempotent. `--dry-run` previews without writing.
 - **`.github/workflows/version-watch.yml`** runs it **weekly** (Mon 07:00 UTC — the
-  "max once per week" cap) and, on a change: opens/updates a PR, **compile-validates**
-  the bump (guest kernel `CONFIG_ONLY` gate + full kernel/rootfs build, which verifies
+  "max once per week" cap) and, on a change: pushes a bump branch, **compile-validates**
+  it (guest kernel `CONFIG_ONLY` gate + full kernel/rootfs build, which verifies
   `DOCKER_STATIC_SHA256`; a mac-client `DOCKER_CLI_MAC_ARM64_SHA256` check; host
-  `swift build` + `velox-selftest`), and on green **auto-merges and pushes the `vX.Y.Z`
-  tag** that fires `release.yml`. The tag push uses a write-enabled **deploy key**
-  (secret `AUTOMATION_SSH_KEY`) — a tag pushed with the default `GITHUB_TOKEN` would not
-  trigger `release.yml` (recursion guard); PR create/merge use `GITHUB_TOKEN`.
+  `swift build` + `velox-selftest`), and on green **fast-forwards main to the validated
+  commit and pushes the `vX.Y.Z` tag** that fires `release.yml`. All pushes use a
+  write-enabled **deploy key** (secret `AUTOMATION_SSH_KEY`) — a tag pushed with the
+  default `GITHUB_TOKEN` would not trigger `release.yml` (recursion guard). No PR is
+  opened (the run + `release:` commit + tag + release are the audit trail).
 - **Accepted limitation:** CI cannot boot the VM, so "green" is compile + config-gate +
   SHA + selftest — **not** a boot/run test. A kernel that compiles but won't boot, or a
   Docker **major** that silently breaks `<name>.velox.local` named access (the

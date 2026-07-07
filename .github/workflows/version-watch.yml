@@ -1,11 +1,12 @@
 # Velox upstream-maintenance pipeline — the ONE sanctioned automatic release path
 # (CLAUDE.md §9 + the "opt-in, never automatic" carve-out). Weekly, it:
 #   1. detects a newer MINOR/MAJOR kernel or Docker release (Scripts/check-upstream.sh),
-#   2. rewrites the pins in versions.env + regenerates Versions.swift, opens/updates a PR,
+#   2. rewrites the pins in versions.env + regenerates Versions.swift, pushes a bump branch,
 #   3. compile-validates the bump (guest kernel+rootfs build; host swift build+selftest),
-#   4. on green validation, auto-merges the PR and pushes the vX.Y.Z tag that fires
-#      release.yml — which builds, Ed25519-signs, and publishes the release the
-#      in-app updater serves.
+#   4. on green validation, fast-forwards main to the validated commit and pushes the
+#      vX.Y.Z tag that fires release.yml — which builds, Ed25519-signs, and publishes the
+#      release the in-app updater serves. (No PR — the audit trail is the run + commit +
+#      tag + release; GITHUB_TOKEN can't open PRs here anyway.)
 #
 # The CI WORKFLOW does the merge+tag — never the AI agent or a human by hand
 # (that stays opt-in). Note the deliberate limitation: GitHub-hosted runners cannot
@@ -44,9 +45,12 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1) Detect upstream bumps, rewrite pins, regenerate Versions.swift, open/update
-  #    the PR. Branch push + PR ops use the default GITHUB_TOKEN — none of them need
-  #    to trigger a downstream workflow (validation runs inline below).
+  # 1) Detect upstream bumps, rewrite pins, regenerate Versions.swift, and push the
+  #    bump to a branch for the validate jobs to build. NO pull request is opened
+  #    (default GITHUB_TOKEN isn't allowed to, and the PR was only an audit artifact —
+  #    validation runs inline as this workflow's own jobs). `ship` fast-forwards the
+  #    validated branch onto main and tags it. The run summary carries the advisory
+  #    post-release checklist the PR body used to.
   # ---------------------------------------------------------------------------
   prepare:
     runs-on: ubuntu-24.04-arm
@@ -57,6 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}   # deploy key for the branch push
           fetch-depth: 0          # need full history to base the branch off main cleanly
 
       # jq is preinstalled on GitHub-hosted ubuntu runners; check-upstream.sh needs it.
@@ -64,10 +69,9 @@ jobs:
         id: scout
         run: ./Scripts/check-upstream.sh
 
-      - name: Regenerate Versions.swift, push branch, open/update PR
+      - name: Regenerate Versions.swift + push bump branch
         if: steps.scout.outputs.changed == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           TITLE:        ${{ steps.scout.outputs.title }}
           NEW:          ${{ steps.scout.outputs.new_version }}
           PREV:         ${{ steps.scout.outputs.prev_version }}
@@ -81,9 +85,16 @@ jobs:
           set -euo pipefail
           ./Scripts/gen-versions.sh
 
-          # --- assemble the PR body (summary + advisory post-release checklist) ---
+          git config user.name  "velox-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git switch -C "$BUMP_BRANCH"
+          git add versions.env Sources/VeloxCore/Support/Versions.swift
+          git commit -m "$TITLE"
+          git push -f origin "$BUMP_BRANCH"    # non-main branch: triggers nothing; validated before it reaches main
+
+          # --- run summary: what changed + the advisory post-release checklist ---
           {
-            echo "Automated upstream bump opened by \`version-watch.yml\` (CLAUDE.md §9)."
+            echo "## Automated upstream bump — \`v$NEW\` (CLAUDE.md §9)"
             echo
             echo "| Component | From | To | Kind |"
             echo "| --- | --- | --- | --- |"
@@ -91,36 +102,15 @@ jobs:
             [ -n "$DOCKER_KIND" ] && echo "| Docker engine | \`$DOCKER_FROM\` | \`$DOCKER_TO\` | $DOCKER_KIND |"
             echo "| Velox | \`$PREV\` | \`$NEW\` | minor |"
             echo
-            echo "This PR **auto-merges and tags \`v$NEW\`** once the version-watch validation jobs are green."
-            echo "Green = compiles + kernel config-symbol gate + SHAs verify + host selftest. CI **cannot** boot"
-            echo "the VM, so the checks below are **advisory / post-release** — verify on a real Mac and, if"
-            echo "regressed, ship a corrective bump via \`rollback.yml\`."
+            echo "Auto-merges to main + tags \`v$NEW\` once validation is green. Green = compiles +"
+            echo "config-symbol gate + SHAs verify + host selftest; CI **cannot boot the VM**, so the"
+            echo "checks below are **advisory / post-release** (recover via \`rollback.yml\`)."
             echo
             echo "### Post-release verification (advisory)"
-            echo "- [ ] Ran \`docs/bench/run.sh\` on Apple Silicon with **both** Velox (this build) and Docker Desktop live; no regression vs Docker Desktop (\`docs/benchmarks.md\`)."
-            [ -n "$KERNEL_KIND" ] && echo "- [ ] Kernel bump: \`velox.fragment\` still resolves all required CONFIG symbols (the CONFIG_ONLY gate covers this) and the guest boots with VirtioFS + Rosetta working."
-            if [ "$DOCKER_KIND" = "major" ]; then
-              echo "- [ ] **Docker MAJOR**: re-verified \`assert_direct_access_rules()\` in \`guest/vinit/src/main.rs\` — chains \`filter-FORWARD\` + \`raw-PREROUTING\` in table \`ip docker-bridges\` still exist under those names, and the nftables-backend flags are unchanged. **CI cannot check this** — named \`<name>.velox.local\` access silently breaks otherwise (versions.env MAJOR-BUMP CHECKLIST)."
-            fi
-            echo "- [ ] Updated \`docs/benchmarks.md\` if numbers moved."
-          } > /tmp/pr-body.md
-
-          git config user.name  "velox-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git switch -C "$BUMP_BRANCH"
-          git add versions.env Sources/VeloxCore/Support/Versions.swift
-          git commit -m "$TITLE"
-          git push -f origin "$BUMP_BRANCH"
-
-          # Idempotent: force-push updates an already-OPEN PR; create only if none is open
-          # (a prior merged PR keeps the branch name, so check state==open specifically).
-          gh label create automated-bump --color 1d76db --description "Automated upstream version bump" 2>/dev/null || true
-          if [ -n "$(gh pr list --head "$BUMP_BRANCH" --state open --json number --jq '.[].number')" ]; then
-            gh pr edit "$BUMP_BRANCH" --title "$TITLE" --body-file /tmp/pr-body.md
-          else
-            gh pr create --base main --head "$BUMP_BRANCH" \
-              --title "$TITLE" --body-file /tmp/pr-body.md --label automated-bump
-          fi
+            echo "- [ ] \`docs/bench/run.sh\` on Apple Silicon vs Docker Desktop — no regression (\`docs/benchmarks.md\`)."
+            [ -n "$KERNEL_KIND" ] && echo "- [ ] Kernel: guest boots with VirtioFS + Rosetta (CONFIG_ONLY gate covers symbols only)."
+            [ "$DOCKER_KIND" = "major" ] && echo "- [ ] **Docker MAJOR**: re-verify \`assert_direct_access_rules()\` chains (\`filter-FORWARD\`/\`raw-PREROUTING\` in \`ip docker-bridges\`) — CI can't; named access breaks silently otherwise."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # 2a) Validate the guest builds (native arm64 Linux). Mirrors release.yml's
@@ -202,33 +192,33 @@ jobs:
         run: swift run velox-selftest
 
   # ---------------------------------------------------------------------------
-  # 3) Ship: only if prepare + both validations succeeded. Squash-merge the PR
-  #    (subject stays `release:`-prefixed so ci.yml skips the redundant main build),
-  #    then tag vX.Y.Z with the PAT so release.yml fires and publishes the release.
+  # 3) Ship: only if prepare + both validations succeeded. Fast-forward main to the
+  #    validated bump commit (its `release:`-prefixed message makes ci.yml/ci-guest.yml
+  #    skip it), then tag vX.Y.Z. Both pushes use the deploy key so the tag fires
+  #    release.yml (a GITHUB_TOKEN tag push would not).
   # ---------------------------------------------------------------------------
   ship:
     needs: [prepare, validate-guest, validate-host]
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-24.04-arm
     steps:
-      # ssh-key sets up the deploy key so the TAG push below triggers release.yml.
       - uses: actions/checkout@v6
         with:
           ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}
           fetch-depth: 0
-      - name: Merge PR + push release tag
+      - name: Fast-forward main to the validated bump + tag the release
         env:
-          GH_TOKEN: ${{ github.token }}      # PR merge via API (no downstream trigger needed)
-          NEW:   ${{ needs.prepare.outputs.new_version }}
-          TITLE: ${{ needs.prepare.outputs.title }}
+          NEW: ${{ needs.prepare.outputs.new_version }}
         run: |
           set -euo pipefail
           git config user.name  "velox-bot"
           git config user.email "actions@users.noreply.github.com"
-          # No --admin: works on a repo with no required-check branch protection. If you
-          # protect main with required checks, add --admin (needs an admin-scoped token).
-          gh pr merge "$BUMP_BRANCH" --squash --subject "$TITLE" --delete-branch
-          git fetch origin main
-          git tag "v${NEW}" origin/main
-          git push origin "v${NEW}"          # PAT push → triggers release.yml
-          echo "::notice::Tagged v${NEW}; release.yml will build and publish it."
+          git fetch origin "$BUMP_BRANCH"
+          BUMP_SHA="$(git rev-parse FETCH_HEAD)"
+          # Land the validated commit on main (fast-forward — the branch was cut from main
+          # and nothing else pushes it; the concurrency group serialises version-watch runs).
+          git push origin "${BUMP_SHA}:refs/heads/main"
+          git tag "v${NEW}" "${BUMP_SHA}"
+          git push origin "v${NEW}"                  # deploy-key push → triggers release.yml
+          git push origin --delete "$BUMP_BRANCH" || true
+          echo "::notice::Landed v${NEW} on main and tagged it; release.yml will build and publish."
