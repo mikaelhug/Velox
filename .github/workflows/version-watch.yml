@@ -1,0 +1,234 @@
+# Velox upstream-maintenance pipeline — the ONE sanctioned automatic release path
+# (CLAUDE.md §9 + the "opt-in, never automatic" carve-out). Weekly, it:
+#   1. detects a newer MINOR/MAJOR kernel or Docker release (Scripts/check-upstream.sh),
+#   2. rewrites the pins in versions.env + regenerates Versions.swift, opens/updates a PR,
+#   3. compile-validates the bump (guest kernel+rootfs build; host swift build+selftest),
+#   4. on green validation, auto-merges the PR and pushes the vX.Y.Z tag that fires
+#      release.yml — which builds, Ed25519-signs, and publishes the release the
+#      in-app updater serves.
+#
+# The CI WORKFLOW does the merge+tag — never the AI agent or a human by hand
+# (that stays opt-in). Note the deliberate limitation: GitHub-hosted runners cannot
+# boot a Velox VM (no nested Virtualization.framework), so "green" = compiles +
+# config-symbol gate + SHAs verify + host selftest. It does NOT prove the guest boots
+# or that <name>.velox.local named access survives a Docker MAJOR (the nft-chain
+# checklist in versions.env). Accepted risk; recover with .github/workflows/rollback.yml.
+#
+# Requires repo secret AUTOMATION_SSH_KEY — the PRIVATE half of a write-enabled deploy
+# key (its public half is registered on the repo). The default GITHUB_TOKEN CANNOT be
+# used for the release tag: a tag pushed with GITHUB_TOKEN does not trigger release.yml
+# (GitHub's recursion guard). A push authenticated by a DEPLOY KEY is treated as a normal
+# actor and DOES trigger it. The GITHUB_TOKEN still drives the PR create/merge (which need
+# no downstream trigger — validation runs inline as this workflow's own jobs). This is why
+# a PAT isn't needed and the whole thing is provisionable with `gh`.
+name: version-watch
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'          # weekly, Mondays 07:00 UTC. Kernel minors land ~every
+                                  # 9-10 weeks and Docker minors every few months, and we
+                                  # skip patches, so nothing here is time-critical. This is
+                                  # also the "max once per week" cap.
+  workflow_dispatch: {}          # manual run (first cutover / testing)
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: version-watch
+  cancel-in-progress: false      # let an in-flight bump finish rather than clobber the branch
+
+env:
+  BUMP_BRANCH: automation/version-bump
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Detect upstream bumps, rewrite pins, regenerate Versions.swift, open/update
+  #    the PR. Branch push + PR ops use the default GITHUB_TOKEN — none of them need
+  #    to trigger a downstream workflow (validation runs inline below).
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      changed:     ${{ steps.scout.outputs.changed }}
+      new_version: ${{ steps.scout.outputs.new_version }}
+      title:       ${{ steps.scout.outputs.title }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # need full history to base the branch off main cleanly
+
+      # jq is preinstalled on GitHub-hosted ubuntu runners; check-upstream.sh needs it.
+      - name: Scout upstream + rewrite versions.env
+        id: scout
+        run: ./Scripts/check-upstream.sh
+
+      - name: Regenerate Versions.swift, push branch, open/update PR
+        if: steps.scout.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE:        ${{ steps.scout.outputs.title }}
+          NEW:          ${{ steps.scout.outputs.new_version }}
+          PREV:         ${{ steps.scout.outputs.prev_version }}
+          KERNEL_FROM:  ${{ steps.scout.outputs.kernel_from }}
+          KERNEL_TO:    ${{ steps.scout.outputs.kernel_to }}
+          KERNEL_KIND:  ${{ steps.scout.outputs.kernel_kind }}
+          DOCKER_FROM:  ${{ steps.scout.outputs.docker_from }}
+          DOCKER_TO:    ${{ steps.scout.outputs.docker_to }}
+          DOCKER_KIND:  ${{ steps.scout.outputs.docker_kind }}
+        run: |
+          set -euo pipefail
+          ./Scripts/gen-versions.sh
+
+          # --- assemble the PR body (summary + advisory post-release checklist) ---
+          {
+            echo "Automated upstream bump opened by \`version-watch.yml\` (CLAUDE.md §9)."
+            echo
+            echo "| Component | From | To | Kind |"
+            echo "| --- | --- | --- | --- |"
+            [ -n "$KERNEL_KIND" ] && echo "| Linux kernel | \`$KERNEL_FROM\` | \`$KERNEL_TO\` | $KERNEL_KIND |"
+            [ -n "$DOCKER_KIND" ] && echo "| Docker engine | \`$DOCKER_FROM\` | \`$DOCKER_TO\` | $DOCKER_KIND |"
+            echo "| Velox | \`$PREV\` | \`$NEW\` | minor |"
+            echo
+            echo "This PR **auto-merges and tags \`v$NEW\`** once the version-watch validation jobs are green."
+            echo "Green = compiles + kernel config-symbol gate + SHAs verify + host selftest. CI **cannot** boot"
+            echo "the VM, so the checks below are **advisory / post-release** — verify on a real Mac and, if"
+            echo "regressed, ship a corrective bump via \`rollback.yml\`."
+            echo
+            echo "### Post-release verification (advisory)"
+            echo "- [ ] Ran \`docs/bench/run.sh\` on Apple Silicon with **both** Velox (this build) and Docker Desktop live; no regression vs Docker Desktop (\`docs/benchmarks.md\`)."
+            [ -n "$KERNEL_KIND" ] && echo "- [ ] Kernel bump: \`velox.fragment\` still resolves all required CONFIG symbols (the CONFIG_ONLY gate covers this) and the guest boots with VirtioFS + Rosetta working."
+            if [ "$DOCKER_KIND" = "major" ]; then
+              echo "- [ ] **Docker MAJOR**: re-verified \`assert_direct_access_rules()\` in \`guest/vinit/src/main.rs\` — chains \`filter-FORWARD\` + \`raw-PREROUTING\` in table \`ip docker-bridges\` still exist under those names, and the nftables-backend flags are unchanged. **CI cannot check this** — named \`<name>.velox.local\` access silently breaks otherwise (versions.env MAJOR-BUMP CHECKLIST)."
+            fi
+            echo "- [ ] Updated \`docs/benchmarks.md\` if numbers moved."
+          } > /tmp/pr-body.md
+
+          git config user.name  "velox-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git switch -C "$BUMP_BRANCH"
+          git add versions.env Sources/VeloxCore/Support/Versions.swift
+          git commit -m "$TITLE"
+          git push -f origin "$BUMP_BRANCH"
+
+          # Idempotent: force-push updates an already-OPEN PR; create only if none is open
+          # (a prior merged PR keeps the branch name, so check state==open specifically).
+          gh label create automated-bump --color 1d76db --description "Automated upstream version bump" 2>/dev/null || true
+          if [ -n "$(gh pr list --head "$BUMP_BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BUMP_BRANCH" --title "$TITLE" --body-file /tmp/pr-body.md
+          else
+            gh pr create --base main --head "$BUMP_BRANCH" \
+              --title "$TITLE" --body-file /tmp/pr-body.md --label automated-bump
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2a) Validate the guest builds (native arm64 Linux). Mirrors release.yml's
+  #     `guest` job cache keys so unrelated re-runs are cheap and a real bump does
+  #     the honest build. CONFIG_ONLY runs first as a fast fragment/symbol gate.
+  # ---------------------------------------------------------------------------
+  validate-guest:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: automation/version-bump }
+
+      - name: Compute cache keys (same recipe as release.yml)
+        id: keys
+        run: |
+          set -a; . ./versions.env; set +a
+          KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF"; \
+                     cat guest/kernel/velox.fragment guest/kernel/Dockerfile.builder Scripts/build-kernel.sh; \
+                   } | sha256sum | cut -c1-16 )
+          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
+                     cat guest/rootfs/Dockerfile guest/vinit/src/main.rs guest/vinit/Cargo.toml \
+                         guest/vinit/Cargo.lock Scripts/make-guest.sh; \
+                   } | sha256sum | cut -c1-16 )
+          echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"
+          echo "rootfs=rootfs-${DOCKER_VERSION}-${RHASH}"     >> "$GITHUB_OUTPUT"
+
+      # Fast fragment/symbol/check-config gate (~1-2 min) — catches the #1 kernel-bump
+      # failure (renamed/dropped CONFIG symbols) before spending compile minutes.
+      - name: Kernel config gate (CONFIG_ONLY)
+        run: CONFIG_ONLY=1 ./Scripts/build-kernel.sh
+
+      - name: Restore cached kernel
+        id: kcache
+        uses: actions/cache@v5
+        with:
+          path: Assets/velox-vmlinux
+          key: ${{ steps.keys.outputs.kernel }}
+      - name: Build kernel (only when its inputs changed)
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: ./Scripts/build-kernel.sh
+
+      - name: Restore cached rootfs
+        id: rcache
+        uses: actions/cache@v5
+        with:
+          path: guest/build/root.img
+          key: ${{ steps.keys.outputs.rootfs }}
+      # Building the rootfs verifies DOCKER_STATIC_SHA256 (Dockerfile build-arg).
+      - name: Build guest rootfs (only when its inputs changed)
+        if: steps.rcache.outputs.cache-hit != 'true'
+        run: ./Scripts/make-guest.sh
+
+      # Close the gap: the mac-client SHA is otherwise only checked in build-app.sh
+      # (the release `app` job) — verify it here so a bad pin fails BEFORE merge+tag.
+      - name: Verify bundled mac docker-client SHA-256
+        run: |
+          set -a; . ./versions.env; set +a
+          curl -fSL "https://download.docker.com/mac/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz" -o /tmp/docker-cli.tgz
+          echo "${DOCKER_CLI_MAC_ARM64_SHA256}  /tmp/docker-cli.tgz" | sha256sum -c -
+
+  # ---------------------------------------------------------------------------
+  # 2b) Validate the host builds + the selftest passes (same as ci.yml's swift job).
+  # ---------------------------------------------------------------------------
+  validate-host:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+        with: { ref: automation/version-bump }
+      - run: swift --version
+      - name: Build (all targets)
+        run: |
+          ./Scripts/gen-versions.sh
+          swift build
+      - name: Selftest
+        run: swift run velox-selftest
+
+  # ---------------------------------------------------------------------------
+  # 3) Ship: only if prepare + both validations succeeded. Squash-merge the PR
+  #    (subject stays `release:`-prefixed so ci.yml skips the redundant main build),
+  #    then tag vX.Y.Z with the PAT so release.yml fires and publishes the release.
+  # ---------------------------------------------------------------------------
+  ship:
+    needs: [prepare, validate-guest, validate-host]
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      # ssh-key sets up the deploy key so the TAG push below triggers release.yml.
+      - uses: actions/checkout@v6
+        with:
+          ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}
+          fetch-depth: 0
+      - name: Merge PR + push release tag
+        env:
+          GH_TOKEN: ${{ github.token }}      # PR merge via API (no downstream trigger needed)
+          NEW:   ${{ needs.prepare.outputs.new_version }}
+          TITLE: ${{ needs.prepare.outputs.title }}
+        run: |
+          set -euo pipefail
+          git config user.name  "velox-bot"
+          git config user.email "actions@users.noreply.github.com"
+          # No --admin: works on a repo with no required-check branch protection. If you
+          # protect main with required checks, add --admin (needs an admin-scoped token).
+          gh pr merge "$BUMP_BRANCH" --squash --subject "$TITLE" --delete-branch
+          git fetch origin main
+          git tag "v${NEW}" origin/main
+          git push origin "v${NEW}"          # PAT push → triggers release.yml
+          echo "::notice::Tagged v${NEW}; release.yml will build and publish it."

@@ -1,0 +1,75 @@
+# Guest build-validation for HUMAN edits to the pins / guest sources — so a bad hand-
+# bump of versions.env (or a guest change) fails HERE, not at tag/release time. It's a
+# separate, `paths`-scoped workflow (GitHub has no job-level path filter, and the main
+# ci.yml must still run its swift/vinit jobs on every PR). Mirrors release.yml's `guest`
+# job and reuses the same input-keyed cache, so it's cheap when nothing relevant changed.
+#
+# The automated version-watch bump PR is intentionally SKIPPED here: version-watch.yml
+# already compile-validates that branch inline. This only guards human-authored changes.
+name: ci-guest
+
+on:
+  pull_request:
+    paths: ['versions.env', 'guest/**', 'Scripts/build-kernel.sh', 'Scripts/make-guest.sh']
+  push:
+    branches: [main]
+    paths: ['versions.env', 'guest/**', 'Scripts/build-kernel.sh', 'Scripts/make-guest.sh']
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-guest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest:
+    # Skip the bot's own bump PR (version-watch validates it) and release commits on
+    # main (release.yml already builds those).
+    if: >-
+      github.head_ref != 'automation/version-bump' &&
+      (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release:'))
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute cache keys (same recipe as release.yml)
+        id: keys
+        run: |
+          set -a; . ./versions.env; set +a
+          KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF"; \
+                     cat guest/kernel/velox.fragment guest/kernel/Dockerfile.builder Scripts/build-kernel.sh; \
+                   } | sha256sum | cut -c1-16 )
+          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
+                     cat guest/rootfs/Dockerfile guest/vinit/src/main.rs guest/vinit/Cargo.toml \
+                         guest/vinit/Cargo.lock Scripts/make-guest.sh; \
+                   } | sha256sum | cut -c1-16 )
+          echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"
+          echo "rootfs=rootfs-${DOCKER_VERSION}-${RHASH}"     >> "$GITHUB_OUTPUT"
+
+      - name: Kernel config gate (CONFIG_ONLY)
+        run: CONFIG_ONLY=1 ./Scripts/build-kernel.sh
+
+      - name: Restore cached kernel
+        id: kcache
+        uses: actions/cache@v5
+        with:
+          path: Assets/velox-vmlinux
+          key: ${{ steps.keys.outputs.kernel }}
+      - name: Build kernel (only when its inputs changed)
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: ./Scripts/build-kernel.sh
+
+      - name: Restore cached rootfs
+        id: rcache
+        uses: actions/cache@v5
+        with:
+          path: guest/build/root.img
+          key: ${{ steps.keys.outputs.rootfs }}
+      - name: Build guest rootfs (verifies DOCKER_STATIC_SHA256)
+        if: steps.rcache.outputs.cache-hit != 'true'
+        run: ./Scripts/make-guest.sh
+
+      - name: Verify bundled mac docker-client SHA-256
+        run: |
+          set -a; . ./versions.env; set +a
+          curl -fSL "https://download.docker.com/mac/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz" -o /tmp/docker-cli.tgz
+          echo "${DOCKER_CLI_MAC_ARM64_SHA256}  /tmp/docker-cli.tgz" | sha256sum -c -

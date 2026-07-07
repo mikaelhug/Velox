@@ -76,18 +76,26 @@ rootfs of static binaries — **no LinuxKit, no initramfs**, see §7) running st
 
 The following conventions are **binding** — keep them true in all future work.
 
-> **Releasing is opt-in, never automatic.** Do **not** ship a release on your own:
-> no `VELOX_VERSION` bump in `versions.env`, no `release: vX.Y.Z` commit, and above all
-> no `vX.Y.Z` tag or tag push — a `v*` tag push triggers the CI release that the updater
-> serves to users. Implement and commit requested fixes as normal, but **cut a release
-> only when the user explicitly asks for it** ("ship it", "release vX", "tag it"). When
-> in doubt, leave it untagged and ask.
+> **Releasing is opt-in for humans and the agent, never automatic — with ONE
+> exception: the `version-watch` CI pipeline.** Do **not** ship a release on your own
+> (you, the agent, or a human by hand): no `VELOX_VERSION` bump in `versions.env`, no
+> `release: vX.Y.Z` commit, and above all no `vX.Y.Z` tag or tag push — a `v*` tag push
+> triggers the CI release that the updater serves to users. Implement and commit
+> requested fixes as normal, but **cut a release only when the user explicitly asks for
+> it** ("ship it", "release vX", "tag it"). When in doubt, leave it untagged and ask.
+> The sole sanctioned automatic path is `.github/workflows/version-watch.yml`, which
+> auto-bumps upstream pins and, on green compile validation, auto-merges and tags a
+> release **from CI itself** — see §9. That machine is allowed to; you are not.
 >
-> **Pre-release gate:** the North Star is comparative, so before a release that touches
-> the datapath, kernel, disk, or engine version, re-run the benchmark scorecard
+> **Pre-release gate:** the North Star is comparative, so before a *human-cut* release,
+> or any change to datapath/kernel/disk/engine **code**, re-run the benchmark scorecard
 > (`docs/bench/run.sh`) and check it against `docs/benchmarks.md` — a regression vs
 > Docker Desktop is a release blocker, not a footnote. On a `DOCKER_VERSION` major bump,
 > also walk the checklist comment above it in `versions.env` (named-access nft chains).
+> **The automated `version-watch` releases cannot run this gate** — GitHub CI can't boot
+> the VM (no nested Virtualization.framework) or run `docs/bench/run.sh` — so for those
+> the benchmark is a **post-release advisory** check with a `rollback.yml` recovery path,
+> not a blocker. Keep it a hard blocker for everything else.
 
 ## 1. User-facing CLI is the stock `docker`, via a Docker **context**
 
@@ -253,6 +261,39 @@ connections stall and serialize on the VM queue.
 - Do NOT hand-roll raw-socket HTTP against the docker socket for streaming; use
   `DockerClient` (it handles persistent streams + cancellation correctly). A
   raw-socket `/events` reader through the proxy churns connections and breaks it.
+
+## 9. Automated upstream maintenance (the one auto-release path)
+
+Keeping the guest kernel and Docker engine current is automated end-to-end by CI —
+this is the single exception to "releasing is opt-in" (see the binding blockquote).
+
+- **`Scripts/check-upstream.sh`** is the scout: it reads the current pins from
+  `versions.env`, discovers the newest **mainline-stable** kernel (kernel.org
+  `releases.json` + the GPG-signed `sha256sums.asc` — no tarball download) and the
+  newest **static-stable** Docker (the `download.docker.com/.../aarch64/` index, SHAs
+  computed by downloading the two tarballs), and rewrites only the pins that changed.
+  Policy: bump on a new **major.minor** line only; **skip pure in-line patches**
+  (`6.18.35→6.18.36`, `29.5.3→29.5.4`) — fewer, meaningful releases, at the cost of not
+  auto-pulling in-line CVE patches (hand-bump those, or add a `--include-patch` channel
+  later). Each qualifying batch bumps `VELOX_VERSION` one **minor** (`0.3.1→0.4.0`),
+  derived from `main` so re-runs are idempotent. `--dry-run` previews without writing.
+- **`.github/workflows/version-watch.yml`** runs it **weekly** (Mon 07:00 UTC — the
+  "max once per week" cap) and, on a change: opens/updates a PR, **compile-validates**
+  the bump (guest kernel `CONFIG_ONLY` gate + full kernel/rootfs build, which verifies
+  `DOCKER_STATIC_SHA256`; a mac-client `DOCKER_CLI_MAC_ARM64_SHA256` check; host
+  `swift build` + `velox-selftest`), and on green **auto-merges and pushes the `vX.Y.Z`
+  tag** that fires `release.yml`. The tag push uses a write-enabled **deploy key**
+  (secret `AUTOMATION_SSH_KEY`) — a tag pushed with the default `GITHUB_TOKEN` would not
+  trigger `release.yml` (recursion guard); PR create/merge use `GITHUB_TOKEN`.
+- **Accepted limitation:** CI cannot boot the VM, so "green" is compile + config-gate +
+  SHA + selftest — **not** a boot/run test. A kernel that compiles but won't boot, or a
+  Docker **major** that silently breaks `<name>.velox.local` named access (the
+  `assert_direct_access_rules` nft chains — versions.env MAJOR-BUMP CHECKLIST), can ship.
+  Recover by rolling **forward**: **`.github/workflows/rollback.yml`** restores a prior
+  tag's pins, minor-bumps `VELOX_VERSION`, and re-releases (the updater only moves up).
+- Reuses, never forks: the same `versions.env` single source of truth (§2), the same
+  `gen-versions.sh` codegen, and the same `release.yml` cache-key recipe. Don't add a
+  second release path or hard-code versions outside `versions.env`.
 
 ## Build / run quick reference
 

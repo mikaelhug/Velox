@@ -1,0 +1,88 @@
+# Velox rollback — the "roll forward to undo" lever. The in-app updater only moves
+# FORWARD (higher version wins), so a bad auto-release can't be recalled; you recover
+# by shipping a NEW release that restores the last-good component pins.
+#
+# This manually-triggered workflow reverts the five component pins (kernel x2, docker x3)
+# in versions.env to the values from a prior release tag, bumps VELOX_VERSION one MINOR
+# (so it's newer than the bad release), regenerates Versions.swift, commits to main, and
+# tags it — firing release.yml to build and publish the corrective release.
+#
+# LIMITATION: it reverts PINS only, not code. If main also carries guest/vinit/kernel-
+# fragment changes since <to_version>, revert those separately. In the pure auto-maintenance
+# flow main changes only via version-watch pin bumps, so a pin revert is a clean undo.
+#
+# Requires the AUTOMATION_SSH_KEY deploy key (so the pushed tag triggers release.yml;
+# a GITHUB_TOKEN tag push would not).
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      to_version:
+        description: 'Prior release tag whose kernel/docker pins to restore (e.g. v0.3.1 or 0.3.1)'
+        required: true
+      reason:
+        description: 'Why (recorded in the commit message)'
+        required: false
+        default: 'rollback bad upstream bump'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: version-watch          # share the version-watch lane so a rollback and a
+  cancel-in-progress: false     # weekly bump never race on main/the tag.
+
+jobs:
+  rollback:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}
+          fetch-depth: 0
+
+      - name: Restore pins from ${{ inputs.to_version }} + minor-bump VELOX_VERSION
+        id: revert
+        env:
+          TO_INPUT: ${{ inputs.to_version }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          # Normalise the tag ref (accept 0.3.1 or v0.3.1).
+          TO="${TO_INPUT}"; case "$TO" in v*) : ;; *) TO="v$TO";; esac
+          git rev-parse -q --verify "refs/tags/${TO}" >/dev/null \
+            || { echo "::error::tag ${TO} not found"; exit 1; }
+
+          set_var(){ tmp="$(mktemp)"; awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" {print k "=" v; next} {print}' versions.env > "$tmp"; mv "$tmp" versions.env; }
+          get_from_tag(){ git show "${TO}:versions.env" | awk -F= -v k="$1" '$1==k{print $2; exit}'; }
+
+          for k in KERNEL_ORG_VERSION KERNEL_ORG_SHA256 DOCKER_VERSION DOCKER_STATIC_SHA256 DOCKER_CLI_MAC_ARM64_SHA256; do
+            v="$(get_from_tag "$k")"
+            [ -n "$v" ] || { echo "::error::could not read $k from ${TO}:versions.env"; exit 1; }
+            set_var "$k" "$v"
+          done
+
+          set -a; . ./versions.env; set +a
+          NEW="$(printf '%s' "$VELOX_VERSION" | awk -F. '{print $1"."$2+1".0"}')"
+          set_var VELOX_VERSION "$NEW"
+          ./Scripts/gen-versions.sh
+          echo "new_version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "restored_from=$TO" >> "$GITHUB_OUTPUT"
+          echo "::notice::restored kernel/docker pins from ${TO}; VELOX_VERSION -> ${NEW}"
+
+      - name: Commit + tag corrective release
+        env:
+          NEW:    ${{ steps.revert.outputs.new_version }}
+          FROM:   ${{ steps.revert.outputs.restored_from }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          git config user.name  "velox-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add versions.env Sources/VeloxCore/Support/Versions.swift
+          git commit -m "release: v${NEW} — rollback pins to ${FROM} (${REASON})"
+          git push origin HEAD:main
+          git tag "v${NEW}"
+          git push origin "v${NEW}"          # PAT push → triggers release.yml
+          echo "::notice::Tagged v${NEW}; release.yml will build and publish the corrective release."
