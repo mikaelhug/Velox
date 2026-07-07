@@ -110,7 +110,8 @@ jobs:
             echo "- [ ] \`docs/bench/run.sh\` on Apple Silicon vs Docker Desktop — no regression (\`docs/benchmarks.md\`)."
             [ -n "$KERNEL_KIND" ] && echo "- [ ] Kernel: guest boots with VirtioFS + Rosetta (CONFIG_ONLY gate covers symbols only)."
             [ "$DOCKER_KIND" = "major" ] && echo "- [ ] **Docker MAJOR**: re-verify \`assert_direct_access_rules()\` chains (\`filter-FORWARD\`/\`raw-PREROUTING\` in \`ip docker-bridges\`) — CI can't; named access breaks silently otherwise."
-          } >> "$GITHUB_STEP_SUMMARY"
+            :   # guarantee the group's last command is truthy under `set -e`
+          } >> "$GITHUB_STEP_SUMMARY" || true
 
   # ---------------------------------------------------------------------------
   # 2a) Validate the guest builds (native arm64 Linux). Mirrors release.yml's
