@@ -13,7 +13,7 @@
 [Website](https://mikaelhug.github.io/Velox/) ·
 [Benchmarks](docs/benchmarks.md) ·
 [Releases](https://github.com/mikaelhug/Velox/releases) ·
-[Discord](https://discord.gg/UCXFzfF38)
+[Discord](https://discord.gg/kNysBA9VU5)
 
 <img src="docs/images/dashboard.png" width="820" alt="Velox dashboard — engine status, resource cards, disk breakdown, live usage" />
 
