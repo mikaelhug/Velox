@@ -6,8 +6,10 @@
 #   Contents/MacOS/VeloxApp           the SwiftUI menu-bar app (runs the engine in-process)
 #   Contents/Resources/kernel         the custom guest kernel  (Assets/velox-vmlinux)
 #   Contents/Resources/root.img       the erofs guest rootfs   (guest/build/root.img)
-#   Contents/Resources/bin/velox      the CLI (start/update/status) — installed onto PATH
-#   Contents/Resources/bin/docker     the stock Docker client for macOS — installed onto PATH
+#   Contents/Resources/bin/velox          the CLI (start/update/status) — installed onto PATH
+#   Contents/Resources/bin/docker         the stock Docker client for macOS — installed onto PATH
+#   Contents/Resources/bin/docker-compose the compose CLI plugin — linked into ~/.docker/cli-plugins
+#   Contents/Resources/bin/docker-buildx  the buildx  CLI plugin — linked into ~/.docker/cli-plugins
 #
 # GuestImage.resolve() reads kernel/root.img from the bundle when ~/.velox is empty,
 # so no `make-guest.sh` is required on the user's machine. First-run install of the
@@ -59,6 +61,30 @@ if [ ! -x "$DOCKER_CLI" ]; then
     tar -xzf "$DIST/docker-cli.tgz" -C "$DIST/docker-cli" --strip-components=1 docker/docker
 fi
 
+# --- fetch the host-side docker CLI plugins (compose + buildx) -----------------
+# compose/buildx are CLIENT plugins the `docker` CLI discovers under its cli-plugins
+# dirs (FirstRun links them into ~/.docker/cli-plugins). The mac static tarball above
+# ships only `docker`, so these are bundled separately — pinned + SHA-verified from
+# versions.env, arm64-only like the client. Each release uses a DIFFERENT filename:
+# compose = docker-compose-darwin-aarch64, buildx = buildx-v<ver>.darwin-arm64.
+fetch_plugin() {  # <dest-name> <url> <sha256>
+    local name="$1" url="$2" sha="$3" out="$DIST/plugins/$1"
+    [ -x "$out" ] && return
+    [ "$DARCH" = "aarch64" ] || { echo "error: no pinned CLI-plugin SHA-256 for $DARCH (Velox is arm64-only)" >&2; exit 1; }
+    mkdir -p "$DIST/plugins"
+    echo "==> download $name plugin for macOS ($DARCH)"
+    curl -fSL "$url" -o "$out"
+    echo "${sha}  $out" | shasum -a 256 -c - >/dev/null \
+        || { echo "error: $name SHA-256 mismatch — expected ${sha} (versions.env)" >&2; exit 1; }
+    chmod +x "$out"
+}
+fetch_plugin docker-compose \
+    "https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VERSION}/docker-compose-darwin-aarch64" \
+    "$DOCKER_COMPOSE_MAC_ARM64_SHA256"
+fetch_plugin docker-buildx \
+    "https://github.com/docker/buildx/releases/download/v${DOCKER_BUILDX_VERSION}/buildx-v${DOCKER_BUILDX_VERSION}.darwin-arm64" \
+    "$DOCKER_BUILDX_MAC_ARM64_SHA256"
+
 # --- assemble the bundle ------------------------------------------------------
 echo "==> assemble $APP"
 rm -rf "$APP"
@@ -67,10 +93,13 @@ cp "$BIN_DIR/VeloxApp"          "$APP/Contents/MacOS/VeloxApp"
 cp "$BIN_DIR/velox"             "$APP/Contents/Resources/bin/velox"
 cp "$BIN_DIR/velox-porthelper"  "$APP/Contents/Resources/bin/velox-porthelper"
 cp "$DOCKER_CLI"                "$APP/Contents/Resources/bin/docker"
+cp "$DIST/plugins/docker-compose" "$APP/Contents/Resources/bin/docker-compose"
+cp "$DIST/plugins/docker-buildx"  "$APP/Contents/Resources/bin/docker-buildx"
 cp "$KERNEL_SRC"                "$APP/Contents/Resources/kernel"
 cp "$ROOT_SRC"                  "$APP/Contents/Resources/root.img"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker" \
+         "$APP/Contents/Resources/bin/docker-compose" "$APP/Contents/Resources/bin/docker-buildx" \
          "$APP/Contents/Resources/bin/velox-porthelper"
 
 cat > "$APP/Contents/Info.plist" <<EOF
@@ -114,6 +143,9 @@ sign() {  # <path> [entitlements-file]
 }
 echo "==> codesign ($SIGN_IDENTITY)"
 sign "$APP/Contents/Resources/bin/docker"
+# The compose/buildx CLI plugins are pure clients like `docker` — no entitlements.
+sign "$APP/Contents/Resources/bin/docker-compose"
+sign "$APP/Contents/Resources/bin/docker-buildx"
 # The port helper runs as root via launchd; its power comes from that, not an
 # entitlement — so it's signed plain, like the docker client.
 sign "$APP/Contents/Resources/bin/velox-porthelper"

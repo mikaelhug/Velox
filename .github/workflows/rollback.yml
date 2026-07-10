@@ -63,6 +63,13 @@ jobs:
             set_var "$k" "$v"
           done
 
+          # Host CLI plugins (compose/buildx) were added later — restore them if the
+          # target tag carried the pin, but don't fail rolling back to a pre-plugin tag.
+          for k in DOCKER_COMPOSE_VERSION DOCKER_COMPOSE_MAC_ARM64_SHA256 DOCKER_BUILDX_VERSION DOCKER_BUILDX_MAC_ARM64_SHA256; do
+            v="$(get_from_tag "$k")"
+            if [ -n "$v" ]; then set_var "$k" "$v"; else echo "::notice::$k absent in ${TO} (pre-plugin tag) — leaving current pin"; fi
+          done
+
           set -a; . ./versions.env; set +a
           NEW="$(printf '%s' "$VELOX_VERSION" | awk -F. '{print $1"."$2+1".0"}')"
           set_var VELOX_VERSION "$NEW"

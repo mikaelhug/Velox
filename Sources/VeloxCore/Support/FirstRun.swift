@@ -34,17 +34,70 @@ public enum FirstRun {
         }
         try? fm.createDirectory(at: binDir, withIntermediateDirectories: true)
         var linked = true
-        for tool in ["velox", "docker"] {
+        // compose/buildx are CLI plugins, not PATH tools, but we still keep a symlink to
+        // each in ~/.velox/bin as a stable indirection target (and it makes the hyphenated
+        // `docker-compose` / `docker-buildx` invocations resolve on PATH too). The plugin
+        // form (`docker compose`) is wired up separately by installCLIPlugins().
+        for tool in ["velox", "docker", "docker-compose", "docker-buildx"] {
             let link = binDir.appendingPathComponent(tool)
             let src = bundledBin.appendingPathComponent(tool)
             try? fm.removeItem(at: link)
             do { try fm.createSymbolicLink(at: link, withDestinationURL: src) } catch { linked = false }
         }
+        let linkedPlugins = installCLIPlugins()
         let pathUpdated = updateShellProfile ? ensurePATH() : false
-        return Result(linkedTools: linked, updatedPATH: pathUpdated, binDir: binDir.path,
-                      message: linked
-                        ? "Installed `docker` and `velox` into \(binDir.path)."
-                        : "Could not link the CLIs into \(binDir.path).")
+        var message = linked
+            ? "Installed `docker` and `velox` into \(binDir.path)."
+            : "Could not link the CLIs into \(binDir.path)."
+        if !linkedPlugins.isEmpty {
+            message += " Linked the \(linkedPlugins.joined(separator: " + ")) plugin(s) into ~/.docker/cli-plugins."
+        }
+        return Result(linkedTools: linked, updatedPATH: pathUpdated, binDir: binDir.path, message: message)
+    }
+
+    /// Docker discovers CLI plugins under `~/.docker/cli-plugins` (and a few system dirs) —
+    /// NOT on `$PATH` — so `docker compose` / `docker buildx` only work if a `docker-compose`
+    /// / `docker-buildx` binary lives there. We link the bundled plugins in, but ONLY when the
+    /// subcommand doesn't already resolve, so a user's existing compose/buildx (Docker Desktop,
+    /// Homebrew, …) is never shadowed. The link targets the stable `~/.velox/bin/<name>`
+    /// indirection (refreshed each launch above), so it survives app updates/moves. Returns the
+    /// subcommands that were newly linked (empty when everything was already present).
+    @discardableResult
+    private static func installCLIPlugins() -> [String] {
+        let fm = FileManager.default
+        let docker = CLIBinding.dockerPath()
+        let pluginDir = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".docker/cli-plugins", isDirectory: true)
+        var linked: [String] = []
+        for (name, subcommand) in [("docker-compose", "compose"), ("docker-buildx", "buildx")] {
+            // Don't shadow a compose/buildx the user's docker already resolves (any source).
+            if let docker, pluginResolves(docker: docker, subcommand: subcommand) { continue }
+            let target = binDir.appendingPathComponent(name)          // ~/.velox/bin/<name> → bundle
+            guard fm.isReadableFile(atPath: target.path) else { continue }   // not bundled (dev build)
+            let link = pluginDir.appendingPathComponent(name)
+            // Leave any real file / valid symlink already there; only fill an empty slot or
+            // replace a dangling symlink — never delete a user's plugin binary.
+            if fm.fileExists(atPath: link.path) { continue }          // follows symlinks → false if dangling
+            try? fm.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: link)                              // clears a dangling symlink, if any
+            if (try? fm.createSymbolicLink(at: link, withDestinationURL: target)) != nil {
+                linked.append(subcommand)
+            }
+        }
+        return linked
+    }
+
+    /// Whether `<docker> <subcommand> version` succeeds — i.e. the CLI plugin is already
+    /// installed and discoverable. Local (prints the plugin's own version), needs no engine.
+    private static func pluginResolves(docker: String, subcommand: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: docker)
+        p.arguments = [subcommand, "version"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 
     /// Where the CLIs live inside the running bundle: `Velox.app/Contents/Resources/bin`.

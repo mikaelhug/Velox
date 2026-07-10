@@ -26,6 +26,10 @@ public enum Versions {
     public static let kernelVersion = "${KERNEL_ORG_VERSION}"
     /// Docker Engine version in the guest (Docker's official static release).
     public static let dockerVersion = "${DOCKER_VERSION}"
+    /// Docker Compose plugin version bundled for the host CLI (\`docker compose\`).
+    public static let composeVersion = "${DOCKER_COMPOSE_VERSION}"
+    /// Docker Buildx plugin version bundled for the host CLI (\`docker buildx\`).
+    public static let buildxVersion = "${DOCKER_BUILDX_VERSION}"
     /// Ed25519 public key (base64) release .zips are signed with; empty = dev build,
     /// updater signature verification skipped. See VELOX_RELEASE_PUBKEY in versions.env.
     public static let releasePubkey = "${VELOX_RELEASE_PUBKEY:-}"

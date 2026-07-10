@@ -28,8 +28,11 @@ in [docs/benchmarks.md](docs/benchmarks.md).
 ## Highlights
 
 - **The stock `docker` CLI.** No wrapper command — Velox registers a Docker
-  context named `velox`, so `compose`, `buildx`, Testcontainers and every
-  Docker SDK just work, alongside any other Docker install.
+  context named `velox`, so Testcontainers and every Docker SDK just work,
+  alongside any other Docker install. **`compose` and `buildx` are bundled**: the
+  app ships and links the two CLI plugins into `~/.docker/cli-plugins`, so
+  `docker compose` / `docker buildx` work on a clean Mac with no Docker Desktop —
+  and it never overwrites a compose/buildx you already have.
 - **Reach containers by name** at `<name>.velox.local` — details below.
 - **A native Mac app.** Compose-grouped containers, images, volumes and
   networks with live CPU/MEM, streaming logs, a ⌘K command palette, a menu-bar

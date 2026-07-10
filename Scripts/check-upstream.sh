@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Velox upstream-maintenance scout: detect newer MINOR/MAJOR Linux-kernel and
-# Docker-engine releases, rewrite the pins in versions.env, and print a
-# machine-readable summary. Driven weekly by .github/workflows/version-watch.yml;
-# also runnable locally (--dry-run) to preview a bump.
+# Velox upstream-maintenance scout: detect newer MINOR/MAJOR Linux-kernel,
+# Docker-engine, and Docker CLI-plugin (compose + buildx) releases, rewrite the
+# pins in versions.env, and print a machine-readable summary. Driven weekly by
+# .github/workflows/version-watch.yml; also runnable locally (--dry-run) to preview.
 #
 # Policy (see CLAUDE.md §9 and the plan):
 #   * Kernel  — track the NEWEST MAINLINE STABLE line (kernel.org latest_stable),
@@ -11,6 +11,8 @@
 #               the newest patch OF the newest line (6.18.35 -> 7.1.3).
 #   * Docker  — same rule on the static-stable channel (29.5.3 -> 29.6.1 minor,
 #               29.x -> 30.0.0 major; skip 29.5.3 -> 29.5.4 patch).
+#   * Compose/Buildx — the host CLI plugins, same major.minor rule, discovered from
+#               each project's GitHub releases/latest (docker/compose, docker/buildx).
 #   * VELOX_VERSION — one MINOR bump per batch (0.3.1 -> 0.4.0), derived from the
 #               value on the current branch so re-runs are idempotent.
 #
@@ -37,6 +39,14 @@ elif command -v sha256sum >/dev/null 2>&1; then _sha(){ sha256sum | cut -d' ' -f
 else echo "error: need shasum or sha256sum" >&2; exit 1; fi
 
 set -a; . ./versions.env; set +a
+
+# GitHub API GET (authenticated when GITHUB_TOKEN is set, to dodge the 60/hr
+# anonymous rate limit in CI). A function, not a `curl … ${arr[@]}`, so it stays
+# safe under `set -u` on macOS's bash 3.2 (empty-array expansion would fault).
+gh_curl(){ # <url>
+  if [ -n "${GITHUB_TOKEN:-}" ]; then curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$1"
+  else curl -fsSL "$1"; fi
+}
 
 # --- version helpers -------------------------------------------------------
 mm(){ printf '%s' "$1" | cut -d. -f1-2; }          # 6.18.35 -> 6.18
@@ -65,7 +75,7 @@ set_var(){ # KEY VALUE
 # ===========================================================================
 # Discover: kernel (no tarball download — releases.json + signed sha256sums.asc)
 # ===========================================================================
-echo "==> current pins: kernel ${KERNEL_ORG_VERSION}, docker ${DOCKER_VERSION}, velox ${VELOX_VERSION}" >&2
+echo "==> current pins: kernel ${KERNEL_ORG_VERSION}, docker ${DOCKER_VERSION}, compose ${DOCKER_COMPOSE_VERSION}, buildx ${DOCKER_BUILDX_VERSION}, velox ${VELOX_VERSION}" >&2
 
 K_LATEST="$(curl -fsSL https://www.kernel.org/releases.json | jq -r '.latest_stable.version')"
 [ -n "$K_LATEST" ] && [ "$K_LATEST" != "null" ] || { echo "error: could not read latest_stable from kernel.org releases.json" >&2; exit 1; }
@@ -82,9 +92,23 @@ D_LATEST="$(printf '%s' "$D_INDEX" \
 D_KIND="$(classify "$DOCKER_VERSION" "$D_LATEST")"
 
 # ===========================================================================
+# Discover: compose + buildx (host CLI plugins) — each project's releases/latest
+# (excludes pre-releases/drafts). SHAs need a binary download (done below).
+# ===========================================================================
+gh_latest(){ # <owner/repo> -> X.Y.Z (strips the leading v); dies on failure
+  local tag; tag="$(gh_curl "https://api.github.com/repos/$1/releases/latest" | jq -r '.tag_name')"
+  [ -n "$tag" ] && [ "$tag" != "null" ] || { echo "error: could not read latest release for $1" >&2; exit 1; }
+  printf '%s' "${tag#v}"
+}
+CP_LATEST="$(gh_latest docker/compose)"
+CP_KIND="$(classify "$DOCKER_COMPOSE_VERSION" "$CP_LATEST")"
+BX_LATEST="$(gh_latest docker/buildx)"
+BX_KIND="$(classify "$DOCKER_BUILDX_VERSION" "$BX_LATEST")"
+
+# ===========================================================================
 # Compute new pins for whatever qualifies
 # ===========================================================================
-K_SHA="" D_GUEST_SHA="" D_MAC_SHA=""
+K_SHA="" D_GUEST_SHA="" D_MAC_SHA="" CP_SHA="" BX_SHA=""
 
 if [ -n "$K_KIND" ]; then
   KMAJ="$(maj "$K_LATEST")"
@@ -107,11 +131,32 @@ if [ -n "$D_KIND" ]; then
   echo "==> docker guest sha ${D_GUEST_SHA}; mac sha ${D_MAC_SHA}" >&2
 fi
 
+# The darwin plugin binaries are on the GitHub release CDN (public, no auth). Note
+# the DIFFERENT asset names: compose = docker-compose-darwin-aarch64, buildx =
+# buildx-v<ver>.darwin-arm64.
+if [ -n "$CP_KIND" ]; then
+  CP_URL="https://github.com/docker/compose/releases/download/v${CP_LATEST}/docker-compose-darwin-aarch64"
+  curl -fsIL -o /dev/null "$CP_URL" || { echo "error: compose darwin binary for v${CP_LATEST} not published yet — refusing to bump compose this run" >&2; exit 1; }
+  echo "==> compose ${DOCKER_COMPOSE_VERSION} -> ${CP_LATEST} (${CP_KIND}); fetching binary to hash (~30MB)" >&2
+  CP_SHA="$(curl -fsSL "$CP_URL" | _sha)"
+  [ -n "$CP_SHA" ] || { echo "error: failed to compute compose SHA" >&2; exit 1; }
+  echo "==> compose sha ${CP_SHA}" >&2
+fi
+
+if [ -n "$BX_KIND" ]; then
+  BX_URL="https://github.com/docker/buildx/releases/download/v${BX_LATEST}/buildx-v${BX_LATEST}.darwin-arm64"
+  curl -fsIL -o /dev/null "$BX_URL" || { echo "error: buildx darwin binary for v${BX_LATEST} not published yet — refusing to bump buildx this run" >&2; exit 1; }
+  echo "==> buildx ${DOCKER_BUILDX_VERSION} -> ${BX_LATEST} (${BX_KIND}); fetching binary to hash (~60MB)" >&2
+  BX_SHA="$(curl -fsSL "$BX_URL" | _sha)"
+  [ -n "$BX_SHA" ] || { echo "error: failed to compute buildx SHA" >&2; exit 1; }
+  echo "==> buildx sha ${BX_SHA}" >&2
+fi
+
 # ===========================================================================
 # Emit outputs + (unless --dry-run) rewrite versions.env
 # ===========================================================================
 NEW_VELOX=""
-if [ -n "$K_KIND" ] || [ -n "$D_KIND" ]; then
+if [ -n "$K_KIND" ] || [ -n "$D_KIND" ] || [ -n "$CP_KIND" ] || [ -n "$BX_KIND" ]; then
   NEW_VELOX="$(bump_minor "$VELOX_VERSION")"
 fi
 
@@ -128,15 +173,20 @@ if [ -z "$NEW_VELOX" ]; then
 fi
 
 # Human-readable one-liners (also consumed by the workflow to build the PR body).
-[ -n "$K_KIND" ] && echo "CHANGED kernel ${KERNEL_ORG_VERSION} ${K_LATEST} ${K_KIND}"
-[ -n "$D_KIND" ] && echo "CHANGED docker ${DOCKER_VERSION} ${D_LATEST} ${D_KIND}"
+[ -n "$K_KIND" ]  && echo "CHANGED kernel ${KERNEL_ORG_VERSION} ${K_LATEST} ${K_KIND}"
+[ -n "$D_KIND" ]  && echo "CHANGED docker ${DOCKER_VERSION} ${D_LATEST} ${D_KIND}"
+[ -n "$CP_KIND" ] && echo "CHANGED compose ${DOCKER_COMPOSE_VERSION} ${CP_LATEST} ${CP_KIND}"
+[ -n "$BX_KIND" ] && echo "CHANGED buildx ${DOCKER_BUILDX_VERSION} ${BX_LATEST} ${BX_KIND}"
 echo "VELOX ${VELOX_VERSION} ${NEW_VELOX}"
 
-# Compose a short title the commit/PR/tag reuse.
-TITLE="release: v${NEW_VELOX} —"
-[ -n "$K_KIND" ] && TITLE="${TITLE} kernel ${KERNEL_ORG_VERSION}→${K_LATEST}"
-[ -n "$K_KIND" ] && [ -n "$D_KIND" ] && TITLE="${TITLE},"
-[ -n "$D_KIND" ] && TITLE="${TITLE} docker ${DOCKER_VERSION}→${D_LATEST}"
+# Compose a short title the commit/PR/tag reuse, comma-joining whatever changed.
+TITLE_PARTS=""
+add_part(){ [ -n "$1" ] && TITLE_PARTS="${TITLE_PARTS:+$TITLE_PARTS, }$1"; return 0; }
+add_part "${K_KIND:+kernel ${KERNEL_ORG_VERSION}→${K_LATEST}}"
+add_part "${D_KIND:+docker ${DOCKER_VERSION}→${D_LATEST}}"
+add_part "${CP_KIND:+compose ${DOCKER_COMPOSE_VERSION}→${CP_LATEST}}"
+add_part "${BX_KIND:+buildx ${DOCKER_BUILDX_VERSION}→${BX_LATEST}}"
+TITLE="release: v${NEW_VELOX} — ${TITLE_PARTS}"
 
 emit "changed=true"
 emit "prev_version=${VELOX_VERSION}"
@@ -147,6 +197,12 @@ emit "kernel_kind=${K_KIND}"
 emit "docker_from=${DOCKER_VERSION}"
 emit "docker_to=${D_KIND:+$D_LATEST}"
 emit "docker_kind=${D_KIND}"
+emit "compose_from=${DOCKER_COMPOSE_VERSION}"
+emit "compose_to=${CP_KIND:+$CP_LATEST}"
+emit "compose_kind=${CP_KIND}"
+emit "buildx_from=${DOCKER_BUILDX_VERSION}"
+emit "buildx_to=${BX_KIND:+$BX_LATEST}"
+emit "buildx_kind=${BX_KIND}"
 emit "title=${TITLE}"
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -162,6 +218,14 @@ if [ -n "$D_KIND" ]; then
   set_var DOCKER_VERSION              "$D_LATEST"
   set_var DOCKER_STATIC_SHA256        "$D_GUEST_SHA"
   set_var DOCKER_CLI_MAC_ARM64_SHA256 "$D_MAC_SHA"
+fi
+if [ -n "$CP_KIND" ]; then
+  set_var DOCKER_COMPOSE_VERSION          "$CP_LATEST"
+  set_var DOCKER_COMPOSE_MAC_ARM64_SHA256 "$CP_SHA"
+fi
+if [ -n "$BX_KIND" ]; then
+  set_var DOCKER_BUILDX_VERSION           "$BX_LATEST"
+  set_var DOCKER_BUILDX_MAC_ARM64_SHA256  "$BX_SHA"
 fi
 set_var VELOX_VERSION "$NEW_VELOX"
 echo "==> versions.env updated (velox ${VELOX_VERSION} -> ${NEW_VELOX})." >&2
