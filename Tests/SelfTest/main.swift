@@ -686,6 +686,69 @@ do {
     }
 }
 
+// MARK: SocketPump — data integrity, backpressure re-arm, half-close
+
+// Wrapped in a sync function: top-level script code is an async context, where the
+// blocking DispatchSemaphore.wait / NSLock used to drive the async pump are unavailable.
+@MainActor func socketPumpTest() {
+    section("SocketPump")
+    func makePair() -> (Int32, Int32) {
+        var fds = [Int32](repeating: -1, count: 2)
+        _ = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
+        return (fds[0], fds[1])
+    }
+    // pump splices pumpA <-> pumpB; the test drives testA/testB (the far ends).
+    let (testA, pumpA) = makePair()
+    let (testB, pumpB) = makePair()
+
+    let closed = DispatchSemaphore(value: 0)
+    let pump = SocketPump(fdA: pumpA, fdB: pumpB) { closed.signal() }
+    pump.start()
+
+    // A payload several times the 256 KiB pump buffer, so the read/write re-arm and the
+    // backpressure drain-coupling are exercised across many chunks (not a single read).
+    let count = 1_000_000
+    var sent = [UInt8](repeating: 0, count: count)
+    var x: UInt32 = 0x9E37_79B9
+    for i in 0..<count { x = x &* 1_664_525 &+ 1_013_904_223; sent[i] = UInt8(truncatingIfNeeded: x >> 24) }
+
+    // Reader: drain testB until EOF, then half-close so the reverse direction can finish.
+    let readerDone = DispatchSemaphore(value: 0)
+    let recvLock = NSLock()
+    nonisolated(unsafe) var received = [UInt8]()
+    DispatchQueue.global().async {
+        var buf = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let n = read(testB, &buf, buf.count)
+            if n <= 0 { break }
+            recvLock.lock(); received.append(contentsOf: buf[0..<n]); recvLock.unlock()
+        }
+        shutdown(testB, SHUT_WR) // EOF for the B→A direction so the pump can fully close
+        readerDone.signal()
+    }
+
+    // Writer: send the whole payload, then half-close the A→B direction.
+    let sentCopy = sent
+    DispatchQueue.global().async {
+        var off = 0
+        while off < count {
+            let n = sentCopy[off...].withUnsafeBytes { write(testA, $0.baseAddress, $0.count) }
+            if n <= 0 { break }
+            off += n
+        }
+        shutdown(testA, SHUT_WR)
+    }
+
+    check(readerDone.wait(timeout: .now() + 15) == .success, "reader reached EOF (half-close propagated A→B)")
+    check(closed.wait(timeout: .now() + 15) == .success, "onClose fired once both directions closed")
+    recvLock.lock(); let got = received; recvLock.unlock()
+    equal(got.count, count, "every byte forwarded through the pump")
+    check(got == sent, "payload survives the pump byte-for-byte across many buffers")
+
+    close(testA); close(testB)
+}
+socketPumpTest()
+
 // MARK: Summary
 
 print("\n----------------------------------------")
