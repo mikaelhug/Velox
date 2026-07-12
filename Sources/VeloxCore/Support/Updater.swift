@@ -167,6 +167,14 @@ public enum Updater {
         guard let target = runningAppBundle() else {
             print("Could not locate the installed Velox.app — open \(dest.path) to install."); reveal(dest); return
         }
+        // Preflight the install location BEFORE unpacking or stopping the engine: a
+        // read-only volume, SIP-protected path, or /Applications without admin can't be
+        // written, and there's no point tearing the running engine down for a swap that
+        // will fail. Reveal the download for a manual install instead.
+        guard fm.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
+            Log.error("update: \(target.deletingLastPathComponent().path) is not writable — open \(dest.path) to install manually.")
+            print("Open \(dest.path) to install the update manually."); reveal(dest); return
+        }
         // Unpack beside the target (same volume → atomic replace works), then swap.
         let staging = target.deletingLastPathComponent().appendingPathComponent(".velox-update-\(release.tag)")
         try? fm.removeItem(at: staging)
@@ -175,14 +183,16 @@ public enum Updater {
                 .first(where: { $0.pathExtension == "app" }) else {
             Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return
         }
-        // The relaunch below ends in exit(0), which destroys this process and with it the running
-        // VM. Flush + cleanly stop the guest FIRST (the GUI passes a hook that does this) so the
-        // data disk is synced and consistent — skipping it tore the ext4 and got it
-        // reformatted on the next boot.
-        beforeRelaunch?()
         do {
             _ = try fm.replaceItemAt(target, withItemAt: newApp)
             try? fm.removeItem(at: staging)
+            // The swap is committed. The relaunch below ends in exit(0), which destroys this
+            // process and with it the running VM, so flush + cleanly stop the guest now (the
+            // GUI passes a hook that does this) — skipping it tore the ext4 and got it
+            // reformatted on the next boot. Deferred until AFTER the swap on purpose: a failed
+            // swap (the catch below) must leave the engine running with the old app, never
+            // stopped with the old app and nothing to restart it.
+            beforeRelaunch?()
             // Re-register the new bundle with LaunchServices so its icon + Info.plist
             // changes take effect immediately, rather than from a stale icon cache.
             let lsregister = "/System/Library/Frameworks/CoreServices.framework"
