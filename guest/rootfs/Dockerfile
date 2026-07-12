@@ -11,10 +11,13 @@
 
 ARG RUST_BUILD_IMAGE=rust:1-alpine
 ARG ALPINE_IMAGE=alpine:3.23
-ARG DOCKER_VERSION=29.5.3
-# SHA-256 of the docker tgz below — pinned in versions.env (DOCKER_STATIC_SHA256) and
-# passed through by make-guest.sh; the default is a fallback for bare `docker build`.
-ARG DOCKER_SHA256=02eea44490f1f39ce340fe0bc74124002d957bacaa574d66345fbb353381362d
+# The Docker engine version + its tgz SHA-256. The SINGLE source is versions.env
+# (DOCKER_VERSION / DOCKER_STATIC_SHA256); Scripts/make-guest.sh passes them as build-args.
+# NO defaults on purpose (CLAUDE.md §2): a hard-coded value silently drifted from versions.env
+# and shipped the wrong engine on a bare `docker build`. Without these args the guard in the
+# `docker` stage fails loudly — always build via Scripts/make-guest.sh.
+ARG DOCKER_VERSION
+ARG DOCKER_SHA256
 
 # --- vinit: static musl PID1 (init + supervisor + vsock agent) ---
 FROM ${RUST_BUILD_IMAGE} AS vinit
@@ -29,6 +32,10 @@ RUN cargo build --release && strip target/release/vinit && cp target/release/vin
 FROM ${ALPINE_IMAGE} AS docker
 ARG DOCKER_VERSION
 ARG DOCKER_SHA256
+# Fail loudly if the build-args weren't supplied (bare `docker build` instead of make-guest.sh),
+# rather than fetching a wrong/empty version — versions.env is the single source of truth (§2).
+RUN test -n "${DOCKER_VERSION}" && test -n "${DOCKER_SHA256}" \
+ || { echo "ERROR: DOCKER_VERSION/DOCKER_SHA256 build-args required — build via Scripts/make-guest.sh (from versions.env)" >&2; exit 1; }
 RUN wget -qO docker.tgz "https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz" \
  && echo "${DOCKER_SHA256}  docker.tgz" | sha256sum -c - \
  && tar xf docker.tgz \
