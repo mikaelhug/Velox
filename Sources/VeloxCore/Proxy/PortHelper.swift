@@ -18,7 +18,10 @@ public enum PortHelperProto: Sendable { case tcp, udp }
 /// Supplies a bound, loopback listener fd for a privileged (<1024) port. Injected into
 /// `PortForwarder` / `UDPForwarder`; nil result ⇒ the helper isn't available yet.
 public protocol PrivilegedPortBinder: AnyObject, Sendable {
-    func boundListener(port: UInt16, proto: PortHelperProto) -> Int32?
+    /// `ipv6: true` binds `[::1]` (the address `localhost` resolves to first) instead of
+    /// 127.0.0.1 — needed so a published `<1024` port is reachable via `localhost`, not
+    /// just `127.0.0.1`. An old helper that predates the v6 verb returns nil (skipped).
+    func boundListener(port: UInt16, proto: PortHelperProto, ipv6: Bool) -> Int32?
 }
 
 // MARK: - Manager (what the forwarders + engine talk to)
@@ -38,8 +41,8 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
 
     /// Request a privileged-port listener fd from the running helper (nil if it isn't
     /// installed/answering, or the bind failed). Thread-safe — just syscalls.
-    public func boundListener(port: UInt16, proto: PortHelperProto) -> Int32? {
-        PortHelperClient.requestListener(port: port, proto: proto)
+    public func boundListener(port: UInt16, proto: PortHelperProto, ipv6: Bool = false) -> Int32? {
+        PortHelperClient.requestListener(port: port, proto: proto, ipv6: ipv6)
     }
 
     /// Add/remove a host route to a container subnet via the helper (named-access routing).
@@ -135,7 +138,7 @@ package enum PortHelperClient {
     /// Production never touches it. (Written once by the test before any use.)
     package nonisolated(unsafe) static var socketPath = productionSocketPath
 
-    package static func requestListener(port: UInt16, proto: PortHelperProto) -> Int32? {
+    package static func requestListener(port: UInt16, proto: PortHelperProto, ipv6: Bool = false) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -159,7 +162,8 @@ package enum PortHelperClient {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
         }
         guard connected == 0 else { return nil }
-        let request = "\(proto == .tcp ? "tcp" : "udp") \(port)\n"
+        let verb = (proto == .tcp ? "tcp" : "udp") + (ipv6 ? "6" : "")
+        let request = "\(verb) \(port)\n"
         guard FDIO.writeAll(fd, Array(request.utf8)) else { return nil }
         let (status, received) = receiveFD(fd)
         guard status == 0, let received else {

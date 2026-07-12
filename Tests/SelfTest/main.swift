@@ -654,6 +654,7 @@ do {
         (0, -1),           // route add → ok
         (1, -1),           // route del → failure
         (0, -1),           // ipfwd → ok
+        (2, -1),           // tcp6 bind → failure (asserts the v6 wire verb only)
     ]
     if let daemon = FakeDaemon(script: script) {
         PortHelperClient.socketPath = daemon.path
@@ -669,11 +670,13 @@ do {
         check(PortHelperClient.route(add: true, subnet: "172.18.0.0/16", gateway: "192.168.64.2"), "route add status 0 → true")
         check(!PortHelperClient.route(add: false, subnet: "172.18.0.0/16", gateway: ""), "route del status 1 → false")
         check(PortHelperClient.restoreIPForwarding(), "ipfwd status 0 → true")
+        // ipv6:true selects the [::1] loopback bind (privileged-port localhost twin).
+        check(PortHelperClient.requestListener(port: 80, proto: .tcp, ipv6: true) == nil, "tcp6 bind failure → nil")
 
         // The wire format is the contract with the root daemon — assert it verbatim.
         equal(daemon.requests, ["tcp 80", "udp 81",
                                 "route add 172.18.0.0/16 192.168.64.2",
-                                "route del 172.18.0.0/16", "ipfwd"],
+                                "route del 172.18.0.0/16", "ipfwd", "tcp6 80"],
               "request lines match the daemon protocol")
         daemon.stop()
         close(pipeFds[0])

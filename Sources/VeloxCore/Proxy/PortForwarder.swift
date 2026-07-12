@@ -68,7 +68,7 @@ public final class PortForwarder: @unchecked Sendable {
         if port < 1024 {
             // Privileged port: an unprivileged bind(2) returns EACCES, so the
             // listening socket comes from the root helper (already listening).
-            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .tcp) else {
+            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .tcp, ipv6: false) else {
                 if warnedPrivileged.insert(port).inserted {
                     Log.warn("port-forward: 127.0.0.1:\(port) needs the privileged helper — not authorized yet")
                 }
@@ -100,18 +100,20 @@ public final class PortForwarder: @unchecked Sendable {
             fd = s
         }
         var sources = [makeAcceptSource(fd: fd, port: port)]
-        // Best-effort ::1 twin (unprivileged ports only — the helper hands out v4).
-        // Failure (e.g. another process wildcard-bound the v6 port) is non-fatal: the
-        // v4 listener still serves, exactly as before — but say so, because macOS
-        // resolves `localhost` to ::1 first and the symptom ("connection refused on
-        // localhost, works on 127.0.0.1") is baffling without this line.
-        if port >= 1024 {
-            if let v6 = Self.bindV6Loopback(port) {
-                sources.append(makeAcceptSource(fd: v6, port: port))
-            } else {
-                Log.warn("port-forward: [::1]:\(port) unavailable (held by another process?) — "
-                         + "`localhost` may resolve there first; use 127.0.0.1:\(port)")
-            }
+        // Best-effort ::1 twin. macOS resolves `localhost` to ::1 first, so a v4-only
+        // listener yields the baffling "connection refused on localhost, works on
+        // 127.0.0.1" — most acute for the privileged reverse-proxy ports (:80/:443) the
+        // helper exists to serve. Privileged ports get the twin from the helper (it binds
+        // v4 and v6); the rest bind it directly. Failure is non-fatal (v4 still serves) —
+        // e.g. an old helper predating the v6 verb, or another process holding the port.
+        let v6fd: Int32? = port < 1024
+            ? privilegedBinder?.boundListener(port: port, proto: .tcp, ipv6: true)
+            : Self.bindV6Loopback(port)
+        if let v6fd {
+            sources.append(makeAcceptSource(fd: v6fd, port: port))
+        } else {
+            Log.warn("port-forward: [::1]:\(port) unavailable (old helper, or held by another process?) — "
+                     + "`localhost` may resolve there first; use 127.0.0.1:\(port)")
         }
         listeners[port] = Listener(sources: sources)
         warnedPrivileged.remove(port)

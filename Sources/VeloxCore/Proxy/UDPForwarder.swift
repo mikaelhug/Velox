@@ -85,7 +85,7 @@ public final class UDPForwarder: @unchecked Sendable {
         let fd: Int32
         if port < 1024 {
             // Privileged UDP port: bound by the root helper (loopback, <1024).
-            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp) else {
+            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp, ipv6: false) else {
                 if warnedPrivileged.insert(port).inserted {
                     Log.warn("udp-forward: 127.0.0.1:\(port)/udp needs the privileged helper — not authorized yet")
                 }

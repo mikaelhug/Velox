@@ -10,7 +10,8 @@
 //! Darwin, no Foundation, no dependencies: the smallest possible privileged surface.
 //!
 //! Protocol (one request per connection, on `/var/run/velox-porthelper.sock`):
-//!   client → "tcp <port>\n" | "udp <port>\n"          (1 ≤ port < 1024)
+//!   client → "tcp <port>\n"  | "udp <port>\n"         (1 ≤ port < 1024, 127.0.0.1)
+//!          | "tcp6 <port>\n" | "udp6 <port>\n"        (1 ≤ port < 1024, [::1] — localhost resolves to ::1 first)
 //!          | "route add <cidr> <ipv4>\n" | "route del <cidr>\n"  (RFC-1918 only, strictly validated)
 //!          | "ipfwd\n"                                (restore net.inet.ip.forwarding=1; never 0)
 //!   helper → 1 status byte (0 = ok, else errno) + on a port bind the fd via SCM_RIGHTS
@@ -83,6 +84,28 @@ func bindLoopback(type: Int32, port: UInt16) -> Int32 {
     return s
 }
 
+/// Bind a fresh IPv6 loopback socket on `[::1]:port` (V6ONLY so it never shadows the
+/// v4 listener). macOS resolves `localhost` to `::1` first, so a published `<1024` port
+/// (e.g. a reverse proxy on `:80`) needs this twin or `curl http://localhost/` gets
+/// connection-refused while `127.0.0.1` works. Returns the fd, or -1 with `errno` set.
+func bindLoopbackV6(type: Int32, port: UInt16) -> Int32 {
+    let s = socket(AF_INET6, type, 0)
+    if s < 0 { return -1 }
+    var yes: Int32 = 1
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+    setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+    var addr = sockaddr_in6()
+    addr.sin6_family = sa_family_t(AF_INET6)
+    addr.sin6_port = port.bigEndian
+    addr.sin6_addr = in6addr_loopback
+    let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(s, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+    } }
+    if r != 0 { let e = errno; close(s); errno = e; return -1 }
+    if type == SOCK_STREAM, listen(s, 128) != 0 { let e = errno; close(s); errno = e; return -1 }
+    return s
+}
+
 /// Send the 1-byte status, attaching `fd` via SCM_RIGHTS when `fd >= 0`.
 func reply(_ conn: Int32, fd: Int32, status: UInt8) {
     var statusByte = status
@@ -112,7 +135,7 @@ func reply(_ conn: Int32, fd: Int32, status: UInt8) {
 /// One parsed request: bind a privileged loopback port, add/remove a host route, or
 /// restore IP forwarding.
 enum Req {
-    case bind(type: Int32, port: UInt16)
+    case bind(type: Int32, port: UInt16, ipv6: Bool)
     case route(add: Bool, subnet: String, gateway: String)
     case ipForward
 }
@@ -189,9 +212,11 @@ func readRequest(_ conn: Int32, max: Int = 96) -> Req? {
     }
     let parts = String(decoding: bytes, as: UTF8.self).split(separator: " ").map(String.init)
     switch parts.first {
-    case "tcp", "udp":
+    case "tcp", "udp", "tcp6", "udp6":
         guard parts.count == 2, let port = UInt16(parts[1]), port > 0, port < 1024 else { return nil }
-        return .bind(type: parts[0] == "tcp" ? SOCK_STREAM : SOCK_DGRAM, port: port)
+        let stream = parts[0].hasPrefix("tcp")
+        let ipv6 = parts[0].hasSuffix("6")
+        return .bind(type: stream ? SOCK_STREAM : SOCK_DGRAM, port: port, ipv6: ipv6)
     case "route":
         guard parts.count >= 3 else { return nil }
         switch parts[1] {
@@ -229,8 +254,8 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
         return
     }
     switch req {
-    case let .bind(type, port):
-        let s = bindLoopback(type: type, port: port)
+    case let .bind(type, port, ipv6):
+        let s = ipv6 ? bindLoopbackV6(type: type, port: port) : bindLoopback(type: type, port: port)
         if s < 0 {
             let e = errno
             log("bind \(port) failed: \(String(cString: strerror(e)))")
@@ -239,7 +264,7 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
         }
         reply(conn, fd: s, status: 0)
         close(s) // hand-off complete — VeloxApp holds the only reference now
-        log("bound 127.0.0.1:\(port)/\(type == SOCK_STREAM ? "tcp" : "udp")")
+        log("bound \(ipv6 ? "[::1]" : "127.0.0.1"):\(port)/\(type == SOCK_STREAM ? "tcp" : "udp")")
     case let .route(add, subnet, gateway):
         let rc = runRoute(add: add, subnet: subnet, gateway: gateway)
         reply(conn, fd: -1, status: UInt8(truncatingIfNeeded: rc))
