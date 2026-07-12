@@ -124,7 +124,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
-        with: { ref: automation/version-bump }
+        with: { ref: "${{ env.BUMP_BRANCH }}" }
 
       - name: Compute cache keys (same recipe as release.yml)
         id: keys
@@ -194,7 +194,7 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v6
-        with: { ref: automation/version-bump }
+        with: { ref: "${{ env.BUMP_BRANCH }}" }
       - run: swift --version
       - name: Build (all targets)
         run: |

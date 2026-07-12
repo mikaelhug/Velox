@@ -131,11 +131,11 @@ public enum Updater {
     /// place, and relaunch. Falls back to revealing the download in Finder if the app
     /// can't be replaced automatically (e.g. it lives somewhere read-only).
     private static func applyUpdate(_ release: Release, beforeRelaunch: (@Sendable () -> Void)? = nil) {
-        // The .zip is programmatically unpackable; the .dmg is the human download.
-        guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") })
-                ?? release.assets.first(where: { $0.name.hasSuffix(".dmg") }),
+        // The macOS release asset is the programmatically-unpackable .zip (build-app.sh
+        // ships no .dmg — see the release workflow).
+        guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") }),
               let assetURL = URL(string: asset.url) else {
-            Log.error("update: release \(release.tag) has no macOS asset"); return
+            Log.error("update: release \(release.tag) has no macOS .zip asset"); return
         }
         let fm = FileManager.default
         let dir = Paths.root.appendingPathComponent("updates/\(release.tag)", isDirectory: true)
@@ -156,8 +156,6 @@ public enum Updater {
         guard saved else { Log.error("update: download failed"); return }
         print("Saved \(dest.lastPathComponent).")
 
-        // Only a .zip can be applied in place; a .dmg is revealed for manual install.
-        guard asset.name.hasSuffix(".zip") else { reveal(dest); return }
         // Integrity gate: the CI signs each release .zip with Ed25519 (release-sign.swift);
         // the matching public key is baked into this build (versions.env → Versions.swift).
         // No/invalid signature ⇒ never auto-install — reveal the download for a manual call.

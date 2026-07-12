@@ -23,6 +23,13 @@ on:
     tags: ['v*']
   workflow_dispatch: {}      # manual runs build + package but don't publish a Release
 
+# Serialize releases: two closely-spaced v* tags would otherwise run the pipeline in
+# parallel and race on the shared build cache. Keyed per ref so distinct tags queue
+# rather than cancel each other (never cancel an in-flight release).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
