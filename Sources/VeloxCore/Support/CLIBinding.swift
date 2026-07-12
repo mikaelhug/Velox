@@ -27,16 +27,70 @@ public enum CLIBinding {
 
         switch mode {
         case .none:
+            // Heal a prior --bind docker session that crashed before it could restore
+            // (a SIGKILL/panic runs no teardown, stranding the active context on 'velox').
+            recoverStalePreviousContext(docker: docker)
             Log.info("engine ready — run `docker context use velox` (or `export DOCKER_HOST=\(host)`) to point docker at Velox.")
             return {}
         case .docker:
-            let previous = output([docker, "context", "show"]) ?? "default"
+            let previous = capturePreviousContext(docker: docker)
+            persistPrevious(previous) // so a hard crash can restore on the next start
             _ = run([docker, "context", "use", "velox"])
             Log.info("`docker` now targets Velox (context 'velox'); restoring '\(previous)' on stop.")
             return {
                 if previous != "velox" { _ = run([docker, "context", "use", previous]) }
+                clearPersistedPrevious()
             }
         }
+    }
+
+    // MARK: - Crash-durable previous-context tracking (--bind docker)
+    //
+    // The teardown closure only runs on a graceful stop (onStop / SIGINT / SIGTERM),
+    // so a SIGKILL or panic would strand the active context on 'velox' pointing at a
+    // dead socket. We persist the pre-bind context to disk on switch and clear it on a
+    // clean restore; the next start reads it and heals a crashed session.
+
+    private static var previousContextFile: URL {
+        Paths.root.appendingPathComponent("cli-previous-context")
+    }
+
+    /// The context to restore to when binding. If a prior session recorded one but never
+    /// restored (a crash left the active context on 'velox'), that saved value is the real
+    /// previous — not the current 'velox'. 'velox' is never a restore target: restoring to
+    /// it is a no-op that would leave the CLI permanently stuck (the self-poison bug).
+    private static func capturePreviousContext(docker: String) -> String {
+        let current = output([docker, "context", "show"]) ?? "default"
+        if current == "velox" { return readPersistedPrevious() ?? "default" }
+        return current
+    }
+
+    /// Restore a stale bind left by a crashed prior session: if a previous context was
+    /// recorded and the active one is still 'velox', switch back. Clears the record either
+    /// way. A no-op when nothing was left dangling, so it's safe on every start.
+    private static func recoverStalePreviousContext(docker: String) {
+        guard let saved = readPersistedPrevious() else { return }
+        let current = output([docker, "context", "show"]) ?? "default"
+        if current == "velox", saved != "velox" {
+            Log.info("restoring docker context '\(saved)' left bound to 'velox' by a previous session.")
+            _ = run([docker, "context", "use", saved])
+        }
+        clearPersistedPrevious()
+    }
+
+    private static func persistPrevious(_ context: String) {
+        try? FileManager.default.createDirectory(at: Paths.root, withIntermediateDirectories: true)
+        try? context.write(to: previousContextFile, atomically: true, encoding: .utf8)
+    }
+
+    private static func readPersistedPrevious() -> String? {
+        guard let s = try? String(contentsOf: previousContextFile, encoding: .utf8) else { return nil }
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func clearPersistedPrevious() {
+        try? FileManager.default.removeItem(at: previousContextFile)
     }
 
     /// Create (or update) the `velox` context pointing at the engine socket.
