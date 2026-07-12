@@ -188,6 +188,31 @@ jobs:
           for f in dist/Velox-*.zip; do
             swift Scripts/release-sign.swift sign "$f" "$RELEASE_KEY"
           done
+
+      # Fail closed. Every client build bakes in VELOX_RELEASE_PUBKEY (versions.env) and
+      # its updater REFUSES to auto-install a release whose .sig is missing or doesn't
+      # verify. So if a public key is configured, each .zip MUST carry a signature that
+      # verifies against it — otherwise this release would silently break auto-update for
+      # the whole fleet (users fall back to a manual download). This one guard catches both
+      # failure modes the `if:`-gated signing step can't: a missing signing secret (no .sig
+      # produced) and a rotated/mismatched keypair (signature present but invalid).
+      - name: Verify release signatures match the shipped public key
+        run: |
+          set -euo pipefail
+          PUBKEY="$(grep -E '^VELOX_RELEASE_PUBKEY=' versions.env | head -1 | cut -d= -f2-)"
+          if [ -z "$PUBKEY" ]; then
+            echo "VELOX_RELEASE_PUBKEY is empty (dev build) — signature verification skipped."
+            exit 0
+          fi
+          for f in dist/Velox-*.zip; do
+            [ -f "$f" ] || continue
+            if [ ! -f "$f.sig" ]; then
+              echo "::error::$f is unsigned but VELOX_RELEASE_PUBKEY is set — the VELOX_ED25519_PRIVATE_KEY secret is missing. Every client would reject this update." >&2
+              exit 1
+            fi
+            swift Scripts/release-sign.swift verify "$f" "$PUBKEY"
+          done
+
       - name: Generate SHA256SUMS
         run: cd dist && shasum -a 256 Velox-*.zip > SHA256SUMS
 
