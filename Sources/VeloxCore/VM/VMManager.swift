@@ -16,6 +16,10 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
     private let queue = DispatchQueue(label: "dev.velox.vm")
     private var vm: VZVirtualMachine?
     private var stopHandler: (@Sendable (Error?) -> Void)?
+    /// Stop completions that arrived while the VM wasn't yet stoppable (a stop racing
+    /// the boot window). Honored the moment `machine.start` completes — never dropped,
+    /// so a stop during `.starting` can't leave a running VM with no plumbing. On `queue`.
+    private var pendingStops: [@Sendable () -> Void] = []
 
     public override init() { super.init() }
 
@@ -40,10 +44,24 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
             let machine = VZVirtualMachine(configuration: configuration, queue: self.queue)
             machine.delegate = self
             self.vm = machine
-            machine.start { result in
+            machine.start { [weak self] result in
+                guard let self else { completion(result); return }
                 switch result {
-                case .success: completion(.success(()))
-                case .failure(let error): completion(.failure(error))
+                case .success:
+                    completion(.success(()))
+                    // A stop that raced the boot window couldn't run while the VM was
+                    // still `.starting`; now that it's up (and stoppable) honor it, so we
+                    // never leave a running-but-unwired VM behind (the stop's caller bumped
+                    // the start generation, so `performStart` bails without plumbing it).
+                    if !self.pendingStops.isEmpty { self.attemptStop() }
+                case .failure(let error):
+                    // Boot failed: VZ does not deliver the delegate stop callbacks for a
+                    // machine that never ran, so clear the handle here — otherwise the next
+                    // start() is refused by the `vm == nil` guard and the engine is dead
+                    // until relaunch. Any queued stop is trivially satisfied (nothing runs).
+                    self.vm = nil
+                    completion(.failure(error))
+                    self.drainPendingStops()
                 }
             }
         }
@@ -135,9 +153,26 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
 
     private func hardStop(_ completion: @escaping @Sendable () -> Void) {
         queue.async {
-            guard let vm = self.vm, vm.canStop else { completion(); return }
-            vm.stop { _ in self.vm = nil; completion() } // host-initiated stop: clear the ref here
+            self.pendingStops.append(completion)
+            self.attemptStop()
         }
+    }
+
+    /// Stop the VM if it exists and is stoppable, firing every queued stop completion
+    /// once it's confirmed stopped (or already gone). If the VM exists but isn't
+    /// stoppable yet (mid-boot), leave the requests queued — `machine.start`'s
+    /// completion re-invokes this, so a stop is deferred, never dropped. On `queue`.
+    private func attemptStop() {
+        guard let vm = self.vm else { self.drainPendingStops(); return } // nothing to stop
+        guard vm.canStop else { return } // mid-boot: start's completion will re-invoke us
+        vm.stop { _ in self.vm = nil; self.drainPendingStops() } // host-initiated stop: clear the ref here
+    }
+
+    /// Fire and clear every queued stop completion (the VM is confirmed stopped/gone).
+    private func drainPendingStops() {
+        let pending = self.pendingStops
+        self.pendingStops.removeAll()
+        for completion in pending { completion() }
     }
 
     // MARK: - VZVirtualMachineDelegate
@@ -146,11 +181,13 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
         Log.info("guest stopped")
         stopHandler?(nil)
         vm = nil // guest-initiated stop: allow a later start() to boot a fresh VM
+        drainPendingStops() // a queued host stop is satisfied — the VM is down
     }
 
     public func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
         Log.error("guest stopped: \(error.localizedDescription)")
         stopHandler?(error)
         vm = nil
+        drainPendingStops()
     }
 }
