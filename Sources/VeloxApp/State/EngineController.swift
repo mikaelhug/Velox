@@ -215,6 +215,7 @@ final class EngineController {
             let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
                 ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                               kernelCommandLine: GuestImage.defaultCommandLine)
+                    .advertising(shares: shareURLs) // else extra shares attach but never mount
             // Capture the guest serial console (kernel + vinit + dockerd) for the
             // Engine Logs view: hand the VM a pipe as its console write end and drain
             // the read end into the ring buffer. (The CLI keeps stdout.)

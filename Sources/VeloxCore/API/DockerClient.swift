@@ -40,13 +40,14 @@ public actor DockerClient: DockerClientProtocol {
         }
     }
 
-    private func send(_ method: String, _ path: String, body: Data? = nil, readTimeout: Int32? = nil) async throws -> Data {
+    private func send(_ method: String, _ path: String, body: Data? = nil, readTimeout: Int32? = 300) async throws -> Data {
         let fd = try await openConnection()
         if let readTimeout {
             // Bound the wait so a wedged dockerd (accepts the VSOCK connection but never
-            // replies) can't park this ioQueue thread + the awaiting Task forever. Only
-            // the read-only reconcile calls pass this — never actions like `stop`, which
-            // legitimately block until the container actually stops.
+            // replies) can't park this ioQueue thread + the awaiting Task forever. Reconcile
+            // calls pass a tight value; everything else (actions, prunes) gets a generous
+            // 300s default — well above any real `stop`/prune, but not unbounded. A caller
+            // that must never time out can pass nil explicitly.
             var tv = timeval(tv_sec: Int(readTimeout), tv_usec: 0)
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         }

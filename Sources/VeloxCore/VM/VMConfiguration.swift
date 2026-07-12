@@ -192,7 +192,8 @@ public enum VMConfiguration {
         // User-configured extra shares (File Sharing setting). Each host dir is
         // exposed under its own VirtioFS tag; the guest mounts each tag at its
         // host path (the tag→path map is advertised on the kernel cmdline as
-        // `velox.shares=<base64>` — assembled in EngineController, read by vinit).
+        // `velox.shares=<base64>` — assembled in GuestImage.advertising(shares:),
+        // from the same shareAdvertisement, and read by vinit).
         for advert in shareAdvertisement(for: extraShares) {
             let url = URL(fileURLWithPath: advert.path, isDirectory: true)
             let share = VZSingleDirectoryShare(

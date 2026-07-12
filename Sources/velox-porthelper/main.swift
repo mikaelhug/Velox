@@ -183,7 +183,14 @@ func runRoute(add: Bool, subnet: String, gateway: String) -> Int32 {
     if rc != 0 { return rc }
     var status: Int32 = 0
     waitpid(pid, &status, 0)
-    return 0   // best-effort: a delete of a missing route or add of an existing one is fine
+    // A delete stays best-effort (removing a missing route is fine → success). An add must
+    // report a genuine failure, or the host records the subnet as routed when it isn't and
+    // named access silently breaks. The host deletes before every add
+    // (NamedAccessRouter.reconcile), so a failing add is a real error, not "already exists".
+    if !add { return 0 }
+    let exited = (status & 0x7f) == 0            // WIFEXITED
+    let code = (status >> 8) & 0xff              // WEXITSTATUS
+    return (exited && code == 0) ? 0 : EIO
 }
 
 /// Restore the kernel IP-forwarding switch that Apple's vmnet NAT (the whole container

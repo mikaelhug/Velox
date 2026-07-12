@@ -208,14 +208,17 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         // Refresh the direct-dial map every reconcile (a restart can change a container's IP
         // without changing the published-port *set*), independent of the onPorts diff below.
         endpoints?.update(endpointMap)
-        names?.update(nameMap)
         // Bridge-network subnets → the host routes each to the guest so container IPs are
-        // reachable. A second cheap list (coalesced); only fires the callback on a real change.
+        // reachable. Install these BEFORE publishing names, so a freshly-resolvable
+        // <name>.velox.local is routable the moment DNS answers it (rather than briefly
+        // resolving a container IP whose subnet route isn't in place yet). A second cheap
+        // list (coalesced); only fires the callback on a real change.
         if let onSubnets, let nets = try? await docker.networks() {
             let subnets = Set(nets.filter { $0.driver == "bridge" }.flatMap { $0.subnets }
                                   .filter { $0.contains(".") })   // IPv4 CIDRs only
             if commitSubnets(subnets) { onSubnets(subnets) }
         }
+        names?.update(nameMap)
         if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
     }
 
