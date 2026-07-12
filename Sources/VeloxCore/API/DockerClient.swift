@@ -18,8 +18,14 @@ public actor DockerClient: DockerClientProtocol {
     static let apiVersion = "v1.47"
     private static let ioQueue = DispatchQueue(label: "dev.velox.docker.io", attributes: .concurrent)
 
+    /// One shared `/events` connection, fanned out to every consumer (port watcher,
+    /// resource saver, dashboards) — so they don't each open their own VSOCK stream
+    /// (CLAUDE.md §8's "one persistent VSOCK connection"). See `DockerEventHub`.
+    private nonisolated let eventHub: DockerEventHub
+
     public init(manager: VMManager) {
         self.manager = manager
+        self.eventHub = DockerEventHub { DockerClient.rawEventsStream(manager: manager) }
     }
 
     private static func path(_ suffix: String) -> String { "/\(apiVersion)\(suffix)" }
@@ -249,8 +255,16 @@ public actor DockerClient: DockerClientProtocol {
 
     // MARK: - Streams (events / stats / logs)
 
+    /// The public events stream — a subscription onto the shared hub (one upstream VSOCK
+    /// connection fanned out to all consumers). Each subscription still finishes when the
+    /// upstream drops, so the consumer's informer loop reconciles + re-subscribes as before.
     public nonisolated func events() -> AsyncStream<DockerEvent> {
-        makeStream(method: "GET", path: Self.path("/events")) { bytes, acc, yield in
+        eventHub.subscribe()
+    }
+
+    /// One raw `/events` connection — used only by the hub to feed all subscribers.
+    nonisolated static func rawEventsStream(manager: VMManager) -> AsyncStream<DockerEvent> {
+        makeStream(manager: manager, method: "GET", path: path("/events")) { bytes, acc, yield in
             acc.append(bytes)
             for line in acc.takeLines() {
                 if let event = try? JSONDecoder().decode(DockerEvent.self, from: line) { yield(event) }
@@ -261,8 +275,8 @@ public actor DockerClient: DockerClientProtocol {
     public nonisolated func stats(container id: String) -> AsyncStream<ContainerStatsSample> {
         // Only the freshest sample matters, so drop backlog if a consumer (a paused
         // table) falls behind — a slow UI can't grow an unbounded queue of stale samples.
-        makeStream(method: "GET", path: Self.path("/containers/\(id)/stats?stream=1"),
-                   bufferingPolicy: .bufferingNewest(2)) { bytes, acc, yield in
+        Self.makeStream(manager: manager, method: "GET", path: Self.path("/containers/\(id)/stats?stream=1"),
+                        bufferingPolicy: .bufferingNewest(2)) { bytes, acc, yield in
             acc.append(bytes)
             for line in acc.takeLines() {
                 if let raw = try? JSONDecoder().decode(RawStats.self, from: line) { yield(raw.sample()) }
@@ -279,8 +293,8 @@ public actor DockerClient: DockerClientProtocol {
         // Cap the backlog: a container logging faster than a backgrounded log view drains
         // must not grow host memory without bound. Keep the newest frames (like `tail`) —
         // the view holds its own scrollback, so dropping the oldest un-drained lines is fine.
-        return makeStream(method: "GET", path: path,
-                          bufferingPolicy: .bufferingNewest(4096)) { bytes, acc, yield in
+        return Self.makeStream(manager: manager, method: "GET", path: path,
+                               bufferingPolicy: .bufferingNewest(4096)) { bytes, acc, yield in
             acc.append(bytes)
             parser.parse(&acc, yield: yield)
         }
@@ -290,13 +304,13 @@ public actor DockerClient: DockerClientProtocol {
     /// stream on `ioQueue`, and feed body bytes through `parse`, which yields
     /// decoded items into the AsyncStream. Cancellation shuts the fd down via
     /// `StreamConnection` so a reader blocked in `read()` unwinds promptly.
-    private nonisolated func makeStream<T: Sendable>(
+    private nonisolated static func makeStream<T: Sendable>(
+        manager: VMManager,
         method: String,
         path: String,
         bufferingPolicy: AsyncStream<T>.Continuation.BufferingPolicy = .unbounded,
         parse: @escaping @Sendable (Data, inout Data, (T) -> Void) -> Void
     ) -> AsyncStream<T> {
-        let manager = self.manager
         return AsyncStream(bufferingPolicy: bufferingPolicy) { continuation in
             let conn = StreamConnection()
             continuation.onTermination = { _ in conn.cancel() }

@@ -749,6 +749,68 @@ do {
 }
 socketPumpTest()
 
+// MARK: DockerEventHub — one upstream fanned out, finish-on-drop, reconnect
+
+@MainActor func eventHubTest() {
+    section("DockerEventHub")
+
+    func mkEvent(_ action: String) -> DockerEvent {
+        try! JSONDecoder().decode(DockerEvent.self,
+            from: Data(#"{"Type":"container","Action":"\#(action)"}"#.utf8))
+    }
+    // The hub starts/stops its upstream task asynchronously — spin-wait for the state.
+    func spin(_ cond: @escaping () -> Bool, _ secs: Double = 5) -> Bool {
+        let deadline = Date().addingTimeInterval(secs)
+        while Date() < deadline { if cond() { return true }; Thread.sleep(forTimeInterval: 0.005) }
+        return cond()
+    }
+    // A controllable upstream: counts connections, yields on demand, finishes on drop().
+    final class Upstream: @unchecked Sendable {
+        let lock = NSLock()
+        var cont: AsyncStream<DockerEvent>.Continuation?
+        var connects = 0
+        func make() -> AsyncStream<DockerEvent> {
+            AsyncStream { c in lock.lock(); cont = c; connects += 1; lock.unlock() }
+        }
+        func yield(_ e: DockerEvent) { lock.lock(); let c = cont; lock.unlock(); c?.yield(e) }
+        func drop() { lock.lock(); let c = cont; cont = nil; lock.unlock(); c?.finish() }
+        func count() -> Int { lock.lock(); defer { lock.unlock() }; return connects }
+    }
+    final class Sink: @unchecked Sendable {
+        let lock = NSLock()
+        var got = [String](); var finished = false
+        func add(_ s: String) { lock.lock(); got.append(s); lock.unlock() }
+        func finish() { lock.lock(); finished = true; lock.unlock() }
+        func has(_ s: String) -> Bool { lock.lock(); defer { lock.unlock() }; return got.contains(s) }
+        func done() -> Bool { lock.lock(); defer { lock.unlock() }; return finished }
+    }
+
+    let up = Upstream()
+    let hub = DockerEventHub { up.make() }
+
+    let sinkA = Sink(); let sinkB = Sink()
+    let taskA = Task.detached { for await e in hub.subscribe() { sinkA.add(e.action ?? "") }; sinkA.finish() }
+    let taskB = Task.detached { for await e in hub.subscribe() { sinkB.add(e.action ?? "") }; sinkB.finish() }
+
+    check(spin { up.count() == 1 }, "two subscribers share one upstream connection")
+    up.yield(mkEvent("start"))
+    check(spin { sinkA.has("start") && sinkB.has("start") }, "event fans out to every subscriber")
+    equal(up.count(), 1, "still a single upstream connection after broadcast")
+
+    up.drop() // dockerd restart
+    check(spin { sinkA.done() && sinkB.done() },
+          "subscriber streams finish on upstream drop (so consumers reconcile)")
+
+    let sinkC = Sink()
+    let taskC = Task.detached { for await e in hub.subscribe() { sinkC.add(e.action ?? "") }; sinkC.finish() }
+    check(spin { up.count() == 2 }, "re-subscribe reconnects exactly one fresh upstream")
+    up.yield(mkEvent("die"))
+    check(spin { sinkC.has("die") }, "reconnected subscriber receives events")
+
+    taskA.cancel(); taskB.cancel(); taskC.cancel()
+}
+eventHubTest()
+
 // MARK: Summary
 
 print("\n----------------------------------------")
