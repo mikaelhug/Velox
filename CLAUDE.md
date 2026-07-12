@@ -161,8 +161,8 @@ all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
   collisions + slow bind mounts). Only the final `Image` is copied back to
   `Assets/velox-vmlinux` (and `~/.velox/kernel`).
 - The kernel version + SHA-256 are pinned in `versions.env`
-  (`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`; the kernel.org `v6.x` dir is derived
-  from the version). No LinuxKit.
+  (`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`; the kernel.org `v<MAJOR>.x` dir is
+  derived from the version). No LinuxKit.
 - `Scripts/make-guest.sh` builds **only the erofs root userspace** (no LinuxKit,
   no initramfs); the kernel comes from `Assets/velox-vmlinux`. Both VirtioFS `-v`
   mounts and Rosetta x86 depend on this kernel — don't switch to a stock kernel
@@ -219,7 +219,8 @@ The binding architecture:
   DHCP via ioctl** (no udhcpc/dhcpcd), data-disk format/mount + swap, VirtioFS,
   Rosetta binfmt — then forks+supervises `dockerd` (on a unix socket, with
   `--host-gateway-ip` for host.docker.internal), runs the vsock agent (ports 2375
-  docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock), and reaps
+  docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock / 2378
+  gateway-probe), and reaps
   zombies. All custom guest code is Rust (pillar #3) — keep it lean.
 - The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
   `versions.env`). A tiny musl userland (`nftables`, `e2fsprogs`, `ca-certificates`
