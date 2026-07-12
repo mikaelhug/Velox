@@ -47,7 +47,11 @@ BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 # --- fetch the stock Docker client for macOS (pinned DOCKER_VERSION) ----------
 ARCH="$(uname -m)"; case "$ARCH" in arm64) DARCH=aarch64;; x86_64) DARCH=x86_64;; *) DARCH=aarch64;; esac
 DOCKER_CLI="$DIST/docker-cli/docker"
-if [ ! -x "$DOCKER_CLI" ]; then
+DOCKER_CLI_STAMP="$DIST/docker-cli/.docker-version"
+# Reuse the cached client only when it is the PINNED version. Keying on existence alone
+# let a stale client from a previous DOCKER_VERSION ship unchanged after a bump — a host
+# `docker` / guest `dockerd` skew the single-source-of-truth (§2) is meant to prevent.
+if [ ! -x "$DOCKER_CLI" ] || [ "$(cat "$DOCKER_CLI_STAMP" 2>/dev/null)" != "$DOCKER_VERSION" ]; then
     echo "==> download stock docker client $DOCKER_VERSION ($DARCH) for macOS"
     # Docker ships no checksum sidecar for the static tarballs, so the SHA-256 is
     # pinned in versions.env (bumped together with DOCKER_VERSION). arm64-only:
@@ -59,6 +63,7 @@ if [ ! -x "$DOCKER_CLI" ]; then
     echo "${DOCKER_CLI_MAC_ARM64_SHA256}  $DIST/docker-cli.tgz" | shasum -a 256 -c - >/dev/null \
         || { echo "error: docker-cli.tgz SHA-256 mismatch — expected ${DOCKER_CLI_MAC_ARM64_SHA256} (versions.env)" >&2; exit 1; }
     tar -xzf "$DIST/docker-cli.tgz" -C "$DIST/docker-cli" --strip-components=1 docker/docker
+    echo "$DOCKER_VERSION" > "$DOCKER_CLI_STAMP"
 fi
 
 # --- fetch the host-side docker CLI plugins (compose + buildx) -----------------
@@ -69,7 +74,10 @@ fi
 # compose = docker-compose-darwin-aarch64, buildx = buildx-v<ver>.darwin-arm64.
 fetch_plugin() {  # <dest-name> <url> <sha256>
     local name="$1" url="$2" sha="$3" out="$DIST/plugins/$1"
-    [ -x "$out" ] && return
+    # The plugin binary IS the SHA-pinned artifact, so verify the cache against the pin:
+    # a stale binary from a previous plugin version won't match and is re-fetched. Keying
+    # on existence alone shipped the old plugin after a version/SHA bump (§2 skew).
+    [ -x "$out" ] && echo "${sha}  $out" | shasum -a 256 -c - >/dev/null 2>&1 && return
     [ "$DARCH" = "aarch64" ] || { echo "error: no pinned CLI-plugin SHA-256 for $DARCH (Velox is arm64-only)" >&2; exit 1; }
     mkdir -p "$DIST/plugins"
     echo "==> download $name plugin for macOS ($DARCH)"
