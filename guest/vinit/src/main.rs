@@ -257,11 +257,32 @@ fn setup_network() -> std::io::Result<()> {
     iface_up(s, IFNAME);
 
     let mac = get_mac(s)?;
+    unsafe { libc::close(s); } // apply_lease opens its own socket for addressing
     let lease = dhcp::acquire(IFNAME, mac)?;
     log!("DHCP lease: ip={} mask={} gw={} dns={:?} lease={}s",
         ipstr(lease.ip), ipstr(lease.mask), ipstr(lease.router),
         lease.dns.iter().map(|d| ipstr(*d)).collect::<Vec<_>>(), lease.lease_secs);
+    apply_lease(&lease);
 
+    // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
+    // a long-running VM would eventually lose its address. Renew in the
+    // background at ~half the lease interval (best-effort). `velox.dhcprenew=<secs>`
+    // on the cmdline (via VELOX_KCMDLINE_EXTRA) forces the interval — a test/ops
+    // knob to exercise renewal without waiting out a long vmnet lease.
+    let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
+    let force = cmdline_value("velox.dhcprenew").and_then(|v| v.parse::<u64>().ok());
+    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs, force));
+    Ok(())
+}
+
+/// Apply a DHCP lease to eth0: address, netmask, default route, the atomics the rest of
+/// the guest reads (gateway / our IP+mask), a `:53` DNS responder, and resolv.conf. Used
+/// for the initial lease AND to adopt a *changed* IP on re-acquire (a vmnet lease-table
+/// reset), so the guest recovers its network instead of staying dark until a VM restart.
+fn apply_lease(lease: &dhcp::Lease) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if s < 0 { log!("apply_lease: socket failed: {}", std::io::Error::last_os_error()); return; }
     // address
     let mut ra = IfReqAddr { name: ifname_bytes(), addr: sockaddr_in(lease.ip) };
     if unsafe { libc::ioctl(s, SIOCSIFADDR as _, &mut ra) } != 0 {
@@ -279,9 +300,9 @@ fn setup_network() -> std::io::Result<()> {
     }
     // Remember the gateway (the Mac on the vmnet bridge) for host.docker.internal, plus our
     // own IP/mask so the host can locate the bridge interface for the conduit pool.
-    GATEWAY_IP.store(lease.router, std::sync::atomic::Ordering::Relaxed);
-    GUEST_IP.store(lease.ip, std::sync::atomic::Ordering::Relaxed);
-    GUEST_MASK.store(lease.mask, std::sync::atomic::Ordering::Relaxed);
+    GATEWAY_IP.store(lease.router, Relaxed);
+    GUEST_IP.store(lease.ip, Relaxed);
+    GUEST_MASK.store(lease.mask, Relaxed);
     unsafe { libc::close(s); }
 
     // DNS: run an in-guest responder so every container gets `host.docker.internal`
@@ -291,22 +312,13 @@ fn setup_network() -> std::io::Result<()> {
     // file to default-bridge containers and uses it as the embedded resolver's
     // ExtServer on user-defined nets — for every container too. The real upstream(s)
     // follow as a fallback. dockerd strips loopback from the copied file, so we must
-    // advertise eth0's address here, never 127.0.0.1.
+    // advertise eth0's address here, never 127.0.0.1. (On a changed-IP re-adopt this
+    // starts a fresh responder on the new address; the old one idles on the vanished IP.)
     let upstream = lease.dns.first().copied().unwrap_or(lease.router);
     start_dns_proxy(lease.ip, lease.router, upstream);
     let mut nameservers = vec![lease.ip];
     nameservers.extend_from_slice(&lease.dns);
     write_resolv_conf(&nameservers);
-
-    // Keep the lease alive. Apple's NAT hands out finite leases; without renewal
-    // a long-running VM would eventually lose its address. Renew in the
-    // background at ~half the lease interval (best-effort). `velox.dhcprenew=<secs>`
-    // on the cmdline (via VELOX_KCMDLINE_EXTRA) forces the interval — a test/ops
-    // knob to exercise renewal without waiting out a long vmnet lease.
-    let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
-    let force = cmdline_value("velox.dhcprenew").and_then(|v| v.parse::<u64>().ok());
-    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs, force));
-    Ok(())
 }
 
 /// Enable IPv4/IPv6 packet forwarding before dockerd starts. Docker 29's native
@@ -761,7 +773,7 @@ mod dhcp {
     /// Background renewal loop: re-request the lease at ~half its lifetime (or
     /// every 30 min if the server gave no lease time). Runs for the life of the VM.
     /// `force_interval` (from `velox.dhcprenew`) overrides the cadence for testing.
-    pub fn renew_loop(ifname: &'static str, mac: [u8; 6], ip: u32, server: u32,
+    pub fn renew_loop(ifname: &'static str, mac: [u8; 6], mut ip: u32, mut server: u32,
                       lease_secs: u32, force_interval: Option<u64>) {
         let interval = force_interval
             .unwrap_or(if lease_secs >= 120 { (lease_secs / 2) as u64 } else { 1800 });
@@ -783,10 +795,17 @@ mod dhcp {
                             Ok(l) if l.ip == ip =>
                                 log!("DHCP lease re-acquired after failed renewals ({})",
                                      super::ipstr(ip)),
-                            Ok(l) => log!("WARNING: DHCP re-acquire returned a different \
-                                           lease (ip {} -> {}) — keeping the configured \
-                                           address; restart the VM to adopt the new one",
-                                          super::ipstr(ip), super::ipstr(l.ip)),
+                            Ok(l) => {
+                                // vmnet handed us a DIFFERENT address (its lease table reset).
+                                // Adopt it — re-address eth0, re-point routing/DNS, and renew
+                                // the NEW ip henceforth — instead of leaving the guest dark on
+                                // the stale address until a VM restart.
+                                log!("DHCP re-acquire returned a different lease (ip {} -> {}) — adopting it",
+                                     super::ipstr(ip), super::ipstr(l.ip));
+                                super::apply_lease(&l);
+                                ip = l.ip;
+                                if l.server != 0 { server = l.server; }
+                            }
                             Err(e) => log!("DHCP re-acquire failed: {e} (retrying next cycle)"),
                         }
                     }
@@ -948,6 +967,18 @@ fn vdb_byte_size() -> Option<u64> {
         .ok()?.trim().parse::<u64>().ok().map(|sectors| sectors * 512)
 }
 
+/// The filesystem's estimated minimum size in blocks (`resize2fs -P`) — the floor a
+/// shrink can reach given the used data. `None` if resize2fs isn't runnable or its output
+/// can't be parsed, in which case the caller just attempts the shrink as before.
+fn ext4_min_blocks(dev: &str) -> Option<u64> {
+    let out = Command::new("/usr/sbin/resize2fs").args(["-P", dev]).output().ok()?;
+    if !out.status.success() { return None; }
+    // "Estimated minimum size of the filesystem: <blocks>"
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.rsplit(':').next().and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
 /// Whether the data ext4 must grow or shrink to match `velox.disk` (GiB on the kernel
 /// cmdline), and to how many blocks. `None` when it already matches (within one block)
 /// or the target/geometry can't be read. A grow is clamped to the real device size, so
@@ -1006,10 +1037,21 @@ fn setup_data_disk() -> bool {
     // normal boot pays nothing. resize2fs ships in e2fsprogs-extra; e2fsck is base.
     let resize = planned_resize(dev);
     if let Some((ResizeDir::Shrink, blocks)) = resize {
-        log!("data disk: shrinking ext4 → {blocks} blocks (velox.disk)");
-        let _ = Command::new("/sbin/e2fsck").args(["-f", "-y", dev]).status();
-        match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
-            Ok(s) if s.success() => {}, other => log!("resize2fs shrink failed: {other:?}"),
+        // A shrink below the filesystem's used space can never succeed, and the geometry
+        // then stays large — so planned_resize would return Shrink on EVERY subsequent boot,
+        // re-running a full `e2fsck -f` + a doomed resize2fs indefinitely (a multi-second
+        // boot penalty on a misconfigured velox.disk). Skip when the target is below the
+        // filesystem's own estimated minimum. (`-P` reads the fs without a full check; if it
+        // can't tell, we fall through and attempt the shrink as before — no regression.)
+        if let Some(min) = ext4_min_blocks(dev).filter(|&min| blocks < min) {
+            log!("data disk: velox.disk asks for {blocks} blocks but the fs needs ≥ {min} for its \
+                  used data — skipping shrink (raise velox.disk or free space)");
+        } else {
+            log!("data disk: shrinking ext4 → {blocks} blocks (velox.disk)");
+            let _ = Command::new("/sbin/e2fsck").args(["-f", "-y", dev]).status();
+            match Command::new("/usr/sbin/resize2fs").args([dev, &blocks.to_string()]).status() {
+                Ok(s) if s.success() => {}, other => log!("resize2fs shrink failed: {other:?}"),
+            }
         }
     }
     // /var/lib/docker is overlay-snapshot churn central — every `docker run`
@@ -1149,7 +1191,9 @@ fn assert_direct_access_rules() {
                 for chain in ["filter-FORWARD", "raw-PREROUTING"] {
                     match nft(&["list", "chain", "ip", "docker-bridges", chain]) {
                         Ok(out) if out.status.success() => {
-                            if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws}")) {
+                            // Trailing space anchors the match: nft prints `ip saddr <ip> counter
+                            // … accept`, so `saddr 1.2.3.1 ` can't be satisfied by `saddr 1.2.3.10`.
+                            if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws} ")) {
                                 continue; // rule already in place
                             }
                             match nft(&["insert", "rule", "ip", "docker-bridges", chain,
@@ -1333,7 +1377,13 @@ fn setup_virtiofs() {
 }
 
 fn make_rshared(target: &str) {
-    let ctgt = cstr(target);
+    // NUL-safe: `target` can be a host-supplied share path (velox.shares). With
+    // `panic = "abort"` a panic in PID 1 is a kernel panic, so never `cstr()` outside
+    // input here — skip the propagation on a NUL rather than take down the whole VM.
+    let Ok(ctgt) = CString::new(target) else {
+        log!("make_rshared {target}: NUL in path — skipping");
+        return;
+    };
     unsafe {
         libc::mount(std::ptr::null(), ctgt.as_ptr(), std::ptr::null(),
             libc::MS_SHARED | libc::MS_REC, std::ptr::null());
@@ -1485,8 +1535,9 @@ fn handle_control(fd: RawFd) {
 
 /// Clock re-sync: the host writes "<unix-epoch>\n" (at start and whenever the Mac
 /// wakes). Apple VZ has no RTC, so a slept-then-resumed guest is behind by the
-/// sleep duration — enough to break TLS. Re-set the clock only on large drift to
-/// avoid needless jitter. Host-authoritative, no NTP daemon (see CLAUDE.md §6).
+/// sleep duration — enough to break TLS. Re-set the clock only when it drifts by more
+/// than ~2s (normal periodic pushes are sub-second), to avoid needless jitter.
+/// Host-authoritative, no NTP daemon (see CLAUDE.md §6).
 fn handle_clock(fd: RawFd) {
     let mut line = Vec::new();
     let mut b = [0u8; 1];
