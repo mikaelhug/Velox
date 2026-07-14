@@ -188,3 +188,9 @@ toolchain (Command Line Tools are enough).
 The signing entitlement is `com.apple.security.virtualization` only. Kernel
 config lives in `guest/kernel/velox.fragment`; the guest filesystem in
 `guest/rootfs/Dockerfile`.
+
+## License
+
+Velox is licensed under the GNU Lesser General Public License, version 2.1 or
+later (`SPDX-License-Identifier: LGPL-2.1-or-later`). See [`LICENSE`](LICENSE)
+for the full text.
