@@ -9,6 +9,7 @@
 [![Latest release](https://img.shields.io/github/v/release/mikaelhug/Velox)](https://github.com/mikaelhug/Velox/releases)
 ![Platform](https://img.shields.io/badge/platform-macOS%2015%2B%20%C2%B7%20Apple%20Silicon-blue)
 ![Swift](https://img.shields.io/badge/host-100%25%20Swift-orange)
+[![License](https://img.shields.io/badge/license-LGPL--2.1+-blue)](LICENSE)
 
 [Website](https://mikaelhug.github.io/Velox/) ·
 [Benchmarks](docs/benchmarks.md) ·
