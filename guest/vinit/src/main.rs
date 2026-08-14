@@ -151,11 +151,20 @@ fn mount_all() {
     do_mount("tmpfs", "/tmp", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, Some("mode=1777"));
     // Writable /var on tmpfs (the read-only root can't be written). The persistent
     // data disk is mounted over /var/lib/docker below; everything else under /var
-    // (containerd state, /var/run) stays ephemeral — by design (no stale records).
+    // (containerd state, the /run symlink) stays ephemeral — by design (no stale records).
     do_mount("tmpfs", "/var", "tmpfs", 0, Some("mode=0755"));
     let _ = std::fs::create_dir_all("/var/lib/docker");
     let _ = std::fs::create_dir_all("/var/lib/containerd");
-    let _ = std::fs::create_dir_all("/var/run");
+    // /var/run is a SYMLINK to /run, as on every mainstream distro — NOT a real dir.
+    // dockerd listens on /run/docker.sock, but the near-universal socket-mount idiom is
+    // `-v /var/run/docker.sock:/var/run/docker.sock`. With a real (empty) /var/run that bind
+    // SOURCE doesn't exist, and Docker's rule for a missing source is to CREATE it — so the
+    // container silently gets an empty directory instead of the API socket (measured).
+    // Side effect (intended): dockerd's default exec-root /var/run/docker resolves to
+    // /run/docker — same ephemeral tmpfs, same flags/propagation, so nothing else changes.
+    if let Err(e) = std::os::unix::fs::symlink("/run", "/var/run") {
+        log!("symlink /var/run -> /run failed: {e}");
+    }
     // cgroup v2 unified hierarchy — dockerd/containerd require it.
     do_mount("cgroup2", "/sys/fs/cgroup", "cgroup2", libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None);
     // binfmt_misc for Rosetta.
