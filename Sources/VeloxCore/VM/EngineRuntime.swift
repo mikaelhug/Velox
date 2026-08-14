@@ -36,7 +36,7 @@ public final class EngineRuntime: @unchecked Sendable {
     private var stopped = false
     private let lock = NSLock()
 
-    public init(manager: VMManager) {
+    public init(manager: VMManager, publish: PublishBind = .wildcard) {
         self.manager = manager
         let bridge = VsockBridge(manager: manager)
         proxy = DockerSocketProxy(
@@ -44,13 +44,14 @@ public final class EngineRuntime: @unchecked Sendable {
             guestPort: VsockPort.docker,
             bridge: bridge)
         docker = DockerClient(manager: manager)
-        // Published ports: 127.0.0.1 listeners per `-p` port, reverse-forwarded to the
-        // guest. Privileged ports (<1024) come pre-bound from the root helper.
+        // Published ports: one listener per `-p` port on the configured host address
+        // (all interfaces by default, like Docker), reverse-forwarded to the guest.
+        // Privileged ports (<1024) come pre-bound from the root helper.
         let helper = PortHelperManager()
         portHelper = helper
-        let fwd = PortForwarder(bridge: bridge, privilegedBinder: helper)
+        let fwd = PortForwarder(bridge: bridge, privilegedBinder: helper, publish: publish)
         forwarder = fwd
-        let udp = UDPForwarder(manager: manager, privilegedBinder: helper)
+        let udp = UDPForwarder(manager: manager, privilegedBinder: helper, publish: publish)
         udpForwarder = udp
         // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
         endpoints = PublishedEndpoints()

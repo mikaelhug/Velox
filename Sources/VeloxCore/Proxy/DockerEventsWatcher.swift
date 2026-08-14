@@ -14,7 +14,7 @@ import Foundation
 /// source of truth (the informer pattern).
 public final class DockerEventsWatcher: @unchecked Sendable {
     private let docker: any DockerClientProtocol
-    private let onPorts: @Sendable (Set<UInt16>, Set<UInt16>) -> Void
+    private let onPorts: @Sendable (Set<PublishedPort>, Set<PublishedPort>) -> Void
     /// Updated each reconcile with `hostPort → "containerIP:containerPort"` for direct-dial
     /// (the conduit pool reads it). Optional — nil when the conduit fast path isn't used.
     private let endpoints: PublishedEndpoints?
@@ -24,8 +24,8 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// each to the guest so container IPs are reachable. Nil → named-access routing disabled.
     private let onSubnets: (@Sendable (Set<String>) -> Void)?
     private var task: Task<Void, Never>?
-    private var lastTCP: Set<UInt16> = []
-    private var lastUDP: Set<UInt16> = []
+    private var lastTCP: Set<PublishedPort> = []
+    private var lastUDP: Set<PublishedPort> = []
     private var lastSubnets: Set<String> = []
     /// Coalesces event-driven reconciles so a healthcheck / `compose up` storm collapses
     /// to one `containers()` fetch instead of one per event (CLAUDE.md §8).
@@ -49,7 +49,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
 
     /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
     public init(docker: any DockerClientProtocol,
-                onPorts: @escaping @Sendable (Set<UInt16>, Set<UInt16>) -> Void,
+                onPorts: @escaping @Sendable (Set<PublishedPort>, Set<PublishedPort>) -> Void,
                 endpoints: PublishedEndpoints? = nil,
                 names: NameRegistry? = nil,
                 onSubnets: (@Sendable (Set<String>) -> Void)? = nil) {
@@ -173,8 +173,11 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         // A successful list means dockerd is up and answering — release any
         // startup waiter (the source of truth for readiness, not a `/_ping` poll).
         signalReady()
-        var tcp: Set<UInt16> = []
-        var udp: Set<UInt16> = []
+        // port → "every binding dockerd reported for it was loopback". Accumulated with AND
+        // across containers and across a port's v4/v6 entries, so a port is narrowed to
+        // host-only only when nothing published it on a wider address.
+        var tcpBinds: [UInt16: Bool] = [:]
+        var udpBinds: [UInt16: Bool] = [:]
         var endpointMap: [UInt16: String] = [:]
         var nameMap: [String: in_addr_t] = [:]
         for c in containers where c.state == "running" {
@@ -194,13 +197,16 @@ public final class DockerEventsWatcher: @unchecked Sendable {
             }
             for p in c.ports {
                 guard let pub = p.publicPort, pub > 0, pub <= 65_535 else { continue }
+                let port = UInt16(pub)
+                let loopback = PublishBind.isLoopbackLiteral(p.ip)
                 switch p.type {
                 case "tcp":
-                    tcp.insert(UInt16(pub))
+                    tcpBinds[port] = (tcpBinds[port] ?? true) && loopback
                     // Direct-dial endpoint — only when the container's IP is unambiguous;
                     // otherwise omit and the conduit falls back to docker-proxy.
-                    if let ip = c.directIP { endpointMap[UInt16(pub)] = "\(ip):\(p.privatePort)" }
-                case "udp": udp.insert(UInt16(pub))
+                    if let ip = c.directIP { endpointMap[port] = "\(ip):\(p.privatePort)" }
+                case "udp":
+                    udpBinds[port] = (udpBinds[port] ?? true) && loopback
                 default: break
                 }
             }
@@ -219,6 +225,8 @@ public final class DockerEventsWatcher: @unchecked Sendable {
             if commitSubnets(subnets) { onSubnets(subnets) }
         }
         names?.update(nameMap)
+        let tcp = Set(tcpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
+        let udp = Set(udpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
         if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
     }
 
@@ -232,7 +240,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
 
     /// Atomically diff + store the published-port sets; returns whether they changed.
     /// Synchronous so the lock is never held across an `await`.
-    private func commit(_ tcp: Set<UInt16>, _ udp: Set<UInt16>) -> Bool {
+    private func commit(_ tcp: Set<PublishedPort>, _ udp: Set<PublishedPort>) -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }
         guard tcp != lastTCP || udp != lastUDP else { return false }
         lastTCP = tcp; lastUDP = udp

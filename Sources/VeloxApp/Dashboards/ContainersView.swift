@@ -744,7 +744,7 @@ private struct PortLink: View {
             .font(.caption.monospaced())
             .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.link))
             .help(blocked
-                  ? "localhost:" + portText + " couldn't bind — another app holds it"
+                  ? "localhost:" + portText + " is unavailable — another app holds it"
                   : "Open http://localhost:" + portText + "/")
     }
 }

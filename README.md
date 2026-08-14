@@ -98,6 +98,34 @@ one-time admin grant on first launch (a tiny root helper installs a route and
 an `/etc/resolver` entry — control-plane only, it never touches connection
 data); decline it and everything else still works.
 
+## Published ports
+
+`-p` follows Docker's own default: a published port binds **all interfaces**,
+so it is reachable from other machines on your network — the same as Docker
+Desktop, OrbStack and colima. Ports below 1024 work too (`-p 80:80`, `-p 22:22`).
+
+```bash
+docker run -d -p 8080:80 nginx              # reachable at <your-mac-ip>:8080
+docker run -d -p 127.0.0.1:5432:5432 postgres   # host-only, stays private
+```
+
+An explicit **`127.0.0.1:`** in the `-p` spec always wins — a service you
+deliberately pinned to loopback is never widened. To make host-only the
+*default* for every port, set `publishHostIP` in `~/.velox/config.json`:
+
+```json
+{ "publishHostIP": "127.0.0.1" }
+```
+
+The value may also be a specific host address; an unparseable one falls back to
+host-only rather than exposing anything. Changing it restarts the engine.
+
+Two limits worth knowing: a **non-loopback host IP inside the `-p` spec**
+(`-p 192.168.1.50:8080:80`) is unsupported — the guest daemon can't bind a
+macOS address, so use `publishHostIP` instead; and a specific `publishHostIP`
+can't be applied to ports below 1024, which fall back to host-only with a
+warning.
+
 ## Performance
 
 Measured against Docker Desktop on the same Mac, the same way: both engines on
@@ -113,8 +141,9 @@ every number are in [docs/benchmarks.md](docs/benchmarks.md).
 | Container launch (`run --rm alpine true`) | 104 ms | 160 ms | 1.5× faster |
 | Network — container → host (iperf3) | 88.8 Gbit/s | 27.0 Gbit/s | 3.3× faster |
 | Published port — host → container (4 streams) | 59.2 Gbit/s | 18.0 Gbit/s | 3.3× faster |
-| VirtioFS bind-mount write (`dd` 1 GiB) | 2,951 MB/s | 956 MB/s | 3.1× faster |
-| Small-file extract (4,000 files → bind) | 0.21 s | 3.43 s | 16× faster |
+| VirtioFS bind-mount write (`dd` 1 GiB) | 1,030 MB/s | 692 MB/s | 1.5× faster |
+| VirtioFS bind-mount read (`dd` 1 GiB) | 2,135 MB/s | 2,163 MB/s | on par |
+| Small-file extract (4,000 files → bind) | 3.4 s | 3.1 s | ~10% slower |
 | Durable commit latency (`fio --fsync`, 4 K) | 0.31 ms | 0.47 ms | 1.5× faster |
 | Container-overlay write | 1,695 MB/s | 1,217 MB/s | 1.4× faster |
 | Postgres `pgbench` TPS (8 clients, 30 s) | 13,318 | 11,690 | 1.14× faster |
@@ -124,6 +153,14 @@ The idle-RAM row is the loaded benchmark baseline; an empty idle engine
 balloons further down, to a ~70 MB host footprint. Cold pull is the one path
 that trails (~10%), because durable layer extraction is fsync-heavy — the
 visible cost of the durability described below.
+
+> **On the filesystem rows.** Earlier revisions of this table published far larger
+> VirtioFS wins (3.1× write, 16× small-files). Those were a harness bug, not a result:
+> the benchmark bind-mounted `$(mktemp -d)` → `/var/folders/…`, which Docker Desktop
+> shares but Velox does not, so Velox was measuring an empty in-guest directory rather
+> than the host filesystem. The harness now mounts a shared path and aborts if the
+> scratch dir doesn't round-trip to the host. The Docker Desktop column is a June 2026
+> baseline measured on an older Velox; a fresh same-day head-to-head is pending.
 
 The data disk is durable by default: a raw image attached with
 `synchronizationMode: .fsync` and guest barriers on, so every committed write

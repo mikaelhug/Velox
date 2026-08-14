@@ -116,15 +116,21 @@
             </tr>
             <tr>
               <td>VirtioFS bind-mount write</td>
-              <td>2,951 MB/s</td>
-              <td>956 MB/s</td>
-              <td class="status-win">3.1x faster</td>
+              <td>1,030 MB/s</td>
+              <td>692 MB/s</td>
+              <td class="status-win">1.5x faster</td>
+            </tr>
+            <tr>
+              <td>VirtioFS bind-mount read</td>
+              <td>2,135 MB/s</td>
+              <td>2,163 MB/s</td>
+              <td>on par</td>
             </tr>
             <tr>
               <td>Small-file extract to bind mount</td>
-              <td>0.21 s</td>
-              <td>3.43 s</td>
-              <td class="status-win">16x faster</td>
+              <td>3.4 s</td>
+              <td>3.1 s</td>
+              <td class="status-trail">~10% slower</td>
             </tr>
             <tr>
               <td>Durable commit latency, fio fsync 4K</td>

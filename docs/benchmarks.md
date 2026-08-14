@@ -13,9 +13,9 @@ results.
 
 | | Velox | Docker Desktop |
 | --- | --- | --- |
-| 🟢 **Wins** | install 10× smaller, idle RAM ~3.7× less, startup 1.5× faster, **container launch 1.5×**, container→host net 3.3×, **published ports 2.9–3.3×**, VirtioFS write 3.1× / read 2.4× / small-files 16×, **durable commit 1.5× (0.31 ms vs 0.47 ms)**, overlay write 1.4×, **pgbench TPS 1.14× / init 1.3×** | |
-| ⚪ **Par** | parallel launch (1.1×) | |
-| 🔴 **Trails** | cold image pull (~0.9×, durable layer extraction) | |
+| 🟢 **Wins** | install 10× smaller, idle RAM ~2.6× less, startup 1.5× faster, **container launch 1.2–1.3×**, container→host net ~2×, **published ports 3.0–3.7×**, VirtioFS write 1.5×, **durable commit 1.5× (0.31 ms vs 0.47 ms)**, named-volume write ~1.1× | |
+| ⚪ **Par** | VirtioFS read, container-overlay write, pgbench TPS / init | |
+| 🔴 **Trails** | small-file extract (~0.9×), cold image pull (durable layer extraction) | |
 
 Full numbers in [Results](#results). The data disk is raw + durable `.fsync`
 ([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published ports now ride a VZNAT conduit
@@ -96,9 +96,9 @@ Parallel launch x20 (total)           0.97 s           1.11 s    1.14x  WIN
 Network: container→host           88.77 Gbps       27.00 Gbps    3.29x  WIN
 Net: published port (1 stream)    38.38 Gbps       13.00 Gbps    2.95x  WIN
 Net: published port (4 streams)   59.17 Gbps       18.00 Gbps    3.29x  WIN
-FS: VirtioFS bind write           2,951 MB/s         956 MB/s    3.09x  WIN
-FS: VirtioFS bind read            3,861 MB/s       1,628 MB/s    2.37x  WIN
-FS: extract 4000 files (bind)         0.21 s           3.43 s   16.33x  WIN
+FS: VirtioFS bind write           1,030 MB/s         692 MB/s    1.49x  WIN
+FS: VirtioFS bind read            2,135 MB/s       2,163 MB/s    0.99x  par
+FS: extract 4000 files (bind)         3.40 s           3.14 s    0.92x  par
 FS: named-volume write (in-VM)    1,630 MB/s       1,500 MB/s    1.09x  WIN
 FS: container-overlay write       1,695 MB/s       1,217 MB/s    1.39x  WIN
 Durable commit (fio fsync, 4K)     0.31 ms          0.47 ms      1.52x  WIN
@@ -121,6 +121,53 @@ over VSOCK, *data* over VZNAT), so throughput jumps to **38–60 Gbit/s — 2.9�
 Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty). The one path
 that still trails is **cold image pull** (~0.9×): the download rides VZNAT, but durable layer
 *extraction* is fsync-heavy — the single place the data-safety guarantee costs measurably.
+
+## Filesystem: two harness bugs, and a read-ahead fix (2026-08-14)
+
+The VirtioFS figures published before this date were wrong — not because Velox changed,
+but because the harness was measuring the wrong thing. Both bugs are fixed in `run.sh`;
+both inflated or depressed results by more than any real difference between the engines.
+
+1. **The scratch dir wasn't shared.** The suite bind-mounted `$(mktemp -d)`, which on macOS
+   is `/var/folders/…`. Docker Desktop shares `/private`, so **DD's numbers were real** —
+   but Velox shares only `/Users` (plus configured `fileShares`), so the mount silently
+   resolved to an *empty in-guest directory* and the test measured guest-local storage.
+   Proven by writing from the guest and checking the host: the file never appeared.
+   Measured side by side, 1 GiB write — real VirtioFS ~968 MB/s vs guest-local ~1,909 MB/s
+   (2×); 4,000-file extract — **2.8 s vs 0.23 s (12×)**. That is the entire source of the
+   old "16× small-files" claim. `run.sh` now uses a path under `$HOME` and **aborts** if the
+   scratch dir doesn't round-trip to the host.
+2. **No quiesce before timing.** Starting a run seconds after a busy container stopped
+   charges that container's writeback flush to the measurement: named-volume write read
+   ~1,170 MB/s immediately after `docker stop` vs **~1,800 MB/s after a 30 s quiesce** — a
+   35% error, and enough to manufacture a "regression" that does not exist. `run.sh` now
+   syncs and waits `QUIESCE_S` (default 30 s) before the first timer.
+
+With both fixed, the filesystem picture is par-or-better rather than the lopsided win
+previously published — and a genuine deficit surfaced that the bogus numbers had masked:
+
+**VirtioFS read-ahead.** The kernel gives a FUSE/virtiofs backing-dev a **128 KiB**
+read-ahead window against **8 MiB** for the virtio-blk disks, leaving bulk reads
+latency-bound on the host round-trip. Swept in a live guest (caches dropped, 3 runs each,
+1 GiB sequential read):
+
+| `read_ahead_kb` | Read | vs DD (2,163 MB/s) |
+| --- | --: | --: |
+| 128 (kernel default) | 1,683 MB/s | 0.78× |
+| **512** | **2,135 MB/s** | **0.99×** |
+| 1024 | 2,021 MB/s | 0.93× |
+| 4096 | 1,806 MB/s | 0.83× |
+
+512 KiB is the peak — below it the window can't cover the round-trip, above it the surplus
+pages are wasted work. `vinit` now sets it on every VirtioFS mount
+(`tune_virtiofs_readahead`), worth **+27%** and closing the gap.
+
+> **Baseline caveat.** Docker Desktop is no longer installed on the reference Mac, so the
+> DD column is the June 2026 recording — measured against Velox 0.1.11 (kernel 6.18.34,
+> dockerd 29.5.3, 8 GB) rather than the current build. The large structural wins (footprint,
+> RAM, startup, published ports) are far outside that uncertainty; the filesystem and
+> cold-pull deltas are not, and cold pull additionally depends on network conditions on the
+> day. Treat those rows as provisional until a same-day head-to-head is re-run.
 
 ## Disk: raw image + durable `.fsync` (2026-06-09)
 

@@ -655,6 +655,8 @@ do {
         (1, -1),           // route del → failure
         (0, -1),           // ipfwd → ok
         (2, -1),           // tcp6 bind → failure (asserts the v6 wire verb only)
+        (2, -1),           // tcp any bind → failure (asserts the wildcard wire verb only)
+        (2, -1),           // udp6 any bind → failure (wildcard + v6 compose)
     ]
     if let daemon = FakeDaemon(script: script) {
         PortHelperClient.socketPath = daemon.path
@@ -672,11 +674,18 @@ do {
         check(PortHelperClient.restoreIPForwarding(), "ipfwd status 0 → true")
         // ipv6:true selects the [::1] loopback bind (privileged-port localhost twin).
         check(PortHelperClient.requestListener(port: 80, proto: .tcp, ipv6: true) == nil, "tcp6 bind failure → nil")
+        // wildcard:true appends the `any` argument — an all-interface bind, so a published
+        // privileged port is reachable off-box. Absent it, the request MUST stay loopback.
+        check(PortHelperClient.requestListener(port: 80, proto: .tcp, wildcard: true) == nil,
+              "tcp any bind failure → nil")
+        check(PortHelperClient.requestListener(port: 53, proto: .udp, ipv6: true, wildcard: true) == nil,
+              "udp6 any bind failure → nil")
 
         // The wire format is the contract with the root daemon — assert it verbatim.
         equal(daemon.requests, ["tcp 80", "udp 81",
                                 "route add 172.18.0.0/16 192.168.64.2",
-                                "route del 172.18.0.0/16", "ipfwd", "tcp6 80"],
+                                "route del 172.18.0.0/16", "ipfwd", "tcp6 80",
+                                "tcp 80 any", "udp6 53 any"],
               "request lines match the daemon protocol")
         daemon.stop()
         close(pipeFds[0])
@@ -684,6 +693,47 @@ do {
     } else {
         check(false, "fake daemon failed to start")
     }
+
+    // The upgrade path: a helper installed BEFORE the `any` verb rejects an all-interface
+    // request with EINVAL. The manager must then retry the plain loopback verb so the port
+    // still works host-locally, rather than dropping it. This runs exactly once per user —
+    // on the release that introduces the verb — so it must be right without a second chance.
+    var legacyPipe = [Int32](repeating: 0, count: 2)
+    _ = pipe(&legacyPipe)
+    var mark: UInt8 = 0x77
+    _ = write(legacyPipe[1], &mark, 1)
+    close(legacyPipe[1])
+    if let legacy = FakeDaemon(script: [(UInt8(EINVAL & 0xff), -1),   // "tcp 80 any" → rejected
+                                        (0, legacyPipe[0])]) {        // "tcp 80"     → accepted
+        PortHelperClient.socketPath = legacy.path
+        let mgr = PortHelperManager()
+        let fd = mgr.boundListener(port: 80, proto: .tcp, ipv6: false, wildcard: true)
+        check(fd != nil, "pre-`any` helper: wildcard rejected → falls back to loopback, port still bound")
+        if let fd {
+            var back: UInt8 = 0
+            check(read(fd, &back, 1) == 1 && back == 0x77, "fallback returns the real descriptor")
+            close(fd)
+        }
+        equal(legacy.requests, ["tcp 80 any", "tcp 80"],
+              "fallback tried the wildcard verb FIRST, then the loopback verb")
+        legacy.stop()
+        close(legacyPipe[0])
+    } else {
+        check(false, "legacy fake daemon failed to start")
+    }
+
+    // Helper absent entirely (not installed, or the user declined the admin prompt):
+    // every request must fail soft — nil, no crash, no hang.
+    PortHelperClient.socketPath = "/tmp/velox-selftest-absent-\(getpid()).sock"
+    let absent = PortHelperManager()
+    check(absent.boundListener(port: 80, proto: .tcp, ipv6: false, wildcard: true) == nil,
+          "helper absent: wildcard bind returns nil (degrades, never traps)")
+    check(absent.boundListener(port: 80, proto: .tcp, ipv6: false, wildcard: false) == nil,
+          "helper absent: loopback bind returns nil")
+    check(!absent.route(add: true, subnet: "172.18.0.0/16", gateway: "192.168.64.2"),
+          "helper absent: route add returns false")
+    check(!absent.restoreIPForwarding(), "helper absent: ipfwd returns false")
+    PortHelperClient.socketPath = PortHelperClient.productionSocketPath
 }
 
 // MARK: SocketPump — data integrity, backpressure re-arm, half-close
@@ -810,6 +860,55 @@ socketPumpTest()
     taskA.cancel(); taskB.cancel(); taskC.cancel()
 }
 eventHubTest()
+
+// MARK: Published-port bind resolution (host-side reachability semantics)
+
+section("PublishBind / PublishedPort")
+do {
+    // The config knob. An unparseable value must NOT resolve to the wildcard default:
+    // the only reason to set this key is to restrict, so a typo has to fail closed.
+    check(PublishBind.parse("0.0.0.0").isWildcard, "0.0.0.0 → wildcard")
+    check(PublishBind.parse("").isWildcard, "empty → wildcard (the default)")
+    check(!PublishBind.parse("127.0.0.1").isWildcard, "127.0.0.1 → host-only")
+    check(!PublishBind.parse("192.168.5.243").isWildcard, "specific address → not wildcard")
+    equal(PublishBind.parse("192.168.5.243").label, "192.168.5.243", "specific address kept verbatim")
+    check(!PublishBind.parse("127.0.0.").isWildcard, "typo fails CLOSED (host-only), never wildcard")
+    check(!PublishBind.parse("nonsense").isWildcard, "garbage fails CLOSED (host-only)")
+
+    // isLoopback drives the privileged-port degradation path: the root helper can bind
+    // loopback or all-interfaces only, so a *specific* publishHostIP below 1024 must be
+    // detected and reported, never silently bound to loopback while logging the address.
+    check(PublishBind.loopback.isLoopback, "loopback bind reports isLoopback")
+    check(PublishBind.parse("localhost").isLoopback, "localhost normalises to the loopback bind")
+    check(!PublishBind.wildcard.isLoopback, "wildcard is not loopback")
+    check(!PublishBind.parse("192.168.5.243").isLoopback, "a specific address is neither")
+    check(!PublishBind.parse("192.168.5.243").isWildcard, "…and not wildcard → the degraded case")
+
+    // Loopback literals as dockerd reports them in the port list.
+    check(PublishBind.isLoopbackLiteral("127.0.0.1"), "127.0.0.1 is a loopback literal")
+    check(PublishBind.isLoopbackLiteral("::1"), "::1 is a loopback literal")
+    check(!PublishBind.isLoopbackLiteral("0.0.0.0"), "0.0.0.0 is NOT loopback")
+    check(!PublishBind.isLoopbackLiteral("::"), ":: is NOT loopback")
+    check(!PublishBind.isLoopbackLiteral(nil), "absent IP is NOT loopback")
+
+    // The regression this guards: a container that explicitly published on loopback
+    // (`-p 127.0.0.1:5432:5432`) must stay host-only even when the global default is
+    // all-interfaces — otherwise turning on Docker-compatible publishing silently
+    // exposes every deliberately-private service (a database, an admin port) to the LAN.
+    let pinned = PublishedPort(port: 5432, loopbackOnly: true)
+    let plain = PublishedPort(port: 8080, loopbackOnly: false)
+    check(!pinned.bind(default: .wildcard).isWildcard,
+          "explicit -p 127.0.0.1 stays host-only under a wildcard default")
+    check(plain.bind(default: .wildcard).isWildcard,
+          "plain -p publishes on all interfaces under a wildcard default")
+    check(!plain.bind(default: .loopback).isWildcard,
+          "a host-only default still narrows a plain -p")
+
+    // A port whose bind flips must compare unequal, or the forwarder's reconcile would
+    // keep the stale listener (right port, wrong address) instead of rebinding.
+    check(PublishedPort(port: 80, loopbackOnly: true) != PublishedPort(port: 80, loopbackOnly: false),
+          "same port, different bind → distinct specs (forces a rebind)")
+}
 
 // MARK: Summary
 

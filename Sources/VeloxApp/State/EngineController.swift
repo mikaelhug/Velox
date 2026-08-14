@@ -247,7 +247,7 @@ final class EngineController {
             // Engine is up: all the shared plumbing (Docker socket proxy, port
             // forwarders, events watcher, named access, clock sync, conduit pool) is
             // wired by EngineRuntime — the same code path as the `velox` CLI.
-            let runtime = EngineRuntime(manager: manager)
+            let runtime = EngineRuntime(manager: manager, publish: self.config.publishBind)
             runtime.setPortIssueHandler { [portIssues] port, blocked in
                 Task { @MainActor in portIssues.set(port, blocked: blocked) }
             }

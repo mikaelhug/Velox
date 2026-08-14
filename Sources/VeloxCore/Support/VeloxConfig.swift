@@ -30,6 +30,12 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// Expose KVM inside the guest (VZ nested virtualization — M3+/macOS 15).
     /// Opt-in, default off: off means the VZ flag is never set and nothing changes.
     public var nestedVirtualization: Bool
+    /// Host address published container ports bind on the Mac. Default `"0.0.0.0"` — all
+    /// interfaces, matching Docker's own default, so `-p 8080:80` is reachable from other
+    /// machines. Set `"127.0.0.1"` for host-only publishing (what Velox did before this
+    /// setting existed), or a specific host address to pin one interface. Parsed by
+    /// `PublishBind`; an unparseable value falls back to host-only.
+    public var publishHostIP: String
     /// Folder holding the data disk (`data.img`), if the user relocated it off the default
     /// `~/.velox`. `nil` = default location. Set by Settings › Resources › Move…; resolve via
     /// `dataDiskURL`. Deliberately NOT in `bootSignature` — the move restarts the engine itself.
@@ -40,6 +46,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
                 resourceSaverEnabled: Bool = true, resourceSaverMinutes: Int = 5,
                 dontSuggestContext: Bool = false, checkUpdatesOnStartup: Bool = true,
                 notifyOnCrash: Bool = false, nestedVirtualization: Bool = false,
+                publishHostIP: String = "0.0.0.0",
                 dataDirectory: String? = nil) {
         self.cpuCount = cpuCount; self.memoryGiB = memoryGiB; self.diskGiB = diskGiB
         self.swapGiB = swapGiB
@@ -50,6 +57,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         self.checkUpdatesOnStartup = checkUpdatesOnStartup
         self.notifyOnCrash = notifyOnCrash
         self.nestedVirtualization = nestedVirtualization
+        self.publishHostIP = publishHostIP
         self.dataDirectory = dataDirectory
     }
 
@@ -84,6 +92,7 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         notifyOnCrash = try c.decodeIfPresent(Bool.self, forKey: .notifyOnCrash) ?? d.notifyOnCrash
         nestedVirtualization = try c.decodeIfPresent(Bool.self, forKey: .nestedVirtualization)
             ?? d.nestedVirtualization
+        publishHostIP = try c.decodeIfPresent(String.self, forKey: .publishHostIP) ?? d.publishHostIP
         dataDirectory = try c.decodeIfPresent(String.self, forKey: .dataDirectory) ?? d.dataDirectory
     }
 
@@ -117,10 +126,16 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
         return min(max(quarter, 512 * 1024 * 1024), 1024 * 1024 * 1024)
     }
 
+    /// Host bind address for published ports, parsed and validated.
+    public var publishBind: PublishBind { PublishBind.parse(publishHostIP) }
+
     /// Fields that require an engine restart to take effect (resources + shares).
     /// Resource Saver settings apply live, so they are deliberately excluded.
+    /// `publishHostIP` is included: the forwarders bind it when they're constructed, so
+    /// a change only lands once they're rebuilt.
     public var bootSignature: [String] {
-        ["\(cpuCount)", "\(memoryGiB)", "\(diskGiB)", "\(swapGiB)", "\(nestedVirtualization)"]
+        ["\(cpuCount)", "\(memoryGiB)", "\(diskGiB)", "\(swapGiB)", "\(nestedVirtualization)",
+         publishHostIP]
             + fileShares.sorted()
     }
 

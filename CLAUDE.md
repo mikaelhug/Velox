@@ -13,8 +13,14 @@ pillars that deliver it:
 1. **Apple's kernel networking (VZNAT).** The container datapath is Apple's
    in-kernel NAT — the fastest networking path on `Virtualization.framework`
    (measured ~14 Gbit/s down / ~80 Gbit/s up, beating Docker Desktop). **No
-   userspace netstack:** a host-side `PortForwarder` maps published ports to
-   `localhost`, and dockerd `--host-gateway-ip` wires `host.docker.internal`.
+   userspace netstack:** a host-side `PortForwarder` maps published ports to the
+   host address in `VeloxConfig.publishHostIP` — **`0.0.0.0` by default, matching
+   Docker's own default**, so a published port is reachable from other machines
+   (`"127.0.0.1"` restores host-only; see `PublishBind`). The guest always publishes
+   guest-locally on `0.0.0.0`, so a macOS host address is never sent to the guest —
+   per-container `-p <hostIP>:…` is unsupported (the guest dockerd can't bind a Mac
+   address) and the global setting is the knob. dockerd `--host-gateway-ip` wires
+   `host.docker.internal`.
    (Truly *beating* VZNAT on raw throughput would need a custom hypervisor —
    OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)
    **Direct named access** (`<name>.velox.local` → the container's *real* IP, any
@@ -36,8 +42,10 @@ pillars that deliver it:
    `Virtualization.framework`. **No Go, no host-side Rust, no helper daemons** — with
    **one sanctioned exception**: `velox-porthelper`, a tiny root LaunchDaemon (still
    Swift, `Sources/velox-porthelper/`) that exists *only* for the things macOS gives
-   an unprivileged process no other way to do, all **control-plane**: (a) bind a loopback
-   port `<1024` and pass the listening socket fd back over a unix socket, (b) add/remove
+   an unprivileged process no other way to do, all **control-plane**: (a) bind a
+   port `<1024` — loopback, or all interfaces when the request carries the explicit `any`
+   argument, so a published `-p 22:22`/`-p 80:80` is reachable off-box like Docker's
+   default — and pass the listening socket fd back over a unix socket, (b) add/remove
    a host route to a container subnet (for direct **named-container access** — `<name>.velox.local`
    → the container's real IP), and (c) restore `net.inet.ip.forwarding=1` — **restore-only,
    it can never switch forwarding off**. (c) exists because some VPN clients (measured:

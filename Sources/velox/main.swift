@@ -136,7 +136,7 @@ func runStart(bind: BindMode) -> Never {
                 // All the engine plumbing (Docker socket proxy, port forwarders, events
                 // watcher, named access, clock sync, conduit pool) is shared with the
                 // GUI via EngineRuntime — one wiring, no CLI/GUI drift.
-                let runtime = EngineRuntime(manager: manager)
+                let runtime = EngineRuntime(manager: manager, publish: prefs.publishBind)
                 do {
                     try runtime.start()
                     teardown.runtime = runtime

@@ -59,8 +59,34 @@ footprint(){
 }
 
 suite(){            # $1 context  $2 label
-  local CTX="$1" ENG="$2"; local BD; BD="$(mktemp -d)"
+  # Scratch dir MUST live somewhere both engines actually share into the guest, or the
+  # "VirtioFS" tests silently measure guest-local storage instead. macOS `mktemp -d`
+  # returns /var/folders/… which Docker Desktop shares (via /private) but Velox does NOT
+  # (Velox shares /Users + configured fileShares) — so a bind mount there gave Velox an
+  # empty in-guest directory and inflated its fs numbers ~2× on bulk write and ~12× on
+  # small files. $HOME is shared by both. Override with BENCH_TMP if needed.
+  local CTX="$1" ENG="$2"; local BD; BD="${BENCH_TMP:-$HOME/.velox-bench}/run.$$"
+  rm -rf "$BD"; mkdir -p "$BD"
   D(){ docker --context "$CTX" "$@"; }
+
+  # Assert the scratch dir really round-trips through the host filesystem. A guest-local
+  # write here would invalidate every fs number below, so fail loudly rather than publish
+  # a fabricated win.
+  mkdir -p "$BD/mnt"
+  D run --rm -v "$BD/mnt":/m "$IMG_ALPINE" sh -c 'echo shared > /m/.bindprobe' >/dev/null 2>&1
+  if [ ! -f "$BD/mnt/.bindprobe" ]; then
+    log "[$ENG] FATAL: $BD/mnt is not shared into the guest — fs results would be bogus."
+    log "[$ENG]        Add it to the engine's file sharing, or set BENCH_TMP to a shared path."
+    return 1
+  fi
+  rm -f "$BD/mnt/.bindprobe"
+
+  # Let prior writeback drain before timing anything. Measuring seconds after a busy
+  # container stopped charges that container's flush to this run: named-volume write
+  # read ~1,170 MB/s starting immediately vs ~1,800 MB/s after a 30 s quiesce — a 35%
+  # error, easily large enough to invent a "regression" that isn't there.
+  log "[$ENG] quiescing ${QUIESCE_S:-30}s so prior writeback drains"
+  sync; sleep "${QUIESCE_S:-30}"
   for i in "$IMG_ALPINE" "$IMG_IPERF"; do D pull -q "$i" >/dev/null 2>&1; done
 
   log "[$ENG] launch latency (hyperfine x12)"

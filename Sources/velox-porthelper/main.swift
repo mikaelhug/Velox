@@ -4,17 +4,24 @@
 //! the (user-owned) VeloxApp can't open a `127.0.0.1:80` listener for a published
 //! reverse-proxy port. This tiny daemon is the *only* privileged component in Velox
 //! (CLAUDE.md §2 sanctioned exception). It does two root-only, **control-plane** jobs and
-//! nothing else: (1) bind a loopback port <1024 and pass the listening socket fd back to
+//! nothing else: (1) bind a port <1024 and pass the listening socket fd back to
 //! VeloxApp, and (2) add/remove a host route to a container subnet (for direct named-container
 //! access). It never touches a byte of connection data — root stays out of the datapath. Pure
 //! Darwin, no Foundation, no dependencies: the smallest possible privileged surface.
 //!
 //! Protocol (one request per connection, on `/var/run/velox-porthelper.sock`):
-//!   client → "tcp <port>\n"  | "udp <port>\n"         (1 ≤ port < 1024, 127.0.0.1)
-//!          | "tcp6 <port>\n" | "udp6 <port>\n"        (1 ≤ port < 1024, [::1] — localhost resolves to ::1 first)
+//!   client → "tcp <port> [any]\n"  | "udp <port> [any]\n"   (1 ≤ port < 1024; 127.0.0.1, or 0.0.0.0 with `any`)
+//!          | "tcp6 <port> [any]\n" | "udp6 <port> [any]\n"  (1 ≤ port < 1024; [::1], or [::] with `any`
+//!                                                            — localhost resolves to ::1 first)
 //!          | "route add <cidr> <ipv4>\n" | "route del <cidr>\n"  (RFC-1918 only, strictly validated)
 //!          | "ipfwd\n"                                (restore net.inet.ip.forwarding=1; never 0)
 //!   helper → 1 status byte (0 = ok, else errno) + on a port bind the fd via SCM_RIGHTS
+//!
+//! The optional `any` argument is what makes a published container port on a privileged
+//! port (`-p 80:…`, `-p 22:…`) reachable from other machines, matching Docker's default of
+//! publishing on all interfaces. It is strictly opt-in per request: a bare "tcp <port>"
+//! still binds loopback, so an older client keeps its old behaviour, and a client talking
+//! to an older helper gets EINVAL and falls back to loopback rather than failing.
 //! Only the uid passed as `--uid` (the installing user) is served; everything else is
 //! rejected. The control socket lives in root-only-writable /var/run, so no other
 //! local user can replace it.
@@ -65,9 +72,9 @@ func bindControlSocket(_ allowedUID: uid_t) -> Int32 {
     return fd
 }
 
-/// Bind a fresh loopback socket on `port` (TCP listens; UDP just binds). Returns the
-/// fd, or -1 with `errno` set.
-func bindLoopback(type: Int32, port: UInt16) -> Int32 {
+/// Bind a fresh IPv4 socket on `port` (TCP listens; UDP just binds) — `127.0.0.1` by
+/// default, `0.0.0.0` when `wildcard`. Returns the fd, or -1 with `errno` set.
+func bindV4(type: Int32, port: UInt16, wildcard: Bool) -> Int32 {
     let s = socket(AF_INET, type, 0)
     if s < 0 { return -1 }
     var yes: Int32 = 1
@@ -75,7 +82,7 @@ func bindLoopback(type: Int32, port: UInt16) -> Int32 {
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
     addr.sin_port = port.bigEndian
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+    addr.sin_addr.s_addr = wildcard ? INADDR_ANY.bigEndian : inet_addr("127.0.0.1")
     let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
         bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
     } }
@@ -84,11 +91,12 @@ func bindLoopback(type: Int32, port: UInt16) -> Int32 {
     return s
 }
 
-/// Bind a fresh IPv6 loopback socket on `[::1]:port` (V6ONLY so it never shadows the
-/// v4 listener). macOS resolves `localhost` to `::1` first, so a published `<1024` port
-/// (e.g. a reverse proxy on `:80`) needs this twin or `curl http://localhost/` gets
-/// connection-refused while `127.0.0.1` works. Returns the fd, or -1 with `errno` set.
-func bindLoopbackV6(type: Int32, port: UInt16) -> Int32 {
+/// Bind a fresh IPv6 socket on `[::1]:port` — or `[::]:port` when `wildcard` — always
+/// V6ONLY so it never shadows the v4 listener. macOS resolves `localhost` to `::1` first,
+/// so a published `<1024` port (e.g. a reverse proxy on `:80`) needs this twin or
+/// `curl http://localhost/` gets connection-refused while `127.0.0.1` works. Returns the
+/// fd, or -1 with `errno` set.
+func bindV6(type: Int32, port: UInt16, wildcard: Bool) -> Int32 {
     let s = socket(AF_INET6, type, 0)
     if s < 0 { return -1 }
     var yes: Int32 = 1
@@ -97,7 +105,7 @@ func bindLoopbackV6(type: Int32, port: UInt16) -> Int32 {
     var addr = sockaddr_in6()
     addr.sin6_family = sa_family_t(AF_INET6)
     addr.sin6_port = port.bigEndian
-    addr.sin6_addr = in6addr_loopback
+    addr.sin6_addr = wildcard ? in6addr_any : in6addr_loopback
     let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
         bind(s, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
     } }
@@ -135,7 +143,7 @@ func reply(_ conn: Int32, fd: Int32, status: UInt8) {
 /// One parsed request: bind a privileged loopback port, add/remove a host route, or
 /// restore IP forwarding.
 enum Req {
-    case bind(type: Int32, port: UInt16, ipv6: Bool)
+    case bind(type: Int32, port: UInt16, ipv6: Bool, wildcard: Bool)
     case route(add: Bool, subnet: String, gateway: String)
     case ipForward
 }
@@ -205,7 +213,7 @@ func restoreIPForwarding() -> Int32 {
 }
 
 /// Read one bounded request line, parse + validate it.
-///   "tcp <port>" | "udp <port>"                 (1 ≤ port < 1024) → bind
+///   "tcp <port> [any]" | "udp <port> [any]"     (1 ≤ port < 1024) → bind
 ///   "route add <cidr> <ipv4>" | "route del <cidr>" (validated)    → route
 ///   "ipfwd"                                                       → ipForward
 func readRequest(_ conn: Int32, max: Int = 96) -> Req? {
@@ -220,10 +228,15 @@ func readRequest(_ conn: Int32, max: Int = 96) -> Req? {
     let parts = String(decoding: bytes, as: UTF8.self).split(separator: " ").map(String.init)
     switch parts.first {
     case "tcp", "udp", "tcp6", "udp6":
-        guard parts.count == 2, let port = UInt16(parts[1]), port > 0, port < 1024 else { return nil }
+        // The optional 3rd token is the literal "any" (bind all interfaces); anything
+        // else is rejected outright rather than ignored, so a malformed request can
+        // never widen a bind by accident.
+        guard parts.count == 2 || (parts.count == 3 && parts[2] == "any"),
+              let port = UInt16(parts[1]), port > 0, port < 1024 else { return nil }
         let stream = parts[0].hasPrefix("tcp")
         let ipv6 = parts[0].hasSuffix("6")
-        return .bind(type: stream ? SOCK_STREAM : SOCK_DGRAM, port: port, ipv6: ipv6)
+        return .bind(type: stream ? SOCK_STREAM : SOCK_DGRAM, port: port,
+                     ipv6: ipv6, wildcard: parts.count == 3)
     case "route":
         guard parts.count >= 3 else { return nil }
         switch parts[1] {
@@ -250,7 +263,12 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
     // signature (via the peer audit token) is the gold standard and the right follow-up
     // once Velox ships with a Developer ID — at which point SMAppService also replaces
     // this manual install. The residual risk is another process *of the same user*
-    // squatting a loopback <1024 port; loopback-only + <1024-only keep it contained.
+    // squatting a <1024 port; the <1024-only limit and the uid check keep it contained.
+    // Note this surface widened when `any` arrived: a squatted port can now be bound on
+    // all interfaces, not just loopback — reachable from the LAN. That is the same
+    // exposure Docker's own default publishing has, and it is what makes a published
+    // `-p 22:22` work off-box, but it does raise the value of the peer code-signature
+    // check above from "nice to have" to the real fix.
     var euid: uid_t = 0, egid: gid_t = 0
     guard getpeereid(conn, &euid, &egid) == 0, euid == allowedUID else {
         log("reject: peer uid \(euid) != \(allowedUID)")
@@ -261,8 +279,9 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
         return
     }
     switch req {
-    case let .bind(type, port, ipv6):
-        let s = ipv6 ? bindLoopbackV6(type: type, port: port) : bindLoopback(type: type, port: port)
+    case let .bind(type, port, ipv6, wildcard):
+        let s = ipv6 ? bindV6(type: type, port: port, wildcard: wildcard)
+                     : bindV4(type: type, port: port, wildcard: wildcard)
         if s < 0 {
             let e = errno
             log("bind \(port) failed: \(String(cString: strerror(e)))")
@@ -271,7 +290,8 @@ func serve(_ conn: Int32, _ allowedUID: uid_t) {
         }
         reply(conn, fd: s, status: 0)
         close(s) // hand-off complete — VeloxApp holds the only reference now
-        log("bound \(ipv6 ? "[::1]" : "127.0.0.1"):\(port)/\(type == SOCK_STREAM ? "tcp" : "udp")")
+        let bound = ipv6 ? (wildcard ? "[::]" : "[::1]") : (wildcard ? "0.0.0.0" : "127.0.0.1")
+        log("bound \(bound):\(port)/\(type == SOCK_STREAM ? "tcp" : "udp")")
     case let .route(add, subnet, gateway):
         let rc = runRoute(add: add, subnet: subnet, gateway: gateway)
         reply(conn, fd: -1, status: UInt8(truncatingIfNeeded: rc))

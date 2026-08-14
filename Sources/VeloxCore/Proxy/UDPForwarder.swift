@@ -1,7 +1,8 @@
 import Foundation
 
-/// Maintains a `127.0.0.1:<port>` **UDP** listener on the Mac for each published
-/// container UDP port (the datagram sibling of `PortForwarder`).
+/// Maintains a `<publishHostIP>:<port>` **UDP** listener on the Mac for each published
+/// container UDP port (the datagram sibling of `PortForwarder`, and it binds the same
+/// configured host address — all interfaces by default).
 ///
 /// UDP is connectionless, so it can't reuse the TCP stream pump. Instead, per client
 /// flow (keyed by source address+port) the host opens one VSOCK connection to the
@@ -35,17 +36,25 @@ public final class UDPForwarder: @unchecked Sendable {
         let fd: Int32
         let source: DispatchSourceRead
         var flows: [FlowKey: Flow] = [:]
-        init(fd: Int32, source: DispatchSourceRead) { self.fd = fd; self.source = source }
+        /// What this listener was opened for, so a changed bind address rebinds.
+        let spec: PublishedPort
+        init(fd: Int32, source: DispatchSourceRead, spec: PublishedPort) {
+            self.fd = fd; self.source = source; self.spec = spec
+        }
     }
 
     private let manager: VMManager
-    /// Source of loopback sockets for privileged (<1024) UDP ports (nil ⇒ skipped).
+    /// Source of sockets for privileged (<1024) UDP ports (nil ⇒ skipped).
     private let privilegedBinder: PrivilegedPortBinder?
+    /// Host address the listeners bind (default: all interfaces).
+    private let publish: PublishBind
     private let queue = DispatchQueue(label: "dev.velox.udpfwd")
     private let relay = RelayLoop()
     private var listeners: [UInt16: Listener] = [:]
     /// Privileged ports already logged as "helper not ready" (warn-once; all on `queue`).
     private var warnedPrivileged: Set<UInt16> = []
+    /// Privileged ports already warned about a specific `publishHostIP` (warn-once; on `queue`).
+    private var warnedSpecificPrivileged: Set<UInt16> = []
     private let idleSeconds: TimeInterval
     private var reaper: DispatchSourceTimer?
     private let maxPending = 32
@@ -55,18 +64,23 @@ public final class UDPForwarder: @unchecked Sendable {
     /// flows are dropped. 256 distinct live clients per port is well beyond real use.
     private let maxFlows = 256
 
-    public init(manager: VMManager, idleSeconds: TimeInterval = 60, privilegedBinder: PrivilegedPortBinder? = nil) {
+    public init(manager: VMManager, idleSeconds: TimeInterval = 60,
+                privilegedBinder: PrivilegedPortBinder? = nil,
+                publish: PublishBind = .wildcard) {
         self.manager = manager
         self.idleSeconds = idleSeconds
         self.privilegedBinder = privilegedBinder
+        self.publish = publish
     }
 
     /// Reconcile open UDP listeners against the desired set of published ports.
-    public func reconcile(_ wanted: Set<UInt16>) {
+    public func reconcile(_ wanted: Set<PublishedPort>) {
         queue.async {
-            let current = Set(self.listeners.keys)
-            for port in wanted.subtracting(current) { self.open(port) }
-            for port in current.subtracting(wanted) { self.closeListener(port) }
+            // Close what's unwanted or rebound, then open what's unserved (see PortForwarder).
+            for (port, listener) in self.listeners where !wanted.contains(listener.spec) {
+                self.closeListener(port)
+            }
+            for spec in wanted where self.listeners[spec.port] == nil { self.open(spec) }
             self.updateReaper()
         }
     }
@@ -81,13 +95,26 @@ public final class UDPForwarder: @unchecked Sendable {
 
     // MARK: - private (all on `queue` unless noted)
 
-    private func open(_ port: UInt16) {
+    private func open(_ spec: PublishedPort) {
+        let port = spec.port
+        // An explicit per-container `-p 127.0.0.1:…` beats the global default.
+        var publish = spec.bind(default: self.publish)
+        // The helper binds loopback or all-interfaces only — a specific `publishHostIP`
+        // can't be honoured below 1024, so degrade to host-only and say so (see PortForwarder).
+        if port < 1024, !publish.isWildcard, !publish.isLoopback {
+            if warnedSpecificPrivileged.insert(port).inserted {
+                Log.warn("udp-forward: publishHostIP \(publish.label) can't be honoured for privileged "
+                         + "port \(port)/udp — binding 127.0.0.1:\(port) (host-only).")
+            }
+            publish = .loopback
+        }
         let fd: Int32
         if port < 1024 {
-            // Privileged UDP port: bound by the root helper (loopback, <1024).
-            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp, ipv6: false) else {
+            // Privileged UDP port: bound by the root helper (<1024).
+            guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp,
+                                                            ipv6: false, wildcard: publish.isWildcard) else {
                 if warnedPrivileged.insert(port).inserted {
-                    Log.warn("udp-forward: 127.0.0.1:\(port)/udp needs the privileged helper — not authorized yet")
+                    Log.warn("udp-forward: \(publish.label):\(port)/udp needs the privileged helper — not authorized yet")
                 }
                 return
             }
@@ -100,14 +127,14 @@ public final class UDPForwarder: @unchecked Sendable {
             var addr = sockaddr_in()
             addr.sin_family = sa_family_t(AF_INET)
             addr.sin_port = port.bigEndian
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+            addr.sin_addr.s_addr = publish.v4
             let bound = withUnsafePointer(to: &addr) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
             guard bound == 0 else {
-                Log.warn("udp-forward: could not bind 127.0.0.1:\(port)/udp (errno \(errno))")
+                Log.warn("udp-forward: could not bind \(publish.label):\(port)/udp (errno \(errno))")
                 Darwin.close(s); return
             }
             fd = s
@@ -117,11 +144,11 @@ public final class UDPForwarder: @unchecked Sendable {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in self?.readDatagrams(port) }
         source.setCancelHandler { Darwin.close(fd) }
-        let listener = Listener(fd: fd, source: source)
+        let listener = Listener(fd: fd, source: source, spec: spec)
         listeners[port] = listener
         warnedPrivileged.remove(port)
         source.resume()
-        Log.info("udp-forward: localhost:\(port)/udp → guest:\(port)/udp")
+        Log.info("udp-forward: \(publish.label):\(port)/udp → guest:\(port)/udp")
     }
 
     private func closeListener(_ port: UInt16) {
@@ -134,14 +161,17 @@ public final class UDPForwarder: @unchecked Sendable {
         // closes the fd). No flows ⇒ close immediately.
         let flows = listener.flows
         listener.flows = [:]
+        // The listener's own bind, not the default — a loopback-only port closes as such.
+        // Captured by value: the completion below is @Sendable.
+        let label = listener.spec.bind(default: publish).label
         guard !flows.isEmpty else {
             listener.source.cancel()
-            Log.info("udp-forward: closed localhost:\(port)/udp")
+            Log.info("udp-forward: closed \(label):\(port)/udp")
             return
         }
         let remaining = Countdown(flows.count) {
             listener.source.cancel()
-            Log.info("udp-forward: closed localhost:\(port)/udp")
+            Log.info("udp-forward: closed \(label):\(port)/udp")
         }
         for (_, flow) in flows { teardown(flow) { remaining.hit() } }
     }

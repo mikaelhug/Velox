@@ -15,13 +15,18 @@ import Foundation
 
 public enum PortHelperProto: Sendable { case tcp, udp }
 
-/// Supplies a bound, loopback listener fd for a privileged (<1024) port. Injected into
+/// Supplies a bound listener fd for a privileged (<1024) port. Injected into
 /// `PortForwarder` / `UDPForwarder`; nil result ⇒ the helper isn't available yet.
 public protocol PrivilegedPortBinder: AnyObject, Sendable {
-    /// `ipv6: true` binds `[::1]` (the address `localhost` resolves to first) instead of
-    /// 127.0.0.1 — needed so a published `<1024` port is reachable via `localhost`, not
+    /// `ipv6: true` binds the v6 address (`[::1]`, or `[::]` when `wildcard`) instead of
+    /// the v4 one — needed so a published `<1024` port is reachable via `localhost`, not
     /// just `127.0.0.1`. An old helper that predates the v6 verb returns nil (skipped).
-    func boundListener(port: UInt16, proto: PortHelperProto, ipv6: Bool) -> Int32?
+    ///
+    /// `wildcard: true` binds all interfaces (`0.0.0.0`/`[::]`) rather than loopback, so a
+    /// published privileged port (`-p 22:22`) is reachable from other machines — Docker's
+    /// default. A helper predating the verb rejects it; the manager then retries loopback,
+    /// so the port still works host-locally instead of disappearing.
+    func boundListener(port: UInt16, proto: PortHelperProto, ipv6: Bool, wildcard: Bool) -> Int32?
 }
 
 // MARK: - Manager (what the forwarders + engine talk to)
@@ -34,15 +39,43 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
     private var declined = false
     /// The most recent desired port sets, so a post-install reconcile applies current
     /// state rather than a stale snapshot from whichever event triggered the install.
-    private var latestTCP: Set<UInt16> = []
-    private var latestUDP: Set<UInt16> = []
+    private var latestTCP: Set<PublishedPort> = []
+    private var latestUDP: Set<PublishedPort> = []
+    /// Ports already warned about an all-interface bind falling back to loopback on a
+    /// pre-`any` helper (warn-once; guarded by `lock`).
+    private var warnedLegacyBind: Set<UInt16> = []
 
     public init() {}
 
     /// Request a privileged-port listener fd from the running helper (nil if it isn't
     /// installed/answering, or the bind failed). Thread-safe — just syscalls.
-    public func boundListener(port: UInt16, proto: PortHelperProto, ipv6: Bool = false) -> Int32? {
-        PortHelperClient.requestListener(port: port, proto: proto, ipv6: ipv6)
+    ///
+    /// A `wildcard` request that fails is retried on loopback: a helper installed before
+    /// the `any` verb existed rejects it with EINVAL, and degrading to a host-only port
+    /// beats dropping the port entirely while the user hasn't re-authorized the upgrade.
+    public func boundListener(port: UInt16, proto: PortHelperProto,
+                              ipv6: Bool = false, wildcard: Bool = false) -> Int32? {
+        if let fd = PortHelperClient.requestListener(port: port, proto: proto,
+                                                     ipv6: ipv6, wildcard: wildcard) {
+            return fd
+        }
+        guard wildcard else { return nil }
+        guard let fd = PortHelperClient.requestListener(port: port, proto: proto, ipv6: ipv6) else {
+            return nil
+        }
+        warnLegacyOnce(port: port)
+        return fd
+    }
+
+    /// Warn once per port when the installed helper is too old for all-interface binds.
+    private func warnLegacyOnce(port: UInt16) {
+        lock.lock()
+        let firstTime = warnedLegacyBind.insert(port).inserted
+        lock.unlock()
+        guard firstTime else { return }
+        Log.warn("port-forward: the installed privileged helper predates all-interface binds — "
+                 + "port \(port) is bound on 127.0.0.1 only and is NOT reachable from other "
+                 + "machines. Restart Velox and approve the helper upgrade to fix it.")
     }
 
     /// Add/remove a host route to a container subnet via the helper (named-access routing).
@@ -98,13 +131,15 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
     /// When a published port <1024 appears, the helper is authorized+installed once and
     /// the *latest* set is re-reconciled so those ports bind. Shared by GUI + CLI.
     public func reconciler(
-        tcp tcpReconcile: @escaping @Sendable (Set<UInt16>) -> Void,
-        udp udpReconcile: @escaping @Sendable (Set<UInt16>) -> Void
-    ) -> @Sendable (Set<UInt16>, Set<UInt16>) -> Void {
+        tcp tcpReconcile: @escaping @Sendable (Set<PublishedPort>) -> Void,
+        udp udpReconcile: @escaping @Sendable (Set<PublishedPort>) -> Void
+    ) -> @Sendable (Set<PublishedPort>, Set<PublishedPort>) -> Void {
         return { [weak self] tcp, udp in
             // Always reconcile the complete set, in the watcher's serialized callback.
             tcpReconcile(tcp); udpReconcile(udp)
-            guard let self, tcp.contains(where: { $0 < 1024 }) || udp.contains(where: { $0 < 1024 }) else { return }
+            guard let self,
+                  tcp.contains(where: { $0.port < 1024 }) || udp.contains(where: { $0.port < 1024 })
+            else { return }
             self.setLatest(tcp: tcp, udp: udp)
             Task {
                 guard await self.ensureInstalled() else { return }
@@ -115,11 +150,11 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
         }
     }
 
-    private func setLatest(tcp: Set<UInt16>, udp: Set<UInt16>) {
+    private func setLatest(tcp: Set<PublishedPort>, udp: Set<PublishedPort>) {
         lock.lock(); latestTCP = tcp; latestUDP = udp; lock.unlock()
     }
 
-    private func latest() -> (Set<UInt16>, Set<UInt16>) {
+    private func latest() -> (Set<PublishedPort>, Set<PublishedPort>) {
         lock.lock(); defer { lock.unlock() }
         return (latestTCP, latestUDP)
     }
@@ -138,7 +173,8 @@ package enum PortHelperClient {
     /// Production never touches it. (Written once by the test before any use.)
     package nonisolated(unsafe) static var socketPath = productionSocketPath
 
-    package static func requestListener(port: UInt16, proto: PortHelperProto, ipv6: Bool = false) -> Int32? {
+    package static func requestListener(port: UInt16, proto: PortHelperProto,
+                                        ipv6: Bool = false, wildcard: Bool = false) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -163,7 +199,7 @@ package enum PortHelperClient {
         }
         guard connected == 0 else { return nil }
         let verb = (proto == .tcp ? "tcp" : "udp") + (ipv6 ? "6" : "")
-        let request = "\(verb) \(port)\n"
+        let request = "\(verb) \(port)\(wildcard ? " any" : "")\n"
         guard FDIO.writeAll(fd, Array(request.utf8)) else { return nil }
         let (status, received) = receiveFD(fd)
         guard status == 0, let received else {
