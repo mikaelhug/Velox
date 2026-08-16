@@ -11,9 +11,32 @@ enum WindowID {
 /// The Velox desktop app: a menu-bar engine controller plus a dashboard window
 /// and a settings window. The engine runs in-process, so this single app both
 /// hosts the VM and renders its Docker resources.
+/// Makes *every* route out of the app stop the engine, not just the menu-bar Quit button.
+/// ⌘Q from the Dashboard or Settings window, "Quit" from the Dock menu, and a
+/// logout-initiated terminate all arrive here — and previously killed the process outright,
+/// so the guest's filesystems were never flushed. The stop runs on the main actor and the
+/// terminate is deferred until it finishes, the same contract the menu-bar button has.
+@MainActor
+final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
+    /// Set once the app's engine exists; nil during early launch.
+    static weak var engine: EngineController?
+    private var stopping = false
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let engine = Self.engine, !stopping else { return .terminateNow }
+        stopping = true
+        Task {
+            await engine.stop()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct VeloxApp: App {
     @State private var engine = EngineController()
+    @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var appDelegate
 
     init() {
         // Ignore SIGPIPE: writing to a socket whose peer has closed must surface as
@@ -22,6 +45,7 @@ struct VeloxApp: App {
         // a BuildKit build (devcontainers `up`) half-closes its hijacked `/session`
         // stream and the next proxy write kills the whole GUI app.
         signal(SIGPIPE, SIG_IGN)
+        MainActor.assumeIsolated { AppTerminationDelegate.engine = engine }
     }
 
     var body: some Scene {

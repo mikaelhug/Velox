@@ -160,6 +160,24 @@ public actor DockerClient: DockerClientProtocol {
     public func pruneBuildCache() async throws -> UInt64 {
         Self.spaceReclaimed(try await send("POST", Self.path("/build/prune")))
     }
+    /// Turn a `/system/df` failure into something the user can act on.
+    ///
+    /// dockerd totals disk usage over the whole store, so ONE damaged container record
+    /// fails the entire request with a 500 and the breakdown simply disappears behind a
+    /// raw API error. The usual cause is a container whose read-write snapshot is gone
+    /// (an interrupted build, or an engine stopped mid-create), and the remedy is to
+    /// remove that container — so name it and say so. Anything unrecognised is passed
+    /// through unchanged rather than guessed at.
+    public static func diskUsageMessage(for raw: String) -> String {
+        guard raw.contains("rw layer snapshot not found") else { return raw }
+        let id = raw.split(whereSeparator: { !$0.isHexDigit })
+            .first(where: { $0.count >= 12 })
+            .map { String($0.prefix(12)) }
+        let target = id ?? "the affected container"
+        return "A container's storage record is damaged (\(target)), so Docker can't total "
+            + "disk usage. Remove it to restore the breakdown: docker rm -f \(target)"
+    }
+
     public func systemDiskUsage() async throws -> DiskUsage {
         // Volume sizing makes this endpoint slow on big stores — generous timeout.
         try decode(DiskUsage.self,

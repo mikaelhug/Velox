@@ -271,11 +271,20 @@ final class EngineController {
             // guest. Stay in `.starting` until it actually answers — signaled by the
             // events watcher's first successful reconcile — so the dashboards' first
             // load succeeds (no transient "Connection reset by peer", no manual refresh).
-            await waitForDockerReady(runtime)
+            let ready = await waitForDockerReady(runtime)
             // Torn down while we waited for dockerd (e.g. the guest crashed during boot):
             // stay in whatever state cleanup() already set — never write `.running` over a
             // dead engine (which would leave the UI "Running" with no docker client).
             guard gen == startGeneration else { return }
+            if !ready {
+                // dockerd never answered. Reporting `.running` here leaves the engine bound
+                // to a socket with nothing behind it and no way back — every docker command
+                // fails and only an app restart recovers. Surface it instead.
+                cleanup()
+                state = .failed("The engine started but Docker never became ready. "
+                                + "Try starting it again.")
+                return
+            }
             // Keep macOS App Nap from throttling the embedded VM while Velox is
             // backgrounded (you're working in another app and the engine has real work
             // to do). A napped process has its threads — including the VM's vCPUs —
@@ -512,11 +521,13 @@ final class EngineController {
     /// first success is the readiness signal — we don't poll `/_ping` (which would
     /// churn a fresh VSOCK connection every 250 ms; CLAUDE.md §8). Bounded so a
     /// broken guest can't hang the UI in `.starting`.
-    private func waitForDockerReady(_ runtime: EngineRuntime) async {
+    @discardableResult
+    private func waitForDockerReady(_ runtime: EngineRuntime) async -> Bool {
         if await runtime.waitUntilDockerReady(timeout: .seconds(30)) {
             Log.info("dockerd ready")
-        } else {
-            Log.warn("dockerd did not respond within 30s — continuing")
+            return true
         }
+        Log.warn("dockerd did not respond within 30s")
+        return false
     }
 }

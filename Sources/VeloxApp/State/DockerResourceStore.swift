@@ -182,7 +182,7 @@ final class DockerResourceStore {
             diskUsage = try await docker.systemDiskUsage()
             diskUsageError = nil
         } catch {
-            diskUsageError = "\(error)"
+            diskUsageError = DockerClient.diskUsageMessage(for: "\(error)")
         }
     }
 

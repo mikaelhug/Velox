@@ -910,6 +910,65 @@ do {
           "same port, different bind → distinct specs (forces a rebind)")
 }
 
+
+// MARK: Guest install stamp
+
+/// The installed guest is refreshed from the app bundle only when this stamp changes.
+/// Stamping on the VERSION ALONE silently kept a two-month-old guest across a rebuild and
+/// downgraded the running kernel from 7.1.3 to 6.18.35 — invisible, because the versions
+/// matched. These assertions pin the content-sensitivity that fixed it.
+@MainActor func guestInstallStampTest() {
+    section("GuestInstall stamp")
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("velox-stamp-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let kernel = dir.appendingPathComponent("kernel")
+    let root = dir.appendingPathComponent("root.img")
+    FileManager.default.createFile(atPath: kernel.path, contents: Data(repeating: 1, count: 64))
+    FileManager.default.createFile(atPath: root.path, contents: Data(repeating: 2, count: 128))
+
+    let base = GuestInstall.stamp(version: "1.0.0", kernel: kernel, root: root)
+    check(base == GuestInstall.stamp(version: "1.0.0", kernel: kernel, root: root),
+          "same version + same artifacts → identical stamp (no needless reinstall)")
+    check(base != GuestInstall.stamp(version: "1.0.1", kernel: kernel, root: root),
+          "a version bump alone changes the stamp")
+
+    // The regression: same version, rebuilt artifact. Must NOT compare equal.
+    try? Data(repeating: 9, count: 999).write(to: kernel)
+    let rebuiltKernel = GuestInstall.stamp(version: "1.0.0", kernel: kernel, root: root)
+    check(rebuiltKernel != base, "a rebuilt kernel at the SAME version changes the stamp")
+
+    try? Data(repeating: 9, count: 4242).write(to: root)
+    check(GuestInstall.stamp(version: "1.0.0", kernel: kernel, root: root) != rebuiltKernel,
+          "a rebuilt rootfs at the SAME version changes the stamp")
+
+    // A touched-but-identical file still changes mtime, so it re-installs — safe direction.
+    let touched = dir.appendingPathComponent("missing")
+    check(GuestInstall.stamp(version: "1.0.0", kernel: touched, root: root)
+          != GuestInstall.stamp(version: "1.0.0", kernel: kernel, root: root),
+          "a missing artifact never matches a real one")
+}
+guestInstallStampTest()
+
+// MARK: Disk-usage error translation
+
+/// One damaged container record fails the whole `/system/df` request, which used to reach
+/// the user as a raw 500. It must arrive as something actionable instead.
+@MainActor func diskUsageMessageTest() {
+    section("Disk usage error")
+    let raw = "docker API error 500: failed to retrieve container list: rw layer snapshot "
+        + "not found for container 024c634c5abff50b7183208b307e0fbfe18eb96216d8fc4e6f10422d9b1485d5"
+    let msg = DockerClient.diskUsageMessage(for: raw)
+    check(msg.contains("024c634c5abf"), "names the damaged container (short id)")
+    check(msg.contains("docker rm -f"), "tells the user how to fix it")
+    check(!msg.contains("API error 500"), "the raw API error is not what the user reads")
+    let other = "docker API error 500: something else entirely"
+    check(DockerClient.diskUsageMessage(for: other) == other,
+          "unrecognised failures pass through unchanged")
+}
+diskUsageMessageTest()
+
 // MARK: Summary
 
 print("\n----------------------------------------")

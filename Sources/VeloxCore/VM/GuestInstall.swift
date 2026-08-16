@@ -17,21 +17,41 @@ public enum GuestInstall {
     /// `~/.velox/guest.version` — the Velox version whose guest is currently installed.
     private static var stampURL: URL { Paths.root.appendingPathComponent("guest.version") }
 
+    /// Identity of the guest a bundle carries: its version plus each artifact's size and
+    /// modification time. Cheap (no hashing of an 80 MiB rootfs) and enough to notice a
+    /// rebuild — the same size+mtime basis the sleep sidecar uses.
+    public static func stamp(version: String, kernel: URL, root: URL) -> String {
+        func part(_ url: URL) -> String {
+            guard let a = try? FileManager.default.attributesOfItem(atPath: url.path) else { return "?" }
+            let size = (a[.size] as? NSNumber)?.uint64Value ?? 0
+            let mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            return "\(size)@\(mtime)"
+        }
+        return "\(version)|\(part(kernel))|\(part(root))"
+    }
+
     public static func refreshFromBundleIfNeeded() {
         let fm = FileManager.default
         // Only a packaged .app carries a bundled guest; a dev build has none → nothing to sync.
         guard let bundledKernel = bundled("kernel"), let bundledRoot = bundled("root.img") else { return }
 
-        let installedVersion = (try? String(contentsOf: stampURL, encoding: .utf8))?
+        // Stamp on the bundle's CONTENT, not just the version string. Stamping on version
+        // alone meant a guest rebuilt under the same VELOX_VERSION was never installed:
+        // ~/.velox kept the older kernel/rootfs and the VM silently booted it, while the
+        // app bundle carried the new one. That is invisible (the versions match) and costs
+        // a debugging cycle every time — and it would strand users on a stale guest if a
+        // release ever re-cut the same version.
+        let installedStamp = (try? String(contentsOf: stampURL, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleStamp = stamp(version: Versions.velox, kernel: bundledKernel, root: bundledRoot)
         let haveBoth = fm.fileExists(atPath: Paths.kernel.path) && fm.fileExists(atPath: Paths.rootDisk.path)
-        if haveBoth, installedVersion == Versions.velox { return } // already current
+        if haveBoth, installedStamp == bundleStamp { return } // already current
 
         do {
             try Paths.ensureRoot()
             try replace(bundledKernel, into: Paths.kernel)
             try replace(bundledRoot, into: Paths.rootDisk)
-            try Versions.velox.write(to: stampURL, atomically: true, encoding: .utf8)
+            try bundleStamp.write(to: stampURL, atomically: true, encoding: .utf8)
             Log.info("guest install: refreshed ~/.velox kernel+root.img from the app bundle (v\(Versions.velox))")
         } catch {
             // Non-fatal: GuestImage.resolve() still falls back to the in-bundle copy directly.

@@ -139,8 +139,18 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
                 // Read the "OK" off the VM queue would stall the VM, so block on
                 // a background thread; the sync ack flows over VSOCK meanwhile.
                 DispatchQueue.global().async {
+                    // Bounded: an unresponsive guest must not hang the stop forever — that
+                    // strands the engine mid-teardown with no way out (the GUI sits in
+                    // `.stopping`, the CLI never exits). Generous, because a sync against a
+                    // busy data disk legitimately takes a while; on timeout we stop anyway,
+                    // which is the same guarantee a crash gives (ext4 journal recovery).
+                    var timeout = timeval(tv_sec: 60, tv_usec: 0)
+                    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                               socklen_t(MemoryLayout<timeval>.size))
                     var buf = [UInt8](repeating: 0, count: 8)
-                    _ = read(fd, &buf, buf.count) // returns once sync() completes
+                    if read(fd, &buf, buf.count) <= 0 {   // returns once sync() completes
+                        Log.warn("guest flush did not ack in time; stopping anyway")
+                    }
                     close(fd)
                     self.hardStop(completion)
                 }
