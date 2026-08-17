@@ -6,20 +6,22 @@
 #
 # Policy (see CLAUDE.md §9 and the plan):
 #   * Kernel  — track the NEWEST MAINLINE STABLE line (kernel.org latest_stable),
-#               NOT a pinned LTS. Bump only on a new major.minor line; skip pure
-#               in-line stable patches (6.18.35 -> 6.18.36). When we bump, we pin
-#               the newest patch OF the newest line (6.18.35 -> 7.1.3).
-#   * Docker  — same rule on the static-stable channel (29.5.3 -> 29.6.1 minor,
-#               29.x -> 30.0.0 major; skip 29.5.3 -> 29.5.4 patch).
+#               NOT a pinned LTS. Take ANY newer release, including in-line stable
+#               patches (6.18.35 -> 6.18.36), and always the newest one upstream
+#               offers — so a new line wins over a patch (6.18.35 -> 7.1.3).
+#   * Docker  — same rule on the static-stable channel (29.5.3 -> 29.5.4 patch,
+#               29.5.3 -> 29.6.1 minor, 29.x -> 30.0.0 major).
 #   * Compose/Buildx — the host CLI plugins, same major.minor rule, discovered from
 #               each project's GitHub releases/latest (docker/compose, docker/buildx).
-#   * VELOX_VERSION — one MINOR bump per batch (0.3.1 -> 0.4.0), derived from the
+#   * VELOX_VERSION — MINOR bump when a kernel/docker line moved (0.3.1 -> 0.4.0),
+#               PATCH bump when the batch is only in-line patches (0.3.1 -> 0.3.2),
+#               derived from the
 #               value on the current branch so re-runs are idempotent.
 #
-# "Skip patches" is deliberate (fewer, meaningful releases) but means in-line
-# kernel/Docker point releases — which carry CVE fixes — are NOT auto-pulled. A
-# human can hand-bump a patch any time; a future --include-patch mode could add a
-# lower-noise security channel. See the security note in CLAUDE.md §9.
+# Patches ARE auto-pulled, so in-line kernel/Docker point releases — which carry
+# CVE and bugfix content — reach users without a hand-bump. The cost is more
+# releases; the weekly cap (Mon 07:00 UTC) keeps that bounded, and a batch that is
+# only patches produces a patch-level Velox release. See CLAUDE.md §9.
 #
 # Requires: bash, curl, jq, shasum/sha256sum. No repo mutation beyond versions.env.
 #
@@ -53,17 +55,31 @@ mm(){ printf '%s' "$1" | cut -d. -f1-2; }          # 6.18.35 -> 6.18
 maj(){ printf '%s' "${1%%.*}"; }                    # 6.18.35 -> 6
 # newer CUR CAND -> true iff CAND is strictly greater (semantic sort).
 newer(){ [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }
-# classify CUR CAND -> "" (skip: not newer, or same major.minor patch) | "minor" | "major"
+# classify CUR CAND -> "" (not newer) | "patch" | "minor" | "major"
+#
+# In-line stable patches ARE taken. They were skipped originally to keep releases
+# few and meaningful, but that also meant upstream bugfixes and CVEs sat unshipped
+# until the next minor line — and a dockerd nftables endpoint-rollback bug (which
+# corrupts a user-defined network's state and cascades across a whole stack) made
+# the cost of waiting concrete. The candidate is always the newest version upstream
+# offers, so if a newer minor/major exists it is chosen over a patch automatically:
+# there is no "highest patch of the old line" path to fall into.
 classify(){
   newer "$1" "$2" || { printf ''; return; }
-  [ "$(mm "$1")" = "$(mm "$2")" ] && { printf ''; return; }   # in-line patch only -> skip
-  [ "$(maj "$1")" != "$(maj "$2")" ] && printf 'major' || printf 'minor'
+  [ "$(maj "$1")" != "$(maj "$2")" ] && { printf 'major'; return; }
+  [ "$(mm "$1")" != "$(mm "$2")" ] && { printf 'minor'; return; }
+  printf 'patch'
 }
 # X.Y.Z -> X.(Y+1).0
 bump_minor(){ IFS=. read -r a b _ <<EOF
 $1
 EOF
 printf '%s.%s.0' "$a" "$((b+1))"; }
+# X.Y.Z -> X.Y.(Z+1)
+bump_patch(){ IFS=. read -r a b c <<EOF
+$1
+EOF
+printf '%s.%s.%s' "$a" "$b" "$((c+1))"; }
 
 # --- portable in-place rewrite of one KEY= line ----------------------------
 set_var(){ # KEY VALUE
@@ -155,10 +171,14 @@ fi
 # ===========================================================================
 # Emit outputs + (unless --dry-run) rewrite versions.env
 # ===========================================================================
+# Velox's own version mirrors the biggest upstream move in the batch: a new
+# kernel/docker LINE is a minor bump, a batch of pure in-line patches is a patch
+# bump. Keeps `velox version` honest about how much actually moved underneath.
 NEW_VELOX=""
-if [ -n "$K_KIND" ] || [ -n "$D_KIND" ] || [ -n "$CP_KIND" ] || [ -n "$BX_KIND" ]; then
-  NEW_VELOX="$(bump_minor "$VELOX_VERSION")"
-fi
+case " $K_KIND $D_KIND $CP_KIND $BX_KIND " in
+  *" major "*|*" minor "*) NEW_VELOX="$(bump_minor "$VELOX_VERSION")" ;;
+  *" patch "*)             NEW_VELOX="$(bump_patch "$VELOX_VERSION")" ;;
+esac
 
 emit(){ # KEY=VALUE to stdout and, in CI, to $GITHUB_OUTPUT
   printf '%s\n' "$1"
@@ -167,7 +187,7 @@ emit(){ # KEY=VALUE to stdout and, in CI, to $GITHUB_OUTPUT
 }
 
 if [ -z "$NEW_VELOX" ]; then
-  echo "==> up to date — no minor/major kernel or docker bump available." >&2
+  echo "==> up to date — no newer kernel, docker, compose or buildx release." >&2
   emit "changed=false"
   exit 0
 fi

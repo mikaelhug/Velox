@@ -281,11 +281,16 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
   `releases.json` + the GPG-signed `sha256sums.asc` — no tarball download) and the
   newest **static-stable** Docker (the `download.docker.com/.../aarch64/` index, SHAs
   computed by downloading the two tarballs), and rewrites only the pins that changed.
-  Policy: bump on a new **major.minor** line only; **skip pure in-line patches**
-  (`6.18.35→6.18.36`, `29.5.3→29.5.4`) — fewer, meaningful releases, at the cost of not
-  auto-pulling in-line CVE patches (hand-bump those, or add a `--include-patch` channel
-  later). Each qualifying batch bumps `VELOX_VERSION` one **minor** (`0.3.1→0.4.0`),
-  derived from `main` so re-runs are idempotent. `--dry-run` previews without writing.
+  Policy: take **any newer release, patches included** — and always the newest upstream
+  offers, so a new line beats a patch on the old one (`7.1.3→7.2.0`, never
+  `7.1.3→7.1.10` when `7.2.0` exists). In-line patches carry CVE and bugfix content and
+  used to be skipped, which left them unshipped until the next minor line; a dockerd
+  nftables endpoint-rollback bug (it corrupts a user-defined network and cascades across
+  a whole stack) made that cost concrete. `VELOX_VERSION` mirrors the biggest move in the
+  batch: **minor** when a kernel/Docker line changed (`0.3.1→0.4.0`), **patch** when the
+  batch is only in-line patches (`0.3.1→0.3.2`) — derived from `main` so re-runs are
+  idempotent. The weekly cap bounds the extra release volume. `--dry-run` previews
+  without writing.
 - **`.github/workflows/version-watch.yml`** runs it **weekly** (Mon 07:00 UTC — the
   "max once per week" cap) and, on a change: pushes a bump branch, **compile-validates**
   it (guest kernel `CONFIG_ONLY` gate + full kernel/rootfs build, which verifies
