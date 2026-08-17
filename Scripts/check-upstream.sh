@@ -93,8 +93,30 @@ set_var(){ # KEY VALUE
 # ===========================================================================
 echo "==> current pins: kernel ${KERNEL_ORG_VERSION}, docker ${DOCKER_VERSION}, compose ${DOCKER_COMPOSE_VERSION}, buildx ${DOCKER_BUILDX_VERSION}, velox ${VELOX_VERSION}" >&2
 
-K_LATEST="$(curl -fsSL https://www.kernel.org/releases.json | jq -r '.latest_stable.version')"
-[ -n "$K_LATEST" ] && [ "$K_LATEST" != "null" ] || { echo "error: could not read latest_stable from kernel.org releases.json" >&2; exit 1; }
+# A version is only real to us once its tarball is SIGNED AND PUBLISHED: the
+# sha256sums.asc for a major line lists every tarball actually in that directory,
+# so it is the source of truth for "can we pin this?". kernel.org announces a
+# release in releases.json before the sums propagate to the CDN, and treating that
+# window as an error failed the weekly run for days at a time. An announced-but-
+# unpublished version is simply "not out yet" — we take the newest one we CAN pin.
+k_pinnable(){ # <major> -> "<version> <sha>" of the newest published tarball, or ""
+  curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v$1.x/sha256sums.asc" 2>/dev/null \
+    | awk '$2 ~ /^linux-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.xz$/ {
+             v = $2; sub(/^linux-/, "", v); sub(/\.tar\.xz$/, "", v); print v, $1 }' \
+    | sort -V | tail -1
+}
+
+K_ANNOUNCED="$(curl -fsSL https://www.kernel.org/releases.json | jq -r '.latest_stable.version')"
+[ -n "$K_ANNOUNCED" ] && [ "$K_ANNOUNCED" != "null" ] || { echo "error: could not read latest_stable from kernel.org releases.json" >&2; exit 1; }
+# Look in the announced line's directory; if that whole line is unpublished, fall
+# back to the line we are already on, which may still have a newer patch for us.
+K_PICK="$(k_pinnable "$(maj "$K_ANNOUNCED")")"
+[ -n "$K_PICK" ] || K_PICK="$(k_pinnable "$(maj "$KERNEL_ORG_VERSION")")"
+[ -n "$K_PICK" ] || { echo "error: no signed kernel tarball found in v$(maj "$K_ANNOUNCED").x or v$(maj "$KERNEL_ORG_VERSION").x" >&2; exit 1; }
+K_LATEST="${K_PICK%% *}"
+K_SHA_PUBLISHED="${K_PICK##* }"
+[ "$K_LATEST" = "$K_ANNOUNCED" ] || \
+  echo "==> kernel ${K_ANNOUNCED} is announced but not signed/published yet — newest pinnable is ${K_LATEST}" >&2
 K_KIND="$(classify "$KERNEL_ORG_VERSION" "$K_LATEST")"
 
 # ===========================================================================
@@ -127,11 +149,10 @@ BX_KIND="$(classify "$DOCKER_BUILDX_VERSION" "$BX_LATEST")"
 K_SHA="" D_GUEST_SHA="" D_MAC_SHA="" CP_SHA="" BX_SHA=""
 
 if [ -n "$K_KIND" ]; then
-  KMAJ="$(maj "$K_LATEST")"
-  K_SHA="$(curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${KMAJ}.x/sha256sums.asc" \
-           | awk -v f="linux-${K_LATEST}.tar.xz" '$2==f{print $1}')"
-  # Fail hard rather than write a blank pin (propagation lag / EOL line).
-  [ -n "$K_SHA" ] || { echo "error: no sha256sums.asc entry for linux-${K_LATEST}.tar.xz yet — refusing to write a blank pin" >&2; exit 1; }
+  # Already read from the signed sums during discovery — a candidate cannot reach
+  # here without one, so a blank pin is now impossible by construction.
+  K_SHA="$K_SHA_PUBLISHED"
+  [ -n "$K_SHA" ] || { echo "error: internal: kernel candidate ${K_LATEST} has no sha" >&2; exit 1; }
   echo "==> kernel ${KERNEL_ORG_VERSION} -> ${K_LATEST} (${K_KIND}); sha ${K_SHA}" >&2
 fi
 

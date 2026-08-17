@@ -278,7 +278,10 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
 
 - **`Scripts/check-upstream.sh`** is the scout: it reads the current pins from
   `versions.env`, discovers the newest **mainline-stable** kernel (kernel.org
-  `releases.json` + the GPG-signed `sha256sums.asc` — no tarball download) and the
+  `releases.json` + the GPG-signed `sha256sums.asc` — no tarball download; a version
+  announced in `releases.json` whose tarball is not signed/published yet is treated as
+  **not out**, and the newest *pinnable* one is taken instead, because that propagation
+  window used to fail the run for days) and the
   newest **static-stable** Docker (the `download.docker.com/.../aarch64/` index, SHAs
   computed by downloading the two tarballs), and rewrites only the pins that changed.
   Policy: take **any newer release, patches included** — and always the newest upstream
