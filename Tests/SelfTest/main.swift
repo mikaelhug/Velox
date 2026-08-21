@@ -736,12 +736,18 @@ do {
     PortHelperClient.socketPath = PortHelperClient.productionSocketPath
 }
 
-// MARK: SocketPump — data integrity, backpressure re-arm, half-close
+// MARK: EventRelay — data integrity, backpressure re-arm, half-close
+//
+// This coverage moved here from `SocketPump`, which was a second implementation of the same
+// job and has been deleted. The relay now carries BOTH the conduit fast path and the
+// Docker-API proxy, so these assertions guard the one splice everything depends on. The
+// lazy-buffer change makes the bulk case matter more, not less: the payload below is several
+// times the buffer, so it exercises the 32 KiB→256 KiB growth and the drain-coupled re-arm.
 
 // Wrapped in a sync function: top-level script code is an async context, where the
-// blocking DispatchSemaphore.wait / NSLock used to drive the async pump are unavailable.
+// blocking DispatchSemaphore.wait / NSLock used to drive the relay are unavailable.
 @MainActor func socketPumpTest() {
-    section("SocketPump")
+    section("EventRelay")
     func makePair() -> (Int32, Int32) {
         var fds = [Int32](repeating: -1, count: 2)
         _ = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
@@ -752,10 +758,12 @@ do {
     let (testB, pumpB) = makePair()
 
     let closed = DispatchSemaphore(value: 0)
-    let pump = SocketPump(fdA: pumpA, fdB: pumpB) { closed.signal() }
-    pump.start()
+    // A dedicated relay (not `.shared`) so the test can't be disturbed by, or disturb, a
+    // live engine's traffic.
+    let relay = EventRelay(workerCount: 2)
+    relay.relay(pumpA, pumpB) { closed.signal() }
 
-    // A payload several times the 256 KiB pump buffer, so the read/write re-arm and the
+    // A payload several times the relay buffer, so the read/write re-arm and the
     // backpressure drain-coupling are exercised across many chunks (not a single read).
     let count = 1_000_000
     var sent = [UInt8](repeating: 0, count: count)
@@ -792,8 +800,8 @@ do {
     check(readerDone.wait(timeout: .now() + 15) == .success, "reader reached EOF (half-close propagated A→B)")
     check(closed.wait(timeout: .now() + 15) == .success, "onClose fired once both directions closed")
     recvLock.lock(); let got = received; recvLock.unlock()
-    equal(got.count, count, "every byte forwarded through the pump")
-    check(got == sent, "payload survives the pump byte-for-byte across many buffers")
+    equal(got.count, count, "every byte forwarded through the relay")
+    check(got == sent, "payload survives the relay byte-for-byte across many buffers")
 
     close(testA); close(testB)
 }
