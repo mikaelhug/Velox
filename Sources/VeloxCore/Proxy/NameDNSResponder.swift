@@ -7,6 +7,14 @@ import Foundation
 /// the traffic straight to the container — any protocol, no proxy. Unknown name → NXDOMAIN; AAAA →
 /// empty NOERROR (so the stub resolver falls back to A). Binds loopback only: no privilege, no
 /// entitlement. The wire-format mirrors the guest's `answer_dns` (guest/vinit/src/main.rs:433).
+///
+/// Served over **UDP *and* TCP**, on the same port. TCP is not optional: RFC 7766 makes it
+/// mandatory for a DNS server, and macOS's mDNSResponder does fall back to it — measured, a
+/// single name (`hug-caddy-1.velox.local`) resolved over UDP for every other container while
+/// mDNSResponder queried that one over TCP, got nothing back from a UDP-only responder, and
+/// reported NXDOMAIN indefinitely. Flushing the cache did not help and the responder answered
+/// the identical query correctly over UDP the whole time, which made it look like a container
+/// fault. The guest's DNS proxy already served both (`handle_dns_tcp`); the host did not.
 public final class NameDNSResponder: @unchecked Sendable {
     /// The suffix the resolver file routes to us (matches `NamedAccess.domain`).
     public static let domainSuffix = "." + NamedAccess.domain
@@ -16,6 +24,12 @@ public final class NameDNSResponder: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.velox.dns")
     private var fd: Int32 = -1
     private var source: DispatchSourceRead?
+    private var tcpFd: Int32 = -1
+    private var tcpSource: DispatchSourceRead?
+    /// Concurrent TCP handlers in flight. `:53`-equivalent is reachable by any local process, so
+    /// a connection flood must not be able to spawn unbounded work.
+    private let tcpInFlight = Locked(0)
+    private static let maxTCPInFlight = 16
     /// The port actually bound (the kernel's choice when `port == 0`). Valid after `start()`;
     /// `EngineRuntime` publishes it to `/etc/resolver/<domain>` through the porthelper.
     public private(set) var boundPort: UInt16 = 0
@@ -54,11 +68,101 @@ public final class NameDNSResponder: @unchecked Sendable {
         src.setCancelHandler { close(s) }
         source = src
         src.resume()
-        Log.info("named-access DNS responder on 127.0.0.1:\(boundPort)")
+        startTCP()
+        Log.info("named-access DNS responder on 127.0.0.1:\(boundPort) (udp+tcp)")
+    }
+
+    /// Companion TCP listener on the same port. Best-effort: a failure here costs the TCP
+    /// fallback, not named access as a whole, so it warns rather than throwing.
+    private func startTCP() {
+        let s = socket(AF_INET, SOCK_STREAM, 0)
+        guard s >= 0 else { Log.warn("named-access DNS: tcp socket() failed"); return }
+        var yes: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = boundPort.bigEndian     // the port UDP actually got
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let rc = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard rc == 0, listen(s, 16) == 0 else {
+            Log.warn("named-access DNS: tcp bind/listen on 127.0.0.1:\(boundPort) failed (errno \(errno))"
+                     + " — resolvers that fall back to TCP will see NXDOMAIN")
+            close(s); return
+        }
+        let flags = fcntl(s, F_GETFL, 0)
+        _ = fcntl(s, F_SETFL, flags | O_NONBLOCK)
+        tcpFd = s
+        let src = DispatchSource.makeReadSource(fileDescriptor: s, queue: queue)
+        src.setEventHandler { [weak self] in self?.acceptTCP() }
+        src.setCancelHandler { close(s) }
+        tcpSource = src
+        src.resume()
+    }
+
+    private func acceptTCP() {
+        while true {
+            let c = accept(tcpFd, nil, nil)
+            if c < 0 { return }                       // EWOULDBLOCK — drained
+            let n = tcpInFlight.withLock { v -> Int in v += 1; return v }
+            guard n <= Self.maxTCPInFlight else {
+                tcpInFlight.withLock { $0 -= 1 }
+                close(c); continue                    // shed load rather than spawn unbounded work
+            }
+            // Off `queue`: the reads below block (bounded by SO_RCVTIMEO) and this queue also
+            // serves every UDP query.
+            DispatchQueue.global().async { [weak self] in
+                self?.serveTCP(c)
+                self?.tcpInFlight.withLock { $0 -= 1 }
+            }
+        }
+    }
+
+    /// One TCP connection: `[2-byte length][message]`, repeated until EOF (RFC 7766 allows
+    /// several queries per connection). Bounded by a receive timeout so a client that opens a
+    /// connection and says nothing cannot pin a slot.
+    private func serveTCP(_ c: Int32) {
+        defer { close(c) }
+        var tv = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        while true {
+            var len = [UInt8](repeating: 0, count: 2)
+            guard Self.readFull(c, &len, 2) else { return }
+            let want = Int(len[0]) << 8 | Int(len[1])
+            guard want >= 12, want <= 4096 else { return }   // 12 = header; cap the allocation
+            var msg = [UInt8](repeating: 0, count: want)
+            guard Self.readFull(c, &msg, want) else { return }
+            let reply = Self.buildReply(msg, registry: registry)
+            guard !reply.isEmpty, reply.count <= 0xFFFF else { return }
+            var out: [UInt8] = [UInt8((reply.count >> 8) & 0xff), UInt8(reply.count & 0xff)]
+            out += reply
+            guard FDIO.writeAll(c, out) else { return }
+        }
+    }
+
+    /// Read exactly `count` bytes, retrying short reads and EINTR. False on EOF/timeout/error.
+    private static func readFull(_ fd: Int32, _ buf: inout [UInt8], _ count: Int) -> Bool {
+        var got = 0
+        while got < count {
+            let n = buf.withUnsafeMutableBytes { p -> Int in
+                read(fd, p.baseAddress!.advanced(by: got), count - got)
+            }
+            if n > 0 { got += n; continue }
+            if n < 0 && errno == EINTR { continue }
+            return false
+        }
+        return true
     }
 
     public func stop() {
-        queue.async { self.source?.cancel(); self.source = nil; self.fd = -1 }
+        queue.async {
+            self.source?.cancel(); self.source = nil; self.fd = -1
+            self.tcpSource?.cancel(); self.tcpSource = nil; self.tcpFd = -1
+        }
     }
 
     private func handleOne() {

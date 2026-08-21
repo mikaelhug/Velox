@@ -212,6 +212,32 @@ if want "named"; then section "named access (<name>.velox.local)"
   $DOCKER rm -f ${PREFIX}-named >/dev/null 2>&1
 fi
 
+if want "dnstcp"; then section "the responder serves DNS over TCP as well as UDP (RFC 7766)"
+  # macOS's mDNSResponder does fall back to TCP, and a UDP-only responder answers those queries
+  # with nothing at all — which presents as a name that is permanently NXDOMAIN through the
+  # system resolver while `dig` (UDP) resolves it correctly every time. The guest's DNS proxy
+  # served both from the start; the host responder did not.
+  if ! command -v dig >/dev/null 2>&1; then
+    skip "DNS over TCP" "dig not installed"
+  else
+    $DOCKER rm -f ${PREFIX}-dnstcp >/dev/null 2>&1
+    $DOCKER run -d --name ${PREFIX}-dnstcp "$BASE" sleep 120 >/dev/null 2>&1
+    sleep 3
+    want_ip="$($DOCKER inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${PREFIX}-dnstcp 2>/dev/null)"
+    udp="$(dig +short +time=3 +tries=1 @127.0.0.1 -p 49252 ${PREFIX}-dnstcp.velox.local A 2>/dev/null | head -1)"
+    tcp="$(dig +tcp +short +time=3 +tries=1 @127.0.0.1 -p 49252 ${PREFIX}-dnstcp.velox.local A 2>/dev/null | head -1)"
+    assert "resolves over UDP" "$want_ip" "$udp"
+    assert "resolves over TCP" "$want_ip" "$tcp"
+    # A TCP listener must actually be bound, not merely answer by accident.
+    if lsof -nP -iTCP:49252 -sTCP:LISTEN >/dev/null 2>&1; then
+      ok "a TCP listener is bound on the resolver port"
+    else
+      bad "a TCP listener is bound on the resolver port" "nothing is listening on tcp/49252"
+    fi
+    $DOCKER rm -f ${PREFIX}-dnstcp >/dev/null 2>&1
+  fi
+fi
+
 if want "negcache"; then section "a name queried BEFORE its container exists recovers (negative cache)"
   # The failure this guards: query `<name>.velox.local` while the container is down (an engine
   # restart, `compose down`, a recreate) and macOS caches the NXDOMAIN. Without an SOA in the
