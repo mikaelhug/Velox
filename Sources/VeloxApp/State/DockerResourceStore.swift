@@ -225,9 +225,13 @@ final class DockerResourceStore {
             return out
         }
         for (id, anchor) in fetched { anchors[id] = anchor }
-        // The 32-cap keeps one burst bounded, but with no follow-up the containers past it
-        // never got an anchor at all unless another event happened to arrive — so with >32
-        // running they rendered Docker's frozen `status` string instead of a ticking uptime.
-        if missing.count > 32 { await refreshAnchors() }
+        // Continue only if this pass made PROGRESS. `missing` shrinks solely because
+        // `anchors` grew, and `anchors` grows solely from a SUCCESSFUL inspect — so when
+        // every inspect in the batch fails (engine stopping: the socket is gone and the
+        // tasks are cancelled) an unconditional recursion never terminates. That is a tight
+        // loop spawning 32 child tasks per turn, pegging a core and growing the heap until
+        // the app is force-quit. Bail on cancellation too, so a stop ends this immediately.
+        guard !fetched.isEmpty, !Task.isCancelled, missing.count > 32 else { return }
+        await refreshAnchors()
     }
 }

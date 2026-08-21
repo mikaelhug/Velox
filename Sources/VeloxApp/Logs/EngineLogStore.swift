@@ -60,7 +60,16 @@ final class EngineLogStore {
             let n = read(fd, &buf, buf.count)
             // EOF: every write end is gone. A level-triggered read source keeps firing on a
             // stale EOF forever, so tear it down instead of spinning a core.
-            if n == 0 { Task { @MainActor in self?.detach() }; return }
+            if n == 0 {
+                // Cancel on THIS queue, immediately. Hopping to the main actor first left the
+                // level-triggered source re-firing until the hop landed — one `Task` spawned
+                // per fire, spinning `dev.velox.enginelog` and flooding the main actor with a
+                // burst of no-op detaches. `cancel()` is idempotent, so the `detach()` below
+                // (which also clears the stored reference) stays correct.
+                src.cancel()
+                Task { @MainActor in self?.detach() }
+                return
+            }
             guard n > 0 else { return }   // EINTR/EAGAIN — wait for the next event
             let chunk = String(decoding: buf[0 ..< n], as: UTF8.self)
             Task { @MainActor in self?.ingest(chunk) }

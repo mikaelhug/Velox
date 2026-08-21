@@ -9,6 +9,11 @@ struct OnboardingView: View {
     @Environment(EngineController.self) private var engine
     @Environment(\.dismiss) private var dismiss
     @State private var step = 0
+    /// Mirrors `GuestInstall.guestAvailable` into observable state. Reading the static
+    /// directly in `body` meant a successful "Re-check" changed nothing SwiftUI watches, so
+    /// the ✗ row never flipped and the button looked broken even when it had just worked.
+    @State private var guestInstalled = GuestInstall.guestAvailable
+    @State private var rechecking = false
 
     private enum Step: Int, CaseIterable { case welcome, checks, finish }
     private var current: Step { Step(rawValue: step) ?? .welcome }
@@ -42,8 +47,16 @@ struct OnboardingView: View {
                              hint: "Requires Apple Silicon and macOS 15+.")
                     checkRow("Guest image installed", ok: guestInstalled,
                              hint: "The guest image ships with Velox and installs on first launch.")
-                    Button("Re-check") { Task { await engine.refreshReadiness() } }
-                        .padding(.top, 4)
+                    Button(rechecking ? "Checking…" : "Re-check") {
+                        rechecking = true
+                        Task {
+                            await engine.refreshReadiness()
+                            guestInstalled = GuestInstall.guestAvailable
+                            rechecking = false
+                        }
+                    }
+                    .disabled(rechecking)
+                    .padding(.top, 4)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -86,10 +99,6 @@ struct OnboardingView: View {
             }
         }
     }
-
-    /// The guest is "installed" for onboarding purposes if it's on disk OR bundled in the app
-    /// (it's installed from the bundle on launch), so a packaged build is always satisfied.
-    private var guestInstalled: Bool { GuestInstall.guestAvailable }
 
     @ViewBuilder
     private func stepBody(icon: String, title: String, subtitle: String,

@@ -66,5 +66,7 @@ case "verify":
     print("signature OK for \(args[2])")
 
 default:
-    die("usage: keygen | sign <file> <b64-priv> | verify <file> <b64-pub> [sigfile]")
+    die("usage: keygen | sign <file> | verify <file> <b64-pub> [sigfile]\n"
+        + "       sign takes the private key from $RELEASE_KEY, never argv "
+        + "(argv is world-readable via `ps -E`)")
 }

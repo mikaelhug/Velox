@@ -150,7 +150,11 @@ public final class PortForwarder: @unchecked Sendable {
                  + "pausing that listener briefly")
         source.suspend()
         queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
-            guard let self, self.throttled.remove(id) != nil else { return }
+            // Resume UNCONDITIONALLY (see DockerSocketProxy for the full reasoning): a
+            // suspended source never runs its cancel handler, so `closeListener`'s cancel
+            // would leak the listening fd if the forwarder went away inside this window, and
+            // releasing a suspended source traps in libdispatch.
+            self?.throttled.remove(id)
             source.resume()
         }
     }
@@ -160,6 +164,12 @@ public final class PortForwarder: @unchecked Sendable {
             self.stopped = true
             for port in Array(self.listeners.keys) { self.closeListener(port) }
         }
+        // Barrier. `EngineRuntime.stop()` shuts the producers down and only then drains the
+        // shared relay; with a bare `queue.async` that ordering was aspirational — an accept
+        // still queued here could hand a pair to `EventRelay` after the drain and survive the
+        // stop. Bounded: this queue can be mid-`boundListener`, a porthelper round-trip, and
+        // `stop()` is reachable from the main actor.
+        queue.settle("port-forward")
     }
 
     // MARK: - private (all on `queue`)
@@ -187,7 +197,7 @@ public final class PortForwarder: @unchecked Sendable {
         // traffic (verified). Left undetected the conflict would go silent: the LAN works
         // while `localhost` quietly reaches the other app. On loopback binds it stays a
         // hard bind failure, as before. Either way the GUI gets its badge.
-        let shadowed = publish.isWildcard && Self.loopbackHeld(port, type: SOCK_STREAM)
+        let shadowed = publish.isWildcard && loopbackHeld(port, type: SOCK_STREAM)
         let fd: Int32
         if port < 1024 {
             // Privileged port: an unprivileged bind(2) returns EACCES, so the
@@ -260,7 +270,7 @@ public final class PortForwarder: @unchecked Sendable {
     /// True when another process already holds `127.0.0.1:<port>`. `SO_REUSEADDR` does not
     /// permit two sockets on the identical addr:port pair, so a probe bind returns
     /// `EADDRINUSE` — the detection a wildcard bind would otherwise lose.
-    private static func loopbackHeld(_ port: UInt16, type: Int32) -> Bool {
+    private func loopbackHeld(_ port: UInt16, type: Int32) -> Bool {
         let s = socket(AF_INET, type, 0)
         guard s >= 0 else { return false }
         defer { Darwin.close(s) }
@@ -279,9 +289,24 @@ public final class PortForwarder: @unchecked Sendable {
         // A port below 1024 fails the probe bind with EACCES, not EADDRINUSE, so this check
         // was dead for exactly the ports that matter (:80/:443 via the privileged helper).
         // Fall back to *connecting*: if anything accepts on 127.0.0.1:<port>, it's held.
-        if bound != 0 && errno == EACCES && type == SOCK_STREAM { return loopbackAccepts(port) }
+        if bound != 0 && errno == EACCES && type == SOCK_STREAM {
+            // Memoized: this fallback *connects* to whatever is listening, and it is reached
+            // once per `open()` — so a `retryUnbound` burst on `-p 22:22` with Remote Login on
+            // knocked on sshd up to five times in a second, each one logging "Did not receive
+            // identification string". It answers a UI badge, so a slightly stale answer is
+            // fine; a probe storm against someone else's daemon is not.
+            if let memo = shadowProbe[port], memo.expires > DispatchTime.now() { return memo.held }
+            let held = Self.loopbackAccepts(port)
+            shadowProbe[port] = (DispatchTime.now() + Self.shadowProbeTTL, held)
+            return held
+        }
         return false
     }
+
+    /// Cache for the connect-probe below, so a bind-retry burst probes a third-party daemon
+    /// once rather than once per attempt. On `queue`.
+    private var shadowProbe: [UInt16: (expires: DispatchTime, held: Bool)] = [:]
+    private static let shadowProbeTTL = DispatchTimeInterval.seconds(30)
 
     /// True if something is accepting TCP connections on `127.0.0.1:port`. Unprivileged and
     /// works for privileged ports, unlike a probe bind.

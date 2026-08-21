@@ -18,13 +18,14 @@ SOCK="${VELOX_SOCK:-$HOME/.velox/docker.sock}"
 DOCKER="${VELOX_DOCKER:-$HOME/.velox/bin/docker}"
 export DOCKER_HOST="unix://$SOCK"
 PREFIX=velox-e2e
+RESOLVER_FILE=/etc/resolver/velox.local
 FILTER="${2:-}"; [ "${1:-}" = "-k" ] || FILTER=""
 
-pass=0; fail=0; skipped=0; current="(none)"
+pass=0; fail=0; skipped=0
 ok(){   printf '  \033[32mok\033[0m    %s\n' "$1"; pass=$((pass+1)); }
 bad(){  printf '  \033[31mFAIL\033[0m  %s\n' "$1"; [ -n "${2:-}" ] && printf '        %s\n' "$2"; fail=$((fail+1)); }
 skip(){ printf '  --    %s (%s)\n' "$1" "$2"; skipped=$((skipped+1)); }
-section(){ current="$1"; printf '\n== %s ==\n' "$1"; }
+section(){ printf '\n== %s ==\n' "$1"; }
 want(){ [ -z "$FILTER" ] && return 0; case "$1" in *"$FILTER"*) return 0;; *) return 1;; esac; }
 
 # assert <desc> <expected> <actual>
@@ -33,8 +34,11 @@ assert(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2], got [$
 assert_contains(){ case "$3" in *"$2"*) ok "$1";; *) bad "$1" "[$2] not in [$3]";; esac; }
 
 cleanup(){
+  # shellcheck disable=SC2046  # deliberate: each id must become its own argument
   $DOCKER rm -f $($DOCKER ps -aq --filter "name=^${PREFIX}" 2>/dev/null) >/dev/null 2>&1
+  # shellcheck disable=SC2046
   $DOCKER volume rm -f $($DOCKER volume ls -q --filter "name=^${PREFIX}" 2>/dev/null) >/dev/null 2>&1
+  # shellcheck disable=SC2046
   $DOCKER network rm $($DOCKER network ls -q --filter "name=^${PREFIX}" 2>/dev/null) >/dev/null 2>&1
   $DOCKER image rm -f "${PREFIX}-img" >/dev/null 2>&1
   rm -rf "${TMP:-/nonexistent}"
@@ -56,6 +60,8 @@ if want "engine"; then section "engine + API"
   [ -n "$srv" ] && ok "server version reported ($srv)" || bad "server version reported"
   # The CLI must reach the engine through the `velox` context, not just DOCKER_HOST (§1).
   if $DOCKER context inspect velox >/dev/null 2>&1; then
+    # shellcheck disable=SC1007  # deliberate: clear DOCKER_HOST for this one command so the
+    # context (not the env var) is what is being exercised.
     assert "velox docker context works" "ok" "$(DOCKER_HOST= $DOCKER --context velox info >/dev/null 2>&1 && echo ok)"
   else skip "velox docker context" "context not created"; fi
 fi
@@ -132,6 +138,46 @@ if want "port"; then section "published ports (TCP v4/v6/localhost)"
   $DOCKER rm -f ${PREFIX}-web >/dev/null 2>&1
 fi
 
+if want "privileged"; then section "privileged published port (<1024, via velox-porthelper)"
+  # The regression this exists for: the helper's wildcard bind briefly dropped SO_REUSEADDR,
+  # so re-publishing a privileged port within TIME_WAIT of a client connection failed with
+  # EADDRINUSE and the client silently fell back to a LOOPBACK bind — `-p 80:80` came back
+  # host-only, which is not Docker's default and is invisible unless you look at the listener.
+  serve_priv(){ # <name>
+    $DOCKER run -d --name "$1" -p 1023:80 "$BASE" \
+      sh -c 'while :; do printf "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nvelox-ok" | nc -l -p 80 -s 0.0.0.0; done' >/dev/null 2>&1
+  }
+  if ! /usr/bin/pgrep -qf dev.velox.porthelper 2>/dev/null && [ ! -S /var/run/dev.velox.porthelper.sock ]; then
+    skip "privileged published port" "porthelper not installed on this Mac"
+  else
+    serve_priv ${PREFIX}-priv
+    sleep 3
+    assert "privileged port serves (:1023)" "velox-ok" \
+      "$(curl -s --max-time 5 http://127.0.0.1:1023/ 2>/dev/null)"
+    bind_addr="$(lsof -nP -iTCP:1023 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $9}')"
+    case "$bind_addr" in
+      \*:1023) ok "bound on ALL interfaces ($bind_addr) — Docker's default publish" ;;
+      "") skip "privileged bind address" "lsof reported no listener" ;;
+      *) bad "bound on ALL interfaces" "listener is on [$bind_addr] — degraded to host-only" ;;
+    esac
+    # Recreate INSIDE the TIME_WAIT window left by the curl above. Without SO_REUSEADDR the
+    # rebind fails here and the fallback silently makes it loopback-only.
+    $DOCKER rm -f ${PREFIX}-priv >/dev/null 2>&1
+    serve_priv ${PREFIX}-priv2
+    sleep 4
+    assert "re-publishes inside TIME_WAIT" "velox-ok" \
+      "$(curl -s --max-time 5 http://127.0.0.1:1023/ 2>/dev/null)"
+    bind_addr2="$(lsof -nP -iTCP:1023 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $9}')"
+    case "$bind_addr2" in
+      \*:1023) ok "still bound on ALL interfaces after the rebind" ;;
+      "") skip "privileged rebind address" "lsof reported no listener" ;;
+      *) bad "still bound on ALL interfaces after the rebind" \
+             "listener fell back to [$bind_addr2] — the SO_REUSEADDR regression is back" ;;
+    esac
+    $DOCKER rm -f ${PREFIX}-priv2 >/dev/null 2>&1
+  fi
+fi
+
 if want "udp"; then section "published ports (UDP)"
   # A SEPARATE published port + container per family. `nc -u -l … -e /bin/cat` serves exactly
   # one client and then exits for the shell loop to restart it, so probing v4 and v6 against
@@ -164,6 +210,99 @@ if want "named"; then section "named access (<name>.velox.local)"
       || skip "container IP reachability" "ICMP blocked"
   fi
   $DOCKER rm -f ${PREFIX}-named >/dev/null 2>&1
+fi
+
+if want "negcache"; then section "a name queried BEFORE its container exists recovers (negative cache)"
+  # The failure this guards: query `<name>.velox.local` while the container is down (an engine
+  # restart, `compose down`, a recreate) and macOS caches the NXDOMAIN. Without an SOA in the
+  # authority section mDNSResponder picks its own negative TTL, which is long and sticky, so the
+  # name stayed dead long after the container came back — while the responder answered it
+  # correctly the whole time. RFC 2308: the negative TTL is the SOA MINIMUM, and it is 1 s.
+  $DOCKER rm -f ${PREFIX}-neg >/dev/null 2>&1
+  for _ in 1 2 3; do dscacheutil -q host -a name ${PREFIX}-neg.velox.local >/dev/null 2>&1; done
+  early="$(dscacheutil -q host -a name ${PREFIX}-neg.velox.local 2>/dev/null | awk '/ip_address/{print $2; exit}')"
+  [ -z "$early" ] && ok "the name is NXDOMAIN before the container exists" \
+                  || bad "the name is NXDOMAIN before the container exists" "resolved to $early"
+  # The responder itself must carry the SOA — check the wire, not just the behaviour.
+  if command -v dig >/dev/null 2>&1; then
+    soa="$(dig +time=3 +tries=1 @127.0.0.1 -p 49252 ${PREFIX}-neg.velox.local A 2>/dev/null \
+           | awk '/AUTHORITY SECTION/{f=1;next} f&&/SOA/{print $NF; exit}')"
+    assert "NXDOMAIN carries an SOA with MINIMUM=1" "1" "${soa:-missing}"
+  else
+    skip "NXDOMAIN carries an SOA" "dig not installed"
+  fi
+  $DOCKER run -d --name ${PREFIX}-neg "$BASE" sleep 300 >/dev/null 2>&1
+  found=""
+  for _ in $(seq 1 40); do
+    found="$(dscacheutil -q host -a name ${PREFIX}-neg.velox.local 2>/dev/null | awk '/ip_address/{print $2; exit}')"
+    [ -n "$found" ] && break; sleep 0.5
+  done
+  [ -n "$found" ] && ok "the same name resolves within 20s of the container starting ($found)" \
+                  || bad "the same name resolves within 20s of the container starting" \
+                         "still NXDOMAIN — the negative answer is being cached past its SOA MINIMUM"
+  $DOCKER rm -f ${PREFIX}-neg >/dev/null 2>&1
+fi
+
+if want "restart"; then section "state SURVIVES an engine restart (regression guard)"
+  # Why this section exists, in one sentence: the "named access" test above passed while
+  # named access was broken for a real user.
+  #
+  # It resolved a BRAND-NEW name on an already-settled engine. The bug lived in the state
+  # TRANSITION — the DNS responder briefly took an ephemeral port, so every restart rewrote
+  # /etc/resolver, and any lookup that failed across that changeover was cached as NXDOMAIN
+  # by mDNSResponder and never retried (measured: still failing 90 s later while `dig`
+  # straight at the responder answered correctly). A fresh name can never be in that
+  # negative cache, so a fresh-name test is structurally incapable of seeing it.
+  #
+  # The rules this encodes, worth keeping even if the DNS port never changes again:
+  #   1. Re-query a name you ALREADY queried, after a restart — not a new one.
+  #   2. Assert the INVARIANT the old code documented (the resolver file is static), not
+  #      just the behaviour of whatever is currently implemented.
+  restart_engine(){
+    osascript -e 'tell application "Velox" to quit' >/dev/null 2>&1
+    for _ in $(seq 1 300); do pgrep -f "Velox.app/Contents/MacOS/VeloxApp" >/dev/null || break; sleep 0.2; done
+    open -a /Applications/Velox.app >/dev/null 2>&1
+    for _ in $(seq 1 240); do $DOCKER info >/dev/null 2>&1 && return 0; sleep 1; done
+    return 1
+  }
+  $DOCKER run -d --name ${PREFIX}-persist "$BASE" sleep 600 >/dev/null 2>&1
+  sleep 3
+  before_ip="$(dscacheutil -q host -a name ${PREFIX}-persist.velox.local 2>/dev/null | awk '/ip_address/{print $2; exit}')"
+  [ -n "$before_ip" ] && ok "name resolves before restart ($before_ip)" \
+                      || bad "name resolves before restart" "no answer — nothing to compare after"
+  # The domain is a fixed constant (Paths.NamedAccess), NOT derived from the test prefix —
+  # `${PREFIX%-e2e}velox.local` expanded to "veloxvelox.local" and only ever matched through
+  # the fallback, which also meant `before` and `after` could be reading different files.
+  resolver_before="$(cat "$RESOLVER_FILE" 2>/dev/null)"
+  ctrs_before="$($DOCKER ps -aq | wc -l | tr -d ' ')"
+
+  if restart_engine; then
+    ok "engine restarted"
+    # THE assertion. Same name, queried again, through the system resolver a browser uses.
+    after_ip=""
+    for _ in $(seq 1 20); do
+      after_ip="$(dscacheutil -q host -a name ${PREFIX}-persist.velox.local 2>/dev/null | awk '/ip_address/{print $2; exit}')"
+      [ -n "$after_ip" ] && break; sleep 2
+    done
+    [ -n "$after_ip" ] && ok "the SAME name still resolves after a restart ($after_ip)" \
+                       || bad "the SAME name still resolves after a restart" \
+                              "NXDOMAIN via the system resolver — mDNSResponder has cached a failure; \
+                               check whether /etc/resolver changed (sudo killall -HUP mDNSResponder to clear)"
+    resolver_after="$(cat "$RESOLVER_FILE" 2>/dev/null)"
+    assert "/etc/resolver entry is unchanged across a restart" "$resolver_before" "$resolver_after"
+    assert "containers survive the restart" "$ctrs_before" "$($DOCKER ps -aq | wc -l | tr -d ' ')"
+    # A published port must come back too — the forwarders are rebuilt from scratch.
+    $DOCKER rm -f ${PREFIX}-reweb >/dev/null 2>&1
+    $DOCKER run -d --name ${PREFIX}-reweb -p 18086:80 "$BASE" \
+      sh -c 'while :; do printf "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nvelox-ok" | nc -l -p 80 -s 0.0.0.0; done' >/dev/null 2>&1
+    sleep 3
+    assert "a published port works after a restart" "velox-ok" \
+      "$(curl -s --max-time 5 http://localhost:18086/ 2>/dev/null)"
+    $DOCKER rm -f ${PREFIX}-reweb >/dev/null 2>&1
+  else
+    bad "engine restarted" "engine did not come back — everything below is unverified"
+  fi
+  $DOCKER rm -f ${PREFIX}-persist >/dev/null 2>&1
 fi
 
 if want "network"; then section "user-defined networks + DNS between containers"

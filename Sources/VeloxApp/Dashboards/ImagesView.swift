@@ -30,7 +30,9 @@ final class ImagesModel {
             // second — and each assignment invalidates this @Observable, hitching the pane
             // for the whole pull. `LogStore` (33 ms) and `StatsStore` (1 Hz) throttle for the
             // same reason; this path didn't.
-            var lastShown = ContinuousClock.now
+            // Seeded in the past so the FIRST progress line is shown immediately — seeding it
+            // at `now` swallowed it along with everything else inside the first window.
+            var lastShown = ContinuousClock.now - .milliseconds(100)
             for try await line in docker.pullImage(reference) {
                 let now = ContinuousClock.now
                 guard now - lastShown >= .milliseconds(100) else { continue }

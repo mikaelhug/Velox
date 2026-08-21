@@ -63,17 +63,27 @@ public enum ConduitPort {
 /// `Sources/VeloxCore/Proxy/NameDNSResponder.swift`.
 public enum NamedAccess {
     public static let domain = "velox.local"
-    /// Port 0 = let the kernel choose. The responder's real port is published to
-    /// `/etc/resolver/<domain>` at engine start via the porthelper's `resolver` verb.
+    /// FIXED on purpose. Do not make this ephemeral.
     ///
-    /// This was a FIXED 49252, which forced the resolver file to be static — and made the
-    /// port squattable: any local process (including another user's) could bind it while
-    /// Velox was stopped and then answer `*.velox.local` for the whole machine. An ephemeral
-    /// port has nothing to pre-bind.
-    public static let dnsPort: UInt16 = 0
-    /// The port used before the helper learned the `resolver` verb (revision 7). An
-    /// already-installed older helper cannot rewrite `/etc/resolver/<domain>`, and that file
-    /// still names this port — so until the user approves the upgrade the responder keeps
-    /// binding it, and named access keeps working instead of silently breaking.
-    public static let legacyDNSPort: UInt16 = 49252
+    /// It was briefly changed to 0 (kernel-chosen) to close a squat: a fixed unprivileged
+    /// port can be bound by any local process while Velox is stopped, which would let it
+    /// answer `*.velox.local` machine-wide. That trade was wrong, and shipping it broke
+    /// named access for real users.
+    ///
+    /// A new port every launch means `/etc/resolver/<domain>` is rewritten every launch.
+    /// macOS's mDNSResponder caches a FAILED lookup for that domain and does not re-check
+    /// on its own — measured: a name that failed during the changeover was still NXDOMAIN
+    /// through `getaddrinfo` 90 s later while `dig` straight at the responder answered
+    /// correctly the whole time. Recovering needs `sudo killall -HUP mDNSResponder`, which
+    /// is not something a user should ever have to know. A stable port means the resolver
+    /// file never changes, so there is no changeover to be caught by.
+    ///
+    /// Be explicit about what that costs, because it is not zero. `/etc/resolver/velox.local`
+    /// is written once and left in place — it is NOT withdrawn on engine stop, for the same
+    /// mDNSResponder reason — so every `*.velox.local` query on this Mac is directed at a
+    /// fixed, well-known, unprivileged loopback port, including while Velox is not running,
+    /// when any local process of any uid can bind it first and answer for the whole machine.
+    /// The mitigation is detection, not prevention: `NameDNSResponder.start()` logs a failed
+    /// bind loudly rather than silently losing named access. There is no UI badge for it yet.
+    public static let dnsPort: UInt16 = 49252
 }

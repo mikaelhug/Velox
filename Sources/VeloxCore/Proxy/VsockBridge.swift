@@ -55,16 +55,16 @@ public final class VsockBridge: @unchecked Sendable {
         // got at least one of them wrong, separately. `EventRelay` takes ownership of both
         // fds, closes them exactly once, and preserves the half-close that Docker's hijacked
         // attach/exec/logs streams depend on.
-        guard admit() else { close(localFd); close(vsockFd); return }
+        // Admit and splice under the SAME lock hold. Checking `admit()` and then registering
+        // left a window in which `stopAll()` could run in between, so the pair was handed to
+        // the relay after `EngineRuntime.stop()` had already drained it and survived the stop.
+        // Holding the lock across the registration makes "not stopped" and "visible to the
+        // drain" the same instant — `bridge.stopAll()` runs before `EventRelay.stopAll()`, so
+        // anything that got past this guard is in the relay's set by the time it drains.
+        lock.lock()
+        guard !stopped else { lock.unlock(); close(localFd); close(vsockFd); return }
         EventRelay.shared.relay(localFd, vsockFd) {}
-    }
-
-    /// Refuse new streams once the bridge is stopped. `bridge()` completes asynchronously
-    /// (VM queue + a VZ vsock connect callback), so a connect landing after the stop would
-    /// otherwise splice a live stream onto a VM being powered off.
-    private func admit() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !stopped
+        lock.unlock()
     }
 
     /// Stop admitting new streams. The in-flight ones are torn down by

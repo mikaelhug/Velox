@@ -120,7 +120,7 @@ suite(){            # $1 context  $2 label
 
   # fs writes: wall-clock around `dd; sync` (busybox dd lacks conv=fdatasync)
   log "[$ENG] fs bind-mount (VirtioFS) write+read ${DD_MB}MiB"
-  rm -rf "$BD/mnt"; mkdir -p "$BD/mnt"
+  rm -rf "${BD:?}/mnt"; mkdir -p "$BD/mnt"   # :? — an empty BD would make this `rm -rf /mnt`
   t0=$(now); D run --rm -v "$BD/mnt":/m "$IMG_ALPINE" sh -c "dd if=/dev/zero of=/m/f bs=1M count=$DD_MB 2>/dev/null; sync"; t1=$(now)
   rec "$ENG" fs bind_write mbps MBps "$(mbps $t0 $t1)"
   t0=$(now); D run --rm -v "$BD/mnt":/m "$IMG_ALPINE" sh -c 'dd if=/m/f of=/dev/null bs=1M 2>/dev/null'; t1=$(now)

@@ -39,6 +39,9 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq is required (brew install jq)
 if command -v shasum >/dev/null 2>&1; then _sha(){ shasum -a 256 | cut -d' ' -f1; }
 elif command -v sha256sum >/dev/null 2>&1; then _sha(){ sha256sum | cut -d' ' -f1; }
 else echo "error: need shasum or sha256sum" >&2; exit 1; fi
+# gpg verifies kernel.org's sha256sums.asc before any hash in it is trusted (see k_pinnable).
+# Preflight it like jq: without this the kernel path failed with two bare import errors.
+command -v gpg >/dev/null 2>&1 || { echo "error: gpg is required to verify kernel.org signatures (brew install gnupg)" >&2; exit 1; }
 
 set -a; . ./versions.env; set +a
 
@@ -108,7 +111,7 @@ printf '%s.%s.%s' "$a" "$b" "$((c+1))"; }
 # --- portable in-place rewrite of one KEY= line ----------------------------
 set_var(){ # KEY VALUE
   local tmp; tmp="$(mktemp)"
-  awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" {print k "=" v; next} {print}' versions.env > "$tmp"
+  awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" { if (v ~ /[ \t]/) print k "=\"" v "\""; else print k "=" v; next } {print}' versions.env > "$tmp"
   mv "$tmp" versions.env
 }
 
@@ -135,7 +138,7 @@ AUTOSIGNER_FPR=B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1
 AUTOSIGNER_KEY="$(cd "$(dirname "$0")" && pwd)/keys/kernel.org-autosigner.asc"
 
 k_pinnable(){ # <major> -> "<version> <sha>" of the newest published tarball, or ""
-  local asc gnupg out
+  local asc gnupg
   asc="$(mktemp)"; gnupg="$(mktemp -d)"; chmod 700 "$gnupg"
   # shellcheck disable=SC2064
   trap "rm -rf '$asc' '$gnupg'" RETURN
@@ -157,18 +160,39 @@ k_pinnable(){ # <major> -> "<version> <sha>" of the newest published tarball, or
     | sort -V | tail -1
 }
 
-K_ANNOUNCED="$(curl -fsSL https://www.kernel.org/releases.json | jq -r '.latest_stable.version')"
-[ -n "$K_ANNOUNCED" ] && [ "$K_ANNOUNCED" != "null" ] || { echo "error: could not read latest_stable from kernel.org releases.json" >&2; exit 1; }
-# Look in the announced line's directory; if that whole line is unpublished, fall
-# back to the line we are already on, which may still have a newer patch for us.
-K_PICK="$(k_pinnable "$(maj "$K_ANNOUNCED")")"
+KERNEL_UNPINNABLE=0
+# The kernel line degrades to "no kernel bump this week"; it must NOT abort the run. Every
+# failure here (kernel.org unreachable, releases.json shape change, an autosigner key
+# rotation making sha256sums.asc unverifiable) is kernel-specific, and exiting on it also
+# blocked the Docker/compose/buildx bumps — which is where CVE fixes usually arrive. Keeping
+# the current pin is always safe; skipping Docker security updates for a kernel.org outage
+# is not.
+K_ANNOUNCED="$(curl -fsSL https://www.kernel.org/releases.json 2>/dev/null | jq -r '.latest_stable.version' 2>/dev/null || true)"
+[ "$K_ANNOUNCED" != "null" ] || K_ANNOUNCED=""
+K_PICK=""
+if [ -n "$K_ANNOUNCED" ]; then
+  # Look in the announced line's directory; if that whole line is unpublished, fall
+  # back to the line we are already on, which may still have a newer patch for us.
+  K_PICK="$(k_pinnable "$(maj "$K_ANNOUNCED")")"
+fi
 [ -n "$K_PICK" ] || K_PICK="$(k_pinnable "$(maj "$KERNEL_ORG_VERSION")")"
-[ -n "$K_PICK" ] || { echo "error: no signed kernel tarball found in v$(maj "$K_ANNOUNCED").x or v$(maj "$KERNEL_ORG_VERSION").x" >&2; exit 1; }
-K_LATEST="${K_PICK%% *}"
-K_SHA_PUBLISHED="${K_PICK##* }"
-[ "$K_LATEST" = "$K_ANNOUNCED" ] || \
-  echo "==> kernel ${K_ANNOUNCED} is announced but not signed/published yet — newest pinnable is ${K_LATEST}" >&2
-K_KIND="$(classify kernel "$KERNEL_ORG_VERSION" "$K_LATEST")"
+if [ -n "$K_PICK" ]; then
+  K_LATEST="${K_PICK%% *}"
+  K_SHA_PUBLISHED="${K_PICK##* }"
+  [ -z "$K_ANNOUNCED" ] || [ "$K_LATEST" = "$K_ANNOUNCED" ] || \
+    echo "==> kernel ${K_ANNOUNCED} is announced but not signed/published yet — newest pinnable is ${K_LATEST}" >&2
+  K_KIND="$(classify kernel "$KERNEL_ORG_VERSION" "$K_LATEST")"
+else
+  echo "::warning::no signed kernel tarball could be pinned (kernel.org unreachable, or sha256sums.asc did not verify against ${AUTOSIGNER_FPR}) — keeping kernel ${KERNEL_ORG_VERSION} and continuing with the Docker components" >&2
+  K_LATEST="$KERNEL_ORG_VERSION"
+  K_SHA_PUBLISHED="$KERNEL_ORG_SHA256"
+  K_KIND=""
+  # Surfaced as an output, not just a log line. Fail-soft is right — a kernel.org outage must
+  # not block Docker CVE bumps — but a PERSISTENT failure (an autosigner key rotation) would
+  # otherwise be a green run every week while the kernel pin quietly stops moving for months,
+  # with CLAUDE.md §9 still claiming it is automated. The workflow annotates this.
+  KERNEL_UNPINNABLE=1
+fi
 
 # ===========================================================================
 # Discover: docker (parse the static-stable aarch64 index; SHAs need a download)
@@ -270,6 +294,7 @@ emit(){ # KEY=VALUE to stdout and, in CI, to $GITHUB_OUTPUT
 if [ -z "$NEW_VELOX" ]; then
   echo "==> up to date — no newer kernel, docker, compose or buildx release." >&2
   emit "changed=false"
+  emit "kernel_unpinnable=${KERNEL_UNPINNABLE}"
   exit 0
 fi
 
@@ -290,6 +315,7 @@ add_part "${BX_KIND:+buildx ${DOCKER_BUILDX_VERSION}→${BX_LATEST}}"
 TITLE="release: v${NEW_VELOX} — ${TITLE_PARTS}"
 
 emit "changed=true"
+emit "kernel_unpinnable=${KERNEL_UNPINNABLE}"
 emit "prev_version=${VELOX_VERSION}"
 emit "new_version=${NEW_VELOX}"
 emit "kernel_from=${KERNEL_ORG_VERSION}"

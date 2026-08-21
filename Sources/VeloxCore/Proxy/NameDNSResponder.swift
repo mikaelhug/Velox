@@ -144,12 +144,53 @@ public final class NameDNSResponder: @unchecked Sendable {
         return r
     }
 
+    /// Encode a dotted name into DNS wire format (length-prefixed labels, root terminator).
+    static func encodeName(_ name: String) -> [UInt8] {
+        var out: [UInt8] = []
+        for label in name.split(separator: ".") {
+            let bytes = Array(label.utf8.prefix(63))
+            out.append(UInt8(bytes.count))
+            out += bytes
+        }
+        out.append(0)
+        return out
+    }
+
+    /// A minimal SOA for the zone, carrying **MINIMUM = 1 second**.
+    ///
+    /// This is the whole point of the record. Under RFC 2308 a resolver takes its *negative*
+    /// cache TTL from the SOA in the authority section of an NXDOMAIN; with no SOA it falls
+    /// back to its own default, and mDNSResponder's is both long and sticky. That produced a
+    /// recurring, baffling failure: query `<name>.velox.local` while the container happens to
+    /// be down (an engine restart, a `compose down`, a recreate), and the name stays dead for
+    /// the rest of the cache period even though the responder answers it correctly the whole
+    /// time — verifiable only by querying the responder directly. Positive answers already use
+    /// a 2 s TTL for the mirror-image reason (container IPs change on recreate).
+    static func soaAuthority(zone: String) -> [UInt8] {
+        let mname = encodeName("ns." + zone)
+        let rname = encodeName("hostmaster." + zone)
+        var rec = encodeName(zone)
+        rec += [0x00, 0x06, 0x00, 0x01]                   // TYPE=SOA, CLASS=IN
+        rec += [0x00, 0x00, 0x00, 0x01]                   // TTL 1s (the record itself)
+        let rdlen = mname.count + rname.count + 20
+        rec += [UInt8((rdlen >> 8) & 0xff), UInt8(rdlen & 0xff)]
+        rec += mname
+        rec += rname
+        rec += [0, 0, 0, 1]                               // SERIAL
+        rec += [0, 0, 0, 60]                              // REFRESH
+        rec += [0, 0, 0, 60]                              // RETRY
+        rec += [0, 0, 0, 60]                              // EXPIRE
+        rec += [0, 0, 0, 1]                               // MINIMUM — the negative-cache TTL
+        return rec
+    }
+
     static func nxdomain(_ q: [UInt8]) -> [UInt8] {
         guard q.count >= 12 else { return [] }   // r[2…11] below would be out of range
         let qend = parseQName(q).map { $0.2 } ?? min(q.count, 12)
         var r = Array(q[0..<qend])
         r[2] = 0x84 | (q[2] & 0x01); r[3] = 0x83          // RA=1, RCODE=3 (NXDOMAIN)
-        r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 0; r[10] = 0; r[11] = 0
+        r[6] = 0; r[7] = 0; r[8] = 0; r[9] = 1; r[10] = 0; r[11] = 0   // NSCOUNT=1 (the SOA)
+        r += soaAuthority(zone: NamedAccess.domain)
         return r
     }
 }

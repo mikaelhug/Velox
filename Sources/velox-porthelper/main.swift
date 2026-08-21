@@ -85,13 +85,22 @@ func bindV4(type: Int32, port: UInt16, wildcard: Bool) -> Int32 {
     let s = socket(AF_INET, type, 0)
     if s < 0 { return -1 }
     var yes: Int32 = 1
-    // Loopback binds only. On a wildcard bind SO_REUSEADDR succeeds even while another
-    // process holds `127.0.0.1:<port>` (measured, TCP and UDP), so it would plant a
-    // Velox-owned listener on the LAN-facing side of a daemon that deliberately chose
-    // loopback — and it swallows the EADDRINUSE the forwarder needs to report a conflict.
-    if !wildcard {
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-    }
+    // SO_REUSEADDR is set for BOTH bind shapes, and this is a deliberate trade, not an
+    // oversight. Measured on macOS 15 (TCP and UDP):
+    //   • Inside TIME_WAIT from a previous connection, a wildcard bind fails EADDRINUSE
+    //     WITHOUT it and succeeds WITH it. That is the normal case every time a published
+    //     container is recreated or the engine restarts, and dropping it made `-p 80:80`
+    //     unbindable for ~60 s — after which the client's loopback fallback silently
+    //     downgraded it to host-only, losing Docker's default publish semantics.
+    //   • With another process holding `127.0.0.1:P`, a wildcard bind also fails without it
+    //     and succeeds with it. So setting it does re-open the squat: we can plant a listener
+    //     on the LAN-facing side of a daemon that deliberately chose loopback. The helper
+    //     binds as root, so a uid check would not help.
+    // The rebind failure is silent and hits every user who republishes a privileged port; the
+    // squat needs a local daemon on the same privileged port and is surfaced — `PortForwarder`
+    // probes loopback and badges the port (`loopbackHeld`/`loopbackAccepts`). NOTE that probe
+    // is TCP-only, so a UDP shadow is currently unreported.
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
     var addr = sockaddr_in()
     addr.sin_family = sa_family_t(AF_INET)
     addr.sin_port = port.bigEndian
@@ -113,9 +122,7 @@ func bindV6(type: Int32, port: UInt16, wildcard: Bool) -> Int32 {
     let s = socket(AF_INET6, type, 0)
     if s < 0 { return -1 }
     var yes: Int32 = 1
-    if !wildcard {   // see bindV4
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-    }
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))  // see bindV4
     setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
     var addr = sockaddr_in6()
     addr.sin6_family = sa_family_t(AF_INET6)

@@ -72,8 +72,14 @@ public final class DockerSocketProxy: @unchecked Sendable {
     }
 
     public func stop() {
-        source?.cancel()
+        let src = source
         source = nil
+        // Cancel ON `acceptQueue`, synchronously. Two things depend on it: an accept handler
+        // already running finishes before this returns (so `EngineRuntime.stop()`'s documented
+        // "stop admitting, then drain" ordering is actually enforced, not merely intended), and
+        // the cancel is ordered behind any pending fd-exhaustion resume on the same queue.
+        acceptQueue.async { src?.cancel() }
+        acceptQueue.settle("docker-proxy")
         unlink(socketPath)
     }
 
@@ -90,8 +96,15 @@ public final class DockerSocketProxy: @unchecked Sendable {
                     Log.warn("docker socket proxy: out of file descriptors — pausing accepts briefly")
                     source.suspend()
                     acceptQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
-                        guard let self, self.throttled else { return }
-                        self.throttled = false
+                        // Resume UNCONDITIONALLY — never behind `guard let self`. A suspended
+                        // dispatch source does not run its cancel handler, so bailing out here
+                        // (the proxy deallocated inside this 250 ms window, e.g. an engine
+                        // restart) left the listening socket open for the life of the process —
+                        // precisely when the process is already out of fds. Releasing a still-
+                        // suspended source also traps in libdispatch. The strong `source`
+                        // capture keeps it alive to be resumed. Exactly one resume per suspend:
+                        // `stop()` must not resume as well, it just cancels behind this.
+                        self?.throttled = false
                         source.resume()
                     }
                 }

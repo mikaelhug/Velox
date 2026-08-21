@@ -53,6 +53,9 @@ public final class ConduitPool: @unchecked Sendable {
     private let bindIP: in_addr_t      // network byte order; the vmnet bridge (gateway) address
     private let guestIP: in_addr_t     // the only allowed conduit peer (network byte order)
     private let queue = DispatchQueue(label: "dev.velox.conduitpool")
+    /// Set by `stop()`. Checked in `assign` so a late assignment can't splice a pair onto a
+    /// VM being powered off, after `EngineRuntime.stop()` has already drained the relay. On `queue`.
+    private var stopped = false
     private var listenFd: Int32 = -1
     private var source: DispatchSourceRead?
     private var ready: [Parked] = []   // parked idle conduits (all access on `queue`)
@@ -115,12 +118,14 @@ public final class ConduitPool: @unchecked Sendable {
         // Note: the relayed pairs are drained by `EngineRuntime.stop()`, not here — the relay
         // is process-wide, so a stale pool must not be able to cut a newer engine's traffic.
         queue.async {
+            self.stopped = true
             self.source?.cancel(); self.source = nil
             for p in self.ready { p.source.cancel() }   // cancel handler closes the fd
             self.ready.removeAll()
             for w in self.waiting { close(w.fd) }
             self.waiting.removeAll()
         }
+        queue.settle("conduit-pool")   // barrier — see PortForwarder.stopAll
     }
 
     // MARK: - accept (on `queue`)
@@ -244,6 +249,14 @@ public final class ConduitPool: @unchecked Sendable {
     /// `owner` is non-nil when the conduit came from `ready` and its (now-cancelled) read
     /// source still nominally owns the fd; nil for a conduit assigned straight off `accept`.
     private func assign(conduit: Int32, clientFd: Int32, port: UInt16, owner: FdOwner?) {
+        // Refuse to hand a pair to the shared relay once the pool is stopped. `EngineRuntime`
+        // shuts the producers down and only then drains the relay; without this a pair
+        // assigned in between would be spliced after the drain and survive the stop.
+        guard !stopped else {
+            if owner == nil { close(conduit) }
+            close(clientFd)
+            return
+        }
         let target = endpoints?.endpoint(for: port) ?? "\(port)"
         guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
             // Don't close inline when a source still owns it: `cancel()` is asynchronous, so

@@ -23,8 +23,12 @@ release_json="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest
 # titles (generate_release_notes), so matching any https URL let release *text* influence
 # what gets downloaded.
 dl_prefix="https://github.com/${REPO}/releases/download/"
-asset_url="$(printf '%s' "$release_json" | grep -oE "${dl_prefix}[^\"]+macos-arm64\.zip\"" | tr -d '"' | head -1)"
-sums_url="$(printf '%s' "$release_json" | grep -oE "${dl_prefix}[^\"]+/SHA256SUMS\"" | tr -d '"' | head -1)"
+# `|| true` on each grep: under `set -o pipefail` a non-matching grep exits 1 and takes the
+# whole script down right here, so the explicit "no .zip found" / "publishes no SHA256SUMS"
+# messages below — which tell the user what to do — could never be reached. Both are still
+# fail-closed; they now say so.
+asset_url="$(printf '%s' "$release_json" | { grep -oE "${dl_prefix}[^\"]+macos-arm64\.zip\"" || true; } | tr -d '"' | head -1)"
+sums_url="$(printf '%s' "$release_json" | { grep -oE "${dl_prefix}[^\"]+/SHA256SUMS\"" || true; } | tr -d '"' | head -1)"
 if [ -z "${asset_url:-}" ]; then
     echo "error: no macOS arm64 .zip found in the latest release of ${REPO}." >&2
     echo "       See https://github.com/${REPO}/releases" >&2

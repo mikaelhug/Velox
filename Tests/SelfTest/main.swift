@@ -267,6 +267,44 @@ do {
     equal(Int(foreign[3] & 0x0F), 3, "non-velox.local suffix → NXDOMAIN")
 }
 
+// MARK: NXDOMAIN carries an SOA so the negative answer is not cached for long
+
+section("NameDNSResponder.nxdomain")
+@MainActor func nxdomainSOATest() {
+    // A bare NXDOMAIN (no SOA) leaves the negative TTL to the resolver's own default, and
+    // mDNSResponder's is long and sticky — which is why a container that happened to be down
+    // when a name was first queried stayed unreachable by name long after it came back, while
+    // the responder answered it correctly the whole time. RFC 2308: the negative-cache TTL is
+    // the SOA MINIMUM in the authority section. Driven through the public entry point, so this
+    // is what actually goes on the wire.
+    var q: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
+    for label in "nope.velox.local".split(separator: ".") {
+        q.append(UInt8(label.utf8.count)); q.append(contentsOf: Array(label.utf8))
+    }
+    q.append(contentsOf: [0, 0x00, 0x01, 0x00, 0x01])          // root, QTYPE=A, QCLASS=IN
+    let r = NameDNSResponder.buildReply(q, registry: NameRegistry())
+    equal(Int(r[3] & 0x0f), 3, "RCODE is NXDOMAIN")
+    equal((Int(r[6]) << 8) | Int(r[7]), 0, "ANCOUNT is 0")
+    equal((Int(r[8]) << 8) | Int(r[9]), 1, "NSCOUNT is 1 — an SOA is present")
+    // Walk to the authority record: header + question, then the owner name, type/class/ttl.
+    let qend = q.count
+    check(r.count > qend + 11, "the reply carries an authority record after the question")
+    if r.count > qend + 11 {
+        var p = qend
+        while p < r.count, r[p] != 0 { p += Int(r[p]) + 1 }     // skip the owner labels
+        p += 1
+        equal((Int(r[p]) << 8) | Int(r[p + 1]), 6, "authority record is type SOA")
+        let rdlen = (Int(r[p + 8]) << 8) | Int(r[p + 9])
+        equal(rdlen, r.count - (p + 10), "SOA RDLENGTH matches the bytes that follow")
+        // MINIMUM is the last 4 bytes of the RDATA — the field that bounds negative caching.
+        let n = r.count
+        let minimum = (UInt32(r[n - 4]) << 24) | (UInt32(r[n - 3]) << 16)
+                    | (UInt32(r[n - 2]) << 8)  |  UInt32(r[n - 1])
+        equal(minimum, 1, "SOA MINIMUM (negative-cache TTL) is 1 second")
+    }
+}
+nxdomainSOATest()
+
 // MARK: Named-access domain + published bindings (UI affordances)
 
 section("ContainerSummary affordances")
@@ -976,6 +1014,46 @@ guestInstallStampTest()
           "unrecognised failures pass through unchanged")
 }
 diskUsageMessageTest()
+
+// MARK: Host routing table (named-access healing)
+
+section("NamedAccessRouter.installedRoutes")
+@MainActor func installedRoutesTest() {
+    // Parses the raw `sysctl(NET_RT_DUMP)` route dump. It decides whether a route Velox
+    // installed is still present, so a parser that silently returns nothing would make every
+    // network path change re-apply every route (the churn + no-route window this replaced),
+    // and one that returns garbage would make a genuinely flushed route look healthy —
+    // silently killing `<name>.velox.local` after VPN churn. Loopback is on every Mac.
+    let routes = NamedAccessRouter.installedRoutes()
+    check(!routes.isEmpty, "the route dump parses to at least one network route")
+    check(routes["127.0.0.0/8"] != nil, "the loopback network route is found")
+    check(routes.keys.allSatisfy { r in
+        let parts = r.split(separator: "/")
+        guard parts.count == 2, let plen = Int(parts[1]), (0...32).contains(plen) else { return false }
+        return parts[0].split(separator: ".").count == 4
+    }, "every entry is a well-formed IPv4 CIDR")
+    // The next hop is what distinguishes "our route is still installed" from "someone else
+    // took the prefix", so it has to parse too: either a dotted quad or "" for a link route.
+    check(routes.values.allSatisfy { hops in
+        hops.allSatisfy { $0.isEmpty || $0.split(separator: ".").count == 4 }
+    }, "every next hop is either empty (link route) or a dotted quad")
+    // The default route reaches a gateway on any machine with network access, so it is the one
+    // entry we can assert carries a real next hop — and it is also the prefix macOS most often
+    // holds twice, which is why the value is a set.
+    // If Velox is running, its container-subnet routes must carry the guest IP as their next
+    // hop — that is exactly the fact `refresh()` uses to tell "our route survived" from
+    // "someone else took this prefix", so a parser that lost the gateway would silently make
+    // named-access healing a no-op.
+    for (cidr, hops) in routes where cidr.hasPrefix("172.1") || cidr.hasPrefix("172.2") {
+        check(hops.contains { $0.split(separator: ".").count == 4 },
+              "container subnet \(cidr) records a real next hop (\(hops.sorted()))")
+    }
+    if let viaDefault = routes["0.0.0.0/0"] {
+        check(viaDefault.contains { !$0.isEmpty },
+              "the default route records a next hop (\(viaDefault.sorted()))")
+    }
+}
+installedRoutesTest()
 
 // MARK: Summary
 

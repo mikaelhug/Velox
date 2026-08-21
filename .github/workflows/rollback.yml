@@ -54,12 +54,23 @@ jobs:
           git rev-parse -q --verify "refs/tags/${TO}" >/dev/null \
             || { echo "::error::tag ${TO} not found"; exit 1; }
 
-          set_var(){ tmp="$(mktemp)"; awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" {print k "=" v; next} {print}' versions.env > "$tmp"; mv "$tmp" versions.env; }
+          set_var(){ tmp="$(mktemp)"; awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" { if (v ~ /[ \t]/) print k "=\"" v "\""; else print k "=" v; next } {print}' versions.env > "$tmp"; mv "$tmp" versions.env; }
+          # Strip one layer of surrounding double quotes. `set_var` quotes any value that
+          # contains whitespace (a multi-entry deny list), and every reader here has to undo
+          # that the way `source` would — otherwise the quotes are read back as part of the
+          # value and re-quoted on the next append, producing `KEY=""a b" c"`. That is not
+          # sourceable, so `set -a; . ./versions.env` fails (exit 127) in every consumer and
+          # the deny list — the whole point of a rollback — silently empties itself.
+          unquote(){ v="$1"; case "$v" in \"*\") v="${v#\"}"; v="${v%\"}";; esac; printf '%s' "$v"; }
           # cut -f2- (not awk $2): a value containing '=' would be silently truncated.
-          get_from_tag(){ git show "${TO}:versions.env" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+          # `|| true`: a key that is absent must yield an empty string, not kill the run.
+          # Under `set -o pipefail` a non-matching grep exits 1 and propagates, which made the
+          # "absent in <tag> (pre-plugin tag)" branch below unreachable — rolling back to any
+          # tag older than the compose/buildx pins died with a bare shell error instead.
+          get_from_tag(){ unquote "$(git show "${TO}:versions.env" | { grep -E "^$1=" || true; } | head -1 | cut -d= -f2-)"; }
 
           # Snapshot the versions we are rolling away from, before the restore overwrites them.
-          cur_of(){ grep -E "^$1=" versions.env | head -1 | cut -d= -f2-; }
+          cur_of(){ unquote "$({ grep -E "^$1=" versions.env || true; } | head -1 | cut -d= -f2-)"; }
           BAD_KERNEL="$(cur_of KERNEL_ORG_VERSION)"
           BAD_DOCKER="$(cur_of DOCKER_VERSION)"
           BAD_COMPOSE="$(cur_of DOCKER_COMPOSE_VERSION)"
@@ -84,7 +95,7 @@ jobs:
           # runtime one CI structurally cannot see) and re-shipped it to everyone.
           append_blocked(){  # $1 key  $2 version
             [ -n "$2" ] || return 0
-            cur="$(awk -F= -v k="$1" '$1==k{print $2; exit}' versions.env)"
+            cur="$(cur_of "$1")"   # not `awk -F= $2`: that truncates at a second '=' and keeps the quotes
             case " $cur " in *" $2 "*) return 0 ;; esac   # already listed
             set_var "$1" "$(printf '%s %s' "$cur" "$2" | sed 's/^ *//')"
             echo "::notice::$1 += $2"

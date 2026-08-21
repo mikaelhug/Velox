@@ -42,7 +42,9 @@ KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
 # moby's container-host config validator, pinned to a commit AND hashed (see versions.env).
-CHECKCONFIG_REF="${CHECKCONFIG_REF:-${MOBY_CHECKCONFIG_REF:?set MOBY_CHECKCONFIG_REF in versions.env}}"
+# Both come from versions.env and neither is env-overridable: overriding the ref alone could
+# only ever fail the hash check below, and overriding both would defeat the pin's whole point.
+CHECKCONFIG_REF="${MOBY_CHECKCONFIG_REF:?set MOBY_CHECKCONFIG_REF in versions.env}"
 CHECKCONFIG_SHA256="${MOBY_CHECKCONFIG_SHA256:?set MOBY_CHECKCONFIG_SHA256 in versions.env}"
 CHECKCONFIG_URL="https://raw.githubusercontent.com/moby/moby/${CHECKCONFIG_REF}/contrib/check-config.sh"
 VERIFY_GPG="${VERIFY_GPG:-0}"

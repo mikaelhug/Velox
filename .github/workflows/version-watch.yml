@@ -63,7 +63,7 @@ jobs:
       # resolving the branch separately in each validator and again in `ship` left a
       # 20-40 minute window in which a push to it would be fast-forwarded onto main and
       # tagged without ever having been validated.
-      bump_sha:    ${{ steps.scout.outputs.bump_sha }}
+      bump_sha:    ${{ steps.bump.outputs.bump_sha }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -75,7 +75,18 @@ jobs:
         id: scout
         run: ./Scripts/check-upstream.sh
 
+      # Fail-soft is deliberate (a kernel.org outage must not block Docker CVE bumps), but it
+      # must never be invisible: left alone, a rotated autosigner key is a green run every
+      # Monday while the kernel pin silently stops moving.
+      - name: Flag a kernel line that could not be pinned
+        if: steps.scout.outputs.kernel_unpinnable == '1'
+        run: |
+          echo "::warning::kernel.org could not be pinned this run — the kernel stayed at its current version. If this repeats, check Scripts/keys/kernel.org-autosigner.asc against the live sha256sums.asc signer."
+          echo "### ⚠️ Kernel pin skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "kernel.org was unreachable or its \`sha256sums.asc\` did not verify. Docker components were still evaluated. Repeated occurrences mean the vendored autosigner key needs attention." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Regenerate Versions.swift + push bump branch
+        id: bump          # REQUIRED: outputs.bump_sha below is read as steps.bump.outputs
         if: steps.scout.outputs.changed == 'true'
         env:
           TITLE:        ${{ steps.scout.outputs.title }}
@@ -131,8 +142,18 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        # The pinned commit, not the branch name — see prepare.outputs.bump_sha.
+        # The pinned commit, not the branch name — see prepare.outputs.bump_sha. An empty
+        # value here is NOT harmless: actions/checkout treats it as unset and silently checks
+        # out the default branch, so both validators would pass against the UN-BUMPED tree
+        # and report a green that means nothing. Assert it first.
         with: { ref: "${{ needs.prepare.outputs.bump_sha }}" }
+      - name: Assert we are on the validated commit
+        run: |
+          set -euo pipefail
+          want="${{ needs.prepare.outputs.bump_sha }}"
+          [ -n "$want" ] || { echo "::error::prepare exported no bump_sha — refusing to validate the wrong tree"; exit 1; }
+          got="$(git rev-parse HEAD)"
+          [ "$got" = "$want" ] || { echo "::error::checked out $got, expected $want"; exit 1; }
 
       - name: Compute cache keys (same recipe as release.yml)
         id: keys
@@ -204,8 +225,18 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        # The pinned commit, not the branch name — see prepare.outputs.bump_sha.
+        # The pinned commit, not the branch name — see prepare.outputs.bump_sha. An empty
+        # value here is NOT harmless: actions/checkout treats it as unset and silently checks
+        # out the default branch, so both validators would pass against the UN-BUMPED tree
+        # and report a green that means nothing. Assert it first.
         with: { ref: "${{ needs.prepare.outputs.bump_sha }}" }
+      - name: Assert we are on the validated commit
+        run: |
+          set -euo pipefail
+          want="${{ needs.prepare.outputs.bump_sha }}"
+          [ -n "$want" ] || { echo "::error::prepare exported no bump_sha — refusing to validate the wrong tree"; exit 1; }
+          got="$(git rev-parse HEAD)"
+          [ "$got" = "$want" ] || { echo "::error::checked out $got, expected $want"; exit 1; }
       - run: swift --version
       - name: Build (all targets)
         run: |
@@ -232,6 +263,7 @@ jobs:
       - name: Fast-forward main to the validated bump + tag the release
         env:
           NEW: ${{ needs.prepare.outputs.new_version }}
+          GH_TOKEN: ${{ github.token }}   # `gh release view` in the post-push confirmation below
         run: |
           set -euo pipefail
           git config user.name  "velox-bot"
@@ -254,11 +286,35 @@ jobs:
           # bumped versions.env, sees the pins as current, exits `changed=false`, and never
           # ships it. Tagging first makes the failure mode "a tag with no main move", which
           # release.yml handles and which the next run simply repeats.
-          git tag "v${NEW}" "${BUMP_SHA}"
-          git push origin "v${NEW}"                  # deploy-key push → triggers release.yml
+          # Idempotent: a re-run after a partial failure must not die on "tag already exists"
+          # (set -e, exit 128) BEFORE it gets a chance to finish moving main.
+          if git rev-parse -q --verify "refs/tags/v${NEW}" >/dev/null; then
+            existing="$(git rev-list -n1 "v${NEW}")"
+            [ "$existing" = "$BUMP_SHA" ] || {
+              echo "::error::tag v${NEW} already exists on $existing, not on the validated $BUMP_SHA"; exit 1; }
+            echo "::notice::tag v${NEW} already present on the validated commit — continuing to move main"
+          else
+            git tag "v${NEW}" "${BUMP_SHA}"
+            git push origin "v${NEW}"                # deploy-key push → triggers release.yml
+          fi
           if ! git push origin "${BUMP_SHA}:refs/heads/main"; then
             echo "::error::main advanced during the run — fast-forward rejected. v${NEW} is tagged and will build, but main was not moved; re-run version-watch to re-bump from the new main."
             exit 1
           fi
           git push origin --delete "$BUMP_BRANCH" || true
           echo "::notice::Landed v${NEW} on main and tagged it; release.yml will build and publish."
+          # If the tag already existed we did NOT push it, so release.yml was never triggered
+          # by this run. Confirm a release actually exists for it before calling the run green:
+          # otherwise a failed release.yml on that tag disappears — main has moved, so the next
+          # weekly run reads the bumped versions.env, reports `changed=false`, and the version
+          # is never published to anyone. Fail loudly instead; re-running release.yml on the tag
+          # is a one-click fix, silently shipping nothing is not.
+          for _ in $(seq 1 10); do
+            gh release view "v${NEW}" >/dev/null 2>&1 && exit 0
+            sleep 30
+          done
+          if ! gh run list --workflow release.yml --branch "v${NEW}" --limit 1 2>/dev/null | grep -q .; then
+            echo "::error::v${NEW} is tagged and main has moved, but no release and no release.yml run exist for it. Re-run release.yml on tag v${NEW} — the next weekly run will NOT retry this."
+            exit 1
+          fi
+          echo "::notice::release.yml is running for v${NEW}."

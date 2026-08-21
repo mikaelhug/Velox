@@ -164,6 +164,9 @@ final class EngineController {
         // shutdown wait below), and blocking a Swift-concurrency cooperative thread — of
         // which there are only as many as there are cores — can starve every other task in
         // the process. GCD grows its pool instead.
+        // Records whether the pre-relaunch shutdown actually confirmed. The fallback path
+        // below must not "finish" a stop that never happened (see the guard there).
+        let stopStalled = Locked(false)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             Updater.applyLatestUpdate(beforeRelaunch: { [weak self] in
                 // The updater is about to exit(0) to relaunch, which tears down this VM. Block
@@ -179,6 +182,7 @@ final class EngineController {
                 self.shutdownForTerminate { sem.signal() }
                 if sem.wait(timeout: .now() + Self.stopDeadline) == .timedOut {
                     Log.warn("engine did not stop before the update relaunch; continuing")
+                    stopStalled.value = true
                 }
             })
             // Only reached if the update fell back (success calls exit(0)). `beforeRelaunch`
@@ -188,6 +192,19 @@ final class EngineController {
             Task { @MainActor in
                 guard let self else { return }
                 self.updateInProgress = false
+                // The update FELL BACK, so this process keeps running — and if the stop above
+                // timed out, the VM is still alive on `data.img`. `handleGuestStopped` runs
+                // `cleanup()`, which releases the instance lock: exactly the "second engine
+                // attaches the same ext4 image" corruption `vmUnreachable` was added to
+                // prevent in `performStop`. The update path reached the same state by a
+                // different route, so it has to latch it the same way.
+                guard !stopStalled.value else {
+                    self.vmUnreachable = true
+                    self.state = .failed("The engine did not shut down for the update and may "
+                                         + "still be running. Quit and reopen Velox before "
+                                         + "starting it again.")
+                    return
+                }
                 if self.state == .stopping { self.handleGuestStopped(nil) }
             }
         }

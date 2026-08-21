@@ -475,19 +475,32 @@ const DNS_MAX_INFLIGHT: usize = 64;
 /// container issuing ~64 concurrent queries against a slow upstream pinned every slot for up
 /// to the 2 s forward timeout, capping DNS for the WHOLE VM — dockerd and every other
 /// container included — with the rest silently dropped.
+///
+/// It is a share under CONTENTION, not a reservation. Enforced unconditionally it was a
+/// regression in its own right: a single container — the common case, and the only case for
+/// most users — went from 64 concurrent queries to 16, so an `npm install` or a multi-registry
+/// build took ~84 silent drops where it used to take ~36, each costing the stub resolver a
+/// retry timeout. libnetwork's own resolver allows up to 100 concurrent forwards per sandbox.
+/// Below the watermark a source may use the whole budget; at or above it, the share applies,
+/// so a hog cannot claim MORE while someone else needs a slot and the split converges as its
+/// queries drain.
 const DNS_MAX_INFLIGHT_PER_SOURCE: usize = 16;
+/// Global in-flight level at which the per-source share starts being enforced.
+const DNS_CONTENDED: usize = DNS_MAX_INFLIGHT / 2;
 
 /// In-flight queries per source IP. Small map (one entry per active resolver), only touched
 /// on the DNS path.
 static DNS_PER_SOURCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
     std::sync::OnceLock::new();
 
-/// Claim a per-source slot, or false if that source is already at its share.
-fn dns_claim_source(src: std::net::IpAddr) -> bool {
+/// Claim a per-source slot, or false if that source is over its share while the global budget
+/// is contended. `inflight` is the global count this claim was already counted into.
+fn dns_claim_source(src: std::net::IpAddr, inflight: usize) -> bool {
     let m = DNS_PER_SOURCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let Ok(mut map) = m.lock() else { return true }; // never fail closed on DNS
     let e = map.entry(src).or_insert(0);
-    if *e >= DNS_MAX_INFLIGHT_PER_SOURCE { return false }
+    // (A rejection implies *e >= 16, so `or_insert` never leaves a stray zero entry behind.)
+    if inflight >= DNS_CONTENDED && *e >= DNS_MAX_INFLIGHT_PER_SOURCE { return false }
     *e += 1;
     true
 }
@@ -527,7 +540,8 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
             };
             // Bound concurrent handlers so a query flood (or a dead upstream parking
             // threads on the forward recv) can't exhaust PID 1's threads/fds.
-            if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
+            let level = DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if level > DNS_MAX_INFLIGHT {
                 DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 // Rate-limited visibility (1st, 101st, …): silent drops read as a
                 // network partition from inside a container — leave a trace instead.
@@ -537,7 +551,7 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
                 }
                 continue; // drop; the stub resolver retries
             }
-            if !dns_claim_source(src.ip()) {
+            if !dns_claim_source(src.ip(), level) {
                 DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 continue; // this source is at its share; others keep resolving
             }
@@ -573,13 +587,14 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
                             continue;
                         }
                     };
-                    if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
+                    let level = DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if level > DNS_MAX_INFLIGHT {
                         DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         continue; // drop (conn closes on drop); the resolver retries
                     }
                     let srcip = conn.peer_addr().map(|a| a.ip())
                         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                    if !dns_claim_source(srcip) {
+                    if !dns_claim_source(srcip, level) {
                         DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         continue; // conn closes on drop; the resolver retries
                     }
@@ -1321,7 +1336,6 @@ fn assert_conduit_guard() {
 }
 
 fn assert_direct_access_rules() {
-    assert_conduit_guard();
     use std::sync::atomic::Ordering::Relaxed;
     // `run_capture`, not `Command::output()`: the reaper's `waitpid(-1)` races `Child::wait`
     // and wins often enough (measured ~40%) that `output()` returns ECHILD for a command that
@@ -1329,9 +1343,17 @@ fn assert_direct_access_rules() {
     // retry passes with named access dead in between.
     let nft = |args: &[&str]| run_capture(
         Command::new("nft").env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args));
+    // Called on the first iteration where the gateway is known, not at the top of the
+    // function: at the top it returns immediately while GATEWAY_IP is still 0, and if the
+    // DHCP lease then landed mid-loop the allow rules went in and we returned — leaving
+    // containers able to reach GATEWAY_IP:2379 until some later trigger re-ran this. Guarded
+    // by a flag so the wait loop can't re-run it up to 60 times: it is idempotent but costs
+    // three `nft` spawns a pass, and this loop can spin for two minutes waiting for dockerd.
+    let mut guarded = false;
     for _ in 0..60 {
         let gw = GATEWAY_IP.load(Relaxed);
         if gw != 0 {
+            if !guarded { assert_conduit_guard(); guarded = true; }
             let gws = ipstr(gw);
             // The whole table appears only once dockerd's nft init has run — before
             // that there is nothing to assert into; keep waiting.
@@ -1677,7 +1699,9 @@ static VSOCK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 const VSOCK_MAX_INFLIGHT: usize = 256;
 
 fn spawn_listener(port: u32, handler: fn(RawFd)) {
-    spawn_worker("vsock-listener", move || {
+    // A failed spawn here means this vsock port is never served — the Docker API (2375) or
+    // the control channel (2374) would be silently unreachable for the VM's whole life.
+    if !spawn_worker("vsock-listener", move || {
         let lfd = match vsock_listen(port) {
             Ok(f) => f,
             Err(e) => { log!("vsock listen {port} failed: {e}"); return; }
@@ -1715,7 +1739,9 @@ fn spawn_listener(port: u32, handler: fn(RawFd)) {
                 unsafe { libc::close(cfd); }
             }
         }
-    });
+    }) {
+        log!("vinit: vsock port {port} will not be served (listener thread could not start)");
+    }
 }
 
 fn handle_control(fd: RawFd) {
@@ -1826,9 +1852,19 @@ fn start_conduit_pool() {
     spawn_worker("conduit-manager", conduit_manager);
 }
 
-fn spawn_conduit_slot() {
+/// Returns false if the slot thread could not be started.
+fn spawn_conduit_slot() -> bool {
     CONDUIT_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    spawn_worker("conduit-slot", conduit_slot);
+    // Give the slot back if the thread never started — only the thread's own reap path
+    // decrements, so a discarded failure leaks the slot forever and the manager stops
+    // topping the pool up (silently costing ~59 Gbit/s → 1.4 Gbit/s on published ports).
+    // The result MUST reach the growth loop: with the count restored but no thread, a
+    // `while CONDUIT_SLOTS < target` loop never advances and spins PID 1 at 100% — and
+    // spawn failure means fork exhaustion or ENOMEM, i.e. exactly when the guest can least
+    // afford it.
+    if spawn_worker("conduit-slot", conduit_slot) { return true }
+    CONDUIT_SLOTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    false
 }
 
 /// Wake the pool manager: a slot saw the warm pool run low and raised `DESIRED_SLOTS`.
@@ -1852,7 +1888,15 @@ fn conduit_manager() {
         // Grow toward the target. `CONDUIT_SLOTS` is incremented up-front in `spawn_conduit_slot`,
         // so it counts in-flight (still-dialing) slots — no overshoot even before they park idle.
         let target = DESIRED_SLOTS.load(Relaxed).min(CONDUIT_CAP);
-        while CONDUIT_SLOTS.load(Relaxed) < target { spawn_conduit_slot(); }
+        while CONDUIT_SLOTS.load(Relaxed) < target {
+            // Stop growing the moment a spawn fails, and park until the next starvation
+            // signal instead of retrying in a tight loop. The pool simply runs smaller;
+            // published ports fall back to the vsock relay rather than the guest wedging.
+            if !spawn_conduit_slot() {
+                log!("conduit: could not start a slot thread — pool will run below target");
+                break
+            }
+        }
 
         // Park until a starvation signal (or, while decaying, a 1s tick to step the target down).
         let decaying = DESIRED_SLOTS.load(Relaxed) > CONDUIT_FLOOR;
@@ -2038,8 +2082,15 @@ fn relay_init() {
             unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, evfd, &mut ev); }
             let w = std::sync::Arc::new(RelayWorker { epfd, evfd, queue: std::sync::Mutex::new(std::collections::VecDeque::new()) });
             let wc = w.clone();
-            spawn_worker("relay-worker", move || relay_worker_loop(wc));
-            workers.push(w);
+            // Only keep a worker whose loop actually came up. Discarding this Bool left a
+            // thread-less worker in the round-robin: relay_submit would queue a pair to it,
+            // write the eventfd nobody reads, and the connection would hang with both fds
+            // held — 1 in N published-port connections, permanently, after a single EAGAIN.
+            if spawn_worker("relay-worker", move || relay_worker_loop(wc)) {
+                workers.push(w);
+            } else {
+                unsafe { libc::close(w.epfd); libc::close(w.evfd); }
+            }
         }
         Relay { workers, next: std::sync::atomic::AtomicUsize::new(0) }
     });
@@ -2049,6 +2100,11 @@ fn relay_init() {
 /// initialised yet (shouldn't happen — relay_init runs before the pool dials).
 fn relay_submit(conduit: RawFd, container: RawFd) {
     let Some(r) = RELAY.get() else { bridge(conduit, container); return };
+    // No live worker (every epoll thread failed to spawn): fall back to the direct bridge
+    // rather than `% 0`. A divide-by-zero panic here is unwinding-free (`panic = "abort"`)
+    // in PID 1, which the kernel turns into "Attempted to kill init" — the whole VM. The
+    // host's `EventRelay` makes the same check for the same reason; keep the two mirrored.
+    if r.workers.is_empty() { bridge(conduit, container); return }
     relay_set_nonblocking(conduit); relay_set_nonblocking(container);
     let i = r.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % r.workers.len();
     let w = &r.workers[i];
@@ -2423,15 +2479,21 @@ fn child_status_deliver(pid: i32, status: i32) {
 fn run_capture(cmd: &mut Command) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     use std::io::Read;
     let cs = child_status();
+    // Hold the slot lock ACROSS the spawn. The reaper delivers into this slot, and claiming
+    // after `spawn()` returns left a window where it could collect the child first: the
+    // status was dropped, `try_wait` returned ECHILD, and the condvar then blocked the full
+    // 10 s before reporting a failure for a command that had actually succeeded. Downstream
+    // that made `assert_direct_access_rules` re-insert an nft rule it already had, so the
+    // ruleset accreted duplicates over a long session.
+    let mut slot = cs.slot.lock().ok()?;
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())   // don't hand PID 1's console to the child
         .spawn().ok()?;
     let pid = child.id() as i32;
-    {
-        let Ok(mut slot) = cs.slot.lock() else { return None };
-        *slot = Some((pid, None));
-    }
+    *slot = Some((pid, None));
+    drop(slot);
     let mut out = Vec::new();
     let mut err = Vec::new();
     if let Some(mut so) = child.stdout.take() { let _ = so.read_to_end(&mut out); }

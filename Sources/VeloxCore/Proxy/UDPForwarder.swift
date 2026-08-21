@@ -186,6 +186,7 @@ public final class UDPForwarder: @unchecked Sendable {
             self.reaper?.cancel(); self.reaper = nil
             self.relay.stop()   // tear down the shared kqueue loop (thread + kq + wakeup pipe)
         }
+        queue.settle("udp-forward")   // barrier — see PortForwarder.stopAll
     }
 
     // MARK: - private (all on `queue` unless noted)

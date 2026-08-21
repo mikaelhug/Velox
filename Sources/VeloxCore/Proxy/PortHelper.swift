@@ -101,11 +101,14 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
 
     /// Publish (or withdraw, with `port == 0`) the system resolver entry for named access.
     ///
-    /// Written at RUNTIME rather than baked in at install time, which is what lets the DNS
-    /// responder use an ephemeral port. A fixed port had to be squattable: any local process,
-    /// including another user's, could bind it while Velox was stopped and then answer
-    /// `*.velox.local` for the entire machine, since /etc/resolver routes every such query
-    /// there. Withdrawing it on stop also means the file never outlives the responder.
+    /// Written at RUNTIME rather than baked in at install time. That was introduced to allow an
+    /// ephemeral DNS port, which is NO LONGER the design — see `Paths.NamedAccess.dnsPort`: an
+    /// ephemeral port rewrites this file on every launch, and a lookup landing in the changeover
+    /// is negative-cached by mDNSResponder and never retried, which broke `*.velox.local` for a
+    /// whole session with everything else working. The port is fixed again and this file is
+    /// written once and left in place; `port == 0` is used only by the in-app uninstall. The
+    /// runtime write is still worth keeping: it means the entry is repaired if it is deleted,
+    /// without a reinstall.
     @discardableResult
     public func setResolver(port: UInt16) -> Bool {
         PortHelperClient.setResolver(port: port)
@@ -327,9 +330,6 @@ package enum PortHelperClient {
 
 /// Public, read-only view of the installer used by `EngineRuntime` to choose the DNS port.
 public enum PortHelperState {
-    /// True when the installed helper is at the revision this build requires — i.e. it
-    /// understands the `resolver` verb, so the DNS responder may take an ephemeral port.
-    public static var supportsRuntimeResolver: Bool { PortHelperInstaller.isInstalledAndCurrent() }
 }
 
 enum PortHelperInstaller {

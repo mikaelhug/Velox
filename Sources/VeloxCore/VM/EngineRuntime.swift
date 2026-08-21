@@ -66,15 +66,7 @@ public final class EngineRuntime: @unchecked Sendable {
         let registry = NameRegistry()
         let router = NamedAccessRouter(helper: helper)
         namedRouter = router
-        // Ephemeral only when the installed helper can rewrite /etc/resolver (revision 7+).
-        // With an older helper that file still names the legacy fixed port and cannot be
-        // updated, so binding ephemeral would leave every `*.velox.local` query pointed at a
-        // port nothing is listening on. Keep the legacy port until the user approves the
-        // upgrade; the next start after that goes ephemeral.
-        nameDNS = NameDNSResponder(
-            port: PortHelperState.supportsRuntimeResolver ? NamedAccess.dnsPort
-                                                          : NamedAccess.legacyDNSPort,
-            registry: registry)
+        nameDNS = NameDNSResponder(registry: registry)   // fixed port — see NamedAccess.dnsPort
         watcher = DockerEventsWatcher(
             docker: docker,
             onPorts: helper.reconciler(
@@ -143,16 +135,25 @@ public final class EngineRuntime: @unchecked Sendable {
             let installed = await self.portHelper.ensureInstalled()
             guard installed, !self.isStopped else { return }
             self.namedRouter.refresh()
-            // Publish the responder's ACTUAL (ephemeral) port to /etc/resolver now that the
-            // grant exists. Done at runtime rather than at install time so the port need not
-            // be a fixed, squattable constant — see PortHelperManager.setResolver.
+            // Publish the resolver entry, but ONLY if it isn't already correct. The port is
+            // stable, so in the steady state this is a no-op — and it must stay one:
+            // rewriting the file makes mDNSResponder re-read the domain's config, and a
+            // lookup that fails across that window is cached as NXDOMAIN and never retried.
             let dnsPort = self.nameDNS.boundPort
-            if dnsPort != 0, !self.portHelper.setResolver(port: dnsPort) {
+            if dnsPort != 0, !Self.resolverFileMatches(port: dnsPort),
+               !self.portHelper.setResolver(port: dnsPort) {
                 Log.warn("named-access: could not publish /etc/resolver/\(NamedAccess.domain) "
                          + "→ 127.0.0.1:\(dnsPort); <name>.\(NamedAccess.domain) will not resolve")
             }
         }
         adoptProbeTask(probe)
+    }
+
+    /// True when `/etc/resolver/<domain>` already names this port, so we can skip a rewrite.
+    private static func resolverFileMatches(port: UInt16) -> Bool {
+        guard let text = try? String(contentsOfFile: "/etc/resolver/\(NamedAccess.domain)",
+                                     encoding: .utf8) else { return false }
+        return text.contains("port \(port)") && text.contains("nameserver 127.0.0.1")
     }
 
     /// Whether `stop()` has run. Synchronous, so the lock is never held across an `await`.
@@ -210,21 +211,22 @@ public final class EngineRuntime: @unchecked Sendable {
         pool?.stop()
         udpForwarder.stopAll()
         clockSync.stop()
-        // ORDER MATTERS. Stop *admitting* first, then drain. Both the conduit path and the
-        // Docker-API path now hand their pairs to the one shared relay, so draining it before
-        // the producers are shut would let a connection that lands in between (an accept the
-        // proxy's async cancel hasn't stopped yet, or a vsock connect callback still in
-        // flight) be spliced in AFTER the drain and survive the stop.
+        // ORDER MATTERS, and it is now ENFORCED rather than merely intended. Both the conduit
+        // path and the Docker-API path hand their pairs to the one shared relay, so draining it
+        // before the producers are shut would let a connection that lands in between (an accept
+        // the proxy's async cancel hasn't stopped yet, or a vsock connect callback still in
+        // flight) be spliced in AFTER the drain and survive the stop. Each producer's stop is a
+        // barrier — `PortForwarder`/`UDPForwarder`/`ConduitPool` rendezvous on their serial
+        // queue, `DockerSocketProxy` cancels on its accept queue, and `VsockBridge` registers
+        // under the same lock its stop takes — so by the time we reach `EventRelay.stopAll()`
+        // nothing can still be producing.
         proxy.stop()          // stop accepting on the docker socket…
         bridge.stopAll()      // …and stop admitting new bridged streams
-        // Withdraw the system resolver entry: leaving it behind points every
-        // `*.velox.local` query on the machine at a loopback port nobody is listening on —
-        // and, worse, one that any local process is then free to take over.
-        // Synchronous only on the exit path (which runs off the main actor); otherwise
-        // dispatched, because each helper round trip is a blocking 3 s-bounded socket call.
-        let helper = portHelper
-        if waitForTeardown { helper.setResolver(port: 0) }
-        else { DispatchQueue.global().async { helper.setResolver(port: 0) } }
+        // The resolver entry is deliberately NOT withdrawn here. Removing and recreating it
+        // churns the domain's config in mDNSResponder exactly like a port change does, and a
+        // lookup that lands in that window is negatively cached and never retried. The port
+        // is stable, so leaving the file in place is both correct and inert while the engine
+        // is stopped. The in-app uninstall still removes it.
         // Now drop every established pair. These live in the shared relay, not in the pool's
         // or the bridge's own fd sets — and it is drained here rather than inside
         // `ConduitPool.stop()` so a stale pool stopping late can't cut a *newer* engine's
@@ -243,7 +245,24 @@ public final class EngineRuntime: @unchecked Sendable {
     /// Surface published-port bind failures (port, blocked?) — the GUI badges the
     /// affected port links. Call before `start()`.
     public func setPortIssueHandler(_ handler: @escaping @Sendable (UInt16, Bool) -> Void) {
-        forwarder.onBindIssue = handler
-        udpForwarder.onBindIssue = handler   // a failed UDP bind was invisible in the UI
+        // TCP and UDP publish independently, but the GUI badges a *port*, so the two streams
+        // have to be MERGED rather than allowed to overwrite each other. Wiring both straight
+        // to `handler` meant UDP binding cleanly on 5000 cleared the badge TCP had just set
+        // for 5000/tcp (and vice versa) — the warning vanished while the problem remained.
+        // Report the union and keep the per-protocol truth here.
+        let issues = Locked<(tcp: Set<UInt16>, udp: Set<UInt16>)>((tcp: [], udp: []))
+        @Sendable func merge(_ port: UInt16, _ issue: Bool, udp: Bool) {
+            // One lock hold for the whole read-modify-write: the two callbacks fire on the
+            // forwarders' own serial queues, which are DIFFERENT queues, so a get/mutate/set
+            // could interleave and drop one protocol's update.
+            let show = issues.withLock { state -> Bool in
+                if udp { if issue { state.udp.insert(port) } else { state.udp.remove(port) } }
+                else { if issue { state.tcp.insert(port) } else { state.tcp.remove(port) } }
+                return state.tcp.contains(port) || state.udp.contains(port)
+            }
+            handler(port, show)
+        }
+        forwarder.onBindIssue = { port, issue in merge(port, issue, udp: false) }
+        udpForwarder.onBindIssue = { port, issue in merge(port, issue, udp: true) }   // a failed UDP bind was invisible in the UI
     }
 }
