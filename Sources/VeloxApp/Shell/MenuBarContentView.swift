@@ -135,9 +135,9 @@ struct MenuBarContentView: View {
             }
             .keyboardShortcut(",")
             Spacer()
-            Button("Quit") {
-                Task { await engine.stop(); NSApp.terminate(nil) }
-            }
+            // `AppTerminationDelegate` flushes the guest and stops the engine for every
+            // quit route; don't stop it here as well.
+            Button("Quit") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
         }
         .controlSize(.small)

@@ -105,24 +105,45 @@ func runStart(bind: BindMode) -> Never {
 
         let manager = VMManager()
         let teardown = Teardown()
-        manager.onStop { error in
+
+        // Drop the host plumbing — same order as the GUI's `EngineController.teardown()`:
+        // stop accepting docker CLI connections and remove the host routes BEFORE flushing
+        // the guest. `waitForTeardown: true` is not optional here: the named-access routes
+        // are installed out-of-process by the porthelper, and this process calls `exit`
+        // moments later, so an async removal would simply never run and the routes would be
+        // left pointing at a dead VM. Bounded (3 s per porthelper round-trip).
+        let stopPlumbing: @Sendable () -> Void = {
             teardown.run()
-            teardown.runtime?.stop()
+            teardown.runtime?.stop(waitForTeardown: true)
             teardown.saver?.stop()
+        }
+        manager.onStop { error in
+            stopPlumbing()
             exit(error == nil ? 0 : 1)
         }
 
         // Graceful shutdown on Ctrl-C / SIGTERM: request an ACPI power-off so
         // the guest unmounts and flushes the data disk before exiting.
         var signalSources: [DispatchSourceSignal] = []
-        for sig in [SIGINT, SIGTERM] {
+        let interrupted = Locked(false)
+        // SIGHUP and SIGQUIT too: the engine is normally attached to a terminal, so closing
+        // the window (SIGHUP) used to take the default action — killing the process with no
+        // guest flush and no host-route cleanup.
+        for sig in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler {
+                // Second Ctrl-C escalates. The disposition is SIG_IGN, so without this the
+                // terminal is dead to the user for the whole flush window (up to 60 s) with
+                // no way out but `kill -9` — and each extra signal would only queue another
+                // graceful stop.
+                if interrupted.value {
+                    Log.warn("second signal — exiting now; the guest may not be flushed")
+                    exit(1)
+                }
+                interrupted.value = true
                 Log.info("signal \(sig) — flushing and stopping guest…")
-                teardown.run()
-                teardown.runtime?.stop()
-                teardown.saver?.stop()
+                stopPlumbing()
                 manager.stopGracefully { exit(0) }
             }
             source.resume()

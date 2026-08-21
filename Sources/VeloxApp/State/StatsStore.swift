@@ -102,15 +102,26 @@ final class StatsStore {
     /// kept *outside* the tracked closure so only `resources.containers` is a tracked
     /// dependency (not `latest`/the aggregate it mutates), so re-arm fires only on a
     /// container-list change, never on every stats sample.
-    private func trackRunning() {
-        guard tracking else { return }
+    private func trackRunning() { trackRunning(gen: trackGeneration) }
+
+    /// `gen` retires an observer chain across a teardown→retain cycle. `withObservationTracking`
+    /// registers a ONE-SHOT observer, and `teardown()` only cleared `tracking` — it could not
+    /// unregister the one already armed. So after retain → release → retain, the stale observer
+    /// fired too, saw `tracking == true` again, and re-registered: two chains, then three, one
+    /// more per pane-switch cycle. Each duplicate ran a full `syncStreams` ending in
+    /// `recompute(force: true)`, appending an extra sample to every 90-entry sparkline — so a
+    /// single `docker run` eventually injected a dozen identical samples in one frame.
+    private func trackRunning(gen: Int) {
+        guard tracking, gen == trackGeneration else { return }
         let running = withObservationTracking {
             runningIDs()
         } onChange: {
-            Task { @MainActor [weak self] in self?.trackRunning() }
+            Task { @MainActor [weak self] in self?.trackRunning(gen: gen) }
         }
         syncStreams(running: running)
     }
+
+    private var trackGeneration = 0
 
     private func runningIDs() -> Set<String> {
         Set(resources.containers.filter(\.isRunning).map(\.id))
@@ -194,6 +205,7 @@ final class StatsStore {
 
     private func teardown() {
         tracking = false
+        trackGeneration &+= 1   // retire the armed observer chain (see trackRunning(gen:))
         for task in streams.values { task.cancel() }
         streams.removeAll()
         latest.removeAll()

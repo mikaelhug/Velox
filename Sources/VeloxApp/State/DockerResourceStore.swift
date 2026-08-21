@@ -225,5 +225,9 @@ final class DockerResourceStore {
             return out
         }
         for (id, anchor) in fetched { anchors[id] = anchor }
+        // The 32-cap keeps one burst bounded, but with no follow-up the containers past it
+        // never got an anchor at all unless another event happened to arrive — so with >32
+        // running they rendered Docker's frozen `status` string instead of a ticking uptime.
+        if missing.count > 32 { await refreshAnchors() }
     }
 }

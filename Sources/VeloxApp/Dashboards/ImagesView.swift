@@ -26,7 +26,17 @@ final class ImagesModel {
         isPulling = true; pullStatus = "Starting…"
         defer { isPulling = false; pullStatus = "" }
         do {
-            for try await line in docker.pullImage(reference) { pullStatus = line }
+            // Throttle: `/images/create` yields a progress line per layer chunk — hundreds a
+            // second — and each assignment invalidates this @Observable, hitching the pane
+            // for the whole pull. `LogStore` (33 ms) and `StatsStore` (1 Hz) throttle for the
+            // same reason; this path didn't.
+            var lastShown = ContinuousClock.now
+            for try await line in docker.pullImage(reference) {
+                let now = ContinuousClock.now
+                guard now - lastShown >= .milliseconds(100) else { continue }
+                lastShown = now
+                pullStatus = line
+            }
         } catch {
             actionError = "\(error)"
         }
@@ -65,6 +75,15 @@ struct ImagesView: View {
         self.ui = ui
         _model = State(initialValue: ImagesModel(docker: docker, store: store))
         _tableLayout = State(initialValue: TableLayout.load("images"))
+    }
+
+    /// Selection resolved against what actually exists. `ui.imageSelection` holds raw row ids
+    /// in `PaneUIState`, which survives pane switches and engine restarts and is never pruned —
+    /// so after a `docker image prune` elsewhere the toolbar stayed armed and the dialog
+    /// offered to remove images that were already gone. Containers and Volumes both resolve;
+    /// this pane didn't.
+    private var selectedImageIDs: Set<String> {
+        ui.imageSelection.intersection(model.images.map(\.id))
     }
 
     private var filtered: [ImageSummary] {
@@ -161,21 +180,21 @@ struct ImagesView: View {
                 Button(role: .destructive) { removeConfirm = true } label: {
                     Label("Remove Selected", systemImage: "trash")
                 }
-                .disabled(ui.imageSelection.isEmpty)
-                .help(ui.imageSelection.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
+                .disabled(selectedImageIDs.isEmpty)
+                .help(selectedImageIDs.isEmpty ? "Select images to remove" : "Remove the selected image(s)")
             }
         }
         .persistTableLayout(tableLayout, "images")
         .confirmationDialog(
-            "Remove \(ui.imageSelection.count) selected image\(ui.imageSelection.count == 1 ? "" : "s")?",
+            "Remove \(selectedImageIDs.count) selected image\(selectedImageIDs.count == 1 ? "" : "s")?",
             isPresented: $removeConfirm
         ) {
             Button("Remove", role: .destructive) {
-                let ids = ui.imageSelection
+                let ids = selectedImageIDs
                 Task { await model.removeImages(ids, force: false); ui.imageSelection.removeAll() }
             }
         } message: {
-            Text("This removes the selected image\(ui.imageSelection.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
+            Text("This removes the selected image\(selectedImageIDs.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
         }
         .confirmationDialog("Prune unused images?", isPresented: $pruneConfirm) {
             Button("Prune Unused Images", role: .destructive) {

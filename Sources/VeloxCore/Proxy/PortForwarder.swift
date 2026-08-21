@@ -64,21 +64,102 @@ public final class PortForwarder: @unchecked Sendable {
         queue.async { self.conduitPool = pool }
     }
 
+    /// Set by `stopAll()`. A reconcile that lands afterwards must be inert: the
+    /// `PortHelperManager.reconciler` re-reconciles the latest port set from an unowned
+    /// `Task` that awaits the one-time admin prompt, so it can arrive long after the engine
+    /// stopped — and re-opening a listener then binds a host port on a dead runtime that
+    /// nothing will ever close (libdispatch retains a resumed source), so the *next* start
+    /// fails with EADDRINUSE for the rest of the process's life. On `queue`.
+    private var stopped = false
+    /// Bumped by every `reconcile`, so a scheduled bind retry from an older desired set
+    /// bails instead of re-opening a port that has since been unpublished. On `queue`.
+    private var reconcileGen = 0
+    /// Last desired set, so a network change can re-bind without waiting for a docker event.
+    private var lastWanted: Set<PublishedPort> = []
+    /// Accept sources currently paused for fd exhaustion (see `pauseForFDExhaustion`).
+    private var throttled: Set<ObjectIdentifier> = []
+    private static let maxBindAttempts = 5
+    private static let bindRetryDelay: DispatchTimeInterval = .milliseconds(150)
+
     /// Reconcile open listeners against the desired set of published ports.
     public func reconcile(_ wanted: Set<PublishedPort>) {
         queue.async {
-            // Close anything no longer wanted *or* whose bind address changed, then open
-            // whatever is left unserved — so a port that flips between loopback-only and
-            // the default rebinds instead of silently keeping its old address.
-            for (port, listener) in self.listeners where !wanted.contains(listener.spec) {
-                self.closeListener(port)
+            self.reconcileGen &+= 1
+            self.reconcileOnQueue(wanted, gen: self.reconcileGen, attempt: 0)
+        }
+    }
+
+    private func reconcileOnQueue(_ wanted: Set<PublishedPort>, gen: Int, attempt: Int) {
+        guard !stopped, gen == reconcileGen else { return }
+        lastWanted = wanted
+        // Close anything no longer wanted *or* whose bind address changed, then open
+        // whatever is left unserved — so a port that flips between loopback-only and
+        // the default rebinds instead of silently keeping its old address.
+        for (port, listener) in listeners where !wanted.contains(listener.spec) {
+            closeListener(port)
+        }
+        for spec in wanted where listeners[spec.port] == nil { open(spec) }
+        retryUnbound(wanted, gen: gen, attempt: attempt)
+    }
+
+    /// Re-arm the reconcile when a wanted port failed to bind. Two reasons this is not
+    /// optional:
+    ///  • **Close-then-rebind.** `closeListener` only *cancels* the accept source; the cancel
+    ///    handler that actually closes the fd is asynchronous, so re-binding the same port in
+    ///    the same pass hits EADDRINUSE (SO_REUSEADDR does not permit an identical addr:port).
+    ///    That is the normal path when a container is recreated from `-p 127.0.0.1:8080:80`
+    ///    to `-p 8080:80` and both states land in one coalescer window.
+    ///  • **Transient conflicts** — another process momentarily holding the port.
+    /// Without a retry the failure is permanent: the published-port *set* is unchanged, so
+    /// `DockerEventsWatcher.commit` never fires `onPorts` again and nothing ever revisits it.
+    private func retryUnbound(_ wanted: Set<PublishedPort>, gen: Int, attempt: Int) {
+        guard wanted.contains(where: { listeners[$0.port] == nil }),
+              attempt < Self.maxBindAttempts else { return }
+        queue.asyncAfter(deadline: .now() + Self.bindRetryDelay) { [weak self] in
+            self?.reconcileOnQueue(wanted, gen: gen, attempt: attempt + 1)
+        }
+    }
+
+    /// Re-bind listeners pinned to a SPECIFIC host address (a non-default `publishHostIP`).
+    /// That socket keeps existing after a Wi-Fi switch or DHCP renewal moves the address, but
+    /// silently stops receiving, and nothing else re-triggers a reconcile because the
+    /// published-port set is unchanged. Wildcard and loopback binds are unaffected by an
+    /// address change, so they're left alone.
+    public func rebindPinnedAddresses() {
+        queue.async {
+            guard !self.stopped else { return }
+            var changed = false
+            for (port, listener) in self.listeners {
+                let bind = listener.spec.bind(default: self.publish)
+                guard !bind.isWildcard, !bind.isLoopback else { continue }
+                self.closeListener(port); changed = true
             }
-            for spec in wanted where self.listeners[spec.port] == nil { self.open(spec) }
+            guard changed else { return }
+            self.reconcileGen &+= 1
+            self.reconcileOnQueue(self.lastWanted, gen: self.reconcileGen, attempt: 0)
+        }
+    }
+
+    /// Pause an accept source that hit EMFILE/ENFILE. The source is level-triggered and the
+    /// connection stays queued, so simply returning re-fires it immediately and spins the
+    /// queue at 100% CPU — exactly when the process can least afford it.
+    private func pauseForFDExhaustion(_ source: DispatchSourceRead, port: UInt16) {
+        let id = ObjectIdentifier(source)
+        guard throttled.insert(id).inserted else { return }
+        Log.warn("port-forward: out of file descriptors accepting on port \(port) — "
+                 + "pausing that listener briefly")
+        source.suspend()
+        queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+            guard let self, self.throttled.remove(id) != nil else { return }
+            source.resume()
         }
     }
 
     public func stopAll() {
-        queue.async { for port in Array(self.listeners.keys) { self.closeListener(port) } }
+        queue.async {
+            self.stopped = true
+            for port in Array(self.listeners.keys) { self.closeListener(port) }
+        }
     }
 
     // MARK: - private (all on `queue`)
@@ -194,7 +275,33 @@ public final class PortForwarder: @unchecked Sendable {
                 bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        return bound != 0 && errno == EADDRINUSE
+        if bound != 0 && errno == EADDRINUSE { return true }
+        // A port below 1024 fails the probe bind with EACCES, not EADDRINUSE, so this check
+        // was dead for exactly the ports that matter (:80/:443 via the privileged helper).
+        // Fall back to *connecting*: if anything accepts on 127.0.0.1:<port>, it's held.
+        if bound != 0 && errno == EACCES && type == SOCK_STREAM { return loopbackAccepts(port) }
+        return false
+    }
+
+    /// True if something is accepting TCP connections on `127.0.0.1:port`. Unprivileged and
+    /// works for privileged ports, unlike a probe bind.
+    private static func loopbackAccepts(_ port: UInt16) -> Bool {
+        let s = socket(AF_INET, SOCK_STREAM, 0)
+        guard s >= 0 else { return false }
+        defer { Darwin.close(s) }
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        return ok
     }
 
     /// Non-blocking accept source for a listening socket; owns + closes the fd on cancel.
@@ -202,7 +309,9 @@ public final class PortForwarder: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in self?.accept(on: fd, port: port) }
+        // Strong capture of `source` is deliberate: dispatch releases both handlers when the
+        // source is cancelled, so the cycle breaks exactly then.
+        source.setEventHandler { [weak self] in self?.accept(on: fd, port: port, source: source) }
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
         return source
@@ -237,10 +346,13 @@ public final class PortForwarder: @unchecked Sendable {
         Log.info("port-forward: closed \(listener.spec.bind(default: publish).label):\(port)")
     }
 
-    private func accept(on fd: Int32, port: UInt16) {
+    private func accept(on fd: Int32, port: UInt16, source: DispatchSourceRead) {
         while true {
             let client = Darwin.accept(fd, nil, nil)
-            if client < 0 { break }
+            if client < 0 {
+                if errno == EMFILE || errno == ENFILE { pauseForFDExhaustion(source, port: port) }
+                break // EWOULDBLOCK (drained) or error
+            }
             // No Nagle on the client leg: replies are written in protocol-sized pieces
             // (headers, then body) and a delayed-ACK hold-back here is pure added latency.
             // The guest/conduit leg sets its own NODELAY.

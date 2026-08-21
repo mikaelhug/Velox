@@ -9,7 +9,7 @@ public enum Versions {
     public static let githubRepo = "mikaelhug/Velox"
     /// Privileged-port-helper revision. The helper is (re)installed (one admin prompt) only when
     /// this changes — not on every Velox update. Bumped in versions.env when the helper changes.
-    public static let porthelperRevision = "6"
+    public static let porthelperRevision = "7"
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
     public static let kernelVersion = "7.1.8"

@@ -15,8 +15,56 @@ import Foundation
 /// (`RelayLoop`) instead of a thread per flow, so a source-port flood can't grow
 /// threads; host→guest writes are non-blocking (a backed-up guest costs dropped
 /// datagrams — UDP is lossy — never a stalled queue).
+/// A client's address exactly as `recvfrom` reported it, with the length it reported.
+/// A POD C struct on purpose: it is copied to the relay thread for every registration, and
+/// modelling it as an enum or with `Data` would put retain/release traffic on that hot path.
+/// Shared by `UDPForwarder` and its `RelayLoop`, hence file scope.
+private struct ClientAddr {
+    var storage = sockaddr_storage()
+    var len: socklen_t = 0
+}
+
 public final class UDPForwarder: @unchecked Sendable {
-    private struct FlowKey: Hashable { let addr: UInt32; let port: UInt16 }
+    /// A client identity that is unambiguous across BOTH address families.
+    ///
+    /// Built from explicit fields, never by hashing `sockaddr_storage` bytes: `sin6_flowinfo`
+    /// legitimately varies between datagrams from the same peer and the struct's tail padding
+    /// is uninitialised, either of which would split one client into many flows — each holding
+    /// a VSOCK fd on both sides — until the per-port flow cap started dropping traffic.
+    /// `scope` keeps two link-local peers on different interfaces apart, and `listenerFd`
+    /// keeps a v4 and a v6 client that happen to share a port from colliding.
+    private struct FlowKey: Hashable {
+        let listenerFd: Int32     // which socket it arrived on (v4 or v6 twin)
+        let v6: Bool
+        let addr: [UInt8]         // 4 bytes for v4, 16 for v6
+        let port: UInt16
+        let scope: UInt32         // sin6_scope_id; 0 for v4
+    }
+
+    /// Decompose a `recvfrom` result into a key. Returns nil for a family we don't serve.
+    private static func flowKey(_ sa: sockaddr_storage, _ listenerFd: Int32) -> FlowKey? {
+        var s = sa
+        switch Int32(s.ss_family) {
+        case AF_INET:
+            return withUnsafeBytes(of: &s) { raw -> FlowKey? in
+                let a = raw.baseAddress!.assumingMemoryBound(to: sockaddr_in.self).pointee
+                var ip = a.sin_addr.s_addr
+                let bytes = withUnsafeBytes(of: &ip) { Array($0) }
+                return FlowKey(listenerFd: listenerFd, v6: false, addr: bytes,
+                               port: UInt16(bigEndian: a.sin_port), scope: 0)
+            }
+        case AF_INET6:
+            return withUnsafeBytes(of: &s) { raw -> FlowKey? in
+                let a = raw.baseAddress!.assumingMemoryBound(to: sockaddr_in6.self).pointee
+                var ip = a.sin6_addr
+                let bytes = withUnsafeBytes(of: &ip) { Array($0) }
+                return FlowKey(listenerFd: listenerFd, v6: true, addr: bytes,
+                               port: UInt16(bigEndian: a.sin6_port), scope: a.sin6_scope_id)
+            }
+        default:
+            return nil
+        }
+    }
 
     /// Per-flow state. All mutable access is serialized on `queue` (the relay loop
     /// only holds the immutable fd/client copies handed over at registration), so the
@@ -28,20 +76,28 @@ public final class UDPForwarder: @unchecked Sendable {
         var token: UInt64 = 0            // relay-loop registration identity
         var pending: [[UInt8]] = []      // datagrams buffered during async connect
         var lastActive = Date()
-        var client = sockaddr_in()
+        var client = ClientAddr()
     }
 
     /// Mutated only on `queue`; captured by relay-loop completions that hop back here.
     private final class Listener: @unchecked Sendable {
-        let fd: Int32
-        let source: DispatchSourceRead
+        /// One entry per address family. TCP models this the same way
+        /// (`PortForwarder.Listener.sources`); UDP additionally needs the fd itself, because
+        /// unlike `accept` it both receives on and replies from the listening socket.
+        let sockets: [(fd: Int32, source: DispatchSourceRead)]
         var flows: [FlowKey: Flow] = [:]
         /// What this listener was opened for, so a changed bind address rebinds.
         let spec: PublishedPort
-        init(fd: Int32, source: DispatchSourceRead, spec: PublishedPort) {
-            self.fd = fd; self.source = source; self.spec = spec
+        init(sockets: [(fd: Int32, source: DispatchSourceRead)], spec: PublishedPort) {
+            self.sockets = sockets; self.spec = spec
         }
     }
+
+    /// Reported when a published UDP port can't be served (true) or recovers (false), so the
+    /// GUI badges it. TCP had this; UDP failures were a log line only, i.e. invisible.
+    /// Note the store is keyed by port number alone, so a port published on both protocols
+    /// shares one badge.
+    public var onBindIssue: (@Sendable (UInt16, Bool) -> Void)?
 
     private let manager: VMManager
     /// Source of sockets for privileged (<1024) UDP ports (nil ⇒ skipped).
@@ -73,20 +129,59 @@ public final class UDPForwarder: @unchecked Sendable {
         self.publish = publish
     }
 
+    /// Set by `stopAll()`. A reconcile that lands afterwards must be inert: the
+    /// `PortHelperManager.reconciler` re-reconciles the latest port set from an unowned
+    /// `Task` that awaits the one-time admin prompt, so it can arrive long after the engine
+    /// stopped — and re-opening a listener then binds a host port on a dead runtime that
+    /// nothing will ever close (libdispatch retains a resumed source), so the *next* start
+    /// fails with EADDRINUSE for the rest of the process's life. On `queue`.
+    private var stopped = false
+    /// Bumped by every `reconcile`, so a scheduled bind retry from an older desired set
+    /// bails instead of re-opening a port that has since been unpublished. On `queue`.
+    private var reconcileGen = 0
+    private static let maxBindAttempts = 5
+    private static let bindRetryDelay: DispatchTimeInterval = .milliseconds(150)
+
     /// Reconcile open UDP listeners against the desired set of published ports.
     public func reconcile(_ wanted: Set<PublishedPort>) {
         queue.async {
-            // Close what's unwanted or rebound, then open what's unserved (see PortForwarder).
-            for (port, listener) in self.listeners where !wanted.contains(listener.spec) {
-                self.closeListener(port)
-            }
-            for spec in wanted where self.listeners[spec.port] == nil { self.open(spec) }
-            self.updateReaper()
+            self.reconcileGen &+= 1
+            self.reconcileOnQueue(wanted, gen: self.reconcileGen, attempt: 0)
+        }
+    }
+
+    private func reconcileOnQueue(_ wanted: Set<PublishedPort>, gen: Int, attempt: Int) {
+        guard !stopped, gen == reconcileGen else { return }
+        // Close what's unwanted or rebound, then open what's unserved (see PortForwarder).
+        for (port, listener) in listeners where !wanted.contains(listener.spec) {
+            closeListener(port)
+        }
+        for spec in wanted where listeners[spec.port] == nil { open(spec) }
+        updateReaper()
+        retryUnbound(wanted, gen: gen, attempt: attempt)
+    }
+
+    /// Re-arm the reconcile when a wanted port failed to bind. Two reasons this is not
+    /// optional:
+    ///  • **Close-then-rebind.** `closeListener` only *cancels* the accept source; the cancel
+    ///    handler that actually closes the fd is asynchronous, so re-binding the same port in
+    ///    the same pass hits EADDRINUSE (SO_REUSEADDR does not permit an identical addr:port).
+    ///    That is the normal path when a container is recreated from `-p 127.0.0.1:8080:80`
+    ///    to `-p 8080:80` and both states land in one coalescer window.
+    ///  • **Transient conflicts** — another process momentarily holding the port.
+    /// Without a retry the failure is permanent: the published-port *set* is unchanged, so
+    /// `DockerEventsWatcher.commit` never fires `onPorts` again and nothing ever revisits it.
+    private func retryUnbound(_ wanted: Set<PublishedPort>, gen: Int, attempt: Int) {
+        guard wanted.contains(where: { listeners[$0.port] == nil }),
+              attempt < Self.maxBindAttempts else { return }
+        queue.asyncAfter(deadline: .now() + Self.bindRetryDelay) { [weak self] in
+            self?.reconcileOnQueue(wanted, gen: gen, attempt: attempt + 1)
         }
     }
 
     public func stopAll() {
         queue.async {
+            self.stopped = true
             for port in Array(self.listeners.keys) { self.closeListener(port) }
             self.reaper?.cancel(); self.reaper = nil
             self.relay.stop()   // tear down the shared kqueue loop (thread + kq + wakeup pipe)
@@ -108,51 +203,113 @@ public final class UDPForwarder: @unchecked Sendable {
             }
             publish = .loopback
         }
+        // IPv4 first — it is required; the v6 twin is best-effort (see below).
         let fd: Int32
         if port < 1024 {
-            // Privileged UDP port: bound by the root helper (<1024).
             guard let pfd = privilegedBinder?.boundListener(port: port, proto: .udp,
                                                             ipv6: false, wildcard: publish.isWildcard) else {
                 if warnedPrivileged.insert(port).inserted {
                     Log.warn("udp-forward: \(publish.label):\(port)/udp needs the privileged helper — not authorized yet")
                 }
+                onBindIssue?(port, true)
                 return
             }
             fd = pfd
         } else {
-            let s = socket(AF_INET, SOCK_DGRAM, 0)
-            guard s >= 0 else { return }
-            var yes: Int32 = 1
-            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = port.bigEndian
-            addr.sin_addr.s_addr = publish.v4
-            let bound = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-            guard bound == 0 else {
+            guard let s = Self.bindUDP(port: port, v4: publish.v4) else {
                 Log.warn("udp-forward: could not bind \(publish.label):\(port)/udp (errno \(errno))")
-                Darwin.close(s); return
+                onBindIssue?(port, true)
+                return
             }
             fd = s
         }
+        var sockets = [(fd: fd, source: makeReadSource(fd: fd, port: port))]
+
+        // The IPv6 twin (V6ONLY, so it never shadows the v4 socket). macOS resolves
+        // `localhost` to `::1` FIRST, so without this a published UDP service is simply
+        // unreachable via `localhost` — the exact failure `PublishBind` documents and that
+        // TCP has always handled. Best-effort and warn-only: a v6 failure must still leave
+        // the v4 listener registered, or `retryUnbound` spins and the port never opens.
+        if let v6addr = publish.v6 {
+            let v6fd: Int32?
+            if port < 1024 {
+                v6fd = privilegedBinder?.boundListener(port: port, proto: .udp,
+                                                       ipv6: true, wildcard: publish.isWildcard)
+            } else {
+                v6fd = Self.bindUDP6(port: port, address: v6addr)
+            }
+            if let f = v6fd {
+                sockets.append((fd: f, source: makeReadSource(fd: f, port: port)))
+            } else {
+                Log.warn("udp-forward: \(publish.label):\(port)/udp bound v4 only — no IPv6 twin "
+                         + "(localhost may resolve to ::1 and fail)")
+            }
+        }
+
+        let listener = Listener(sockets: sockets, spec: spec)
+        listeners[port] = listener
+        warnedPrivileged.remove(port)
+        for s in sockets { s.source.resume() }
+        onBindIssue?(port, false)   // serving now — clear any earlier badge
+        Log.info("udp-forward: \(publish.label):\(port)/udp → guest:\(port)/udp"
+                 + (sockets.count == 2 ? " (v4+v6)" : ""))
+    }
+
+    /// A non-blocking UDP socket bound to `v4`:`port`, or nil.
+    private static func bindUDP(port: UInt16, v4: in_addr_t) -> Int32? {
+        let s = socket(AF_INET, SOCK_DGRAM, 0)
+        guard s >= 0 else { return nil }
+        var yes: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = v4
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { let e = errno; Darwin.close(s); errno = e; return nil }
+        return s
+    }
+
+    /// The V6ONLY twin, so it never shadows the v4 socket.
+    private static func bindUDP6(port: UInt16, address: in6_addr) -> Int32? {
+        let s = socket(AF_INET6, SOCK_DGRAM, 0)
+        guard s >= 0 else { return nil }
+        var yes: Int32 = 1
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = port.bigEndian
+        addr.sin6_addr = address
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(s, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        guard bound == 0 else { let e = errno; Darwin.close(s); errno = e; return nil }
+        return s
+    }
+
+    /// The read source for one listening socket. The fd is CAPTURED, not re-derived from
+    /// `listeners[port]` — with two sockets per port there is no single "the" fd any more,
+    /// and the handler must know which one the datagram arrived on so the reply goes back
+    /// out of the same socket. (TCP does the same in `makeAcceptSource`.)
+    private func makeReadSource(fd: Int32, port: UInt16) -> DispatchSourceRead {
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in self?.readDatagrams(port) }
+        source.setEventHandler { [weak self] in self?.readDatagrams(port: port, fd: fd) }
         source.setCancelHandler { Darwin.close(fd) }
-        let listener = Listener(fd: fd, source: source, spec: spec)
-        listeners[port] = listener
-        warnedPrivileged.remove(port)
-        source.resume()
-        Log.info("udp-forward: \(publish.label):\(port)/udp → guest:\(port)/udp")
+        return source
     }
 
     private func closeListener(_ port: UInt16) {
         warnedPrivileged.remove(port)
+        onBindIssue?(port, false) // unpublished → whatever issue it had is moot
         guard let listener = listeners.removeValue(forKey: port) else { return }
         // Every flow must be deregistered from the relay loop BEFORE the shared UDP fd
         // closes: a sendto on a closed (kernel-reused) fd number could misdirect
@@ -164,33 +321,42 @@ public final class UDPForwarder: @unchecked Sendable {
         // The listener's own bind, not the default — a loopback-only port closes as such.
         // Captured by value: the completion below is @Sendable.
         let label = listener.spec.bind(default: publish).label
+        // BOTH sockets' sources must stay behind the countdown: the fd-reuse hazard above
+        // applies to whichever socket a flow replies on, so cancelling either early re-opens
+        // it.
+        let sources = listener.sockets.map(\.source)
         guard !flows.isEmpty else {
-            listener.source.cancel()
+            for src in sources { src.cancel() }
             Log.info("udp-forward: closed \(label):\(port)/udp")
             return
         }
         let remaining = Countdown(flows.count) {
-            listener.source.cancel()
+            for src in sources { src.cancel() }
             Log.info("udp-forward: closed \(label):\(port)/udp")
         }
         for (_, flow) in flows { teardown(flow) { remaining.hit() } }
     }
 
-    /// Drain all pending datagrams on a port's UDP socket, demultiplex by client.
-    private func readDatagrams(_ port: UInt16) {
+    /// Drain all pending datagrams on ONE of a port's UDP sockets (v4 or v6), demultiplex
+    /// by client. `fd` is the socket the event fired on — replies must go back out of the
+    /// same one, and it is part of the flow identity.
+    private func readDatagrams(port: UInt16, fd: Int32) {
         guard let listener = listeners[port] else { return }
         var buf = [UInt8](repeating: 0, count: 65535)
         while true {
-            var from = sockaddr_in()
-            var flen = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let n = withUnsafeMutablePointer(to: &from) { fp in
+            var client = ClientAddr()
+            client.len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let n = withUnsafeMutablePointer(to: &client.storage) { fp in
                 fp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    recvfrom(listener.fd, &buf, buf.count, 0, sa, &flen)
+                    recvfrom(fd, &buf, buf.count, 0, sa, &client.len)
                 }
             }
-            if n <= 0 { break }
+            // n == 0 is a legitimate ZERO-LENGTH datagram (keepalives and several
+            // protocols send them), not EOF — UDP sockets have no EOF. Treating it as one
+            // both discarded the datagram and exited the drain loop early.
+            if n < 0 { break }
             let datagram = Array(buf[0..<n])
-            let key = FlowKey(addr: from.sin_addr.s_addr, port: from.sin_port)
+            guard let key = Self.flowKey(client.storage, fd) else { continue }
             if let flow = listener.flows[key] {
                 flow.lastActive = Date()
                 if flow.ready {
@@ -204,7 +370,7 @@ public final class UDPForwarder: @unchecked Sendable {
                 continue // over the per-port flow cap — drop (UDP is lossy); bounds fds
             } else {
                 let flow = Flow()
-                flow.client = from
+                flow.client = client
                 flow.pending.append(datagram)
                 listener.flows[key] = flow
                 connect(flow, port: port, key: key)
@@ -246,12 +412,22 @@ public final class UDPForwarder: @unchecked Sendable {
                         return
                     }
                     flow.token = self.relay.add(
-                        fd: vsockFd, listenerFd: listener.fd, client: flow.client,
+                        fd: vsockFd, listenerFd: key.listenerFd, client: flow.client,
                         touch: { [weak self] in self?.touch(port: port, key: key) },
                         onEOF: { [weak self] in
                             guard let self else { return }
                             self.queue.async { self.reclaim(port: port, key: key) }
                         })
+                    guard flow.token != 0 else {
+                        // The relay refused the registration (torn down, or its loop failed to
+                        // start). Marking it registered anyway sent `teardown` down the
+                        // `drop()` path, whose `done()` would never fire — so this fd was
+                        // never closed and the listener's Countdown never completed.
+                        Darwin.close(vsockFd)
+                        flow.vsockFd = -1; flow.ready = false
+                        listener.flows[key] = nil
+                        return
+                    }
                     flow.registered = true
                 }
             }
@@ -371,8 +547,11 @@ private final class RelayLoop: @unchecked Sendable {
     struct Registration {
         let fd: Int32
         let token: UInt64
+        /// The socket the client's datagrams ARRIVED on — replies must leave by the same one
+        /// (a v6 client's reply on the v4 socket fails EAFNOSUPPORT, and the `sendto` result
+        /// is discarded, so it would be a silent one-way blackhole).
         let listenerFd: Int32
-        let client: sockaddr_in
+        let client: ClientAddr
         let touch: @Sendable () -> Void
         let onEOF: @Sendable () -> Void
     }
@@ -386,6 +565,7 @@ private final class RelayLoop: @unchecked Sendable {
         var need = 0                   // payload length (valid once the header completed)
         var inHeader = true
         var lastTouch = Date.distantPast
+        var deliverErrors = 0
         init(_ reg: Registration) { self.reg = reg }
     }
 
@@ -407,7 +587,7 @@ private final class RelayLoop: @unchecked Sendable {
 
     /// Register a flow's vsock fd (must already be non-blocking). Returns the token
     /// that `drop` needs (registration identity — fd numbers get reused).
-    func add(fd: Int32, listenerFd: Int32, client: sockaddr_in,
+    func add(fd: Int32, listenerFd: Int32, client: ClientAddr,
              touch: @escaping @Sendable () -> Void,
              onEOF: @escaping @Sendable () -> Void) -> UInt64 {
         lock.lock()
@@ -419,7 +599,11 @@ private final class RelayLoop: @unchecked Sendable {
         let needStart = !started
         started = true
         lock.unlock()
-        if needStart { start() }
+        if needStart, !start() {
+            // Roll back so `drop()` takes its `done()`-now path and the caller's fd is closed.
+            lock.lock(); started = false; stopped = true; commands.removeAll(); lock.unlock()
+            return 0
+        }
         wake()
         return token
     }
@@ -447,14 +631,30 @@ private final class RelayLoop: @unchecked Sendable {
         if running { wake() }
     }
 
-    private func start() {
+    /// Returns false if the loop could not be created. The caller must then treat the loop as
+    /// never-started: leaving `started == true` makes `drop()` queue a command nobody will
+    /// service, so `done()` never fires, the flow's vsock fd is never closed, and the
+    /// listener's `Countdown` never completes — a permanent fd leak per flow plus a listener
+    /// socket that stays bound forever.
+    private func start() -> Bool {
         kq = kqueue()
-        var fds: [Int32] = [0, 0]
-        _ = fds.withUnsafeMutableBufferPointer { pipe($0.baseAddress) }
+        guard kq >= 0 else {
+            Log.error("udp relay: kqueue() failed (\(errno)) — UDP forwarding unavailable")
+            return false
+        }
+        var fds: [Int32] = [-1, -1]
+        // Unchecked, a failed pipe() left the fds at 0 and registered *stdin* as the wakeup
+        // pipe (the same bug EventRelay documents).
+        guard fds.withUnsafeMutableBufferPointer({ pipe($0.baseAddress) }) == 0 else {
+            Log.error("udp relay: pipe() failed (\(errno)) — UDP forwarding unavailable")
+            close(kq); kq = -1
+            return false
+        }
         pipeR = fds[0]; pipeW = fds[1]
         let fl = fcntl(pipeR, F_GETFL, 0)
         _ = fcntl(pipeR, F_SETFL, fl | O_NONBLOCK)
         Thread.detachNewThread { [self] in run() }
+        return true
     }
 
     private func wake() {
@@ -560,15 +760,23 @@ private final class RelayLoop: @unchecked Sendable {
     }
 
     private func deliver(_ entry: Entry) {
-        var client = entry.reg.client
+        var client = entry.reg.client.storage
+        // The length `recvfrom` reported, never `sizeof(sockaddr_in)` — a v6 address with a
+        // v4 length is EINVAL, and since the result is discarded that failure is invisible.
+        let salen = entry.reg.client.len
         let need = entry.need
-        _ = entry.payload.withUnsafeBytes { raw in
+        let sent = entry.payload.withUnsafeBytes { raw in
             withUnsafePointer(to: &client) { cp in
                 cp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    sendto(entry.reg.listenerFd, raw.baseAddress, need, 0, sa,
-                           socklen_t(MemoryLayout<sockaddr_in>.size))
+                    sendto(entry.reg.listenerFd, raw.baseAddress, need, 0, sa, salen)
                 }
             }
+        }
+        // Don't swallow it entirely: a persistent reply failure is a one-way blackhole that
+        // otherwise looks exactly like a silent application bug.
+        if sent < 0, entry.deliverErrors == 0 {
+            entry.deliverErrors += 1
+            Log.warn("udp-forward: reply sendto failed (errno \(errno)) — client may see no response")
         }
         // Idle-tracking ping, throttled to ≤1 queue hop per second per flow so a
         // high-rate stream doesn't flood the forwarder queue with touch tasks.

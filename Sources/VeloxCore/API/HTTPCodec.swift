@@ -173,7 +173,18 @@ final class SocketChannel {
             guard let size = Int(hex.trimmingCharacters(in: .whitespaces), radix: 16) else {
                 throw DockerError.transport("bad chunk size \"\(sizeLine)\"")
             }
-            if size == 0 { _ = try readLine(); return } // trailer CRLF
+            if size == 0 {
+                // RFC 9112: the terminal chunk may be followed by trailer FIELDS, then a
+                // final empty line. Reading exactly one line consumed only the first of
+                // those, leaving the rest in the buffer — harmless today only because every
+                // request sends `Connection: close` and the fd is closed per request, but a
+                // silent stream desync the moment connection reuse is introduced. Bounded so
+                // a peer can't hold us here forever.
+                for _ in 0..<64 {
+                    guard let line = try readLine(), !line.isEmpty else { return }
+                }
+                return
+            }
             let chunk = try readExactly(size)
             _ = try readLine() // trailing CRLF after chunk data
             if !chunk.isEmpty { onBytes(chunk) }

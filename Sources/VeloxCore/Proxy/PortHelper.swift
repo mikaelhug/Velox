@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// Host side of the privileged port helper (`velox-porthelper`).
 ///
@@ -63,19 +64,31 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
         guard let fd = PortHelperClient.requestListener(port: port, proto: proto, ipv6: ipv6) else {
             return nil
         }
-        warnLegacyOnce(port: port)
+        warnDegradedOnce(port: port)
         return fd
     }
 
-    /// Warn once per port when the installed helper is too old for all-interface binds.
-    private func warnLegacyOnce(port: UInt16) {
+    /// Warn once per port when a wildcard bind was downgraded to loopback.
+    ///
+    /// The helper answers with a bare status byte, so the client cannot tell "EINVAL, unknown
+    /// `any` verb" from "EADDRINUSE on that address". Blaming an outdated helper
+    /// unconditionally sent users to restart and re-approve — advice that fixes nothing when
+    /// something else simply holds the address. Use the installed revision, which we DO know,
+    /// to say the right thing.
+    private func warnDegradedOnce(port: UInt16) {
         lock.lock()
         let firstTime = warnedLegacyBind.insert(port).inserted
         lock.unlock()
         guard firstTime else { return }
-        Log.warn("port-forward: the installed privileged helper predates all-interface binds — "
-                 + "port \(port) is bound on 127.0.0.1 only and is NOT reachable from other "
-                 + "machines. Restart Velox and approve the helper upgrade to fix it.")
+        if PortHelperInstaller.isInstalledAndCurrent() {
+            Log.warn("port-forward: could not bind port \(port) on all interfaces (something "
+                     + "else is likely holding that address) — it is bound on 127.0.0.1 only "
+                     + "and is NOT reachable from other machines.")
+        } else {
+            Log.warn("port-forward: the installed privileged helper predates all-interface "
+                     + "binds — port \(port) is bound on 127.0.0.1 only and is NOT reachable "
+                     + "from other machines. Restart Velox and approve the helper upgrade.")
+        }
     }
 
     /// Add/remove a host route to a container subnet via the helper (named-access routing).
@@ -84,6 +97,18 @@ public final class PortHelperManager: PrivilegedPortBinder, @unchecked Sendable 
     @discardableResult
     public func route(add: Bool, subnet: String, gateway: String) -> Bool {
         PortHelperClient.route(add: add, subnet: subnet, gateway: gateway)
+    }
+
+    /// Publish (or withdraw, with `port == 0`) the system resolver entry for named access.
+    ///
+    /// Written at RUNTIME rather than baked in at install time, which is what lets the DNS
+    /// responder use an ephemeral port. A fixed port had to be squattable: any local process,
+    /// including another user's, could bind it while Velox was stopped and then answer
+    /// `*.velox.local` for the entire machine, since /etc/resolver routes every such query
+    /// there. Withdrawing it on stop also means the file never outlives the responder.
+    @discardableResult
+    public func setResolver(port: UInt16) -> Bool {
+        PortHelperClient.setResolver(port: port)
     }
 
     /// Switch `net.inet.ip.forwarding` back on via the helper (restore-only — the
@@ -220,6 +245,15 @@ package enum PortHelperClient {
         return recv(fd, &status, 1, 0) == 1 && status == 0
     }
 
+    /// Point `/etc/resolver/<domain>` at `127.0.0.1:<port>`, or remove it with port 0.
+    package static func setResolver(port: UInt16) -> Bool {
+        guard let fd = connectToDaemon() else { return false }
+        defer { close(fd) }
+        guard FDIO.writeAll(fd, Array("resolver \(port)\n".utf8)) else { return false }
+        var status: UInt8 = 0xFF
+        return recv(fd, &status, 1, 0) == 1 && status == 0
+    }
+
     /// Ask the helper to restore `net.inet.ip.forwarding=1` (it can never set 0).
     package static func restoreIPForwarding() -> Bool {
         guard let fd = connectToDaemon() else { return false }
@@ -291,6 +325,13 @@ package enum PortHelperClient {
 
 // MARK: - Installer (one-time admin-authorized LaunchDaemon install)
 
+/// Public, read-only view of the installer used by `EngineRuntime` to choose the DNS port.
+public enum PortHelperState {
+    /// True when the installed helper is at the revision this build requires — i.e. it
+    /// understands the `resolver` verb, so the DNS responder may take an ephemeral port.
+    public static var supportsRuntimeResolver: Bool { PortHelperInstaller.isInstalledAndCurrent() }
+}
+
 enum PortHelperInstaller {
     static let label = "dev.velox.porthelper"
     static let installedBinary = "/Library/PrivilegedHelperTools/dev.velox.porthelper"
@@ -334,13 +375,43 @@ enum PortHelperInstaller {
         return nil
     }
 
+    /// A `codesign` designated-requirement string pinning the running app's signing
+    /// authority, or nil when the app is ad-hoc/unsigned (local builds). Read from the
+    /// *running* bundle, which is the thing the user actually authorized.
+    static func signingIdentityRequirement() -> String? {
+        var codeRef: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &codeRef) == errSecSuccess,
+              let code = codeRef else { return nil }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation),
+                                            &infoRef) == errSecSuccess,
+              let info = infoRef as? [String: Any],
+              let chain = info[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              let leaf = chain.first else { return nil }
+        var cn: CFString?
+        guard SecCertificateCopyCommonName(leaf, &cn) == errSecSuccess, let name = cn as String? else {
+            return nil
+        }
+        return "anchor apple generic and certificate leaf[subject.CN] = \"\(name)\""
+    }
+
     static func install() async -> Bool {
         guard let helper = bundledHelperURL() else {
             Log.warn("port-helper: bundled velox-porthelper not found — cannot install")
             return false
         }
+        // `codesign --verify` alone only proves the binary wasn't modified after signing —
+        // the same user could re-sign it ad-hoc. When the running app carries a real signing
+        // identity, pin the helper to that same identity so a re-signed substitute is
+        // rejected too. Nil for ad-hoc/unsigned builds, where no such pin exists.
+        let requirement = signingIdentityRequirement()
+        if requirement == nil {
+            Log.warn("port-helper: this build is not Developer-ID signed, so the helper can "
+                     + "only be checked for tampering, not for provenance")
+        }
         let plistB64 = Data(launchDaemonPlist(uid: getuid()).utf8).base64EncodedString()
-        let script = installScript(helperSrc: helper.path, plistB64: plistB64, version: requiredRevision)
+        let script = installScript(helperSrc: helper.path, plistB64: plistB64,
+                                   version: requiredRevision, requirement: requirement)
         Log.info("port-helper: requesting authorization to install the privileged port helper")
         let prompt = "Velox needs administrator access once to enable direct container access — "
             + "reaching containers by name (like web.velox.local), publishing ports below 1024 "
@@ -381,8 +452,22 @@ enum PortHelperInstaller {
     /// One privileged shell command (so one auth prompt) that installs the binary,
     /// the LaunchDaemon, and (re)bootstraps it. The plist is base64-piped so the whole
     /// thing stays a single line — no heredoc/newlines to fight the AppleScript string.
-    private static func installScript(helperSrc: String, plistB64: String, version: String) -> String {
-        [
+    private static func installScript(helperSrc: String, plistB64: String, version: String,
+                                     requirement: String?) -> String {
+        // Verify the payload BEFORE root copies it. `helperSrc` lives inside the app bundle,
+        // which is owned by the unprivileged user (`/Applications/Velox.app` is
+        // `mikael:admin`, mode 755) — so without this, malware running as the user could
+        // overwrite the bundled helper, wait for the next install or revision bump, and have
+        // the user's legitimate-looking Velox prompt bootstrap *its* binary as a permanent
+        // root LaunchDaemon. `codesign --verify` fails on any modified binary; when the build
+        // is Developer-ID signed we additionally pin the signing identity, which an attacker
+        // cannot reproduce. (An ad-hoc local build can be re-signed by the same user, so that
+        // case is defence-in-depth only — the real fix there is shipping signed.)
+        let verify = requirement.map {
+            "codesign --verify --strict -R \(shq($0)) \(shq(helperSrc))"
+        } ?? "codesign --verify --strict \(shq(helperSrc))"
+        return [
+            verify,
             "mkdir -p /Library/PrivilegedHelperTools '/Library/Application Support/Velox'",
             "cp \(shq(helperSrc)) \(shq(installedBinary))",
             "chown root:wheel \(shq(installedBinary))",
@@ -394,12 +479,11 @@ enum PortHelperInstaller {
             "chown root:wheel \(shq(plistPath))",
             "chmod 644 \(shq(plistPath))",
             "printf '%s' \(shq(version)) > \(shq(versionMarker))",
-            // Direct (named) container access: route *.<domain> DNS queries to Velox's loopback
-            // responder. Folded into the same one-time grant as the port helper (CLAUDE.md §2) so
-            // the user is prompted only once. The responder port is fixed, so the file is static.
+            // NOTE: /etc/resolver/<domain> is deliberately NOT written here any more. It is
+            // published at engine start (and withdrawn at stop) through the helper's
+            // `resolver` verb, so the responder can use an ephemeral port instead of a fixed,
+            // squattable one — and so the file never points at a port nobody is listening on.
             "mkdir -p /etc/resolver",
-            "printf 'nameserver 127.0.0.1\\nport %s\\n' \(shq(String(NamedAccess.dnsPort))) > /etc/resolver/\(shq(NamedAccess.domain))",
-            "chmod 644 /etc/resolver/\(shq(NamedAccess.domain))",
             "launchctl bootout system \(shq(plistPath)) 2>/dev/null; true",
             "launchctl bootstrap system \(shq(plistPath))",
         ].joined(separator: " && ")

@@ -23,10 +23,14 @@ ARG DOCKER_SHA256
 FROM ${RUST_BUILD_IMAGE} AS vinit
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-COPY vinit/Cargo.toml ./
+COPY vinit/Cargo.toml vinit/Cargo.lock ./
 COPY vinit/src ./src
 # rust:alpine already targets *-musl, so a normal release build is fully static.
-RUN cargo build --release && strip target/release/vinit && cp target/release/vinit /vinit
+# `--locked`: without the lockfile in the context, cargo re-resolved `libc = "0.2"` to
+# whatever was newest on crates.io at build time — floating dependencies compiled into the
+# VM's PID 1, and two builds of the same commit producing different bytes (which also
+# quietly invalidated the premise of the rootfs cache key, since Cargo.lock IS hashed into it).
+RUN cargo build --locked --release && strip target/release/vinit && cp target/release/vinit /vinit
 
 # --- Docker static server binaries ---
 FROM ${ALPINE_IMAGE} AS docker

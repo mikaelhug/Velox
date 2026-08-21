@@ -11,25 +11,95 @@ enum WindowID {
 /// The Velox desktop app: a menu-bar engine controller plus a dashboard window
 /// and a settings window. The engine runs in-process, so this single app both
 /// hosts the VM and renders its Docker resources.
-/// Makes *every* route out of the app stop the engine, not just the menu-bar Quit button.
-/// ⌘Q from the Dashboard or Settings window, "Quit" from the Dock menu, and a
-/// logout-initiated terminate all arrive here — and previously killed the process outright,
-/// so the guest's filesystems were never flushed. The stop runs on the main actor and the
-/// terminate is deferred until it finishes, the same contract the menu-bar button has.
+/// The single place the engine is stopped on the way out. ⌘Q, "Quit" from the Dock menu,
+/// the menu-bar panel's Quit button and a logout-initiated terminate all arrive here — they
+/// used to kill the process outright, so the guest's filesystems were never flushed. The
+/// terminate is deferred until the flush + power-off finishes.
+///
+/// That stop runs **off the main actor** and its reply is delivered on the **run loop**, so
+/// the guest still gets flushed when the UI is busy, and `NSApp.terminate` is safe to call
+/// from anywhere — including inside a Task. See `replyOnMainRunLoop` for why that matters.
 @MainActor
 final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
-    /// Set once the app's engine exists; nil during early launch.
-    static weak var engine: EngineController?
+    /// Set once the app's engine exists; nil during early launch. Strong on purpose —
+    /// a nil here silently skips the guest flush this whole class exists to guarantee,
+    /// and the controller lives for the process anyway.
+    static var engine: EngineController?
     private var stopping = false
+    private var replied = false
+    private var watchdog: Timer?
+    /// Signalled when the engine shutdown finishes. Lets a *second* terminate request wait
+    /// for the shutdown already in flight instead of having to choose between cancelling it
+    /// and killing the guest. Nonisolated: the completion fires on a background queue.
+    private nonisolated let shutdownDone = DispatchSemaphore(value: 0)
+
+    /// Backstop only. The stop itself is bounded (`VMManager.stopGracefully` gives the guest
+    /// flush 60 s) and runs off the main actor, so this should never fire.
+    private static let stopDeadline: TimeInterval = 90
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let engine = Self.engine, !stopping else { return .terminateNow }
-        stopping = true
-        Task {
-            await engine.stop()
-            NSApp.reply(toApplicationShouldTerminate: true)
+        guard let engine = Self.engine else { return .terminateNow }
+        // A second request — an impatient ⌘Q, or a logout/restart arriving while a ⌘Q
+        // shutdown is still in flight (the guest `sync()` alone gets up to 60 s). Neither
+        // simple answer is right: `.terminateNow` kills the guest mid-flush and tears the
+        // ext4 image, `.terminateCancel` aborts the user's entire logout. So wait for the
+        // shutdown already running and then answer truthfully. Blocking the main thread here
+        // is safe *because* that shutdown is deliberately main-actor-independent — see
+        // `EngineController.shutdownForTerminate`. Bounded, so a logout can't be held up
+        // indefinitely, and it doubles as the escape hatch if the reply was already spent.
+        if stopping {
+            if shutdownDone.wait(timeout: .now() + Self.stopDeadline) == .timedOut {
+                Log.warn("engine stop did not finish in \(Int(Self.stopDeadline))s — terminating anyway")
+            }
+            shutdownDone.signal()   // keep the gate open for any further request
+            return .terminateNow
         }
+        stopping = true
+        engine.shutdownForTerminate {
+            self.shutdownDone.signal()
+            self.replyOnMainRunLoop()
+        }
+        armWatchdog()
         return .terminateLater
+    }
+
+    /// Answer AppKit's deferred terminate exactly once — the stop path and the
+    /// watchdog both route through here, and a second reply is a hard AppKit error.
+    private func reply() {
+        guard !replied else { return }
+        replied = true
+        watchdog?.invalidate()
+        watchdog = nil
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
+
+    /// Answer the deferred terminate from the **run loop**, not the main queue.
+    ///
+    /// This is the crux of the quit path. While AppKit waits out a `.terminateLater` it
+    /// spins a nested run loop, and libdispatch refuses to re-enter the main-queue drain
+    /// from inside one — so anything scheduled with `DispatchQueue.main` or an unstructured
+    /// `Task` may never run, and the reply never arrives (the app then hangs with no way out
+    /// but Force Quit). A `CFRunLoopPerformBlock` in the modes that nested loop actually
+    /// runs always lands. Keeping the reply on this route is what makes the terminate safe
+    /// no matter where `NSApp.terminate` was called from.
+    nonisolated private func replyOnMainRunLoop() {
+        RunLoop.main.perform(inModes: [.common, .default, .modalPanel]) {
+            MainActor.assumeIsolated { self.reply() }
+        }
+    }
+
+    /// Last-resort deadline, in case the stop never reports back at all. A run-loop timer
+    /// for the same reason `replyOnMainRunLoop` exists — a dispatch-based one would not fire.
+    private func armWatchdog() {
+        let timer = Timer(timeInterval: Self.stopDeadline, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                Log.warn("engine stop did not finish in \(Int(Self.stopDeadline))s — terminating anyway")
+                self.reply()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        watchdog = timer
     }
 }
 

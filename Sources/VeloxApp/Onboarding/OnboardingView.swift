@@ -42,7 +42,7 @@ struct OnboardingView: View {
                              hint: "Requires Apple Silicon and macOS 15+.")
                     checkRow("Guest image installed", ok: guestInstalled,
                              hint: "The guest image ships with Velox and installs on first launch.")
-                    Button("Re-check") { engine.refreshReadiness() }
+                    Button("Re-check") { Task { await engine.refreshReadiness() } }
                         .padding(.top, 4)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

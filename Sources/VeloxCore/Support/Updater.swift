@@ -130,12 +130,25 @@ public enum Updater {
     /// Download the new release's macOS `.zip`, replace the installed `Velox.app` in
     /// place, and relaunch. Falls back to revealing the download in Finder if the app
     /// can't be replaced automatically (e.g. it lives somewhere read-only).
+    /// Safe to use as a single path component? `tag` and `asset.name` arrive in the release
+    /// JSON, which is read *before* any signature check, and both are used to build paths
+    /// (`updates/<tag>/<name>`, `.velox-update-<tag>` beside the app) that are then created,
+    /// extracted into, and `removeItem`'d. A `/` or `..` escapes the intended directory.
+    private static func safePathComponent(_ s: String) -> Bool {
+        !s.isEmpty && s.count <= 128 && !s.hasPrefix(".")
+            && s.allSatisfy { $0.isLetter || $0.isNumber || "._-+".contains($0) }
+    }
+
     private static func applyUpdate(_ release: Release, beforeRelaunch: (@Sendable () -> Void)? = nil) {
         // The macOS release asset is the programmatically-unpackable .zip (build-app.sh
         // ships no .dmg — see the release workflow).
         guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") }),
               let assetURL = URL(string: asset.url) else {
             Log.error("update: release \(release.tag) has no macOS .zip asset"); return
+        }
+        guard safePathComponent(release.tag), safePathComponent(asset.name) else {
+            Log.error("update: refusing release \(release.tag) — tag or asset name is not a "
+                      + "safe path component"); return
         }
         let fm = FileManager.default
         let dir = Paths.root.appendingPathComponent("updates/\(release.tag)", isDirectory: true)
@@ -180,6 +193,21 @@ public enum Updater {
               let newApp = (try? fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil))?
                 .first(where: { $0.pathExtension == "app" }) else {
             Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return
+        }
+        // Version binding. The Ed25519 signature covers the zip BYTES, while the version we
+        // compared against came from the unsigned `tag_name`. Anyone able to control the
+        // /releases/latest response (repo compromise, or a TLS-intercepting proxy with a
+        // trusted root) could therefore advertise a high tag pointing at an older, genuinely
+        // signed build and downgrade us onto a known-vulnerable version. Read the version out
+        // of the STAGED bundle — which the signature does cover — and require a real upgrade.
+        let stagedVersion = (NSDictionary(contentsOf: newApp
+            .appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"]
+            as? String) ?? ""
+        guard compareSemver(stagedVersion, Versions.velox) > 0 else {
+            Log.error("update: staged bundle reports v\(stagedVersion.isEmpty ? "?" : stagedVersion)"
+                      + ", which is not newer than v\(Versions.velox) — refusing "
+                      + "(advertised \(release.tag)). Possible downgrade or replay.")
+            try? fm.removeItem(at: staging); reveal(dest); return
         }
         do {
             _ = try fm.replaceItemAt(target, withItemAt: newApp)

@@ -21,6 +21,13 @@ final class EngineController {
     /// the resuming start writing `.running` over a dead engine.
     private var startGeneration = 0
 
+    /// True once the VM is alive and attached to `data.img` with nothing left managing it —
+    /// a stop that timed out, or a start that failed after the guest was already running.
+    /// `state` cannot express this: the engine lands in `.failed`, which reads as "not
+    /// running" to every guard. Anything that touches the disk or the instance lock must
+    /// consult this instead. Only a relaunch clears it.
+    private(set) var vmUnreachable = false
+
     /// True while a data-disk relocation is in flight (stop → move → restart). Gates the UI so
     /// Start/Restart/Move can't interleave; `moveProgress` (0…1) drives the move sheet.
     private(set) var isRelocatingDisk = false
@@ -56,8 +63,15 @@ final class EngineController {
     // Engine plumbing — created on `start`, torn down on stop. All the wiring shared
     // with the CLI (proxy, forwarders, watcher, named access, clock sync, conduit
     // pool) lives in EngineRuntime; only GUI-specific pieces stay here.
-    private let manager = VMManager()
-    private var runtime: EngineRuntime?
+    // `manager` and the live `runtime` are reachable WITHOUT the main actor on purpose:
+    // app termination has to flush and power off the guest even when the main actor is
+    // busy (see `shutdownForTerminate`). Both types are already thread-safe.
+    private nonisolated let manager = VMManager()
+    private nonisolated let runtimeBox = Locked<EngineRuntime?>(nil)
+    private var runtime: EngineRuntime? {
+        get { runtimeBox.value }
+        set { runtimeBox.value = newValue }
+    }
     private var resourceSaver: ResourceSaver?
     /// Single-instance guard: acquired before boot, released on stop. Prevents a
     /// concurrent `velox start` (or second app) from attaching the same data.img.
@@ -146,18 +160,36 @@ final class EngineController {
     func applyUpdate() {
         guard !updateInProgress else { return }
         updateInProgress = true
-        Task.detached(priority: .userInitiated) {
+        // A GCD queue, not `Task.detached`: `applyLatestUpdate` blocks (download, then the
+        // shutdown wait below), and blocking a Swift-concurrency cooperative thread — of
+        // which there are only as many as there are cores — can starve every other task in
+        // the process. GCD grows its pool instead.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             Updater.applyLatestUpdate(beforeRelaunch: { [weak self] in
                 // The updater is about to exit(0) to relaunch, which tears down this VM. Block
                 // here until the guest has flushed (sync over the control channel) and the VM has
                 // cleanly stopped, so the data disk isn't left torn (which would be
                 // reformatted on next boot, losing all containers/images).
+                //
+                // Via the nonisolated teardown, never `await stop()`: this thread is blocked,
+                // so a main-actor-bound stop that can't be scheduled would park it forever and
+                // the relaunch would never happen. Bounded for the same reason.
                 guard let self else { return }
                 let sem = DispatchSemaphore(value: 0)
-                Task { await self.stop(); sem.signal() }
-                sem.wait()
+                self.shutdownForTerminate { sem.signal() }
+                if sem.wait(timeout: .now() + Self.stopDeadline) == .timedOut {
+                    Log.warn("engine did not stop before the update relaunch; continuing")
+                }
             })
-            await MainActor.run { [weak self] in self?.updateInProgress = false }
+            // Only reached if the update fell back (success calls exit(0)). `beforeRelaunch`
+            // stopped the engine through the terminate path, which deliberately skips the UI
+            // state machine — so finish it here, or the app is stuck in `.stopping` holding
+            // the instance lock with `performStart` refusing to run.
+            Task { @MainActor in
+                guard let self else { return }
+                self.updateInProgress = false
+                if self.state == .stopping { self.handleGuestStopped(nil) }
+            }
         }
     }
 
@@ -176,9 +208,16 @@ final class EngineController {
     }
 
     /// Re-evaluate readiness, installing the bundled guest first if it isn't in place yet.
-    func refreshReadiness() {
-        GuestInstall.refreshFromBundleIfNeeded()
-        needsOnboarding = !EngineController.isReady
+    ///
+    /// Deliberately does NOT clear `needsOnboarding`: the onboarding sheet is bound to that
+    /// flag, so a successful re-check used to dismiss the wizard out from under the user —
+    /// skipping the finish step, which is the only place `start()` is called. Setup then
+    /// "completed" into a stopped engine with no explanation. Only `completeOnboarding()`
+    /// dismisses. It can still re-raise the sheet if readiness was lost.
+    /// The guest copy is off the main actor — it's up to ~90 MB.
+    func refreshReadiness() async {
+        await Task.detached(priority: .userInitiated) { GuestInstall.refreshFromBundleIfNeeded() }.value
+        if !needsOnboarding, !EngineController.isReady { needsOnboarding = true }
     }
 
     /// Dismiss onboarding explicitly (user finished or chose to continue anyway).
@@ -190,9 +229,21 @@ final class EngineController {
 
     private func performStart() async {
         guard state.isStopped || state.failureMessage != nil else { return }
+        // Refuse while an orphan VM may still hold the disk. `flock` is per-open-file-
+        // description, so re-acquiring throws even inside this same process — and the catch
+        // below calls `cleanup()`, which would release the lock the LIVE VM depends on and
+        // let a second engine attach the same ext4 image.
+        guard !vmUnreachable, instanceLock == nil else {
+            state = .failed("A previous engine is still holding the data disk. Quit and "
+                            + "reopen Velox.")
+            return
+        }
         state = .starting
         startGeneration &+= 1
         let gen = startGeneration
+        // Tracks whether `manager.start` succeeded, so the catch knows whether there is a
+        // live guest to stop. Inferring it from `state` is exactly what went wrong before.
+        var vmStarted = false
         do {
             let resources = config.resources
             let shareURLs = config.shareURLs
@@ -211,7 +262,10 @@ final class EngineController {
             try Storage.ensureDataDisk(at: dataDisk, sizeGiB: resources.diskGiB)
             // After an app update, refresh the installed guest from the (newer) bundled copy so we
             // never boot a stale ~/.velox kernel/rootfs against a new host.
-            GuestInstall.refreshFromBundleIfNeeded()
+            // Off the main actor: this copies the kernel (~10 MB) and rootfs (~80 MB) after
+            // an app update, and doing it inline beach-balled the whole UI — menu bar,
+            // dashboard, and the Engine Logs view that should be showing boot progress.
+            await Task.detached(priority: .userInitiated) { GuestInstall.refreshFromBundleIfNeeded() }.value
             let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
                 ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                               kernelCommandLine: GuestImage.defaultCommandLine)
@@ -240,6 +294,9 @@ final class EngineController {
                     cont.resume(with: result)
                 }
             }
+            // From here on the guest is RUNNING and holding `data.img`, so any later failure
+            // has to power it off rather than just drop the plumbing — see the catch below.
+            vmStarted = true
             // Stopped/torn down while the VM was starting — don't wire plumbing onto a
             // dead or stopping VM (the teardown path bumped the generation).
             guard gen == startGeneration else { return }
@@ -280,9 +337,16 @@ final class EngineController {
                 // dockerd never answered. Reporting `.running` here leaves the engine bound
                 // to a socket with nothing behind it and no way back — every docker command
                 // fails and only an app restart recovers. Surface it instead.
-                cleanup()
-                state = .failed("The engine started but Docker never became ready. "
-                                + "Try starting it again.")
+                //
+                // Stop the VM properly rather than just dropping the plumbing: it is still
+                // running and attached to `data.img`, and an orphan there is what makes a
+                // later Start or data-disk move act on a live disk. `.starting` is `isBusy`,
+                // so `performStop` runs, and it latches `vmUnreachable` if it can't confirm.
+                let stopped = await performStop()
+                state = .failed(stopped
+                    ? "The engine started but Docker never became ready. Try starting it again."
+                    : "Docker never became ready and the engine did not shut down. Quit and "
+                      + "reopen Velox.")
                 return
             }
             // Keep macOS App Nap from throttling the embedded VM while Velox is
@@ -302,25 +366,101 @@ final class EngineController {
             // switch if needed. Backgrounded so it never delays the UI flipping to running.
             Task { await self.setUpTerminalAndContext() }
         } catch {
-            cleanup()
-            state = .failed(error.localizedDescription)
+            // `runtime.start()` throws when the docker socket can't bind (a full or unwritable
+            // ~/.velox, EMFILE) — by which point the guest is up and journaling the data disk.
+            // `cleanup()` alone would release the instance lock under a live VM, letting a
+            // second engine attach the same image, and would leave `.failed` looking "not
+            // running" to the data-disk move. Power it off properly; `performStop` latches
+            // `vmUnreachable` if it can't confirm.
+            if vmStarted {
+                let stopped = await performStop()
+                state = .failed(stopped
+                    ? error.localizedDescription
+                    : error.localizedDescription + " The engine also did not shut down cleanly; "
+                      + "quit and reopen Velox.")
+            } else {
+                cleanup()
+                state = .failed(error.localizedDescription)
+            }
             Log.error("engine start failed: \(error.localizedDescription)")
         }
     }
 
-    private func performStop() async {
-        guard state.isRunning || state.isBusy else { return }
+    /// Ceiling on a graceful VM stop before `performStop` gives up waiting. Above the
+    /// 60 s guest-flush timeout in `VMManager.stopGracefully` plus the power-off, so this
+    /// only fires on a genuine stall — never on a slow-but-working shutdown.
+    private nonisolated static let stopDeadline: TimeInterval = 120
+
+    /// **The** engine teardown: drop the host plumbing (docker socket, forwarders, host
+    /// routes), then flush the guest and power the VM off. Both stop routes — the UI's
+    /// `performStop` and app termination's `shutdownForTerminate` — go through here, so
+    /// the sequence can't drift the way the CLI's and GUI's wiring once did (the reason
+    /// `EngineRuntime` exists at all).
+    ///
+    /// Nonisolated on purpose: termination must be able to flush the guest even when the
+    /// main actor is busy. Everything touched is thread-safe (`EngineRuntime.stop` is
+    /// lock-guarded, `VMManager.stopGracefully` completes on the VM queue), and the
+    /// blocking route removal stays off the main thread. `completion` fires on a
+    /// background queue.
+    private nonisolated func teardown(completion: @escaping @Sendable () -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [manager, runtimeBox] in
+            runtimeBox.value?.stop(waitForTeardown: true)
+            manager.stopGracefully {
+                // Off the VM queue: this completion runs on `dev.velox.vm`, and the stop
+                // below blocks on synchronous porthelper round trips (up to 3 s per route).
+                // Holding the VM queue there stalls every other VZ operation queued on it.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    // A `performStart` that raced this teardown can have wired fresh plumbing
+                    // in between (it publishes `runtime` only after `EngineRuntime.start()`).
+                    // Stopping again is idempotent for the runtime we already stopped, and
+                    // catches that one — so nothing outlives a teardown.
+                    runtimeBox.value?.stop(waitForTeardown: true)
+                    completion()
+                }
+            }
+        }
+    }
+
+    /// Returns true once the VM is confirmed down. **False means the VM is still alive** —
+    /// callers must not treat that as stopped.
+    @discardableResult
+    private func performStop() async -> Bool {
+        guard state.isRunning || state.isBusy else { return true }
         startGeneration &+= 1   // invalidate any in-flight performStart
         state = .stopping
-        // Tear the plumbing down first (stop accepting docker CLI connections, remove
-        // host routes) — idempotent, so the post-stop cleanup() calling it again is fine.
-        runtime?.stop()
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            manager.stopGracefully { cont.resume() }
+        let confirmed = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            let once = OnceResume(cont)
+            teardown { once.fire(true) }
+            // Bound it. `VMManager.attemptStop` parks the completion while the VM isn't
+            // stoppable yet (`canStop == false` during the boot window) and only
+            // `machine.start`'s completion re-invokes it — so a VZ start that never
+            // completes strands this continuation and the UI sticks on "Stopping…"
+            // forever. Generous: above the 60 s guest flush plus the VM's own power-off.
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.stopDeadline) {
+                if once.fire(false) {
+                    Log.warn("VM stop did not complete in \(Int(Self.stopDeadline))s — "
+                             + "abandoning the wait; the guest may still be running")
+                }
+            }
+        }
+        // Timed out: the VM is STILL ALIVE and still attached to data.img. Do not fall into
+        // the normal path — `cleanup()` releases the instance lock, which would let a second
+        // engine attach the same ext4 image (the corruption `InstanceLock` exists to
+        // prevent), and `moveDataDisk` would go on to copy a live disk and unlink the
+        // original. Surface it and leave the lock held.
+        guard confirmed else {
+            // The VM is still alive on `data.img` and nothing manages it any more. Latch it:
+            // every disk-touching action must now refuse, and the instance lock must stay
+            // held so no other engine can attach the same image.
+            vmUnreachable = true
+            state = .failed("The engine did not shut down and may still be running. Quit and "
+                            + "reopen Velox before starting it again.")
+            return false
         }
         // `handleGuestStopped` typically lands first via the delegate; this is a
         // backstop so the UI never sticks on "Stopping…".
         if state == .stopping { handleGuestStopped(nil) }
+        return true
     }
 
     // Public lifecycle controls. While a data-disk relocation owns the engine
@@ -331,8 +471,35 @@ final class EngineController {
     func stop() async { guard !isRelocatingDisk else { return }; await performStop() }
     func restart() async {
         guard !isRelocatingDisk else { return }
-        await performStop()
+        // Never boot a second VM onto a disk the first one is still holding.
+        guard await performStop() else { return }
         await performStart()
+    }
+
+    /// Flush and power off the guest for app termination — **without ever needing the main
+    /// actor**.
+    ///
+    /// `applicationShouldTerminate` returns `.terminateLater` and AppKit then waits for a
+    /// reply. If that wait depended on main-actor work, a busy (or wedged) UI would mean the
+    /// guest never gets flushed — precisely the data-durability outcome the deferred
+    /// terminate exists to protect, and how a quit could hang until Force Quit. So this
+    /// route runs the shared `teardown()` sequence, which touches only thread-safe,
+    /// callback-driven pieces. `completion` fires on a background queue.
+    ///
+    /// The UI state machine is deliberately not on the critical path — the process is
+    /// exiting. It is only nudged best-effort, so an in-flight `performStart` can't wire
+    /// fresh plumbing onto a VM we just powered off; if the main actor is stuck that hop
+    /// never runs, but then `performStart` is stuck too and there is nothing to invalidate.
+    nonisolated func shutdownForTerminate(completion: @escaping @Sendable () -> Void) {
+        Task { @MainActor in self.beginTerminating() }
+        teardown(completion: completion)
+    }
+
+    /// Best-effort UI bookkeeping for a terminate already under way (see above).
+    private func beginTerminating() {
+        guard state.isRunning || state.isBusy else { return }
+        startGeneration &+= 1
+        state = .stopping
     }
 
     /// Relocate `data.img` into `destinationDir`. Stops the engine first (so the image is flushed
@@ -348,20 +515,38 @@ final class EngineController {
         guard !FileManager.default.fileExists(atPath: dst.path) else {
             throw VeloxError.diskMove("A data.img already exists in \(destinationDir.path).")
         }
-        // Free-space preflight (a same-volume rename needs ~none, but the check is cheap and safe).
-        let srcAllocated = (try? src.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
-            .totalFileAllocatedSize.map(Int64.init) ?? 0
-        if let free = (try? destinationDir.resourceValues(
-                forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
-           free > 0, srcAllocated > free {
-            throw VeloxError.diskMove("Not enough free space at the destination "
-                + "(need \(Format.bytes(srcAllocated)), \(Format.bytes(free)) available).")
+        // Free-space preflight — but ONLY for a real copy. A same-volume move is a hard link
+        // (same inode), so it needs no space at all; checking anyway refused the common case
+        // outright: a 60 GB-allocated data.img being reorganised on a drive with 40 GB free
+        // was rejected with "not enough free space" for an operation that costs zero bytes.
+        if !Storage.moveIsHardLink(from: src, to: destinationDir.appendingPathComponent("data.img")) {
+            let srcAllocated = (try? src.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+                .totalFileAllocatedSize.map(Int64.init) ?? 0
+            if let free = (try? destinationDir.resourceValues(
+                    forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+               free > 0, srcAllocated > free {
+                throw VeloxError.diskMove("Not enough free space at the destination "
+                    + "(need \(Format.bytes(srcAllocated)), \(Format.bytes(free)) available).")
+            }
         }
 
+        // NOT inferred from `state`: a stop-timeout leaves `.failed` with a live VM, which
+        // reads as "not running" here — the move would then copy a disk the guest is still
+        // journaling and `removeMovedSource` would unlink the original.
+        guard !vmUnreachable else {
+            throw VeloxError.diskMove("The engine may still be running and holding the data "
+                + "disk. Quit and reopen Velox, then try again.")
+        }
         let wasRunning = state.isRunning || state.isBusy
         isRelocatingDisk = true; moveProgress = 0
-        defer { isRelocatingDisk = false }
-        if wasRunning { await performStop() }   // flush + release the VZ file handle
+        defer { isRelocatingDisk = false; moveProgress = 0 }
+        // Flush + release the VZ file handle. If the engine won't stop, abort: copying a disk
+        // the guest is still writing to yields a torn image, and the success path unlinks the
+        // original — that's total data loss, not a degraded copy.
+        if wasRunning, await performStop() == false {
+            throw VeloxError.diskMove("The engine did not shut down, so the data disk can't be "
+                + "moved safely. Quit and reopen Velox, then try again.")
+        }
 
         do {
             try await Task.detached(priority: .userInitiated) {

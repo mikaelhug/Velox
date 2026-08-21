@@ -45,7 +45,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     // The GUI awaits this to leave `.starting`, so it never has to poll `/_ping`.
     private let readyLock = NSLock()
     private var isReady = false
-    private var readyWaiters: [ReadyWaiter] = []
+    private var readyWaiters: [OnceResume<Bool>] = []
 
     /// `onPorts` is called with the published (tcp, udp) port sets whenever either changes.
     public init(docker: any DockerClientProtocol,
@@ -98,7 +98,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// polling (CLAUDE.md §8); returns immediately if dockerd already answered.
     public func waitUntilReady(timeout: Duration) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            let waiter = ReadyWaiter(cont)
+            let waiter = OnceResume<Bool>(cont)
             // Register, or fire immediately if dockerd already answered (decided
             // atomically under the lock — see registerWaiter).
             if registerWaiter(waiter) {
@@ -117,7 +117,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// Register `waiter` to be released when dockerd becomes ready, or return true
     /// if it is *already* ready (the caller fires immediately and skips registering).
     /// Synchronous so the lock is never held across an `await`.
-    private func registerWaiter(_ waiter: ReadyWaiter) -> Bool {
+    private func registerWaiter(_ waiter: OnceResume<Bool>) -> Bool {
         readyLock.lock(); defer { readyLock.unlock() }
         if isReady { return true }
         readyWaiters.append(waiter)
@@ -135,7 +135,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         for w in waiters { w.fire(true) }
     }
 
-    private func removeWaiter(_ waiter: ReadyWaiter) {
+    private func removeWaiter(_ waiter: OnceResume<Bool>) {
         readyLock.lock()
         readyWaiters.removeAll { $0 === waiter }
         readyLock.unlock()
@@ -180,6 +180,12 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         var udpBinds: [UInt16: Bool] = [:]
         var endpointMap: [UInt16: String] = [:]
         var nameMap: [String: in_addr_t] = [:]
+        // Bare compose service aliases, merged after the loop: two projects each with a `db`
+        // both claimed `db.velox.local` and resolution went to whichever dockerd happened to
+        // list last — non-deterministic, and able to flip between reconciles. A real
+        // container's own name must also always win over a service alias.
+        var bareAliases: [String: in_addr_t] = [:]
+        var ambiguous = Set<String>()
         for c in containers where c.state == "running" {
             // Named access: `name → container IP` (+ compose `<service>` and `<service>.<project>`
             // aliases). `directIP` is non-nil only when the container's network is unambiguous.
@@ -188,9 +194,18 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                 if addr != INADDR_NONE {
                     if let n = c.names.first { nameMap[n.lowercased()] = addr }
                     if let svc = c.labels["com.docker.compose.service"] {
-                        nameMap[svc.lowercased()] = addr
+                        // The QUALIFIED `<service>.<project>` form is always unambiguous, so
+                        // it goes straight in.
                         if let proj = c.labels["com.docker.compose.project"] {
                             nameMap["\(svc).\(proj)".lowercased()] = addr
+                        }
+                        // The bare `<service>` alias is NOT unambiguous — collected here and
+                        // merged after the loop, once we know whether it collides.
+                        let bare = svc.lowercased()
+                        if let existing = bareAliases[bare], existing != addr {
+                            ambiguous.insert(bare)
+                        } else {
+                            bareAliases[bare] = addr
                         }
                     }
                 }
@@ -224,6 +239,16 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                                   .filter { $0.contains(".") })   // IPv4 CIDRs only
             if commitSubnets(subnets) { onSubnets(subnets) }
         }
+        // Merge the bare aliases last: skip any that two projects claim (a clear NXDOMAIN
+        // beats silently reaching the wrong database) and any that a real container name
+        // already owns.
+        for (alias, addr) in bareAliases where !ambiguous.contains(alias) && nameMap[alias] == nil {
+            nameMap[alias] = addr
+        }
+        if !ambiguous.isEmpty {
+            Log.warn("named-access: compose service name(s) \(ambiguous.sorted().joined(separator: ", ")) "
+                     + "are used by more than one project — use <service>.<project>.\(NamedAccess.domain) instead")
+        }
         names?.update(nameMap)
         let tcp = Set(tcpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
         let udp = Set(udpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
@@ -245,17 +270,5 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         guard tcp != lastTCP || udp != lastUDP else { return false }
         lastTCP = tcp; lastUDP = udp
         return true
-    }
-}
-
-/// One pending `waitUntilReady` caller. Resumes its continuation exactly once,
-/// whichever of readiness or timeout fires first.
-private final class ReadyWaiter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cont: CheckedContinuation<Bool, Never>?
-    init(_ cont: CheckedContinuation<Bool, Never>) { self.cont = cont }
-    func fire(_ value: Bool) {
-        lock.lock(); let c = cont; cont = nil; lock.unlock()
-        c?.resume(returning: value)
     }
 }

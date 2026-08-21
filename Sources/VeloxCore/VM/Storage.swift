@@ -119,6 +119,13 @@ public enum Storage {
     }
 
     /// Whether `src` and `dst`'s parent folder live on the same volume (so a rename suffices).
+    /// Whether a move from `src` to `dst` will be an instant same-volume hard link (needing
+    /// no free space at all) rather than a copy. Exposed so a caller's free-space preflight
+    /// doesn't refuse a link it doesn't need space for.
+    public static func moveIsHardLink(from src: URL, to dst: URL) -> Bool {
+        sameVolume(src, dst)
+    }
+
     private static func sameVolume(_ src: URL, _ dst: URL) -> Bool {
         func volID(_ url: URL) -> (NSCopying & NSSecureCoding & NSObjectProtocol)? {
             (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier

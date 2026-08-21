@@ -18,6 +18,12 @@ package final class DockerEventHub: @unchecked Sendable {
     private let lock = NSLock()
     private var subscribers: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
     private var upstream: Task<Void, Never>?
+    /// Identifies the current upstream. `remove()` clears the slot *before* `run()` finishes
+    /// unwinding, so a new subscriber can legitimately start a second upstream in between —
+    /// and without this the old run's tail would then finish the NEW upstream's subscribers
+    /// and nil the slot again, stranding a live `/events` connection, a dup'd vsock fd and a
+    /// parked reader thread that broadcast to nobody, one more per cycle.
+    private var upstreamGen = 0
     /// Opens one raw `/events` connection (one real VSOCK stream). Called once per connect.
     private let makeUpstream: @Sendable () -> AsyncStream<DockerEvent>
 
@@ -32,11 +38,13 @@ package final class DockerEventHub: @unchecked Sendable {
             continuation.onTermination = { [weak self] _ in self?.remove(id) }
             lock.lock()
             subscribers[id] = continuation
-            // Start the shared upstream on the first subscriber. `run()` can only start
-            // while `upstream == nil`, and it nils `upstream` before returning, so at most
-            // one upstream connection is ever live.
+            // Start the shared upstream on the first subscriber. `upstreamGen` is what
+            // actually keeps this to one live connection — `upstream == nil` alone does not,
+            // because `remove()` clears the slot before the old run has finished unwinding.
             if upstream == nil {
-                upstream = Task { [weak self] in await self?.run() }
+                upstreamGen &+= 1
+                let gen = upstreamGen
+                upstream = Task { [weak self] in await self?.run(gen: gen) }
             }
             lock.unlock()
         }
@@ -62,18 +70,21 @@ package final class DockerEventHub: @unchecked Sendable {
     /// cancelled), then finish the current subscribers so their consumers reconcile and
     /// re-subscribe — the re-subscribe starts a fresh `run()`. Single-shot on purpose:
     /// reconnect is driven by re-subscription, so two `run()`s never overlap.
-    private func run() async {
+    private func run(gen: Int) async {
         for await event in makeUpstream() {
             broadcast(event)
         }
         // → consumers reconcile + re-subscribe (informer self-heal). Cleared via a sync
         // helper so the NSLock is never touched from this async context.
-        for c in takeSubscribersForReconnect() { c.finish() }
+        for c in takeSubscribersForReconnect(gen: gen) { c.finish() }
     }
 
-    /// Clear the subscribers and the upstream slot, returning the continuations to finish.
-    private func takeSubscribersForReconnect() -> [AsyncStream<DockerEvent>.Continuation] {
+    /// Clear the subscribers and the upstream slot, returning the continuations to finish —
+    /// but only if this run still owns the slot (see `upstreamGen`). A superseded run must
+    /// touch nothing.
+    private func takeSubscribersForReconnect(gen: Int) -> [AsyncStream<DockerEvent>.Continuation] {
         lock.lock(); defer { lock.unlock() }
+        guard gen == upstreamGen else { return [] }
         let conts = Array(subscribers.values)
         subscribers.removeAll()
         upstream = nil

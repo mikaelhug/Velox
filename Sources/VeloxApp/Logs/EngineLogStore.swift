@@ -1,4 +1,5 @@
 import Foundation
+import VeloxCore
 import Observation
 
 /// Captures the guest's serial-console stream — kernel + `vinit` + `dockerd` output,
@@ -33,8 +34,20 @@ final class EngineLogStore {
 
     /// Begin draining `handle` (the read end of the console pipe). Safe to call once.
     func attach(_ handle: FileHandle) {
-        guard source == nil else { return }
-        let fd = handle.fileDescriptor
+        // Replace, don't silently skip: after a stop that timed out, `detach()` never ran and
+        // the old source is still bound to the PREVIOUS pipe (whose write end a still-live VM
+        // holds, so it never EOFs). Skipping left Engine Logs blank for the whole new boot.
+        if source != nil {
+            Log.warn("engine log: replacing a console reader that was never detached")
+            detach()
+        }
+        // Own a DUP of the pipe's read fd. `cancel()` is asynchronous, and
+        // `EngineController.cleanup()` releases the owning `Pipe` — closing its fd — on the
+        // very next line after `detach()`. Reading or closing an fd out from under a live
+        // DispatchSource is an fd-reuse bug and an EXC_GUARD crash, so give the source an fd
+        // it owns and closes itself in the cancel handler.
+        let fd = dup(handle.fileDescriptor)
+        guard fd >= 0 else { return }
         let src = DispatchSource.makeReadSource(
             fileDescriptor: fd, queue: DispatchQueue(label: "dev.velox.enginelog"))
         // The handler runs on the background queue above, so it MUST be non-isolated.
@@ -45,11 +58,15 @@ final class EngineLogStore {
         let handler: @Sendable () -> Void = { [weak self] in
             var buf = [UInt8](repeating: 0, count: 16 * 1024)
             let n = read(fd, &buf, buf.count)
-            guard n > 0 else { return }
+            // EOF: every write end is gone. A level-triggered read source keeps firing on a
+            // stale EOF forever, so tear it down instead of spinning a core.
+            if n == 0 { Task { @MainActor in self?.detach() }; return }
+            guard n > 0 else { return }   // EINTR/EAGAIN — wait for the next event
             let chunk = String(decoding: buf[0 ..< n], as: UTF8.self)
             Task { @MainActor in self?.ingest(chunk) }
         }
         src.setEventHandler(handler: handler)
+        src.setCancelHandler { close(fd) }
         src.resume()
         source = src
     }

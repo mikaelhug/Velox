@@ -16,6 +16,9 @@ public final class NameDNSResponder: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.velox.dns")
     private var fd: Int32 = -1
     private var source: DispatchSourceRead?
+    /// The port actually bound (the kernel's choice when `port == 0`). Valid after `start()`;
+    /// `EngineRuntime` publishes it to `/etc/resolver/<domain>` through the porthelper.
+    public private(set) var boundPort: UInt16 = 0
 
     public init(port: UInt16 = NamedAccess.dnsPort, registry: NameRegistry) {
         self.port = port; self.registry = registry
@@ -36,13 +39,22 @@ public final class NameDNSResponder: @unchecked Sendable {
             }
         }
         guard rc == 0 else { close(s); throw VeloxError.socketSetupFailed("dns bind(127.0.0.1:\(port))", errno) }
+        // Read back the port the kernel actually assigned — with `port == 0` (the default)
+        // that is the whole point, and it is what gets published to /etc/resolver.
+        var bound = sockaddr_in()
+        var blen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let gotName = withUnsafeMutablePointer(to: &bound) { bp in
+            bp.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(s, $0, &blen) == 0 }
+        }
+        guard gotName else { close(s); throw VeloxError.socketSetupFailed("dns getsockname", errno) }
+        boundPort = UInt16(bigEndian: bound.sin_port)
         fd = s
         let src = DispatchSource.makeReadSource(fileDescriptor: s, queue: queue)
         src.setEventHandler { [weak self] in self?.handleOne() }
         src.setCancelHandler { close(s) }
         source = src
         src.resume()
-        Log.info("named-access DNS responder on 127.0.0.1:\(port)")
+        Log.info("named-access DNS responder on 127.0.0.1:\(boundPort)")
     }
 
     public func stop() {
@@ -58,6 +70,7 @@ public final class NameDNSResponder: @unchecked Sendable {
         }
         guard n >= 12 else { return }
         let reply = Self.buildReply(Array(buf[0..<n]), registry: registry)
+        guard !reply.isEmpty else { return }   // not a query we should answer
         _ = withUnsafePointer(to: &from) { fp in
             fp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 reply.withUnsafeBytes { sendto(fd, $0.baseAddress, reply.count, 0, sa, fromLen) }
@@ -67,11 +80,33 @@ public final class NameDNSResponder: @unchecked Sendable {
 
     // MARK: wire-format (ported from the guest: parse_qname / build_a_reply / build_empty_reply)
 
+    /// Nil when the header says this isn't a plain single-question query we should answer.
+    /// Checked before anything else because answering a *response* creates a self-sustaining
+    /// packet loop with any local process that can spoof our own source port, and because
+    /// echoing a QDCOUNT we then truncate produces a malformed reply.
+    ///   • QR (bit 7 of byte 2) must be 0 — a query, not a response.
+    ///   • OPCODE (bits 3-6) must be 0 — a standard query, not NOTIFY/UPDATE.
+    ///   • QDCOUNT must be exactly 1 — we only ever copy the first question.
+    static func isAnswerableQuery(_ q: [UInt8]) -> Bool {
+        guard q.count >= 12 else { return false }
+        guard q[2] & 0x80 == 0, (q[2] >> 3) & 0x0F == 0 else { return false }
+        return (UInt16(q[4]) << 8 | UInt16(q[5])) == 1
+    }
+
     public static func buildReply(_ q: [UInt8], registry: NameRegistry) -> [UInt8] {
-        guard let (name, qtype, qend) = parseQName(q), name.hasSuffix(domainSuffix) else { return nxdomain(q) }
+        guard isAnswerableQuery(q) else { return [] }   // not ours to answer — stay silent
+        // QCLASS must be IN (1); a CH/HS question must not get an IN answer.
+        guard let (name, qtype, qend) = parseQName(q), qclassIsIN(q, qend: qend),
+              name.hasSuffix(domainSuffix) else { return nxdomain(q) }
         let bare = String(name.dropLast(domainSuffix.count))
         guard let ip = registry.address(for: bare) else { return nxdomain(q) }
         return qtype == 1 ? aReply(q, qend: qend, addr: ip) : emptyReply(q, qend: qend)
+    }
+
+    /// QCLASS sits in the two bytes just before `qend`.
+    static func qclassIsIN(_ q: [UInt8], qend: Int) -> Bool {
+        guard qend >= 2, qend <= q.count else { return false }
+        return (UInt16(q[qend - 2]) << 8 | UInt16(q[qend - 1])) == 1
     }
 
     /// Extract the lowercased query name, qtype, and the offset just past the question.
@@ -110,6 +145,7 @@ public final class NameDNSResponder: @unchecked Sendable {
     }
 
     static func nxdomain(_ q: [UInt8]) -> [UInt8] {
+        guard q.count >= 12 else { return [] }   // r[2…11] below would be out of range
         let qend = parseQName(q).map { $0.2 } ?? min(q.count, 12)
         var r = Array(q[0..<qend])
         r[2] = 0x84 | (q[2] & 0x01); r[3] = 0x83          // RA=1, RCODE=3 (NXDOMAIN)

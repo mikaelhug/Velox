@@ -10,6 +10,7 @@ public final class DockerSocketProxy: @unchecked Sendable {
     private let bridge: VsockBridge
     private let acceptQueue = DispatchQueue(label: "dev.velox.proxy.accept")
     private var listenFd: Int32 = -1
+    private var throttled = false   // accepts paused for fd exhaustion (on `acceptQueue`)
     private var source: DispatchSourceRead?
 
     public init(socketPath: String, guestPort: UInt32, bridge: VsockBridge) {
@@ -58,8 +59,12 @@ public final class DockerSocketProxy: @unchecked Sendable {
 
         listenFd = fd
         let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
-        src.setEventHandler { [weak self] in self?.acceptConnections() }
-        src.setCancelHandler { close(fd) }
+        // Strong `src` capture: dispatch releases the handlers on cancel, breaking the cycle.
+        src.setEventHandler { [weak self] in self?.acceptConnections(source: src) }
+        // Clear the field in the cancel handler — it runs on `acceptQueue`, the same queue
+        // as `acceptConnections`, so a queued accept event that lands after `stop()` sees
+        // -1 and bails instead of calling `accept()` on a closed (possibly reused) fd.
+        src.setCancelHandler { [weak self] in self?.listenFd = -1; close(fd) }
         src.resume()
         source = src
 
@@ -72,10 +77,26 @@ public final class DockerSocketProxy: @unchecked Sendable {
         unlink(socketPath)
     }
 
-    private func acceptConnections() {
+    private func acceptConnections(source: DispatchSourceRead) {
         while true {
-            let client = accept(listenFd, nil, nil)
-            if client < 0 { break } // EWOULDBLOCK (drained) or error
+            let fd = listenFd
+            guard fd >= 0 else { return } // stopped
+            let client = accept(fd, nil, nil)
+            if client < 0 {
+                // Level-triggered: under fd exhaustion the connection stays queued and this
+                // source re-fires immediately, spinning the accept queue at 100% CPU.
+                if errno == EMFILE || errno == ENFILE, !throttled {
+                    throttled = true
+                    Log.warn("docker socket proxy: out of file descriptors — pausing accepts briefly")
+                    source.suspend()
+                    acceptQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+                        guard let self, self.throttled else { return }
+                        self.throttled = false
+                        source.resume()
+                    }
+                }
+                break // EWOULDBLOCK (drained) or error
+            }
             bridge.bridge(localFd: client, toGuestPort: guestPort)
         }
     }

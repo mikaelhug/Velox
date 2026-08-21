@@ -36,6 +36,12 @@ public enum GatewayProbe {
             manager.connectToGuestPort(VsockPort.gateway) { result in
                 guard case .success(let fd) = result else { cont.resume(returning: nil); return }
                 DispatchQueue.global().async {
+                    // Bounded: without a receive timeout a guest that accepts but never
+                    // writes parks this thread and this continuation forever, so the probe
+                    // Task never completes and the retry loop never advances.
+                    var tv = timeval(tv_sec: 5, tv_usec: 0)
+                    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                               socklen_t(MemoryLayout<timeval>.size))
                     var buf = [UInt8]()
                     var byte: UInt8 = 0
                     while buf.count < 64 {

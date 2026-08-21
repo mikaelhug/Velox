@@ -33,10 +33,21 @@ public final class ConduitPool: @unchecked Sendable {
     /// A parked, idle conduit plus a read source that prunes it if it dies. The guest never
     /// writes to a conduit before the host assigns it, so *any* readable event on a parked
     /// conduit means EOF/error (e.g. VZNAT conntrack evicted it) → drop it from the pool.
+    /// One-bit fd ownership, shared between a parked conduit and its source's cancel handler.
+    /// A separate object so the handler doesn't retain `Parked` (which retains the source).
+    /// Read and written only on `queue` — which is also the source's queue, so the cancel
+    /// handler is serialized against every other mutation here.
+    private final class FdOwner { var owns = true }
+
     private final class Parked {
         let fd: Int32
         let source: DispatchSourceRead
-        init(fd: Int32, source: DispatchSourceRead) { self.fd = fd; self.source = source }
+        /// Cleared when the fd is handed to `EventRelay` on assignment, so the source's
+        /// cancel handler leaves it alone.
+        let owner: FdOwner
+        init(fd: Int32, source: DispatchSourceRead, owner: FdOwner) {
+            self.fd = fd; self.source = source; self.owner = owner
+        }
     }
 
     private let bindIP: in_addr_t      // network byte order; the vmnet bridge (gateway) address
@@ -101,9 +112,11 @@ public final class ConduitPool: @unchecked Sendable {
     }
 
     public func stop() {
+        // Note: the relayed pairs are drained by `EngineRuntime.stop()`, not here — the relay
+        // is process-wide, so a stale pool must not be able to cut a newer engine's traffic.
         queue.async {
             self.source?.cancel(); self.source = nil
-            for p in self.ready { p.source.cancel(); close(p.fd) }
+            for p in self.ready { p.source.cancel() }   // cancel handler closes the fd
             self.ready.removeAll()
             for w in self.waiting { close(w.fd) }
             self.waiting.removeAll()
@@ -131,16 +144,26 @@ public final class ConduitPool: @unchecked Sendable {
             // immediately instead of parking it.
             if !waiting.isEmpty {
                 let w = waiting.removeFirst()
-                assign(conduit: cfd, clientFd: w.fd, port: w.port)
+                // This IS a served client — count it, or the breaker only ever sees the
+                // empty-on-submit signal and trips (then doubles its bypass to the 16 s cap)
+                // in exactly the sustained-load regime the fast path exists for.
+                breaker.served()
+                assign(conduit: cfd, clientFd: w.fd, port: w.port, owner: nil)
                 continue
             }
             // Otherwise park it. Watch for a readable event before assignment — that's EOF/error
             // (conntrack eviction / guest gone) → prune it so the pool can't accrue dead fds.
             let src = DispatchSource.makeReadSource(fileDescriptor: cfd, queue: queue)
+            let owner = FdOwner()
             src.setEventHandler { [weak self] in self?.discardDead(cfd) }
-            src.setCancelHandler { } // fd lifetime is managed explicitly (kept alive when popped)
+            // The source owns the fd until it's popped for assignment. `cancel()` is
+            // asynchronous, so closing the fd inline (as this used to) can beat libdispatch's
+            // kevent deregistration — the same fd-closed-under-a-live-source violation that
+            // produces EV_VANISHED aborts and fd-reuse cross-talk. Closing from the cancel
+            // handler is the only ordering dispatch guarantees.
+            src.setCancelHandler { if owner.owns { close(cfd) } }
             src.resume()
-            ready.append(Parked(fd: cfd, source: src))
+            ready.append(Parked(fd: cfd, source: src, owner: owner))
         }
     }
 
@@ -148,8 +171,7 @@ public final class ConduitPool: @unchecked Sendable {
     private func discardDead(_ fd: Int32) {
         guard let idx = ready.firstIndex(where: { $0.fd == fd }) else { return }
         let p = ready.remove(at: idx)
-        p.source.cancel()
-        close(p.fd)
+        p.source.cancel()   // cancel handler closes the fd
     }
 
     // MARK: - forward
@@ -163,17 +185,17 @@ public final class ConduitPool: @unchecked Sendable {
             let now = DispatchTime.now()
             // Breaker open (churn) → bypass the pool entirely; straight to vsock, no wait.
             if self.breaker.isOpen(now: now) {
-                self.fallbackHandler?(clientFd, port)
+                self.dropToFallback(clientFd, port)
                 return
             }
             if let p = self.ready.popLast() {
-                p.source.cancel()     // stop monitoring; we own the fd now
+                p.source.cancel()     // stop monitoring; `assign` decides who closes the fd
                 self.breaker.served() // pool is healthy → reset streak + backoff
-                self.assign(conduit: p.fd, clientFd: clientFd, port: port)
+                self.assign(conduit: p.fd, clientFd: clientFd, port: port, owner: p.owner)
             } else {
                 switch self.breaker.emptySubmit(now: now) {
                 case .bypass:
-                    self.fallbackHandler?(clientFd, port) // sustained churn → straight to vsock
+                    self.dropToFallback(clientFd, port) // sustained churn → straight to vsock
                 case .queue:
                     // Queue the client and let one shared sweep enforce the timeout. A per-client
                     // asyncAfter here would flood the serial queue under churn (thousands/s) and
@@ -201,7 +223,7 @@ public final class ConduitPool: @unchecked Sendable {
         let now = DispatchTime.now()
         var still: [(fd: Int32, port: UInt16, deadline: DispatchTime)] = []
         for w in waiting {
-            if w.deadline <= now { fallbackHandler?(w.fd, w.port) } else { still.append(w) }
+            if w.deadline <= now { dropToFallback(w.fd, w.port) } else { still.append(w) }
         }
         waiting = still
         if !waiting.isEmpty { armSweep() }
@@ -209,13 +231,29 @@ public final class ConduitPool: @unchecked Sendable {
 
     /// Write the in-band target (container endpoint when known, else the bare port → docker-proxy)
     /// and splice `clientFd` ↔ `conduit` via the event-loop relay. Stale conduit → vsock fallback.
-    private func assign(conduit: Int32, clientFd: Int32, port: UInt16) {
+    /// Hand the client to the vsock fallback, or close it if none is wired. Silently
+    /// dropping the fd would leak it and leave the client hanging with no EOF.
+    private func dropToFallback(_ clientFd: Int32, _ port: UInt16) {
+        guard let fallback = fallbackHandler else {
+            Log.error("conduit pool: no vsock fallback wired — dropping client on port \(port)")
+            close(clientFd); return
+        }
+        fallback(clientFd, port)
+    }
+
+    /// `owner` is non-nil when the conduit came from `ready` and its (now-cancelled) read
+    /// source still nominally owns the fd; nil for a conduit assigned straight off `accept`.
+    private func assign(conduit: Int32, clientFd: Int32, port: UInt16, owner: FdOwner?) {
         let target = endpoints?.endpoint(for: port) ?? "\(port)"
         guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
-            close(conduit)
-            fallbackHandler?(clientFd, port)
+            // Don't close inline when a source still owns it: `cancel()` is asynchronous, so
+            // this would close the fd before libdispatch deregisters its kevent. Leaving
+            // `owns` set makes the cancel handler do it in the order dispatch guarantees.
+            if owner == nil { close(conduit) }
+            dropToFallback(clientFd, port)
             return
         }
+        owner?.owns = false   // handed off; the cancel handler must not close it
         // The event-loop relay multiplexes this pair onto its worker pool (no thread per
         // connection) and owns both fds until they close.
         EventRelay.shared.relay(clientFd, conduit) {}

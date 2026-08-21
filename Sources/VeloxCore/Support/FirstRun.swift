@@ -125,9 +125,25 @@ public enum FirstRun {
         var wrote = false
         for name in [".zshrc", ".zprofile"] {        // interactive + login zsh (macOS default)
             let rc = home.appendingPathComponent(name)
-            let existing = (try? String(contentsOf: rc, encoding: .utf8)) ?? ""
-            if existing.contains(marker) { continue }
-            if (try? (existing + block).write(to: rc, atomically: true, encoding: .utf8)) != nil { wrote = true }
+            let exists = FileManager.default.fileExists(atPath: rc.path)
+            // Read as bytes, not as a UTF-8 String. A profile containing any non-UTF-8 byte
+            // (latin-1 accents are common) decoded to nil, `?? ""` turned that into an empty
+            // file, and the atomic write below then REPLACED the user's entire profile with
+            // just our block. If we can't read an existing file, leave it completely alone.
+            guard let data = exists ? try? Data(contentsOf: rc) : Data() else { continue }
+            if data.range(of: Data(marker.utf8)) != nil { continue }
+            // Append in place rather than writing a new file: `write(atomically:)` swaps the
+            // inode, which silently detaches a symlinked `~/.zshrc` (dotfiles repos) — the
+            // user keeps editing the repo copy while zsh reads our orphan.
+            if exists, let fh = try? FileHandle(forWritingTo: rc) {
+                defer { try? fh.close() }
+                guard (try? fh.seekToEnd()) != nil,
+                      (try? fh.write(contentsOf: Data(block.utf8))) != nil else { continue }
+                wrote = true
+            } else if !exists,
+                      (try? Data(block.utf8).write(to: rc, options: .withoutOverwriting)) != nil {
+                wrote = true
+            }
         }
         return wrote
     }

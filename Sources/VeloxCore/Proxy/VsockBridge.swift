@@ -5,7 +5,11 @@ import Foundation
 public final class VsockBridge: @unchecked Sendable {
     private let manager: VMManager
     private let lock = NSLock()
-    private var pumps: [UUID: SocketPump] = [:]
+    /// Set by `stopAll()`. `bridge()` completes asynchronously (VM queue + a VZ vsock connect
+    /// callback), so without this a connect landing after the stop would repopulate `pumps`
+    /// with a live pump on a VM being powered off — and since the next start builds a fresh
+    /// `VsockBridge`, that pump and its two fds would leak for the life of the process.
+    private var stopped = false
 
     public init(manager: VMManager) {
         self.manager = manager
@@ -44,19 +48,30 @@ public final class VsockBridge: @unchecked Sendable {
     }
 
     private func startPump(_ localFd: Int32, _ vsockFd: Int32) {
-        let id = UUID()
-        let pump = SocketPump(fdA: localFd, fdB: vsockFd) { [weak self] in
-            self?.remove(id)
-        }
-        store(id, pump)
-        pump.start()
+        // One relay for the whole process (CLAUDE.md: one mechanism per job). This path used
+        // to run its own `SocketPump` — a second, independent implementation of exactly the
+        // same job (bidirectional splice with backpressure and half-close). Both had to get
+        // fd ownership, half-close and teardown ordering right, and in the 2026-08 audit both
+        // got at least one of them wrong, separately. `EventRelay` takes ownership of both
+        // fds, closes them exactly once, and preserves the half-close that Docker's hijacked
+        // attach/exec/logs streams depend on.
+        guard admit() else { close(localFd); close(vsockFd); return }
+        EventRelay.shared.relay(localFd, vsockFd) {}
     }
 
-    private func store(_ id: UUID, _ pump: SocketPump) {
-        lock.lock(); pumps[id] = pump; lock.unlock()
+    /// Refuse new streams once the bridge is stopped. `bridge()` completes asynchronously
+    /// (VM queue + a VZ vsock connect callback), so a connect landing after the stop would
+    /// otherwise splice a live stream onto a VM being powered off.
+    private func admit() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !stopped
     }
 
-    private func remove(_ id: UUID) {
-        lock.lock(); pumps[id] = nil; lock.unlock()
+    /// Stop admitting new streams. The in-flight ones are torn down by
+    /// `EventRelay.shared.stopAll()`, which `EngineRuntime.stop()` calls for every relayed
+    /// pair in the process — conduit and Docker-API alike — so this no longer keeps its own
+    /// registry of live pumps.
+    public func stopAll() {
+        lock.lock(); stopped = true; lock.unlock()
     }
 }

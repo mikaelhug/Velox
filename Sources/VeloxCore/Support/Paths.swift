@@ -63,5 +63,17 @@ public enum ConduitPort {
 /// `Sources/VeloxCore/Proxy/NameDNSResponder.swift`.
 public enum NamedAccess {
     public static let domain = "velox.local"
-    public static let dnsPort: UInt16 = 49252
+    /// Port 0 = let the kernel choose. The responder's real port is published to
+    /// `/etc/resolver/<domain>` at engine start via the porthelper's `resolver` verb.
+    ///
+    /// This was a FIXED 49252, which forced the resolver file to be static — and made the
+    /// port squattable: any local process (including another user's) could bind it while
+    /// Velox was stopped and then answer `*.velox.local` for the whole machine. An ephemeral
+    /// port has nothing to pre-bind.
+    public static let dnsPort: UInt16 = 0
+    /// The port used before the helper learned the `resolver` verb (revision 7). An
+    /// already-installed older helper cannot rewrite `/etc/resolver/<domain>`, and that file
+    /// still names this port — so until the user approves the upgrade the responder keeps
+    /// binding it, and named access keeps working instead of silently breaking.
+    public static let legacyDNSPort: UInt16 = 49252
 }

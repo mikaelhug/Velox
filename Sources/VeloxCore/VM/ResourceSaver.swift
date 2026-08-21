@@ -43,6 +43,10 @@ public final class ResourceSaver: @unchecked Sendable {
         self.idleThreshold = TimeInterval(max(0, idleMinutes) * 60)
     }
 
+    private let seqLock = NSLock()
+    private var evaluateSeq: UInt64 = 0
+    private var committedSeq: UInt64 = 0
+
     public func start() {
         // Coalesce so a healthcheck / compose storm collapses to one container-count
         // read instead of a full `containers()` fetch per event (CLAUDE.md §8).
@@ -77,11 +81,40 @@ public final class ResourceSaver: @unchecked Sendable {
     }
 
     /// Read the running-container count, then apply on `queue`.
+    ///
+    /// Serialized by `evaluateSeq`, not just by the coalescer: `Coalescer` clears its pending
+    /// slot *before* running the action, and the on-(re)connect `evaluate()` runs from a
+    /// different Task entirely, so two reads overlap whenever `containers()` takes longer than
+    /// the coalescing delay — routine over VSOCK during a `compose up`. The `queue.async` hop
+    /// then commits by *completion* order, so a stale `running: 0` could land last while a
+    /// container is actually running, arm the idle countdown, and inflate the balloon out from
+    /// under a live workload. Same hazard `DockerEventsWatcher` solves with `reconcileLock`.
     private func evaluate() async {
+        let seq = nextEvaluateSeq()
         // nil = daemon not reachable; leave the current mode untouched.
         guard let containers = try? await docker.containers() else { return }
         let running = containers.lazy.filter { $0.state == "running" }.count
-        queue.async { [weak self] in self?.apply(running: running) }
+        queue.async { [weak self] in
+            guard let self, self.commitEvaluate(seq) else { return }   // a newer read won
+            self.apply(running: running)
+        }
+    }
+
+    /// Monotonic ticket for each `evaluate()` read. Synchronous helpers so the lock is never
+    /// held across an `await`.
+    private func nextEvaluateSeq() -> UInt64 {
+        seqLock.lock(); defer { seqLock.unlock() }
+        evaluateSeq &+= 1
+        return evaluateSeq
+    }
+
+    /// True if `seq` is still the newest read to have been issued — i.e. this result is not
+    /// stale. Also records it so an older in-flight read can't win later.
+    private func commitEvaluate(_ seq: UInt64) -> Bool {
+        seqLock.lock(); defer { seqLock.unlock() }
+        guard seq > committedSeq else { return false }
+        committedSeq = seq
+        return true
     }
 
     // MARK: - private (all on `queue`)

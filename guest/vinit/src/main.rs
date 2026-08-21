@@ -21,6 +21,25 @@ macro_rules! log {
     ($($a:tt)*) => {{ eprint!("[vinit] "); eprintln!($($a)*); }};
 }
 
+/// Spawn a detached worker, dropping the work if the thread can't be created.
+///
+/// `std::thread::spawn` is `Builder::spawn(..).expect(..)`, so it PANICS when `clone(2)`
+/// returns EAGAIN/ENOMEM — and with `panic = "abort"` a panic in PID 1 is
+/// `Kernel panic - not syncing: Attempted to kill init!`, i.e. the whole VM dies.
+/// That is reachable from an unprivileged container: dockerd sets no default pids limit,
+/// so a fork bomb can exhaust the guest's global `pid_max`, and the very next DNS query or
+/// vsock connect (one thread each) takes PID 1 down with it. Dropping one query or one
+/// connection is always better than killing the machine.
+fn spawn_worker<F: FnOnce() + Send + 'static>(what: &str, f: F) -> bool {
+    match std::thread::Builder::new().spawn(f) {
+        Ok(_) => true,
+        Err(e) => {
+            log!("vinit: cannot spawn {what} thread ({e}) — dropping this work");
+            false
+        }
+    }
+}
+
 const CID_ANY: u32 = 0xFFFF_FFFF;
 // VSOCK ports — keep in sync with the host's `VsockPort` enum (Sources/VeloxCore/Support/Paths.swift).
 const DOCKER_PORT: u32 = 2375;
@@ -53,17 +72,23 @@ fn main() {
     // retries on a lossy bridge — is hidden behind the disk format instead of summed
     // with it. dockerd needs BOTH (the mounted /var/lib/docker, and GATEWAY_IP + DNS
     // from the lease), so the network thread is joined before dockerd starts (below).
-    let net_handle = std::thread::spawn(|| {
+    let net_setup = || {
         if let Err(e) = setup_network() {
             log!("network setup failed (continuing, no outbound until fixed): {e}");
         }
-    });
+    };
+    // Overlapped with the data-disk work below when we can; run inline if the thread can't
+    // be created, because panicking here would take PID 1 (and the VM) down at boot.
+    let net_handle = match std::thread::Builder::new().spawn(net_setup) {
+        Ok(h) => Some(h),
+        Err(e) => { log!("vinit: network thread spawn failed ({e}) — running it inline"); net_setup(); None }
+    };
     let data_ok = setup_data_disk();
     // Swap is a memory-pressure safety valve, not a startup dependency, and on first
     // boot make_swapfile() fallocate()s a multi-GiB file — pure stall before dockerd.
     // Build it off the critical path. Spawned only when data_ok, so the swapfile's
     // parent (/var/lib/docker) is already mounted.
-    if data_ok { std::thread::spawn(setup_swap); }
+    if data_ok { spawn_worker("swap-setup", setup_swap); }
     setup_virtiofs();
     // Diagnosability: one line when the host granted nested virtualization (shows
     // in Engine Logs / Copy Diagnostics). KVM self-disables without EL2 — silent.
@@ -72,7 +97,7 @@ fn main() {
     }
     // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
     // place, so the network must be fully applied before it starts.
-    let _ = net_handle.join();
+    if let Some(h) = net_handle { let _ = h.join(); }
     enable_ip_forwarding();
     tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
@@ -85,7 +110,7 @@ fn main() {
         let pid = spawn_dockerd();
         DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
         start_docker_events_informer(nft_tx.clone());
-        std::thread::spawn(move || dockerd_supervisor(deaths_rx, nft_tx));
+        spawn_worker("dockerd-supervisor", move || dockerd_supervisor(deaths_rx, nft_tx));
     } else {
         // Persistence was expected (/dev/vdb present) but the data fs didn't mount.
         // Running dockerd now would silently use the tmpfs /var and lose every image
@@ -265,7 +290,11 @@ fn setup_network() -> std::io::Result<()> {
     iface_up(s, "lo");
     iface_up(s, IFNAME);
 
-    let mac = get_mac(s)?;
+    // Close before propagating: `get_mac(s)?` used to early-return leaving `s` open.
+    let mac = match get_mac(s) {
+        Ok(m) => m,
+        Err(e) => { unsafe { libc::close(s); } return Err(e); }
+    };
     unsafe { libc::close(s); } // apply_lease opens its own socket for addressing
     let lease = dhcp::acquire(IFNAME, mac)?;
     log!("DHCP lease: ip={} mask={} gw={} dns={:?} lease={}s",
@@ -280,7 +309,7 @@ fn setup_network() -> std::io::Result<()> {
     // knob to exercise renewal without waiting out a long vmnet lease.
     let (ip, server, lease_secs) = (lease.ip, lease.server, lease.lease_secs);
     let force = cmdline_value("velox.dhcprenew").and_then(|v| v.parse::<u64>().ok());
-    std::thread::spawn(move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs, force));
+    spawn_worker("dhcp-renew", move || dhcp::renew_loop(IFNAME, mac, ip, server, lease_secs, force));
     Ok(())
 }
 
@@ -442,6 +471,35 @@ const DOCKER_INTERNAL_NAMES: [&str; 2] = ["host.docker.internal", "gateway.docke
 static DNS_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static DNS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const DNS_MAX_INFLIGHT: usize = 64;
+/// Per-source share of the in-flight budget. The global cap alone has no fairness: one
+/// container issuing ~64 concurrent queries against a slow upstream pinned every slot for up
+/// to the 2 s forward timeout, capping DNS for the WHOLE VM — dockerd and every other
+/// container included — with the rest silently dropped.
+const DNS_MAX_INFLIGHT_PER_SOURCE: usize = 16;
+
+/// In-flight queries per source IP. Small map (one entry per active resolver), only touched
+/// on the DNS path.
+static DNS_PER_SOURCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+    std::sync::OnceLock::new();
+
+/// Claim a per-source slot, or false if that source is already at its share.
+fn dns_claim_source(src: std::net::IpAddr) -> bool {
+    let m = DNS_PER_SOURCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut map) = m.lock() else { return true }; // never fail closed on DNS
+    let e = map.entry(src).or_insert(0);
+    if *e >= DNS_MAX_INFLIGHT_PER_SOURCE { return false }
+    *e += 1;
+    true
+}
+
+fn dns_release_source(src: std::net::IpAddr) {
+    let m = DNS_PER_SOURCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut map) = m.lock() else { return };
+    if let Some(e) = map.get_mut(&src) {
+        *e = e.saturating_sub(1);
+        if *e == 0 { map.remove(&src); }
+    }
+}
 
 fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
     // Bind to eth0's *specific* address, not 0.0.0.0: a wildcard socket sources its
@@ -454,11 +512,19 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
         Err(e) => { log!("dns: bind {listen} failed ({e}); host.docker.internal unavailable"); return; }
     };
     log!("dns: responder on {} (*.docker.internal -> {}, upstream {})", listen, ipstr(gateway), ipstr(upstream));
-    std::thread::spawn(move || {
+    spawn_worker("dns-udp-listener", move || {
         let sock = std::sync::Arc::new(sock);
         let mut buf = [0u8; 1500];
         loop {
-            let (n, src) = match sock.recv_from(&mut buf) { Ok(v) => v, Err(_) => continue };
+            let (n, src) = match sock.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        std::thread::sleep(std::time::Duration::from_millis(50)); // don't spin
+                    }
+                    continue;
+                }
+            };
             // Bound concurrent handlers so a query flood (or a dead upstream parking
             // threads on the forward recv) can't exhaust PID 1's threads/fds.
             if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
@@ -471,12 +537,21 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
                 }
                 continue; // drop; the stub resolver retries
             }
+            if !dns_claim_source(src.ip()) {
+                DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                continue; // this source is at its share; others keep resolving
+            }
             let query = buf[..n].to_vec();
             let s = sock.clone();
-            std::thread::spawn(move || {
+            let srcip = src.ip();
+            if !spawn_worker("dns-udp", move || {
                 answer_dns(&s, &query, src, gateway, upstream);
+                dns_release_source(srcip);
                 DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            }) {
+                dns_release_source(srcip);
+                DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     });
     // TCP :53 fallback — a stub resolver that got a truncated (TC) UDP reply retries
@@ -485,17 +560,37 @@ fn start_dns_proxy(bind_ip: u32, gateway: u32, upstream: u32) {
     // transport hits the one cap.
     match std::net::TcpListener::bind(listen) {
         Ok(l) => {
-            std::thread::spawn(move || {
+            spawn_worker("dns-tcp-listener", move || {
                 for conn in l.incoming() {
-                    let Ok(conn) = conn else { continue };
+                    let conn = match conn {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // A sticky EMFILE/ENFILE would otherwise spin this PID-1 thread
+                            // at 100% CPU; back off so the guest can recover.
+                            if e.kind() != std::io::ErrorKind::Interrupted {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            continue;
+                        }
+                    };
                     if DNS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= DNS_MAX_INFLIGHT {
                         DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         continue; // drop (conn closes on drop); the resolver retries
                     }
-                    std::thread::spawn(move || {
-                        handle_dns_tcp(conn, gateway, upstream);
+                    let srcip = conn.peer_addr().map(|a| a.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                    if !dns_claim_source(srcip) {
                         DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    });
+                        continue; // conn closes on drop; the resolver retries
+                    }
+                    if !spawn_worker("dns-tcp", move || {
+                        handle_dns_tcp(conn, gateway, upstream);
+                        dns_release_source(srcip);
+                        DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }) {
+                        dns_release_source(srcip);
+                        DNS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                 }
             });
         }
@@ -769,7 +864,13 @@ mod dhcp {
         let xid = rand_xid();
         let server_opt = if server != 0 { Some(server) } else { None };
         let request = build(&mac, xid, REQUEST, Some(ip), server_opt);
-        send(sock, &request)?;
+        // `?` here used to early-return WITHOUT closing `sock` — one fd leaked per failed
+        // send (ENETDOWN/ENETUNREACH while the link flaps), forever. `try_acquire` documents
+        // avoiding exactly this.
+        if let Err(e) = send(sock, &request) {
+            unsafe { libc::close(sock); }
+            return Err(e);
+        }
         let res = recv(sock, xid, ACK).map(|_| ())
             .ok_or_else(|| Error::new(ErrorKind::TimedOut, "no DHCP ack on renew"));
         unsafe { libc::close(sock); }
@@ -997,7 +1098,9 @@ fn planned_resize(dev: &str) -> Option<(ResizeDir, u64)> {
     let target_gib = cmdline_value("velox.disk").and_then(|v| v.parse::<u64>().ok())?;
     let (block_size, block_count) = ext4_geometry(dev)?;
     let current = block_size * block_count;
-    let target = target_gib * 1024 * 1024 * 1024;
+    // `velox.disk` is host cmdline input; a wrapped product would select the Shrink branch
+    // with a tiny target. Bail rather than compute a nonsense resize.
+    let target = target_gib.checked_mul(1024 * 1024 * 1024)?;
     if target + block_size < current {
         Some((ResizeDir::Shrink, target / block_size))
     } else if target > current + block_size {
@@ -1105,7 +1208,7 @@ fn start_fstrim_timer() {
     const FITRIM: libc::c_ulong = 0xC018_5879;
     #[repr(C)]
     struct FstrimRange { start: u64, len: u64, minlen: u64 }
-    std::thread::spawn(|| {
+    spawn_worker("fstrim", || {
         // One pass shortly after boot (reclaims anything freed last session), then hourly.
         let mut delay = std::time::Duration::from_secs(60);
         loop {
@@ -1136,7 +1239,7 @@ fn start_fstrim_timer() {
 /// to the container subnets, so it exposes nothing on its own — and a container cannot spoof the
 /// gateway IP (it lives on eth0, not docker0). Verified by spike + e2e (curl → 200 by name).
 fn start_direct_access(triggers: std::sync::mpsc::Receiver<()>) {
-    std::thread::spawn(move || loop {
+    spawn_worker("direct-access", move || loop {
         assert_direct_access_rules();
         // Block until a respawn/network event — pure event wait, no timer. Senders live
         // in main (never returns), the supervisor, and the events informer, so Err is
@@ -1154,7 +1257,7 @@ fn start_direct_access(triggers: std::sync::mpsc::Receiver<()>) {
 /// vanishes across a dockerd restart, and the supervisor's respawn signal covers that gap.
 fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
     use std::io::{Read, Write};
-    std::thread::spawn(move || loop {
+    spawn_worker("events-informer", move || loop {
         if let Ok(mut s) = std::os::unix::net::UnixStream::connect(DOCKER_SOCK) {
             // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly
             // when dockerd rebuilds the drop chains. Headers/chunk framing aren't parsed:
@@ -1183,10 +1286,49 @@ fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
 /// Insert the gateway allow into both drop chains, retrying until dockerd has built its
 /// table (a bounded settle delay after boot/restart — not a status poll: it stops the
 /// moment both rules are in, and gives up after ~2 min if dockerd never comes up).
-fn assert_direct_access_rules() {
+/// Block containers from reaching the host's conduit-pool listener.
+///
+/// The pool on `GATEWAY_IP:POOL_PORT` authenticates a conduit ONLY by source IP, and a
+/// container's egress is masqueraded by dockerd to the guest's eth0 address — which is
+/// exactly the address the host checks for. So without this, any unprivileged container
+/// could open sockets to the pool, have them parked as conduits, and then be spliced into a
+/// host client's published-port connection: interception and response-spoofing of any
+/// published port, plus a trivial DoS by flooding the pool.
+///
+/// vinit's own conduits are locally generated, so they take the `output` hook and never
+/// traverse `forward` — only routed container traffic does. Kept in Velox's OWN table so
+/// dockerd's periodic chain rebuilds can't flush it, at a priority ahead of docker's filter.
+fn assert_conduit_guard() {
     use std::sync::atomic::Ordering::Relaxed;
-    let nft = |args: &[&str]| Command::new("nft")
-        .env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args).output();
+    let gw = GATEWAY_IP.load(Relaxed);
+    if gw == 0 { return }
+    let gws = ipstr(gw);
+    let nft = |args: &[&str]| run_capture(
+        Command::new("nft").env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args));
+    // Idempotent: create the table/chain, then only insert the rule if it isn't there.
+    let _ = nft(&["add", "table", "ip", "velox"]);
+    let _ = nft(&["add", "chain", "ip", "velox", "forward",
+                  "{ type filter hook forward priority -10; policy accept; }"]);
+    let want = format!("daddr {gws} tcp dport {POOL_PORT}");
+    if let Some((true, out, _)) = nft(&["list", "chain", "ip", "velox", "forward"]) {
+        if String::from_utf8_lossy(&out).contains(&want) { return }
+    }
+    match nft(&["add", "rule", "ip", "velox", "forward",
+                "ip", "daddr", &gws, "tcp", "dport", &POOL_PORT.to_string(), "drop"]) {
+        Some((true, _, _)) => log!("conduit-guard: containers blocked from {gws}:{POOL_PORT}"),
+        _ => log!("conduit-guard: could not install the block rule for {gws}:{POOL_PORT}"),
+    }
+}
+
+fn assert_direct_access_rules() {
+    assert_conduit_guard();
+    use std::sync::atomic::Ordering::Relaxed;
+    // `run_capture`, not `Command::output()`: the reaper's `waitpid(-1)` races `Child::wait`
+    // and wins often enough (measured ~40%) that `output()` returns ECHILD for a command that
+    // actually succeeded — which read as failure here and pushed every assertion into 2 s
+    // retry passes with named access dead in between.
+    let nft = |args: &[&str]| run_capture(
+        Command::new("nft").env("PATH", "/bin:/usr/bin:/sbin:/usr/sbin").args(args));
     for _ in 0..60 {
         let gw = GATEWAY_IP.load(Relaxed);
         if gw != 0 {
@@ -1194,20 +1336,20 @@ fn assert_direct_access_rules() {
             // The whole table appears only once dockerd's nft init has run — before
             // that there is nothing to assert into; keep waiting.
             let table_up = nft(&["list", "table", "ip", "docker-bridges"])
-                .map(|o| o.status.success()).unwrap_or(false);
+                .map(|(ok, _, _)| ok).unwrap_or(false);
             if table_up {
                 let mut settled = true;
                 for chain in ["filter-FORWARD", "raw-PREROUTING"] {
                     match nft(&["list", "chain", "ip", "docker-bridges", chain]) {
-                        Ok(out) if out.status.success() => {
+                        Some((true, out, _)) => {
                             // Trailing space anchors the match: nft prints `ip saddr <ip> counter
                             // … accept`, so `saddr 1.2.3.1 ` can't be satisfied by `saddr 1.2.3.10`.
-                            if String::from_utf8_lossy(&out.stdout).contains(&format!("saddr {gws} ")) {
+                            if String::from_utf8_lossy(&out).contains(&format!("saddr {gws} ")) {
                                 continue; // rule already in place
                             }
                             match nft(&["insert", "rule", "ip", "docker-bridges", chain,
                                         "ip", "saddr", &gws, "counter", "accept"]) {
-                                Ok(ins) if ins.status.success() =>
+                                Some((true, _, _)) =>
                                     log!("direct-access: allowed {gws} → containers ({chain})"),
                                 _ => settled = false,
                             }
@@ -1218,8 +1360,8 @@ fn assert_direct_access_rules() {
                         // the informer re-triggers on the event that creates it. Any OTHER
                         // failure (e.g. a transient error while dockerd is mid-rebuild)
                         // must retry, or a rebuilt chain slips through unallowed.
-                        Ok(out) if String::from_utf8_lossy(&out.stderr)
-                                       .contains("No such file or directory") => {}
+                        Some((_, _, err)) if String::from_utf8_lossy(&err)
+                                                 .contains("No such file or directory") => {}
                         _ => settled = false,
                     }
                 }
@@ -1289,7 +1431,11 @@ fn setup_swap() {
         return;
     }
     let path = "/var/lib/docker/.velox-swapfile";
-    match make_swapfile(path, mib * 1024 * 1024) {
+    let Some(swap_bytes) = mib.checked_mul(1024 * 1024) else {
+        log!("velox.swap value is out of range — skipping swap");
+        return;
+    };
+    match make_swapfile(path, swap_bytes) {
         Ok(()) => {
             let cpath = cstr(path);
             if unsafe { libc::swapon(cpath.as_ptr(), 0) } == 0 {
@@ -1351,7 +1497,14 @@ fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
 /// window can't cover the round-trip, above it the surplus pages are wasted work. Purely
 /// best-effort: a missing bdi node just leaves the kernel default in place.
 fn tune_virtiofs_readahead(path: &str) {
-    let c = cstr(path);
+    // NOT `cstr()`: that is `CString::new(..).expect(..)`, and its own doc says never to call
+    // it on host-supplied input — a NUL byte would panic, which in PID 1 (panic = "abort")
+    // takes the whole VM down. `path` comes from the `velox.shares` kernel cmdline payload.
+    // `do_mount` and `make_rshared` already handle this; this tuner (added later) didn't.
+    let Ok(c) = CString::new(path) else {
+        log!("virtiofs: refusing to tune readahead for a path containing NUL");
+        return;
+    };
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 { return; }
     // Linux dev_t encoding — virtiofs gets an anonymous major 0.
@@ -1524,7 +1677,7 @@ static VSOCK_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 const VSOCK_MAX_INFLIGHT: usize = 256;
 
 fn spawn_listener(port: u32, handler: fn(RawFd)) {
-    std::thread::spawn(move || {
+    spawn_worker("vsock-listener", move || {
         let lfd = match vsock_listen(port) {
             Ok(f) => f,
             Err(e) => { log!("vsock listen {port} failed: {e}"); return; }
@@ -1554,10 +1707,13 @@ fn spawn_listener(port: u32, handler: fn(RawFd)) {
                 unsafe { libc::close(cfd); }
                 continue;
             }
-            std::thread::spawn(move || {
+            if !spawn_worker("vsock-conn", move || {
                 handler(cfd);
                 VSOCK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            }) {
+                VSOCK_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                unsafe { libc::close(cfd); }
+            }
         }
     });
 }
@@ -1589,7 +1745,9 @@ fn handle_clock(fd: RawFd) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if (epoch - now).abs() <= 2 { return; } // already aligned
+    // Saturating: `epoch` is peer-supplied, so a hostile value makes the subtraction (and
+    // `i64::MIN.abs()`) overflow — which panics under `overflow-checks`, i.e. kills PID 1.
+    if epoch.saturating_sub(now).saturating_abs() <= 2 { return; } // already aligned
     let tv = libc::timeval { tv_sec: epoch, tv_usec: 0 };
     if unsafe { libc::settimeofday(&tv, std::ptr::null()) } == 0 {
         log!("clock re-synced from host: {now} -> {epoch}");
@@ -1665,12 +1823,12 @@ fn start_conduit_pool() {
         cv: std::sync::Condvar::new(),
     });
     // The manager owns all spawning; its first pass grows the pool up to the floor, then it adapts.
-    std::thread::spawn(conduit_manager);
+    spawn_worker("conduit-manager", conduit_manager);
 }
 
 fn spawn_conduit_slot() {
     CONDUIT_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::thread::spawn(conduit_slot);
+    spawn_worker("conduit-slot", conduit_slot);
 }
 
 /// Wake the pool manager: a slot saw the warm pool run low and raised `DESIRED_SLOTS`.
@@ -1832,10 +1990,23 @@ fn read_assignment_timed(fd: RawFd, timeout_ms: i32) -> Assignment {
 /// either `<container-ip>:<port>` (direct-dial — the guest reaches the container over docker0
 /// in its root netns, skipping docker-proxy's userspace copy) or a bare `<port>` (→
 /// 127.0.0.1:<port>, i.e. docker-proxy) when it couldn't resolve an unambiguous endpoint.
+/// First resolved socket address for `host:port`, as an io::Result so it composes with
+/// `connect_timeout` (which, unlike `connect`, takes a resolved address).
+fn resolve_one(target: &str) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    target.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address for target")
+    })
+}
+
 fn bridge_to_target(fd: RawFd, header: &str) {
     let mut target = header.to_string();
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
-    match std::net::TcpStream::connect(&target) {
+    // Bounded: `connect` with no timeout parks this thread for the full SYN timeout (~2 min)
+    // on a blackholed container IP, and a conduit slot is neither idle nor redialing while it
+    // waits — enough such dials starve the warm pool.
+    match resolve_one(&target)
+        .and_then(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(5))) {
         // Hand the pair to the epoll relay (no thread per connection) instead of bridge().
         Ok(up) => relay_submit(fd, up.into_raw_fd()),
         Err(e) => { log!("conduit dial {target}: {e}"); unsafe { libc::close(fd); } }
@@ -1867,7 +2038,7 @@ fn relay_init() {
             unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, evfd, &mut ev); }
             let w = std::sync::Arc::new(RelayWorker { epfd, evfd, queue: std::sync::Mutex::new(std::collections::VecDeque::new()) });
             let wc = w.clone();
-            std::thread::spawn(move || relay_worker_loop(wc));
+            spawn_worker("relay-worker", move || relay_worker_loop(wc));
             workers.push(w);
         }
         Relay { workers, next: std::sync::atomic::AtomicUsize::new(0) }
@@ -1903,7 +2074,14 @@ fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 512];
     loop {
         let n = unsafe { libc::epoll_wait(w.epfd, events.as_mut_ptr(), 512, -1) };
-        if n < 0 { continue; }
+        if n < 0 {
+            // EINTR is normal; anything else is unrecoverable (a bad epfd spins this thread
+            // at 100% CPU forever, which is exactly when the guest can least afford it).
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue }
+            log!("relay worker: epoll_wait failed ({}) — stopping this worker",
+                 std::io::Error::last_os_error());
+            return;
+        }
         for ev in events.iter().copied().take(n as usize) {
             let fd = ev.u64 as RawFd;
             let mask = ev.events;
@@ -1927,9 +2105,16 @@ fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
                 if mask & (libc::EPOLLOUT as u32) != 0 {
                     if fd == c.a { relay_flush(&mut c.ba); } else { relay_flush(&mut c.ab); }
                 }
-                if mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0 {
-                    if fd == c.a && !c.ab.eof { c.ab.eof = true; unsafe { libc::shutdown(c.ab.dst, libc::SHUT_WR); } }
-                    if fd == c.b && !c.ba.eof { c.ba.eof = true; unsafe { libc::shutdown(c.ba.dst, libc::SHUT_WR); } }
+                // EPOLLHUP/EPOLLERR is a hang-up or error on the SOCKET, not a graceful
+                // half-close (that arrives as read()==0 and is handled in `relay_read`). Only
+                // marking the firing direction meant a peer that ignores our `SHUT_WR` kept
+                // the pair — and both fds, and 512 KiB of buffers — alive forever, an
+                // unbounded leak in the `conns` map. End the whole connection.
+                let hangup = mask & ((libc::EPOLLHUP | libc::EPOLLERR) as u32) != 0;
+                if hangup {
+                    c.ab.eof = true; c.ab.len = 0;
+                    c.ba.eof = true; c.ba.len = 0;
+                    unsafe { libc::shutdown(c.a, libc::SHUT_RDWR); libc::shutdown(c.b, libc::SHUT_RDWR); }
                 }
                 let done = c.ab.finished() && c.ba.finished();
                 if !done { relay_update(w.epfd, &c, c.a); relay_update(w.epfd, &c, c.b); }
@@ -2017,7 +2202,11 @@ fn handle_reverse(fd: RawFd) {
     }
     let mut target = header;
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
-    match std::net::TcpStream::connect(&target) {
+    // Bounded: `connect` with no timeout parks this thread for the full SYN timeout (~2 min)
+    // on a blackholed container IP, and a conduit slot is neither idle nor redialing while it
+    // waits — enough such dials starve the warm pool.
+    match resolve_one(&target)
+        .and_then(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(5))) {
         Ok(up) => bridge(fd, up.into_raw_fd()),
         Err(e) => { log!("reverse dial {target}: {e}"); unsafe { libc::close(fd); } }
     }
@@ -2038,7 +2227,15 @@ fn handle_reverse_udp(vsock: RawFd, port: &str) {
     }
     let udp = sock.as_raw_fd();
     // vsock(framed) → udp(datagrams), and udp → vsock, until one side ends.
-    let t = std::thread::spawn(move || udp_frames_to_dgrams(vsock, udp));
+    let t = match std::thread::Builder::new().spawn(move || udp_frames_to_dgrams(vsock, udp)) {
+        Ok(h) => h,
+        Err(e) => {
+            log!("vinit: cannot spawn udp-relay thread ({e}) — dropping flow");
+            unsafe { libc::close(vsock); }
+            drop(sock);
+            return;
+        }
+    };
     udp_dgrams_to_frames(udp, vsock);
     // unblock the peer thread, then tear down (sock drop closes `udp`).
     unsafe { libc::shutdown(vsock, libc::SHUT_RDWR); libc::shutdown(udp, libc::SHUT_RDWR); }
@@ -2104,10 +2301,18 @@ fn write_all_fd(fd: RawFd, buf: &[u8]) -> bool {
 /// Bidirectional copy with independent half-close (so Docker's hijacked
 /// attach/exec/logs streams aren't truncated). Closes both fds when done.
 fn bridge(a: RawFd, b: RawFd) {
-    let t1 = std::thread::spawn(move || pump(a, b));
-    let t2 = std::thread::spawn(move || pump(b, a));
+    // One direction on a helper thread, the other on this one: half the threads per bridged
+    // connection, and no `thread::spawn` panic path (which in PID 1 is a whole-VM abort).
+    let t1 = match std::thread::Builder::new().spawn(move || pump(a, b)) {
+        Ok(h) => h,
+        Err(e) => {
+            log!("vinit: cannot spawn bridge thread ({e}) — dropping connection");
+            unsafe { libc::close(a); libc::close(b); }
+            return;
+        }
+    };
+    pump(b, a);
     let _ = t1.join();
-    let _ = t2.join();
     unsafe { libc::close(a); libc::close(b); }
 }
 
@@ -2179,6 +2384,80 @@ fn dockerd_supervisor(deaths: std::sync::mpsc::Receiver<()>, nft_restarted: std:
 /// PID-1 reaper: a tight blocking `waitpid` loop that reaps every child immediately and
 /// never sleeps on the dockerd-restart path (that's the supervisor thread's job) — so a
 /// crash-looping dockerd can't leave orphaned shims/containers piling up as zombies.
+/// Single-slot handshake between `reap_forever` and the one place that needs a child's exit
+/// status (`assert_direct_access_rules`).
+///
+/// The reaper blocks in `waitpid(-1, ..)` for the life of the VM, so it can collect any
+/// child before `std::process::Child::wait` gets there — and `wait` then fails with ECHILD
+/// rather than tolerating it. Measured ~40% of `Command::output()` calls failing that way,
+/// which made every named-access assertion after a `docker run` read as failure and take
+/// several 2 s retry passes instead of one, with `<name>.velox.local` dead in between.
+struct ChildStatus {
+    slot: std::sync::Mutex<Option<(i32, Option<i32>)>>, // (claimed pid, status once reaped)
+    cv: std::sync::Condvar,
+}
+static CHILD_STATUS: std::sync::OnceLock<ChildStatus> = std::sync::OnceLock::new();
+fn child_status() -> &'static ChildStatus {
+    CHILD_STATUS.get_or_init(|| ChildStatus {
+        slot: std::sync::Mutex::new(None),
+        cv: std::sync::Condvar::new(),
+    })
+}
+
+/// Called by the reaper for every pid it collects.
+fn child_status_deliver(pid: i32, status: i32) {
+    let cs = child_status();
+    let Ok(mut slot) = cs.slot.lock() else { return };
+    if let Some((claimed, st @ None)) = slot.as_mut().map(|s| (s.0, &mut s.1)) {
+        if claimed == pid {
+            *st = Some(status);
+            cs.cv.notify_all();
+        }
+    }
+}
+
+/// Run `cmd`, capturing stdout and stderr, and return `(exit_ok, stdout, stderr)`.
+/// Serialized: only one claim can be outstanding, which is fine — the sole caller is the
+/// single direct-access thread. (stdout is drained before stderr; both stay far below a
+/// pipe buffer for `nft`, so there is no fill-the-other-pipe deadlock.)
+fn run_capture(cmd: &mut Command) -> Option<(bool, Vec<u8>, Vec<u8>)> {
+    use std::io::Read;
+    let cs = child_status();
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().ok()?;
+    let pid = child.id() as i32;
+    {
+        let Ok(mut slot) = cs.slot.lock() else { return None };
+        *slot = Some((pid, None));
+    }
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    if let Some(mut so) = child.stdout.take() { let _ = so.read_to_end(&mut out); }
+    if let Some(mut se) = child.stderr.take() { let _ = se.read_to_end(&mut err); }
+    // Whoever gets there first wins; both paths are correct.
+    let status = match child.try_wait() {
+        Ok(Some(st)) => st.code().unwrap_or(-1),
+        _ => {
+            let mut slot = cs.slot.lock().ok()?;
+            let deadline = std::time::Duration::from_secs(10);
+            loop {
+                match slot.as_ref().and_then(|s| s.1) {
+                    Some(st) => break if st & 0x7f == 0 { (st >> 8) & 0xff } else { -1 },
+                    None => {
+                        let (g, timeout) = cs.cv.wait_timeout(slot, deadline).ok()?;
+                        slot = g;
+                        if timeout.timed_out() { break -1 }
+                    }
+                }
+            }
+        }
+    };
+    if let Ok(mut slot) = cs.slot.lock() { *slot = None; }
+    Some((status == 0, out, err))
+}
+
 fn reap_forever(deaths: std::sync::mpsc::Sender<()>) -> ! {
     loop {
         let mut status = 0;
@@ -2189,10 +2468,20 @@ fn reap_forever(deaths: std::sync::mpsc::Sender<()>) -> ! {
             continue;
         }
         if pid == DOCKERD_PID.load(std::sync::atomic::Ordering::SeqCst) {
+            // Clear it FIRST. The supervisor backs off for up to 30 s before respawning, and
+            // the kernel recycles pids freely (pid_max 32768, several burned per `docker run`)
+            // — so leaving the dead pid here meant an unrelated orphan reusing it produced a
+            // spurious "dockerd died". The supervisor then counted a fast death and spawned a
+            // SECOND dockerd next to the live one; that one lost the socket bind and exited,
+            // and because DOCKERD_PID now pointed at it, the real dockerd's eventual death was
+            // never noticed again.
+            DOCKERD_PID.store(-1, std::sync::atomic::Ordering::SeqCst);
             // dockerd died — hand the restart to the supervisor and keep reaping now.
             log!("dockerd exited (status {status:#x}) — signalling restart");
             let _ = deaths.send(());
         }
+        // Hand the status to a waiter that claimed this pid (see `run_capture`).
+        child_status_deliver(pid, status);
         // Any other pid is an orphaned grandchild (container proc, shim) — already reaped.
     }
 }

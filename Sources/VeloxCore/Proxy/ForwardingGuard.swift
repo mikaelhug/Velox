@@ -22,16 +22,30 @@ public final class ForwardingGuard: @unchecked Sendable {
     private let helper: PortHelperManager
     private let queue = DispatchQueue(label: "velox.forwarding-guard")
     private var monitor: NWPathMonitor?
+    /// Also fired on every path change. The same VPN churn that clears the forwarding
+    /// sysctl can flush host routes, and the named-access router only ever applies a diff —
+    /// so a route removed behind its back was never re-added and `<name>.velox.local`
+    /// resolved to an unreachable IP for the rest of the session. Reuses this monitor
+    /// rather than starting a second one.
+    private var onPathChange: (@Sendable () -> Void)?
 
     public init(helper: PortHelperManager) {
         self.helper = helper
+    }
+
+    /// Set before `start()`. Called on the guard queue for every network path change.
+    public func setPathChangeHandler(_ handler: @escaping @Sendable () -> Void) {
+        onPathChange = handler
     }
 
     /// Begin watching. NWPathMonitor fires once immediately with the current path,
     /// so this doubles as the boot-time check.
     public func start() {
         let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] _ in self?.check() }
+        monitor.pathUpdateHandler = { [weak self] _ in
+            self?.check()
+            self?.onPathChange?()
+        }
         monitor.start(queue: queue)
         self.monitor = monitor
     }

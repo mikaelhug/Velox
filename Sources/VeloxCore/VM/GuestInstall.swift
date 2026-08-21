@@ -76,8 +76,14 @@ public enum GuestInstall {
         let tmp = dst.appendingPathExtension("tmp")
         try? fm.removeItem(at: tmp)
         try fm.copyItem(at: src, to: tmp)
-        try? fm.removeItem(at: dst)
-        try fm.moveItem(at: tmp, to: dst)
+        // `rename(2)` replaces the destination atomically — no unlink first. The old
+        // remove-then-move left a window with NO kernel/rootfs on disk at all if the move
+        // then failed, which is exactly the crash the temp file was meant to prevent.
+        guard rename(tmp.path, dst.path) == 0 else {
+            let err = errno
+            try? fm.removeItem(at: tmp)
+            throw VeloxError.socketSetupFailed("rename(\(dst.lastPathComponent))", err)
+        }
     }
 
     /// The guest artifact bundled in `Velox.app/Contents/Resources/<name>`, or nil for a dev

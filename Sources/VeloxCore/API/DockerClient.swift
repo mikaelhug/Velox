@@ -412,6 +412,11 @@ final class StreamConnection: @unchecked Sendable {
 /// parser stays in raw mode for the rest of the stream; otherwise a later TTY chunk
 /// that happened to start with byte 0/1/2 would be misread as a frame header.
 public final class LogFrameParser: @unchecked Sendable {
+    /// Ceiling on a single multiplexed frame. dockerd writes log frames far below this;
+    /// anything larger means the stream isn't framed the way we think, so treat it as raw
+    /// rather than blocking forever on bytes that will never arrive.
+    static let maxFrameBytes: UInt32 = 16 * 1024 * 1024
+
     private var isTTY = false
     public init() {}
 
@@ -426,9 +431,11 @@ public final class LogFrameParser: @unchecked Sendable {
         while acc.count >= 8 {
             let header = [UInt8](acc.prefix(8))
             let streamByte = header[0]
-            // Non-multiplexed (TTY) stream: stream byte isn't 0/1/2 → switch to raw
-            // mode for the rest of the stream and emit the buffer as text.
-            guard streamByte <= 2 else {
+            // Non-multiplexed (TTY) stream: switch to raw mode for the rest of the stream
+            // and emit the buffer as text. Bytes 1-3 are reserved and always zero in a real
+            // Docker frame, so requiring that too stops a raw stream that merely *starts*
+            // with 0/1/2 from being mis-framed.
+            guard streamByte <= 2, header[1] == 0, header[2] == 0, header[3] == 0 else {
                 isTTY = true
                 let text = String(decoding: acc, as: UTF8.self)
                 acc.removeAll(keepingCapacity: true)
@@ -437,6 +444,16 @@ public final class LogFrameParser: @unchecked Sendable {
             }
             let size = (UInt32(header[4]) << 24) | (UInt32(header[5]) << 16)
                      | (UInt32(header[6]) << 8) | UInt32(header[7])
+            // A frame larger than dockerd ever emits means we've lost sync (or the stream
+            // isn't multiplexed after all). Without this the parser waits forever for bytes
+            // that never come while `acc` keeps growing.
+            guard size <= Self.maxFrameBytes else {
+                isTTY = true
+                let text = String(decoding: acc, as: UTF8.self)
+                acc.removeAll(keepingCapacity: true)
+                if !text.isEmpty { yield(LogFrame(stream: .stdout, text: text)) }
+                return
+            }
             guard acc.count >= 8 + Int(size) else { return } // wait for full frame
             let payload = acc.subdata(in: 8 ..< 8 + Int(size))
             acc.removeSubrange(0 ..< 8 + Int(size))
