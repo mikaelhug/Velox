@@ -24,7 +24,7 @@ CTX_A="velox";          LBL_A="velox";  APP_A="Velox"
 CTX_B="desktop-linux";  LBL_B="dd";     APP_B="Docker"
 IMG_ALPINE="alpine:3.20"
 IMG_IPERF="networkstatic/iperf3:latest"
-IMG_PULL="python:3.12"      # cold-pull target (removed before each pull)
+IMG_LOAD="python:3.12"      # extraction fixture: saved to a tar once, then re-loaded
 IMG_PG="postgres:16"
 DD_MB=1024                  # dd write/read size, MiB
 SF_COUNT=4000               # small-files count
@@ -145,12 +145,31 @@ suite(){            # $1 context  $2 label
   t0=$(now); D run --rm -v "$BD/mnt":/m "$IMG_ALPINE" sh -c 'mkdir -p /m/o && tar -xf /m/sf.tar -C /m/o && sync' >/dev/null 2>&1; t1=$(now)
   rec "$ENG" fs smallfiles_bind extract_s s "$(secs $t0 $t1)"
 
-  log "[$ENG] cold image pull $IMG_PULL"
-  D rmi "$IMG_PULL" >/dev/null 2>&1
-  t0=$(now); D pull -q "$IMG_PULL" >/dev/null 2>&1; t1=$(now)
-  local sz; sz=$(D image inspect "$IMG_PULL" --format '{{.Size}}' 2>/dev/null)
-  rec "$ENG" pull cold_image total_s s "$(secs $t0 $t1)"
-  rec "$ENG" pull cold_image size_mb MB "$(python3 -c "print(round(${sz:-0}/1048576))")"
+  # Image extraction. `docker load` from a tar built once and reused by both engines: identical
+  # input bytes, no registry, no bandwidth — decompress + write through the snapshotter, which
+  # is where Velox's fsync-durable data disk costs something real.
+  #
+  # This REPLACED a cold `docker pull` timing. Do not add one back. A pull is dominated by
+  # bandwidth to the registry, which is not a property of either engine: the same 381 MB image
+  # measured 4.1 s and 20.0 s on this machine forty minutes apart. It produced a "TRAIL vs
+  # Docker Desktop" row in the scorecard that was really a CDN reading.
+  log "[$ENG] image extraction (docker load)"
+  local TAR="$HERE/loadimage.tar"
+  if [ ! -f "$TAR" ]; then
+    log "  building $TAR once (pulling $IMG_LOAD to save it)"
+    D pull -q "$IMG_LOAD" >/dev/null 2>&1
+    D save -o "$TAR" "$IMG_LOAD" >/dev/null 2>&1
+  fi
+  D rmi "$IMG_LOAD" >/dev/null 2>&1
+  # One untimed load+remove first. `rmi` drops the reference but the just-saved layers can still
+  # be in the content store, and `load` then dedupes against them and reports ~0.09 s instead of
+  # ~7 s — a 75x artefact on whichever run happened to build the tar. This makes every run start
+  # from the same state.
+  D load -i "$TAR" >/dev/null 2>&1; D rmi "$IMG_LOAD" >/dev/null 2>&1
+  t0=$(now); D load -i "$TAR" >/dev/null 2>&1; t1=$(now)
+  local sz; sz=$(D image inspect "$IMG_LOAD" --format '{{.Size}}' 2>/dev/null)
+  rec "$ENG" image load_local total_s s "$(secs $t0 $t1)"
+  rec "$ENG" image load_local size_mb MB "$(python3 -c "print(round(${sz:-0}/1048576))")"
 
   log "[$ENG] real-world: Postgres pgbench"
   D pull -q "$IMG_PG" >/dev/null 2>&1; D rm -f pg >/dev/null 2>&1

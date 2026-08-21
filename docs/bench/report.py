@@ -19,7 +19,7 @@ SPEC = [
     ("fs", "smallfiles_bind", "extract_s",          ("FS: extract 4000 files (bind)", False, "s")),
     ("fs", "vol_write", "mbps",                     ("FS: named-volume write (in-VM)", True, "MB/s")),
     ("fs", "overlay_write", "mbps",                 ("FS: container-overlay write", True, "MB/s")),
-    ("pull", "cold_image", "total_s",               ("Cold image pull", False, "s")),
+    ("image", "load_local", "total_s",              ("Image extraction (docker load)", False, "s")),
     ("realworld", "pgbench_init", "load_s",         ("pgbench init (scale 50)", False, "s")),
     ("realworld", "pgbench_tps", "tps",             ("pgbench TPS (8 clients, 30s)", True, "TPS")),
 ]
@@ -39,7 +39,13 @@ print(f"{'Metric':34}{'Velox':>14}{'Docker Desktop':>16}{'Δ':>9}  Verdict")
 print("-" * 88)
 for s, t, m, (lbl, hb, unit) in SPEC:
     d = rows.get((s, t, m))
-    if not d or "velox" not in d or "dd" not in d:
+    if not d or "velox" not in d:
+        print(f"{lbl:34}{'—':>14}{'—':>16}{'':>9}  not measured")
+        continue
+    if "dd" not in d:
+        # Show it anyway. Skipping rows with no Docker Desktop side made a newly added metric
+        # invisible, which is indistinguishable from one that quietly stopped being collected.
+        print(f"{lbl:34}{fmt(d['velox'])+' '+unit:>14}{'—':>16}{'':>9}  velox only")
         continue
     v, dd = float(d["velox"]), float(d["dd"])
     ratio = (v / dd if dd else 0) if hb else (dd / v if v else 0)  # >1 ⇒ Velox better

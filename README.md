@@ -147,11 +147,10 @@ every number are in [docs/benchmarks.md](docs/benchmarks.md).
 | Durable commit latency (`fio --fsync`, 4 K) | 0.31 ms | 0.47 ms | 1.5× faster |
 | Container-overlay write | 1,695 MB/s | 1,217 MB/s | 1.4× faster |
 | Postgres `pgbench` TPS (8 clients, 30 s) | 13,318 | 11,690 | 1.14× faster |
-| Cold image pull (381 MB on disk) | 19.1 s | 17.3 s | ~10% slower |
 
 The idle-RAM row is the loaded benchmark baseline; an empty idle engine
-balloons further down, to a ~70 MB host footprint. Cold pull is the one path
-that trails (~10%), because durable layer extraction is fsync-heavy — the
+balloons further down, to a ~70 MB host footprint. Small-file extract is the one
+path that trails (~10%), because durable metadata writes are fsync-heavy — the
 visible cost of the durability described below.
 
 > **On the filesystem rows.** Earlier revisions of this table published far larger

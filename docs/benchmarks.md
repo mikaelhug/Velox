@@ -15,7 +15,7 @@ results.
 | --- | --- | --- |
 | 🟢 **Wins** | install 10× smaller, idle RAM ~2.6× less, startup 1.5× faster, **container launch 1.2–1.3×**, container→host net ~2×, **published ports 3.0–3.7×**, VirtioFS write 1.5×, **durable commit 1.5× (0.31 ms vs 0.47 ms)**, named-volume write ~1.1× | |
 | ⚪ **Par** | VirtioFS read, container-overlay write, pgbench TPS / init | |
-| 🔴 **Trails** | small-file extract (~0.9×), cold image pull (durable layer extraction) | |
+| 🔴 **Trails** | small-file extract (~0.9×) | |
 
 Full numbers in [Results](#results). The data disk is raw + durable `.fsync`
 ([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published ports now ride a VZNAT conduit
@@ -78,7 +78,7 @@ These are what make the numbers comparable rather than anecdotal:
 | fs | `bind_write` / `bind_read` | VirtioFS host bind-mount bandwidth |
 | fs | `smallfiles_bind` | extract 4,000 small files into a bind mount (metadata-heavy; `node_modules`/`git`) |
 | fs | `vol_write` / `overlay_write` | in-VM disk (named volume ext4 / container overlay) |
-| pull | `cold_image` | registry download + layer extraction / snapshotter |
+| image | `load_local` | `docker load` of a fixed local tar — decompress + snapshotter write, no registry |
 | realworld | `pgbench_init` | bulk DB load (sequential writes + checkpoint) |
 | realworld | `pgbench_tps` | TPC-B-like txns — dominated by per-commit **fsync latency** |
 
@@ -102,7 +102,6 @@ FS: extract 4000 files (bind)         3.40 s           3.14 s    0.92x  par
 FS: named-volume write (in-VM)    1,630 MB/s       1,500 MB/s    1.09x  WIN
 FS: container-overlay write       1,695 MB/s       1,217 MB/s    1.39x  WIN
 Durable commit (fio fsync, 4K)     0.31 ms          0.47 ms      1.52x  WIN
-Cold image pull (381 MB)             19.06 s          17.30 s    0.91x  TRAIL
 pgbench init (scale 50)               2.18 s           2.88 s    1.32x  WIN
 pgbench TPS (8 clients, 30s)         13,318           11,690     1.14x  WIN
 ```
@@ -118,9 +117,7 @@ Inbound `localhost:PORT → container` used to route over a single `VZVirtioSock
 **pre-warmed VZNAT conduit pool**: the guest keeps idle TCP conduits dialed to the host over
 the fast VZNAT path, and the host hands each published connection an idle conduit (assignment
 over VSOCK, *data* over VZNAT), so throughput jumps to **38–60 Gbit/s — 2.9–3.3× Docker
-Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty). The one path
-that still trails is **cold image pull** (~0.9×): the download rides VZNAT, but durable layer
-*extraction* is fsync-heavy — the single place the data-safety guarantee costs measurably.
+Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty).
 
 ## Filesystem: two harness bugs, and a read-ahead fix (2026-08-14)
 
@@ -165,9 +162,8 @@ pages are wasted work. `vinit` now sets it on every VirtioFS mount
 > **Baseline caveat.** Docker Desktop is no longer installed on the reference Mac, so the
 > DD column is the June 2026 recording — measured against Velox 0.1.11 (kernel 6.18.34,
 > dockerd 29.5.3, 8 GB) rather than the current build. The large structural wins (footprint,
-> RAM, startup, published ports) are far outside that uncertainty; the filesystem and
-> cold-pull deltas are not, and cold pull additionally depends on network conditions on the
-> day. Treat those rows as provisional until a same-day head-to-head is re-run.
+> RAM, startup, published ports) are far outside that uncertainty; the filesystem deltas
+> are not. Treat those rows as provisional until a same-day head-to-head is re-run.
 
 ## Disk: raw image + durable `.fsync` (2026-06-09)
 
@@ -221,9 +217,12 @@ IPIs in ~µs (~23% of launch on its own): container launch (`run --rm true`) 175
   conservative.
 - Bind-mount **read** is influenced by the host page cache (treat *write* + *small-files*
   as the reliable VirtioFS signals).
-- `pgbench` TPS and cold pull are single runs; everything else is medians / fixed windows.
-- Cold pull is partly network-bound (both engines pull the same bytes from the same
-  registry); the engine-specific part is layer extraction.
+- `pgbench` TPS is a single run; everything else is medians / fixed windows.
+- **No metric here touches the network off-box.** Image extraction is measured with
+  `docker load` from a fixed local tar, never a `docker pull`: a pull is dominated by
+  bandwidth to the registry, which is not a property of either engine — the same 381 MB
+  image measured 4.1 s and 20.0 s on this machine forty minutes apart. It had been reported
+  as a "TRAIL vs Docker Desktop" row that was really a CDN reading. Don't add one back.
 
 ## Not yet covered (planned additions)
 
