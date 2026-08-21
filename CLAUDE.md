@@ -278,10 +278,13 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
 
 - **`Scripts/check-upstream.sh`** is the scout: it reads the current pins from
   `versions.env`, discovers the newest **mainline-stable** kernel (kernel.org
-  `releases.json` + the GPG-signed `sha256sums.asc` — no tarball download; a version
-  announced in `releases.json` whose tarball is not signed/published yet is treated as
-  **not out**, and the newest *pinnable* one is taken instead, because that propagation
-  window used to fail the run for days) and the
+  `releases.json` + `sha256sums.asc`, whose OpenPGP signature is **verified** against the
+  vendored `Scripts/keys/kernel.org-autosigner.asc` before a single hash in it is trusted —
+  fail closed: an unverifiable sums file makes that whole line "not pinnable". Note the sums
+  file is signed by `autosigner@kernel.org`, **not** by the Torvalds/Kroah-Hartman keys that
+  sign the tarballs. No tarball download; a version announced in `releases.json` whose
+  tarball is not signed/published yet is treated as **not out**, and the newest *pinnable*
+  one is taken instead, because that propagation window used to fail the run for days) and the
   newest **static-stable** Docker (the `download.docker.com/.../aarch64/` index, SHAs
   computed by downloading the two tarballs), and rewrites only the pins that changed.
   Policy: take **any newer release, patches included** — and always the newest upstream
@@ -308,10 +311,48 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
   Docker **major** that silently breaks `<name>.velox.local` named access (the
   `assert_direct_access_rules` nft chains — versions.env MAJOR-BUMP CHECKLIST), can ship.
   Recover by rolling **forward**: **`.github/workflows/rollback.yml`** restores a prior
-  tag's pins, minor-bumps `VELOX_VERSION`, and re-releases (the updater only moves up).
+  tag's pins, minor-bumps `VELOX_VERSION`, and re-releases (the updater only moves up). It
+  also appends the bad versions to the `*_BLOCKED=` deny lists in `versions.env`, which
+  `check-upstream.sh` honours — without that the next weekly run simply re-adopted the exact
+  version that had just been rolled back, so the documented recovery lasted one week.
 - Reuses, never forks: the same `versions.env` single source of truth (§2), the same
   `gen-versions.sh` codegen, and the same `release.yml` cache-key recipe. Don't add a
   second release path or hard-code versions outside `versions.env`.
+
+## 10. One mechanism per job — never a second implementation
+
+**Do not add a second implementation of a capability that already exists. Extend the first
+one.** "Small, simple, lean" is not enforceable as a line count; this is the form of it that
+is.
+
+The failure this prevents is concrete. Velox once carried **three** independent host
+implementations of bidirectional byte relaying — `EventRelay` (kqueue), `SocketPump`
+(DispatchIO) and `UDPForwarder.RelayLoop` (kqueue). Each had to solve the same four hard
+problems: fd ownership, half-close, backpressure, and teardown ordering. The 2026-08 audit
+found each of them had got at least one of the four wrong — differently — and a fix in one
+protected none of the others. `SocketPump` is gone; the Docker-API proxy and the VZNAT
+conduit path now share `EventRelay`, and the relay's per-connection buffers were made lazy so
+the Docker path's many idle hijacked streams don't pay a bulk path's memory cost.
+
+Precedent to follow, not re-derive: `82a7044` folded four copies of an EINTR-retrying
+`writeAll` into `FDIO.writeAll` "so the retry semantics can't drift apart", and `d405d9d`
+deleted `BulkPump` outright when `EventRelay` superseded it.
+
+Two things this rule does **not** say:
+
+- It is not "write less code". A second *mechanism* is the cost; genuinely new capability is
+  not. The VZNAT conduit pool is ~1000 lines across host and guest and earns every one of
+  them: published-port throughput was 1.4 Gbit/s over vsock alone — 12–19× behind Docker
+  Desktop — versus 59/63 Gbit/s serving and 39/53 ingress with the pool (`9b53fad`). The
+  vsock relay it falls back to is a deliberate fallback, not a redundant twin.
+- It does not apply across the host/guest boundary. The guest's epoll relay in `vinit` is a
+  separate implementation because it is a different language on the other side of the VM
+  boundary; that duplication is unavoidable, so keep the two designs deliberately mirrored
+  and say so in the comments.
+
+When you find yourself about to write "a simpler/faster version of X for this one case",
+that is the moment this rule is for: make X serve the case, or explain in the commit why the
+capability is genuinely different in kind.
 
 ## Build / run quick reference
 

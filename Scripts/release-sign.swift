@@ -6,9 +6,13 @@
 //       secret VELOX_ED25519_PRIVATE_KEY; paste the PUBLIC key into versions.env
 //       (VELOX_RELEASE_PUBKEY). One-time; the private key never enters the repo.
 //
-//   swift Scripts/release-sign.swift sign <file> <base64-private-key>
+//   swift Scripts/release-sign.swift sign <file>            [key in $RELEASE_KEY]
 //       Write `<file>.sig` (base64 Ed25519 signature over the file bytes).
 //       Run by .github/workflows/release.yml for each release .zip.
+//       The private key comes from the RELEASE_KEY environment variable, NEVER argv:
+//       a process's argv is world-readable via `ps -E` and is captured by crash
+//       reporters, so passing a signing key there leaks it to anything running
+//       concurrently on the runner.
 //
 //   swift Scripts/release-sign.swift verify <file> <base64-public-key> [sigfile]
 //       Exit 0 iff the signature (default `<file>.sig`) matches — the same check
@@ -29,8 +33,11 @@ case "keygen":
     print("public  (versions.env VELOX_RELEASE_PUBKEY): \(key.publicKey.rawRepresentation.base64EncodedString())")
 
 case "sign":
-    guard args.count == 4 else { die("usage: sign <file> <base64-private-key>") }
-    guard let raw = Data(base64Encoded: args[3].trimmingCharacters(in: .whitespacesAndNewlines)),
+    guard args.count == 3 else { die("usage: sign <file>   (private key in $RELEASE_KEY)") }
+    guard let keyText = ProcessInfo.processInfo.environment["RELEASE_KEY"], !keyText.isEmpty else {
+        die("RELEASE_KEY is not set (the private key must come from the environment, not argv)")
+    }
+    guard let raw = Data(base64Encoded: keyText.trimmingCharacters(in: .whitespacesAndNewlines)),
           let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else {
         die("invalid private key (want base64 of the 32-byte raw representation)")
     }

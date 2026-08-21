@@ -58,8 +58,14 @@ jobs:
       changed:     ${{ steps.scout.outputs.changed }}
       new_version: ${{ steps.scout.outputs.new_version }}
       title:       ${{ steps.scout.outputs.title }}
+      # The exact commit that gets validated and shipped. Everything downstream pins to
+      # THIS, never to the branch name: `automation/*` is outside main's protection, and
+      # resolving the branch separately in each validator and again in `ship` left a
+      # 20-40 minute window in which a push to it would be fast-forwarded onto main and
+      # tagged without ever having been validated.
+      bump_sha:    ${{ steps.scout.outputs.bump_sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}   # deploy key for the branch push
           fetch-depth: 0          # need full history to base the branch off main cleanly
@@ -91,6 +97,7 @@ jobs:
           git add versions.env Sources/VeloxCore/Support/Versions.swift
           git commit -m "$TITLE"
           git push -f origin "$BUMP_BRANCH"    # non-main branch: triggers nothing; validated before it reaches main
+          echo "bump_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
           # --- run summary: what changed + the advisory post-release checklist ---
           {
@@ -123,19 +130,22 @@ jobs:
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
-        with: { ref: "${{ env.BUMP_BRANCH }}" }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        # The pinned commit, not the branch name — see prepare.outputs.bump_sha.
+        with: { ref: "${{ needs.prepare.outputs.bump_sha }}" }
 
       - name: Compute cache keys (same recipe as release.yml)
         id: keys
         run: |
           set -a; . ./versions.env; set +a
-          KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF"; \
-                     cat guest/kernel/velox.fragment guest/kernel/Dockerfile.builder Scripts/build-kernel.sh; \
+          # Enumerate the inputs with `git ls-files` rather than by hand: the old explicit list
+          # was correct only as long as nobody added a file. A new guest/kernel/* input would
+          # have shipped a STALE cached kernel with no signal at all.
+          KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF $MOBY_CHECKCONFIG_SHA256"; \
+                     git ls-files -z guest/kernel Scripts/build-kernel.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
           RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
-                     cat guest/rootfs/Dockerfile guest/vinit/src/main.rs guest/vinit/Cargo.toml \
-                         guest/vinit/Cargo.lock Scripts/make-guest.sh; \
+                     git ls-files -z guest/rootfs guest/vinit Scripts/make-guest.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
           echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"
           echo "rootfs=rootfs-${DOCKER_VERSION}-${RHASH}"     >> "$GITHUB_OUTPUT"
@@ -147,7 +157,7 @@ jobs:
 
       - name: Restore cached kernel
         id: kcache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: Assets/velox-vmlinux
           key: ${{ steps.keys.outputs.kernel }}
@@ -157,7 +167,7 @@ jobs:
 
       - name: Restore cached rootfs
         id: rcache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: guest/build/root.img
           key: ${{ steps.keys.outputs.rootfs }}
@@ -193,8 +203,9 @@ jobs:
     if: needs.prepare.outputs.changed == 'true'
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
-        with: { ref: "${{ env.BUMP_BRANCH }}" }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        # The pinned commit, not the branch name — see prepare.outputs.bump_sha.
+        with: { ref: "${{ needs.prepare.outputs.bump_sha }}" }
       - run: swift --version
       - name: Build (all targets)
         run: |
@@ -214,7 +225,7 @@ jobs:
     if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}
           fetch-depth: 0
@@ -225,17 +236,29 @@ jobs:
           set -euo pipefail
           git config user.name  "velox-bot"
           git config user.email "actions@users.noreply.github.com"
+          BUMP_SHA="${{ needs.prepare.outputs.bump_sha }}"
+          [ -n "$BUMP_SHA" ] || { echo "::error::prepare did not export bump_sha"; exit 1; }
           git fetch origin "$BUMP_BRANCH"
-          BUMP_SHA="$(git rev-parse FETCH_HEAD)"
+          FETCHED="$(git rev-parse FETCH_HEAD)"
+          if [ "$FETCHED" != "$BUMP_SHA" ]; then
+            echo "::error::$BUMP_BRANCH moved during the run ($FETCHED != validated $BUMP_SHA) — refusing to ship an unvalidated commit."
+            exit 1
+          fi
           # Fast-forward main to the exact commit that was validated. If main advanced
           # during the run (a human push in the ~20-min window), this is non-FF and fails
           # ON PURPOSE — we ship only what was validated, never an unvalidated rebase. The
           # run self-heals next Monday (or re-run it now); nothing partial is left behind.
-          if ! git push origin "${BUMP_SHA}:refs/heads/main"; then
-            echo "::error::main advanced during the run — fast-forward rejected, so nothing shipped. Re-run version-watch (or wait for next Monday); it will re-bump from the new main."
-            exit 1
-          fi
+          # Tag FIRST, then move main. The old order (main, then tag) was not atomic: a tag
+          # push that failed afterwards left main permanently carrying the new VELOX_VERSION
+          # and pins with no tag and no release — and the next weekly run reads the already-
+          # bumped versions.env, sees the pins as current, exits `changed=false`, and never
+          # ships it. Tagging first makes the failure mode "a tag with no main move", which
+          # release.yml handles and which the next run simply repeats.
           git tag "v${NEW}" "${BUMP_SHA}"
           git push origin "v${NEW}"                  # deploy-key push → triggers release.yml
+          if ! git push origin "${BUMP_SHA}:refs/heads/main"; then
+            echo "::error::main advanced during the run — fast-forward rejected. v${NEW} is tagged and will build, but main was not moved; re-run version-watch to re-bump from the new main."
+            exit 1
+          fi
           git push origin --delete "$BUMP_BRANCH" || true
           echo "::notice::Landed v${NEW} on main and tagged it; release.yml will build and publish."

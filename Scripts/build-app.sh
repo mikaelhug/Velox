@@ -27,7 +27,12 @@ ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 APP="Velox.app"
 KERNEL_SRC="${KERNEL_SRC:-Assets/velox-vmlinux}"
 ROOT_SRC="${ROOT_SRC:-guest/build/root.img}"
-[ -f "$ROOT_SRC" ] || ROOT_SRC="$HOME/.velox/root.img"     # fall back to the installed copy
+if [ ! -f "$ROOT_SRC" ]; then
+    # Fall back to the installed copy, but SAY SO: on a self-hosted runner this silently
+    # shipped whatever guest happened to be installed there, with no signal in the log.
+    ROOT_SRC="$HOME/.velox/root.img"
+    echo "==> note: guest/build/root.img missing — falling back to $ROOT_SRC (run Scripts/make-guest.sh for a fresh guest)" >&2
+fi
 SIGN_IDENTITY="${VELOX_SIGN_IDENTITY:--}"                   # "-" = ad-hoc
 DIST="${DIST:-dist}"
 
@@ -51,7 +56,19 @@ DOCKER_CLI_STAMP="$DIST/docker-cli/.docker-version"
 # Reuse the cached client only when it is the PINNED version. Keying on existence alone
 # let a stale client from a previous DOCKER_VERSION ship unchanged after a bump — a host
 # `docker` / guest `dockerd` skew the single-source-of-truth (§2) is meant to prevent.
-if [ ! -x "$DOCKER_CLI" ] || [ "$(cat "$DOCKER_CLI_STAMP" 2>/dev/null)" != "$DOCKER_VERSION" ]; then
+# Also re-verify the cached BINARY, not just the version stamp — the stamp is trivially
+# stale-or-wrong on a local/self-hosted tree, and `fetch_plugin` below already does the
+# stronger check. The pin in versions.env covers the TARBALL, so the stamp records the
+# extracted binary's own hash at download time (after the tarball was verified) and this
+# compares against that.
+cached_cli_ok(){
+    [ -x "$DOCKER_CLI" ] || return 1
+    read -r stamp_version stamp_hash < "$DOCKER_CLI_STAMP" 2>/dev/null || return 1
+    [ "$stamp_version" = "$DOCKER_VERSION" ] || return 1
+    [ -n "$stamp_hash" ] || return 1
+    [ "$(shasum -a 256 "$DOCKER_CLI" | awk '{print $1}')" = "$stamp_hash" ]
+}
+if ! cached_cli_ok; then
     echo "==> download stock docker client $DOCKER_VERSION ($DARCH) for macOS"
     # Docker ships no checksum sidecar for the static tarballs, so the SHA-256 is
     # pinned in versions.env (bumped together with DOCKER_VERSION). arm64-only:
@@ -63,7 +80,9 @@ if [ ! -x "$DOCKER_CLI" ] || [ "$(cat "$DOCKER_CLI_STAMP" 2>/dev/null)" != "$DOC
     echo "${DOCKER_CLI_MAC_ARM64_SHA256}  $DIST/docker-cli.tgz" | shasum -a 256 -c - >/dev/null \
         || { echo "error: docker-cli.tgz SHA-256 mismatch — expected ${DOCKER_CLI_MAC_ARM64_SHA256} (versions.env)" >&2; exit 1; }
     tar -xzf "$DIST/docker-cli.tgz" -C "$DIST/docker-cli" --strip-components=1 docker/docker
-    echo "$DOCKER_VERSION" > "$DOCKER_CLI_STAMP"
+    # version + the extracted binary's own hash (the pin covers the tarball, which was
+    # verified just above) so a later run can re-verify the cached binary, not just its label.
+    printf '%s %s\n' "$DOCKER_VERSION" "$(shasum -a 256 "$DOCKER_CLI" | awk '{print $1}')" > "$DOCKER_CLI_STAMP"
 fi
 
 # --- fetch the host-side docker CLI plugins (compose + buildx) -----------------

@@ -31,7 +31,13 @@ Velox's security-relevant surface is deliberately small:
   (`Scripts/release-sign.swift`); the in-app updater verifies the signature
   against the public key baked into the build (`VELOX_RELEASE_PUBKEY` in
   `versions.env`) and refuses unsigned or invalid archives. `install.sh`
-  verifies the release `SHA256SUMS`.
+  verifies the release `SHA256SUMS` (fail-closed) **and** the installed bundle's own code
+  signature, and leaves Gatekeeper quarantine in place when the build is notarized. It
+  cannot check the Ed25519 `.sig`: macOS ships LibreSSL, which has no Ed25519 support, and
+  there is no portable verifier in base macOS — only the in-app updater performs that check.
+  The `SHA256SUMS` come from the same release as the `.zip`, so they catch corruption and a
+  swapped asset, not a compromised release page; the code-signature check is the one that
+  does not share that trust root.
 - **Build inputs are pinned.** The kernel.org tarball and both Docker static
   tarballs (guest daemon + bundled mac client) are SHA-256-pinned in
   `versions.env` and verified at build time.

@@ -37,7 +37,7 @@ jobs:
   rollback:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ssh-key: ${{ secrets.AUTOMATION_SSH_KEY }}
           fetch-depth: 0
@@ -55,7 +55,15 @@ jobs:
             || { echo "::error::tag ${TO} not found"; exit 1; }
 
           set_var(){ tmp="$(mktemp)"; awk -v k="$1" -v v="$2" '$0 ~ "^" k "=" {print k "=" v; next} {print}' versions.env > "$tmp"; mv "$tmp" versions.env; }
-          get_from_tag(){ git show "${TO}:versions.env" | awk -F= -v k="$1" '$1==k{print $2; exit}'; }
+          # cut -f2- (not awk $2): a value containing '=' would be silently truncated.
+          get_from_tag(){ git show "${TO}:versions.env" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+
+          # Snapshot the versions we are rolling away from, before the restore overwrites them.
+          cur_of(){ grep -E "^$1=" versions.env | head -1 | cut -d= -f2-; }
+          BAD_KERNEL="$(cur_of KERNEL_ORG_VERSION)"
+          BAD_DOCKER="$(cur_of DOCKER_VERSION)"
+          BAD_COMPOSE="$(cur_of DOCKER_COMPOSE_VERSION)"
+          BAD_BUILDX="$(cur_of DOCKER_BUILDX_VERSION)"
 
           for k in KERNEL_ORG_VERSION KERNEL_ORG_SHA256 DOCKER_VERSION DOCKER_STATIC_SHA256 DOCKER_CLI_MAC_ARM64_SHA256; do
             v="$(get_from_tag "$k")"
@@ -69,6 +77,22 @@ jobs:
             v="$(get_from_tag "$k")"
             if [ -n "$v" ]; then set_var "$k" "$v"; else echo "::notice::$k absent in ${TO} (pre-plugin tag) — leaving current pin"; fi
           done
+
+          # Record what we are rolling AWAY from, so the weekly scout cannot re-adopt it.
+          # Restoring the pin alone lasted exactly one week: check-upstream saw the lower pin,
+          # called the bad version "newer", re-validated it (compile-only — the failure was a
+          # runtime one CI structurally cannot see) and re-shipped it to everyone.
+          append_blocked(){  # $1 key  $2 version
+            [ -n "$2" ] || return 0
+            cur="$(awk -F= -v k="$1" '$1==k{print $2; exit}' versions.env)"
+            case " $cur " in *" $2 "*) return 0 ;; esac   # already listed
+            set_var "$1" "$(printf '%s %s' "$cur" "$2" | sed 's/^ *//')"
+            echo "::notice::$1 += $2"
+          }
+          append_blocked KERNEL_ORG_BLOCKED "$BAD_KERNEL"
+          append_blocked DOCKER_BLOCKED "$BAD_DOCKER"
+          append_blocked DOCKER_COMPOSE_BLOCKED "$BAD_COMPOSE"
+          append_blocked DOCKER_BUILDX_BLOCKED "$BAD_BUILDX"
 
           set -a; . ./versions.env; set +a
           NEW="$(printf '%s' "$VELOX_VERSION" | awk -F. '{print $1"."$2+1".0"}')"

@@ -41,8 +41,9 @@ PLATFORM="linux/arm64"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
-# moby's container-host config validator, pinned.
+# moby's container-host config validator, pinned to a commit AND hashed (see versions.env).
 CHECKCONFIG_REF="${CHECKCONFIG_REF:-${MOBY_CHECKCONFIG_REF:?set MOBY_CHECKCONFIG_REF in versions.env}}"
+CHECKCONFIG_SHA256="${MOBY_CHECKCONFIG_SHA256:?set MOBY_CHECKCONFIG_SHA256 in versions.env}"
 CHECKCONFIG_URL="https://raw.githubusercontent.com/moby/moby/${CHECKCONFIG_REF}/contrib/check-config.sh"
 VERIFY_GPG="${VERIFY_GPG:-0}"
 
@@ -148,6 +149,10 @@ echo "    all required symbols present."
 # --- Phase 3: moby check-config.sh; hard-fail on Generally Necessary misses ---
 echo "==> [container] running moby check-config.sh"
 curl -fSL -o /tmp/check-config.sh "${CHECKCONFIG_URL}"
+# Verify BEFORE executing. This runs as root in a container that bind-mounts Assets/
+# read-write and holds the kernel source, so an unverified script here is root RCE into the
+# artifact users install — and CI would then sign the result as authentic.
+echo "${CHECKCONFIG_SHA256}  /tmp/check-config.sh" | sha256sum -c -
 chmod +x /tmp/check-config.sh
 report="$(CONFIG=.config bash /tmp/check-config.sh .config 2>&1 || true)"
 echo "$report"
@@ -193,6 +198,7 @@ docker run --rm --platform "$PLATFORM" \
     -e TARBALL_URL="$TARBALL_URL" \
     -e KERNEL_SHA256="$KERNEL_SHA256" \
     -e CHECKCONFIG_URL="$CHECKCONFIG_URL" \
+    -e CHECKCONFIG_SHA256="$CHECKCONFIG_SHA256" \
     -e VERIFY_GPG="$VERIFY_GPG" \
     -e JOBS="$JOBS" \
     -e OUT_NAME="$OUT_NAME" \

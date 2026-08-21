@@ -55,8 +55,6 @@ mm(){ printf '%s' "$1" | cut -d. -f1-2; }          # 6.18.35 -> 6.18
 maj(){ printf '%s' "${1%%.*}"; }                    # 6.18.35 -> 6
 # newer CUR CAND -> true iff CAND is strictly greater (semantic sort).
 newer(){ [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }
-# classify CUR CAND -> "" (not newer) | "patch" | "minor" | "major"
-#
 # In-line stable patches ARE taken. They were skipped originally to keep releases
 # few and meaningful, but that also meant upstream bugfixes and CVEs sat unshipped
 # until the next minor line — and a dockerd nftables endpoint-rollback bug (which
@@ -64,7 +62,33 @@ newer(){ [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -
 # the cost of waiting concrete. The candidate is always the newest version upstream
 # offers, so if a newer minor/major exists it is chosen over a patch automatically:
 # there is no "highest patch of the old line" path to fall into.
+# blocked COMPONENT VERSION -> true iff that exact version is on the deny list.
+#
+# `rollback.yml` restores a previous tag's pins when a shipped upstream version turns out to
+# be broken — but nothing recorded WHY, so the next weekly run saw the (now lower) pin, found
+# the bad version "newer", re-validated it (compile-only, which is exactly what missed the
+# problem the first time) and re-shipped it to the whole fleet. The documented recovery path
+# had a one-week half-life. rollback.yml now appends to these lists.
+blocked(){
+  local list
+  case "$1" in
+    kernel)  list="${KERNEL_ORG_BLOCKED:-}" ;;
+    docker)  list="${DOCKER_BLOCKED:-}" ;;
+    compose) list="${DOCKER_COMPOSE_BLOCKED:-}" ;;
+    buildx)  list="${DOCKER_BUILDX_BLOCKED:-}" ;;
+    *)       return 1 ;;
+  esac
+  case " $list " in *" $2 "*) return 0 ;; esac
+  return 1
+}
+
+# classify COMPONENT CUR CAND -> "" (not newer, or blocked) | "patch" | "minor" | "major"
 classify(){
+  if blocked "$1" "$3"; then
+    echo "==> $1 $3 is on the deny list (rolled back previously) — not adopting it" >&2
+    printf ''; return
+  fi
+  shift   # drop the component; the rest of this function compares CUR/CAND as before
   newer "$1" "$2" || { printf ''; return; }
   [ "$(maj "$1")" != "$(maj "$2")" ] && { printf 'major'; return; }
   [ "$(mm "$1")" != "$(mm "$2")" ] && { printf 'minor'; return; }
@@ -99,8 +123,35 @@ echo "==> current pins: kernel ${KERNEL_ORG_VERSION}, docker ${DOCKER_VERSION}, 
 # release in releases.json before the sums propagate to the CDN, and treating that
 # window as an error failed the weekly run for days at a time. An announced-but-
 # unpublished version is simply "not out yet" — we take the newest one we CAN pin.
+# The vendored kernel.org checksum-autosigner public key. Verification used to be claimed
+# but never performed: the code parsed the CLEARTEXT body of the clearsigned file and never
+# ran `gpg --verify`, so the `.asc` extension bought nothing and every pin this scout writes
+# was authenticated by TLS-to-CDN alone. Vendored rather than fetched from a keyserver so
+# the build has no keyserver dependency and no trust-on-first-use at run time.
+# NB: the sums file is signed by `autosigner@kernel.org`, NOT by the Torvalds/Kroah-Hartman
+# release keys that sign the tarballs themselves — measured, and worth knowing before anyone
+# "corrects" the fingerprint below.
+AUTOSIGNER_FPR=B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1
+AUTOSIGNER_KEY="$(cd "$(dirname "$0")" && pwd)/keys/kernel.org-autosigner.asc"
+
 k_pinnable(){ # <major> -> "<version> <sha>" of the newest published tarball, or ""
-  curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v$1.x/sha256sums.asc" 2>/dev/null \
+  local asc gnupg out
+  asc="$(mktemp)"; gnupg="$(mktemp -d)"; chmod 700 "$gnupg"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$asc' '$gnupg'" RETURN
+  curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v$1.x/sha256sums.asc" -o "$asc" 2>/dev/null || return 0
+  if ! GNUPGHOME="$gnupg" gpg --batch --quiet --import "$AUTOSIGNER_KEY" 2>/dev/null; then
+    echo "error: could not import $AUTOSIGNER_KEY" >&2; return 0
+  fi
+  # Fail CLOSED: an unverifiable sums file means we cannot authenticate any hash in it, so
+  # this whole line is "not pinnable" and the scout falls back / skips the week. That is the
+  # same safe direction as the existing announced-but-unpublished handling.
+  if ! GNUPGHOME="$gnupg" gpg --batch --quiet --verify "$asc" 2>/dev/null; then
+    echo "warning: sha256sums.asc for v$1.x did not verify against $AUTOSIGNER_FPR — refusing to pin from it" >&2
+    return 0
+  fi
+  # Only now trust the contents. `--output` re-emits the verified cleartext.
+  GNUPGHOME="$gnupg" gpg --batch --quiet --decrypt "$asc" 2>/dev/null \
     | awk '$2 ~ /^linux-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.xz$/ {
              v = $2; sub(/^linux-/, "", v); sub(/\.tar\.xz$/, "", v); print v, $1 }' \
     | sort -V | tail -1
@@ -117,7 +168,7 @@ K_LATEST="${K_PICK%% *}"
 K_SHA_PUBLISHED="${K_PICK##* }"
 [ "$K_LATEST" = "$K_ANNOUNCED" ] || \
   echo "==> kernel ${K_ANNOUNCED} is announced but not signed/published yet — newest pinnable is ${K_LATEST}" >&2
-K_KIND="$(classify "$KERNEL_ORG_VERSION" "$K_LATEST")"
+K_KIND="$(classify kernel "$KERNEL_ORG_VERSION" "$K_LATEST")"
 
 # ===========================================================================
 # Discover: docker (parse the static-stable aarch64 index; SHAs need a download)
@@ -127,21 +178,30 @@ D_LATEST="$(printf '%s' "$D_INDEX" \
   | grep -oE 'docker-[0-9]+\.[0-9]+\.[0-9]+\.tgz' \
   | sed -E 's/^docker-(.*)\.tgz$/\1/' | sort -V | uniq | tail -1)"
 [ -n "$D_LATEST" ] || { echo "error: could not parse a docker version from the static index" >&2; exit 1; }
-D_KIND="$(classify "$DOCKER_VERSION" "$D_LATEST")"
+D_KIND="$(classify docker "$DOCKER_VERSION" "$D_LATEST")"
 
 # ===========================================================================
 # Discover: compose + buildx (host CLI plugins) — each project's releases/latest
 # (excludes pre-releases/drafts). SHAs need a binary download (done below).
 # ===========================================================================
 gh_latest(){ # <owner/repo> -> X.Y.Z (strips the leading v); dies on failure
-  local tag; tag="$(gh_curl "https://api.github.com/repos/$1/releases/latest" | jq -r '.tag_name')"
+  local tag ver
+  tag="$(gh_curl "https://api.github.com/repos/$1/releases/latest" | jq -r '.tag_name')"
   [ -n "$tag" ] && [ "$tag" != "null" ] || { echo "error: could not read latest release for $1" >&2; exit 1; }
-  printf '%s' "${tag#v}"
+  ver="${tag#v}"
+  # Git ref names allow $ ( ) ` ; & | and " — and this value is written verbatim into
+  # versions.env, which a dozen scripts and workflows `source` as SHELL (and which
+  # gen-versions.sh interpolates into a Swift string literal). An upstream tag like
+  # `v1.0.0$(curl …|sh)` would execute on the release runner holding the signing key.
+  case "$ver" in
+    ''|*[!0-9.]*) echo "error: $1 released a non-numeric tag '$tag' — refusing to pin it" >&2; exit 1 ;;
+  esac
+  printf '%s' "$ver"
 }
 CP_LATEST="$(gh_latest docker/compose)"
-CP_KIND="$(classify "$DOCKER_COMPOSE_VERSION" "$CP_LATEST")"
+CP_KIND="$(classify compose "$DOCKER_COMPOSE_VERSION" "$CP_LATEST")"
 BX_LATEST="$(gh_latest docker/buildx)"
-BX_KIND="$(classify "$DOCKER_BUILDX_VERSION" "$BX_LATEST")"
+BX_KIND="$(classify buildx "$DOCKER_BUILDX_VERSION" "$BX_LATEST")"
 
 # ===========================================================================
 # Compute new pins for whatever qualifies
