@@ -110,6 +110,23 @@ The harness appends to `results.csv` (`./run.sh report` prints the scorecard). T
 above are the latest clean **single-engine** measurements — each engine measured with the
 other stopped, since Docker Desktop's daemon proved unstable when both VMs were co-resident.
 
+> **Footprint note (2026-08-24, multi-arch emulation).** Baking the three static QEMU
+> user-mode emulators (arm, i386, x86_64) into the guest grew `root.img` from **78.8 MB to
+> 91.4 MB (+12.7 MB)**, so the installed footprint above moves ~226 MB → **~239 MB** — still
+> ~9.7× smaller than Docker Desktop, which ships the same emulators in a far larger VM image.
+> The cost is disk only: the erofs root is demand-paged, so an emulator that is never used is
+> never read into RAM.
+>
+> The rest of the scorecard was **A/B'd guest-vs-guest** rather than re-run against the table
+> above (that baseline was measured on a different machine state): the pre-change `root.img`
+> and the new one, same host, same hour, zero containers. **No regression attributable to the
+> change** — and a caution for whoever benchmarks next: *single-shot suite numbers on a busy
+> workstation are not evidence*. On identical code the suite reported `c2host` at 36.7, 96.8
+> and 88.4 Gbit/s across three runs, and the ext4 named-volume write it scored at 1,029 MB/s
+> measured a **median of 2,044 MB/s over n=7** with a 102% spread. Repeat the metric, compare
+> medians, and treat a delta smaller than the intra-run spread as noise. The vs-Docker-Desktop
+> half could not be run (Docker Desktop was not installed on the measuring machine).
+
 ### Published ports: now a VZNAT conduit-pool win
 
 Inbound `localhost:PORT → container` used to route over a single `VZVirtioSocketDevice`

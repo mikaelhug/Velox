@@ -89,7 +89,9 @@ fn main() {
     // Build it off the critical path. Spawned only when data_ok, so the swapfile's
     // parent (/var/lib/docker) is already mounted.
     if data_ok { spawn_worker("swap-setup", setup_swap); }
-    setup_virtiofs();
+    let rosetta_ok = setup_virtiofs();
+    // Emulators before dockerd: BuildKit enumerates supported platforms at daemon start.
+    setup_binfmt(rosetta_ok);
     // Diagnosability: one line when the host granted nested virtualization (shows
     // in Engine Logs / Copy Diagnostics). KVM self-disables without EL2 — silent.
     if std::path::Path::new("/dev/kvm").exists() {
@@ -1540,7 +1542,10 @@ fn tune_virtiofs_readahead(path: &str) {
     }
 }
 
-fn setup_virtiofs() {
+/// Mount the VirtioFS shares. Returns whether the **Rosetta** share mounted — the binfmt
+/// registration that goes with it lives in `setup_binfmt()`, with every other emulator, so
+/// there is exactly one place that touches binfmt_misc.
+fn setup_virtiofs() -> bool {
     // host /Users → /Users, shared propagation so container bind mounts resolve.
     let _ = std::fs::create_dir_all("/Users");
     do_mount("vlxusers", "/Users", "virtiofs", 0, None);
@@ -1565,24 +1570,118 @@ fn setup_virtiofs() {
     }
 
     // Rosetta x86-64 translation (optional — only if the host attached the share).
+    // The mount is here with the other shares; the binfmt entry it enables is registered in
+    // setup_binfmt(), which owns the ordering against the qemu emulators.
     let _ = std::fs::create_dir_all("/run/rosetta");
     let csrc = cstr("rosetta");
     let ctgt = cstr("/run/rosetta");
     let cfs = cstr("virtiofs");
     let r = unsafe { libc::mount(csrc.as_ptr(), ctgt.as_ptr(), cfs.as_ptr(), 0, std::ptr::null()) };
-    if r == 0 {
-        // The kernel hex-unescapes the magic/mask itself (string_unescape_inplace,
-        // UNESCAPE_HEX), so we write the LITERAL `\xNN` escaped form — NOT raw
-        // bytes (raw NULs would truncate the magic at scanarg, matching every
-        // 64-bit ELF and breaking arm64 exec). magic matches x86-64 (e_machine
-        // 0x3e at offset 18); arm64 binaries don't match.
-        let reg = ":rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/run/rosetta/rosetta:OCF";
-        match std::fs::write("/proc/sys/fs/binfmt_misc/register", reg) {
-            Ok(_) => log!("rosetta registered"),
-            Err(e) => log!("rosetta binfmt register failed: {e}"),
+    if r != 0 {
+        log!("no rosetta share — linux/amd64 falls back to qemu");
+    }
+    r == 0
+}
+
+// =================== binfmt_misc: multi-arch emulation ===================
+
+/// The QEMU user-mode emulators baked into the rootfs (guest/rootfs/Dockerfile), as
+/// `(binfmt name, magic, mask, interpreter)`. Apple silicon has no AArch32 EL0 and the kernel
+/// is built without CONFIG_COMPAT, so these are the ONLY way a 32-bit image can run.
+///
+/// magic/mask are copied VERBATIM from qemu's own `scripts/qemu-binfmt-conf.sh` — never
+/// hand-derived. They match the ELF header: class at offset 4, e_type at 16 (masked 0xfe so
+/// ET_EXEC and ET_DYN both hit) and e_machine at 18 (0x28 = EM_ARM, 0x03 = EM_386).
+///
+/// linux/amd64 is deliberately absent here — it is handled in `setup_binfmt()` because Rosetta
+/// takes precedence over `qemu-x86_64`.
+const QEMU_EMULATORS: &[(&str, &str, &str, &str)] = &[
+    ("qemu-arm",                                       // linux/arm/v5, /v6, /v7
+     "\\x7fELF\\x01\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x28\\x00",
+     "\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff",
+     "/usr/bin/qemu-arm"),
+    ("qemu-i386",                                      // linux/386
+     "\\x7fELF\\x01\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x03\\x00",
+     "\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff",
+     "/usr/bin/qemu-i386"),
+];
+
+/// x86-64 ELF magic/mask — shared by the two possible linux/amd64 handlers (Rosetta and
+/// qemu-x86_64), which is exactly why only one of them may ever be registered.
+const X86_64_MAGIC: &str =
+    "\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00";
+const X86_64_MASK: &str =
+    "\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff";
+
+/// Register one binfmt_misc ELF handler.
+///
+/// The kernel hex-unescapes magic/mask itself (`string_unescape_inplace`, UNESCAPE_HEX), so we
+/// write the LITERAL `\xNN` escaped form — NOT raw bytes, whose NULs would truncate the magic
+/// at `scanarg` and match every ELF of that class (breaking native arm64 exec).
+///
+/// Flags `OCF` — the same set qemu's `qemu-binfmt-conf.sh` and Docker's own binfmt installer use:
+///   * `O` — hand the target binary to the interpreter as an already-open fd.
+///   * `C` — apply the *target's* credentials (setuid/setgid), not the interpreter's.
+///   * `F` — "fix binary": the kernel opens the interpreter ONCE, here, and clones that open
+///     file for every exec. This is what makes emulation work inside containers at all (a
+///     container rootfs has no `/usr/bin/qemu-*`), and it keeps exec cheap — no path lookup in
+///     the container's mount namespace, no re-open, interpreter pages stay hot in page cache.
+fn register_binfmt(name: &str, magic: &str, mask: &str, interp: &str) -> bool {
+    let reg = format!(":{name}:M::{magic}:{mask}:{interp}:OCF");
+    match std::fs::write("/proc/sys/fs/binfmt_misc/register", reg) {
+        Ok(_) => true,
+        Err(e) => { log!("binfmt: {name} failed to register: {e}"); false }
+    }
+}
+
+/// Register every emulator the guest carries, so `docker run --platform linux/arm/v7 …` works
+/// with no privileged `multiarch/qemu-user-static` / `tonistiigi/binfmt` setup container.
+/// (Those work by writing the same file from inside a container, but their entries live in the
+/// guest kernel and die with the VM — they must be re-run after every engine restart. Doing it
+/// from PID 1 is the only form that is actually reliable, and it is what Docker Desktop's
+/// LinuxKit `pkg/binfmt` does too.)
+///
+/// Runs before `spawn_dockerd()`: dockerd's embedded BuildKit worker probes the supported
+/// platforms once at startup, so anything registered later can never appear in `docker buildx
+/// inspect`. (That list is advisory — measured, buildx builds `--platform linux/arm/v7` fine
+/// even though it does not advertise it — but registering first costs nothing.)
+fn setup_binfmt(rosetta_ok: bool) {
+    let mut registered: Vec<&str> = Vec::new();
+    for (name, magic, mask, interp) in QEMU_EMULATORS {
+        // The emulator set is a build-time choice; tolerate a rootfs built without one.
+        if !std::path::Path::new(interp).exists() {
+            log!("binfmt: {interp} missing — {name} not registered");
+            continue;
         }
+        if register_binfmt(name, magic, mask, interp) { registered.push(name); }
+    }
+
+    // linux/amd64: Rosetta when the host attached its share (far faster than TCG emulation),
+    // and qemu-x86_64 ONLY as the fallback. Never both: binfmt_misc matches the MOST RECENTLY
+    // registered entry first (`hlist_add_head_rcu` since 6.7, `list_add` before), so a
+    // qemu-x86_64 registered after Rosetta would silently shadow it and make every amd64
+    // container an order of magnitude slower — a regression with no error to notice.
+    //
+    // The fallback keys on the REGISTRATION, not just the mount: the `F` flag makes the kernel
+    // open /run/rosetta/rosetta at registration time, so the write can fail on a mounted-but-
+    // unusable share. Falling back then is shadow-safe by construction — a failed registration
+    // put nothing in the list to shadow — and the alternative is amd64 not running at all while
+    // a working emulator sits unused in the rootfs.
+    let rosetta_registered =
+        rosetta_ok && register_binfmt("rosetta", X86_64_MAGIC, X86_64_MASK, "/run/rosetta/rosetta");
+    if rosetta_registered {
+        registered.push("rosetta[amd64]");
+    } else if std::path::Path::new("/usr/bin/qemu-x86_64").exists()
+        && register_binfmt("qemu-x86_64", X86_64_MAGIC, X86_64_MASK, "/usr/bin/qemu-x86_64")
+    {
+        if rosetta_ok { log!("binfmt: rosetta unusable — falling back to qemu for linux/amd64"); }
+        registered.push("qemu-x86_64");
+    }
+
+    if registered.is_empty() {
+        log!("binfmt: nothing registered — only native arm64 images will run");
     } else {
-        log!("no rosetta share — x86 emulation off");
+        log!("binfmt: {}", registered.join(", "));
     }
 }
 

@@ -98,6 +98,9 @@ jobs:
           DOCKER_FROM:  ${{ steps.scout.outputs.docker_from }}
           DOCKER_TO:    ${{ steps.scout.outputs.docker_to }}
           DOCKER_KIND:  ${{ steps.scout.outputs.docker_kind }}
+          QEMU_FROM:    ${{ steps.scout.outputs.qemu_from }}
+          QEMU_TO:      ${{ steps.scout.outputs.qemu_to }}
+          QEMU_KIND:    ${{ steps.scout.outputs.qemu_kind }}
         run: |
           set -euo pipefail
           ./Scripts/gen-versions.sh
@@ -118,6 +121,7 @@ jobs:
             echo "| --- | --- | --- | --- |"
             [ -n "$KERNEL_KIND" ] && echo "| Linux kernel | \`$KERNEL_FROM\` | \`$KERNEL_TO\` | $KERNEL_KIND |"
             [ -n "$DOCKER_KIND" ] && echo "| Docker engine | \`$DOCKER_FROM\` | \`$DOCKER_TO\` | $DOCKER_KIND |"
+            [ -n "$QEMU_KIND" ] && echo "| QEMU user (guest emulators) | \`$QEMU_FROM\` | \`$QEMU_TO\` | $QEMU_KIND |"
             echo "| Velox | \`$PREV\` | \`$NEW\` | minor |"
             echo
             echo "Auto-merges to main + tags \`v$NEW\` once validation is green. Green = compiles +"
@@ -128,6 +132,7 @@ jobs:
             echo "- [ ] \`docs/bench/run.sh\` on Apple Silicon vs Docker Desktop — no regression (\`docs/benchmarks.md\`)."
             [ -n "$KERNEL_KIND" ] && echo "- [ ] Kernel: guest boots with VirtioFS + Rosetta (CONFIG_ONLY gate covers symbols only)."
             [ "$DOCKER_KIND" = "major" ] && echo "- [ ] **Docker MAJOR**: re-verify \`assert_direct_access_rules()\` chains (\`filter-FORWARD\`/\`raw-PREROUTING\` in \`ip docker-bridges\`) — CI can't; named access breaks silently otherwise."
+            [ -n "$QEMU_KIND" ] && echo "- [ ] QEMU: \`Tests/e2e/run.sh -k emulation\` — the build only asserts the binaries are static arm64, not that they still execute."
             :   # guarantee the group's last command is truthy under `set -e`
           } >> "$GITHUB_STEP_SUMMARY" || true
 
@@ -165,7 +170,7 @@ jobs:
           KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF $MOBY_CHECKCONFIG_SHA256"; \
                      git ls-files -z guest/kernel Scripts/build-kernel.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
-          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
+          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE $QEMU_USER_VERSION $QEMU_USER_DEB_SHA256"; \
                      git ls-files -z guest/rootfs guest/vinit Scripts/make-guest.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
           echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"

@@ -363,6 +363,34 @@ if want "rosetta"; then section "Rosetta x86 emulation"
   else skip "Rosetta x86" "amd64 container did not run"; fi
 fi
 
+if want "emulation"; then section "multi-arch emulation (linux/arm, linux/386 via built-in QEMU)"
+  # No `multiarch/qemu-user-static` / `tonistiigi/binfmt` setup container anywhere: vinit
+  # registers these at boot, so they must be live on a plain engine start. Same pull-first
+  # dance as Rosetta above (pull progress on stderr would look like a failure).
+  for spec in "linux/arm/v7:arm32v7/alpine:arm" "linux/386:i386/alpine:86"; do
+    plat="${spec%%:*}"; rest="${spec#*:}"; img="${rest%%:*}"; needle="${rest##*:}"
+    if ! $DOCKER pull -q --platform "$plat" "$img" >/dev/null 2>&1; then
+      skip "$plat runs" "could not pull $img (offline?)"; continue
+    fi
+    arch="$($DOCKER run --rm --platform "$plat" "$img" uname -m 2>/dev/null | tr -d '\r\n')"
+    if [ -n "$arch" ]; then assert_contains "$plat image runs (uname -m = $arch)" "$needle" "$arch"
+    else bad "$plat image runs" "container did not start — is the emulator registered?"; fi
+    $DOCKER image rm -f "$img" >/dev/null 2>&1
+  done
+  # Emulation must also work INSIDE a build, not just at `docker run` — a cross-platform
+  # `RUN` is the case people actually hit. (Note: buildx's advertised `Platforms:` list is
+  # conservative — measured, it omits linux/arm/v7 even while building for it works — so
+  # assert the build, not the advertisement.)
+  mkdir -p "$TMP/bx" && printf 'FROM %s\nRUN uname -m\n' "$BASE" > "$TMP/bx/Dockerfile"
+  if ! $DOCKER buildx version >/dev/null 2>&1; then
+    skip "cross-platform build (linux/arm/v7)" "buildx plugin not installed"
+  elif ! $DOCKER pull -q --platform linux/arm/v7 "$BASE" >/dev/null 2>&1; then
+    skip "cross-platform build (linux/arm/v7)" "could not pull the arm/v7 base (offline?)"
+  elif $DOCKER buildx build --platform linux/arm/v7 -q -t ${PREFIX}-img "$TMP/bx" >/dev/null 2>&1
+  then ok "cross-platform build runs an emulated RUN (linux/arm/v7)"
+  else bad "cross-platform build runs an emulated RUN (linux/arm/v7)" "buildx build failed"; fi
+fi
+
 if want "compose"; then section "compose + buildx plugins"
   if $DOCKER compose version >/dev/null 2>&1; then
     ok "docker compose plugin present ($($DOCKER compose version --short 2>/dev/null))"

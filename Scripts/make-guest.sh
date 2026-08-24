@@ -32,6 +32,9 @@ docker build --platform linux/arm64 -t "$ROOTFS_TAG" \
     --build-arg "ALPINE_IMAGE=${ALPINE_IMAGE}" \
     --build-arg "DOCKER_VERSION=${DOCKER_VERSION}" \
     --build-arg "DOCKER_SHA256=${DOCKER_STATIC_SHA256}" \
+    --build-arg "QEMU_USER_VERSION=${QEMU_USER_VERSION}" \
+    --build-arg "QEMU_USER_SNAPSHOT=${QEMU_USER_SNAPSHOT}" \
+    --build-arg "QEMU_USER_DEB_SHA256=${QEMU_USER_DEB_SHA256}" \
     -f guest/rootfs/Dockerfile guest
 
 echo "==> export the flat tree"

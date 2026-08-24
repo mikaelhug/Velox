@@ -79,6 +79,7 @@ blocked(){
     docker)  list="${DOCKER_BLOCKED:-}" ;;
     compose) list="${DOCKER_COMPOSE_BLOCKED:-}" ;;
     buildx)  list="${DOCKER_BUILDX_BLOCKED:-}" ;;
+    qemu)    list="${QEMU_USER_BLOCKED:-}" ;;
     *)       return 1 ;;
   esac
   case " $list " in *" $2 "*) return 0 ;; esac
@@ -228,6 +229,49 @@ BX_LATEST="$(gh_latest docker/buildx)"
 BX_KIND="$(classify buildx "$DOCKER_BUILDX_VERSION" "$BX_LATEST")"
 
 # ===========================================================================
+# Discover: qemu-user (the guest's multi-arch emulators) — Debian STABLE only
+# ===========================================================================
+# Not the shared pool listing: pool/main/q/qemu also holds testing/unstable uploads and
+# binNMU rebuilds (`+b1`), and "newest in the pool" would silently adopt one of those. The
+# per-suite download page is scoped to stable AND publishes Debian's own SHA-256, so one
+# small page gives version + checksum with no 64 MB fetch to discover (we still download to
+# confirm the bytes agree with it before pinning — two independent sources, like every other
+# pin here). Debian versions are not semver: classify on the upstream part (10.0.11+ds-0+deb13u1
+# -> 10.0.11), and treat a same-upstream Debian revision as a patch — that is what a security
+# rebuild looks like, and skipping it is exactly the mistake the in-line-patch policy above
+# was written to stop making.
+q_up(){ printf '%s' "${1%%+*}"; }
+Q_KIND=""; Q_LATEST=""; Q_SHA=""; Q_STAMP=""
+Q_PAGE="$(curl -fsSL https://packages.debian.org/stable/arm64/qemu-user/download || true)"
+Q_FILE="$(printf '%s' "$Q_PAGE" | grep -oE 'qemu-user_[^"<]+_arm64\.deb' | head -1 || true)"
+if [ -z "$Q_FILE" ]; then
+  echo "==> warning: could not read qemu-user from Debian stable — leaving its pin alone" >&2
+else
+  Q_LATEST="${Q_FILE#qemu-user_}"; Q_LATEST="${Q_LATEST%_arm64.deb}"
+  # This value is written verbatim into versions.env, which a dozen scripts SOURCE as shell
+  # (same reasoning as gh_latest above). Debian versions use only [0-9A-Za-z.+~:-].
+  case "$Q_LATEST" in
+    ''|*[!0-9A-Za-z.+~:-]*) echo "error: refusing to pin a qemu-user version with unexpected characters: '$Q_LATEST'" >&2; exit 1 ;;
+  esac
+  if [ "$Q_LATEST" = "$QEMU_USER_VERSION" ]; then
+    : # already pinned
+  elif blocked qemu "$Q_LATEST"; then
+    echo "==> qemu-user $Q_LATEST is on the deny list (rolled back previously) — not adopting it" >&2
+  else
+    q_cur="$(q_up "$QEMU_USER_VERSION")"; q_new="$(q_up "$Q_LATEST")"
+    if newer "$q_cur" "$q_new"; then
+      if   [ "$(maj "$q_cur")" != "$(maj "$q_new")" ]; then Q_KIND="major"
+      elif [ "$(mm  "$q_cur")" != "$(mm  "$q_new")" ]; then Q_KIND="minor"
+      else Q_KIND="patch"; fi
+    elif [ "$q_cur" = "$q_new" ]; then
+      Q_KIND="patch"          # same upstream, new Debian revision — a stable/security rebuild
+    else
+      echo "==> qemu-user: stable serves an OLDER upstream ($q_new < $q_cur) — not adopting" >&2
+    fi
+  fi
+fi
+
+# ===========================================================================
 # Compute new pins for whatever qualifies
 # ===========================================================================
 K_SHA="" D_GUEST_SHA="" D_MAC_SHA="" CP_SHA="" BX_SHA=""
@@ -273,6 +317,28 @@ if [ -n "$BX_KIND" ]; then
   echo "==> buildx sha ${BX_SHA}" >&2
 fi
 
+if [ -n "$Q_KIND" ]; then
+  Q_URL="https://deb.debian.org/debian/pool/main/q/qemu/qemu-user_${Q_LATEST}_arm64.deb"
+  Q_PAGE_SHA="$(printf '%s' "$Q_PAGE" | sed -n 's|.*SHA256 checksum</th>.*<tt>\([0-9a-f]\{64\}\)</tt>.*|\1|p' | head -1)"
+  [ -n "$Q_PAGE_SHA" ] || { echo "error: Debian's download page published no SHA-256 for qemu-user ${Q_LATEST} — refusing to bump qemu this run" >&2; exit 1; }
+  echo "==> qemu-user ${QEMU_USER_VERSION} -> ${Q_LATEST} (${Q_KIND}); fetching deb to hash (~64MB)" >&2
+  Q_SHA="$(curl -fsSL "$Q_URL" | _sha)"
+  [ -n "$Q_SHA" ] || { echo "error: failed to compute the qemu-user SHA" >&2; exit 1; }
+  # Two independent sources must agree: Debian's published checksum and the bytes the CDN
+  # actually served. A mismatch means a mirror is serving something else — fail, never pin.
+  [ "$Q_SHA" = "$Q_PAGE_SHA" ] || { echo "error: qemu-user ${Q_LATEST} SHA mismatch — page ${Q_PAGE_SHA}, download ${Q_SHA}" >&2; exit 1; }
+  # The immutable snapshot fallback the guest build uses when the pool URL ages out. The
+  # Debian epoch for qemu is 1; if that ever changes the lookup returns nothing and we refuse
+  # to bump rather than pin a version whose fallback URL we cannot construct.
+  Q_STAMP="$(curl -fsSL "https://snapshot.debian.org/mr/binary/qemu-user/1%3A${Q_LATEST}/binfiles?fileinfo=1" \
+             | jq -r '.fileinfo | to_entries[] | .value[] | select(.name | endswith("_arm64.deb")) | .first_seen' | head -1)"
+  case "${Q_STAMP:-}" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z) : ;;
+    *) echo "error: no snapshot.debian.org stamp for qemu-user ${Q_LATEST} — refusing to bump qemu this run" >&2; exit 1 ;;
+  esac
+  echo "==> qemu-user sha ${Q_SHA}; snapshot ${Q_STAMP}" >&2
+fi
+
 # ===========================================================================
 # Emit outputs + (unless --dry-run) rewrite versions.env
 # ===========================================================================
@@ -280,7 +346,7 @@ fi
 # kernel/docker LINE is a minor bump, a batch of pure in-line patches is a patch
 # bump. Keeps `velox version` honest about how much actually moved underneath.
 NEW_VELOX=""
-case " $K_KIND $D_KIND $CP_KIND $BX_KIND " in
+case " $K_KIND $D_KIND $CP_KIND $BX_KIND $Q_KIND " in
   *" major "*|*" minor "*) NEW_VELOX="$(bump_minor "$VELOX_VERSION")" ;;
   *" patch "*)             NEW_VELOX="$(bump_patch "$VELOX_VERSION")" ;;
 esac
@@ -292,7 +358,7 @@ emit(){ # KEY=VALUE to stdout and, in CI, to $GITHUB_OUTPUT
 }
 
 if [ -z "$NEW_VELOX" ]; then
-  echo "==> up to date — no newer kernel, docker, compose or buildx release." >&2
+  echo "==> up to date — no newer kernel, docker, compose, buildx or qemu-user release." >&2
   emit "changed=false"
   emit "kernel_unpinnable=${KERNEL_UNPINNABLE}"
   exit 0
@@ -303,6 +369,7 @@ fi
 [ -n "$D_KIND" ]  && echo "CHANGED docker ${DOCKER_VERSION} ${D_LATEST} ${D_KIND}"
 [ -n "$CP_KIND" ] && echo "CHANGED compose ${DOCKER_COMPOSE_VERSION} ${CP_LATEST} ${CP_KIND}"
 [ -n "$BX_KIND" ] && echo "CHANGED buildx ${DOCKER_BUILDX_VERSION} ${BX_LATEST} ${BX_KIND}"
+[ -n "$Q_KIND" ]  && echo "CHANGED qemu-user ${QEMU_USER_VERSION} ${Q_LATEST} ${Q_KIND}"
 echo "VELOX ${VELOX_VERSION} ${NEW_VELOX}"
 
 # Compose a short title the commit/PR/tag reuse, comma-joining whatever changed.
@@ -312,6 +379,7 @@ add_part "${K_KIND:+kernel ${KERNEL_ORG_VERSION}→${K_LATEST}}"
 add_part "${D_KIND:+docker ${DOCKER_VERSION}→${D_LATEST}}"
 add_part "${CP_KIND:+compose ${DOCKER_COMPOSE_VERSION}→${CP_LATEST}}"
 add_part "${BX_KIND:+buildx ${DOCKER_BUILDX_VERSION}→${BX_LATEST}}"
+add_part "${Q_KIND:+qemu ${QEMU_USER_VERSION}→${Q_LATEST}}"
 TITLE="release: v${NEW_VELOX} — ${TITLE_PARTS}"
 
 emit "changed=true"
@@ -330,6 +398,9 @@ emit "compose_kind=${CP_KIND}"
 emit "buildx_from=${DOCKER_BUILDX_VERSION}"
 emit "buildx_to=${BX_KIND:+$BX_LATEST}"
 emit "buildx_kind=${BX_KIND}"
+emit "qemu_from=${QEMU_USER_VERSION}"
+emit "qemu_to=${Q_KIND:+$Q_LATEST}"
+emit "qemu_kind=${Q_KIND}"
 emit "title=${TITLE}"
 
 if [ "$DRY_RUN" = "1" ]; then
@@ -353,6 +424,11 @@ fi
 if [ -n "$BX_KIND" ]; then
   set_var DOCKER_BUILDX_VERSION           "$BX_LATEST"
   set_var DOCKER_BUILDX_MAC_ARM64_SHA256  "$BX_SHA"
+fi
+if [ -n "$Q_KIND" ]; then
+  set_var QEMU_USER_VERSION    "$Q_LATEST"
+  set_var QEMU_USER_SNAPSHOT   "$Q_STAMP"
+  set_var QEMU_USER_DEB_SHA256 "$Q_SHA"
 fi
 set_var VELOX_VERSION "$NEW_VELOX"
 echo "==> versions.env updated (velox ${VELOX_VERSION} -> ${NEW_VELOX})." >&2

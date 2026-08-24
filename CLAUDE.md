@@ -225,7 +225,7 @@ The binding architecture:
 - **`vinit` (`guest/vinit/`, Rust → static musl) IS PID 1**: it does every boot step
   via direct syscalls (`libc`) — mounts, cgroup2, clock from `velox.epoch`, **native
   DHCP via ioctl** (no udhcpc/dhcpcd), data-disk format/mount + swap, VirtioFS,
-  Rosetta binfmt — then forks+supervises `dockerd` (on a unix socket, with
+  binfmt (`setup_binfmt`) — then forks+supervises `dockerd` (on a unix socket, with
   `--host-gateway-ip` for host.docker.internal), runs the vsock agent (ports 2375
   docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock / 2378
   gateway-probe), and reaps
@@ -239,6 +239,16 @@ The binding architecture:
   for container workloads that run their own `iptables`. Eliminating the musl `/lib`
   entirely (fully-static nft + mke2fs from source → a pure scratch tree) is a noted
   follow-up toward the leaner footprint.
+- **Multi-arch emulation is baked in and registered by `vinit` at boot** — three static
+  QEMU user-mode binaries from Debian's `qemu-user` (arm, i386, x86_64), plus Rosetta.
+  `setup_binfmt()` is the ONLY place that writes `/proc/sys/fs/binfmt_misc/register`, and
+  it registers **either** Rosetta **or** `qemu-x86_64` for linux/amd64, never both: the
+  kernel matches the most recently *registered* entry first, so a second x86-64 handler
+  registered after Rosetta silently shadows it and makes every amd64 container an order of
+  magnitude slower. Don't replace this with a privileged `multiarch/qemu-user-static` /
+  `tonistiigi/binfmt` setup container — its entries live in the guest kernel and die with
+  the VM, so it must be re-run after every restart. (Same design as Docker Desktop's
+  LinuxKit `pkg/binfmt`.)
 - **Do NOT reintroduce:** `linuxkit`, the `docker:*-dind` image, `linuxkit/*` package
   images, an initramfs, or any OCI-image-as-guest-component. There is no
   `guest/velox.yml`. (Buildkit gotcha: a `RUN` immediately after `COPY …/sbin/init`
@@ -286,7 +296,11 @@ this is the single exception to "releasing is opt-in" (see the binding blockquot
   tarball is not signed/published yet is treated as **not out**, and the newest *pinnable*
   one is taken instead, because that propagation window used to fail the run for days) and the
   newest **static-stable** Docker (the `download.docker.com/.../aarch64/` index, SHAs
-  computed by downloading the two tarballs), and rewrites only the pins that changed.
+  computed by downloading the two tarballs), and the guest's **qemu-user** emulators from
+  Debian **stable** only (`packages.debian.org/stable/arm64/qemu-user/download` — the shared
+  pool also carries testing/unstable uploads and binNMU rebuilds; Debian's published SHA-256
+  is cross-checked against the bytes actually served before anything is pinned), and rewrites
+  only the pins that changed.
   Policy: take **any newer release, patches included** — and always the newest upstream
   offers, so a new line beats a patch on the old one (`7.1.3→7.2.0`, never
   `7.1.3→7.1.10` when `7.2.0` exists). In-line patches carry CVE and bugfix content and

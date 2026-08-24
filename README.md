@@ -40,8 +40,11 @@ in [docs/benchmarks.md](docs/benchmarks.md).
   quick panel, crash notifications, and one-click Reclaim Space.
 - **Nested virtualization** (M3+, opt-in): `/dev/kvm` inside containers — run
   QEMU, Firecracker or Android emulators *inside* Docker.
-- **Rosetta x86** (`--platform linux/amd64`), **VirtioFS** bind mounts, the
-  **containerd image store** (multi-platform images, attestations, Wasm).
+- **Multi-arch out of the box.** `linux/amd64` runs on **Rosetta**, `linux/arm`
+  (v5/v6/v7) and `linux/386` on built-in QEMU — registered in the guest at boot, so
+  there is no privileged `multiarch/qemu-user-static` step to re-run after every restart.
+- **VirtioFS** bind mounts and the **containerd image store** (multi-platform
+  images, attestations, Wasm).
 - **Event-driven, never polling.** Published ports come up the instant a
   container starts; a Resource Saver balloons an idle engine down to a
   **sub-100 MB** host footprint; the guest clock survives Mac sleep.

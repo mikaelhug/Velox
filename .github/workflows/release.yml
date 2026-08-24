@@ -70,7 +70,7 @@ jobs:
           KHASH=$( { echo "$KERNEL_ORG_VERSION $KERNEL_ORG_SHA256 $KERNEL_BUILDER_IMAGE $MOBY_CHECKCONFIG_REF $MOBY_CHECKCONFIG_SHA256"; \
                      git ls-files -z guest/kernel Scripts/build-kernel.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
-          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE"; \
+          RHASH=$( { echo "$DOCKER_VERSION $RUST_BUILD_IMAGE $ALPINE_IMAGE $QEMU_USER_VERSION $QEMU_USER_DEB_SHA256"; \
                      git ls-files -z guest/rootfs guest/vinit Scripts/make-guest.sh | sort -z | xargs -0 sha256sum; \
                    } | sha256sum | cut -c1-16 )
           echo "kernel=kernel-${KERNEL_ORG_VERSION}-${KHASH}" >> "$GITHUB_OUTPUT"

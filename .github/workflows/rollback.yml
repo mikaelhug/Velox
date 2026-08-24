@@ -2,7 +2,8 @@
 # FORWARD (higher version wins), so a bad auto-release can't be recalled; you recover
 # by shipping a NEW release that restores the last-good component pins.
 #
-# This manually-triggered workflow reverts the five component pins (kernel x2, docker x3)
+# This manually-triggered workflow reverts the component pins (kernel x2, docker x3, the two
+# host CLI plugins, and the guest's qemu-user emulators)
 # in versions.env to the values from a prior release tag, bumps VELOX_VERSION one MINOR
 # (so it's newer than the bad release), regenerates Versions.swift, commits to main, and
 # tags it — firing release.yml to build and publish the corrective release.
@@ -75,6 +76,7 @@ jobs:
           BAD_DOCKER="$(cur_of DOCKER_VERSION)"
           BAD_COMPOSE="$(cur_of DOCKER_COMPOSE_VERSION)"
           BAD_BUILDX="$(cur_of DOCKER_BUILDX_VERSION)"
+          BAD_QEMU="$(cur_of QEMU_USER_VERSION)"
 
           for k in KERNEL_ORG_VERSION KERNEL_ORG_SHA256 DOCKER_VERSION DOCKER_STATIC_SHA256 DOCKER_CLI_MAC_ARM64_SHA256; do
             v="$(get_from_tag "$k")"
@@ -82,9 +84,11 @@ jobs:
             set_var "$k" "$v"
           done
 
-          # Host CLI plugins (compose/buildx) were added later — restore them if the
-          # target tag carried the pin, but don't fail rolling back to a pre-plugin tag.
-          for k in DOCKER_COMPOSE_VERSION DOCKER_COMPOSE_MAC_ARM64_SHA256 DOCKER_BUILDX_VERSION DOCKER_BUILDX_MAC_ARM64_SHA256; do
+          # Host CLI plugins (compose/buildx) and the guest's qemu-user emulators were added
+          # later — restore them if the target tag carried the pin, but don't fail rolling back
+          # to a tag from before they existed.
+          for k in DOCKER_COMPOSE_VERSION DOCKER_COMPOSE_MAC_ARM64_SHA256 DOCKER_BUILDX_VERSION DOCKER_BUILDX_MAC_ARM64_SHA256 \
+                   QEMU_USER_VERSION QEMU_USER_SNAPSHOT QEMU_USER_DEB_SHA256; do
             v="$(get_from_tag "$k")"
             if [ -n "$v" ]; then set_var "$k" "$v"; else echo "::notice::$k absent in ${TO} (pre-plugin tag) — leaving current pin"; fi
           done
@@ -104,6 +108,7 @@ jobs:
           append_blocked DOCKER_BLOCKED "$BAD_DOCKER"
           append_blocked DOCKER_COMPOSE_BLOCKED "$BAD_COMPOSE"
           append_blocked DOCKER_BUILDX_BLOCKED "$BAD_BUILDX"
+          append_blocked QEMU_USER_BLOCKED "$BAD_QEMU"
 
           set -a; . ./versions.env; set +a
           NEW="$(printf '%s' "$VELOX_VERSION" | awk -F. '{print $1"."$2+1".0"}')"
