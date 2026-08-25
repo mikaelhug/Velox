@@ -97,8 +97,20 @@ The following conventions are **binding** — keep them true in all future work.
 >
 > **Pre-release gate:** the North Star is comparative, so before a *human-cut* release,
 > or any change to datapath/kernel/disk/engine **code**, re-run the benchmark scorecard
-> (`docs/bench/run.sh`) and check it against `docs/benchmarks.md` — a regression vs
-> Docker Desktop is a release blocker, not a footnote. On a `DOCKER_VERSION` major bump,
+> (**`docs/bench/run.sh all`** — the quick ~12 min single round) and check it against
+> `docs/benchmarks.md` — a regression vs Docker Desktop is a release blocker, not a footnote.
+> Single-shot numbers are noisy: treat a delta smaller than the spreads published in the
+> latest `docs/bench/REPORT-*.md` as noise, and re-run the metric before calling it a
+> regression. `run.sh` has no default subcommand — name the cadence you want.
+>
+> **The full head-to-head (`docs/bench/run.sh campaign`, ~2.5 h) is ANNUAL, not per release.**
+> It bounces both applications repeatedly, needs the Mac to itself and AC power, and produces
+> a dated `docs/bench/REPORT-<date>.md`. Run it once a year, when a Docker Desktop major
+> lands, or before putting a new performance claim on the README or website — and when you
+> do, every number in `README.md`, `docs/benchmarks.md`, `docs/benchmarks.html` and
+> `docs/index.html` gets refreshed from it in the same commit, since those four are
+> hand-maintained and have drifted apart before. Never publish a number the current report
+> doesn't contain. On a `DOCKER_VERSION` major bump,
 > also walk the checklist comment above it in `versions.env` (named-access nft chains).
 > **The automated `version-watch` releases cannot run this gate** — GitHub CI can't boot
 > the VM (no nested Virtualization.framework) or run `docs/bench/run.sh` — so for those

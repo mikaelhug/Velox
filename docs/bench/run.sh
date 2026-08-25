@@ -6,6 +6,24 @@
 # same suite against both, ONE ENGINE RESIDENT AT A TIME. Results are appended to
 # results.csv; ./report.py prints the scorecard.
 #
+# TWO CADENCES — pick the right one:
+#
+#   ./run.sh all        QUICK (~12 min).  One round per engine, no engine bouncing.
+#                       This is the pre-release regression check (CLAUDE.md): run it
+#                       before a human-cut release or a datapath/kernel/disk/engine
+#                       change and compare against docs/benchmarks.md. Single-shot, so
+#                       treat a delta smaller than the spreads in the report as noise.
+#
+#   ./run.sh campaign   FULL (~2.5 h).  The publishable head-to-head: order-balanced
+#                       n=5 rounds, idle/CPU windows, RAM-under-load, disk reclaim and
+#                       the functional matrix. Bounces both apps repeatedly and needs
+#                       the Mac to itself. This is ANNUAL (or when a new Docker Desktop
+#                       major lands / before a claim goes on the website) — NOT per
+#                       commit and not per release. Output is a dated report next to
+#                       this script; see REPORT-2026-08-25.md for the last one and
+#                       "Running the annual comparison" in ../benchmarks.md for the
+#                       preconditions that make it fair.
+#
 # Usage:
 #   ./run.sh campaign             # the full order-balanced comparison (see RUN BOOK below)
 #   ./run.sh preflight            # fairness gate: AC power, thermal, host idle, disk, deps
@@ -837,7 +855,9 @@ campaign(){
   python3 "$HERE/report.py"
 }
 
-case "${1:-campaign}" in
+# No default subcommand on purpose: the two cadences differ by 12 minutes vs 2.5 hours
+# and the long one bounces both apps, so it must be asked for by name.
+case "${1:-help}" in
   campaign)  campaign ;;
   preflight) preflight "${2:-}" ;;
   engine)    engine "${2:?usage: engine <velox|dd>}" ;;
@@ -852,5 +872,8 @@ case "${1:-campaign}" in
   matrix)    matrix "${2:?ctx}" "${3:?label}" ;;
   startup)   startup ;;
   report)    python3 "$HERE/report.py" ;;
-  *) echo "usage: $0 [campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|report]" >&2; exit 2 ;;
+  help|-h|--help)
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2
+    echo "usage: $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|report]" >&2 ;;
+  *) echo "usage: $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|report]" >&2; exit 2 ;;
 esac

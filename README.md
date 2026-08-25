@@ -21,10 +21,11 @@
 </div>
 
 Velox runs a real Docker Engine in a minimal Linux VM on Apple's
-`Virtualization.framework` — and gets out of the way: a self-contained 226 MB
-app that restarts to a ready Docker API in under two seconds and shrinks to
-tens of megabytes when idle. Numbers below, methodology and a runnable harness
-in [docs/benchmarks.md](docs/benchmarks.md).
+`Virtualization.framework` — and gets out of the way: a self-contained app that
+installs in 357 MB, restarts to a ready Docker API in about 1.2 seconds, and
+settles to well under half a gigabyte once its resource saver kicks in. Numbers
+below, with the methodology, the raw values and a runnable harness in
+[docs/bench/REPORT-2026-08-25.md](docs/bench/REPORT-2026-08-25.md).
 
 ## Highlights
 
@@ -131,43 +132,56 @@ warning.
 
 ## Performance
 
-Measured against Docker Desktop on the same Mac, the same way: both engines on
-`Virtualization.framework`, identically configured (8 vCPU), one engine under
-load at a time. Full methodology, fairness controls and a harness to reproduce
-every number are in [docs/benchmarks.md](docs/benchmarks.md).
+Measured against Docker Desktop 4.88.0 on the same Mac, on the same day, the same
+way — and the comparison is a close one to make fairly, because **both engines run
+the identical Docker Engine 29.7.2**, the same containerd image store, the same
+`docker` CLI and the same compose plugin, at a verified 8 vCPU / ~8 GB each, with
+only one engine resident at a time. What differs is the host around the engine.
+
+Medians over five order-balanced rounds (three for build/compose). Full
+methodology, every raw value, and the cases where Docker Desktop wins are in
+[docs/bench/REPORT-2026-08-25.md](docs/bench/REPORT-2026-08-25.md).
 
 | Metric | Velox | Docker Desktop | vs Docker Desktop |
 | --- | --- | --- | --- |
-| Install footprint | 226 MB | 2,328 MB | 10× smaller |
-| Idle RAM (host RSS, all processes) | ~0.9 GB | ~3.3 GB | 3.7× less |
-| Startup (restart → API-ready, warm) | 1.74 s | 2.55 s | 1.5× faster |
-| Container launch (`run --rm alpine true`) | 104 ms | 160 ms | 1.5× faster |
-| Network — container → host (iperf3) | 88.8 Gbit/s | 27.0 Gbit/s | 3.3× faster |
-| Published port — host → container (4 streams) | 59.2 Gbit/s | 18.0 Gbit/s | 3.3× faster |
-| VirtioFS bind-mount write (`dd` 1 GiB) | 1,030 MB/s | 692 MB/s | 1.5× faster |
-| VirtioFS bind-mount read (`dd` 1 GiB) | 2,135 MB/s | 2,163 MB/s | on par |
-| Small-file extract (4,000 files → bind) | 3.4 s | 3.1 s | ~10% slower |
-| Durable commit latency (`fio --fsync`, 4 K) | 0.31 ms | 0.47 ms | 1.5× faster |
-| Container-overlay write | 1,695 MB/s | 1,217 MB/s | 1.4× faster |
-| Postgres `pgbench` TPS (8 clients, 30 s) | 13,318 | 11,690 | 1.14× faster |
+| Install footprint | 357 MB | 2,193 MB | 6× smaller |
+| Idle RAM (host RSS, whole engine) | 734 MB | 1,771 MB | 2.4× less |
+| Idle RAM after the resource saver | 373 MB | 847 MB | 2.3× less |
+| Idle CPU (4 min, whole engine) | 0.76 % | 3.52 % | 4.6× less |
+| RAM with 21 containers running | 1,949 MB | 2,991 MB | 1.5× less |
+| Startup (restart → API-ready, warm) | 1.23 s | 1.99 s | 1.6× faster |
+| Container launch (`run --rm alpine true`) | 0.11 s | 0.13 s | 1.2× faster |
+| Published port — host → container (4 streams) | 59.8 Gbit/s | 25.3 Gbit/s | 2.4× faster |
+| `docker cp` out / in (1 GiB) | 540 / 373 MB/s | 225 / 154 MB/s | ~2.4× faster |
+| Disk handed back after deleting ~5 GB | 5,295 MB | 3,594 MB | 1.5× more returned |
+| Named-volume write (`dd` 1 GiB) | 2,115 MB/s | 1,840 MB/s | on par |
+| Image extraction (`docker load`) | 6.70 s | 6.38 s | on par |
+| Incremental `docker build` | 1.52 s | 1.56 s | on par |
+| Postgres `pgbench` TPS (8 clients, 30 s) | 13,796 | 12,372 | on par |
+| Small-file extract (4,000 files → bind) | 3.21 s | 2.56 s | **25% slower** |
+| `compose down` (SIGTERM-ignoring services) | 10.4 s | 3.5 s | **3× slower** |
 
-The idle-RAM row is the loaded benchmark baseline; an empty idle engine
-balloons further down, to a ~70 MB host footprint. Small-file extract is the one
-path that trails (~10%), because durable metadata writes are fsync-heavy — the
-visible cost of the durability described below.
+Two honest trails. `compose down` is the one users feel: for a container that
+ignores `SIGTERM` — most containers running a bare command as PID 1 — Velox waits
+Docker's documented 10-second grace period before `SIGKILL`, while Docker Desktop
+escalates at about 3 s. Given an explicit `docker stop -t`, the two are
+indistinguishable. Small-file extraction over VirtioFS is the other, and it is the
+only filesystem metric Velox loses; bulk reads, named-volume and overlay writes are
+par or better.
 
-> **On the filesystem rows.** Earlier revisions of this table published far larger
-> VirtioFS wins (3.1× write, 16× small-files). Those were a harness bug, not a result:
-> the benchmark bind-mounted `$(mktemp -d)` → `/var/folders/…`, which Docker Desktop
-> shares but Velox does not, so Velox was measuring an empty in-guest directory rather
-> than the host filesystem. The harness now mounts a shared path and aborts if the
-> scratch dir doesn't round-trip to the host. The Docker Desktop column is a June 2026
-> baseline measured on an older Velox; a fresh same-day head-to-head is pending.
+Functionally the two engines came out level on every probe that was run — bind
+mounts, `host.docker.internal`, TCP/UDP/IPv6 publishing, privileged ports, BuildKit
+with attestations, and `linux/amd64`, `linux/arm/v7` and `linux/386` emulation
+(where the emulation tax is the same on both, 4.9× vs 4.8× over native). Velox adds
+`<name>.velox.local`; Docker Desktop supports per-container host-IP publishing,
+which Velox does not. Docker Desktop also ships Kubernetes, Scout, Extensions and
+its AI tooling — none of which Velox has, and which account for much of the size
+difference above.
 
 The data disk is durable by default: a raw image attached with
 `synchronizationMode: .fsync` and guest barriers on, so every committed write
-survives a crash, a power-off and in-place updates, at about 0.3 ms per
-commit. Periodic `fstrim` returns freed space to macOS automatically.
+survives a crash, a power-off and in-place updates. Periodic `fstrim` returns freed
+space to macOS — measured above at 96% of a 5 GB delete handed back.
 
 ## How it's built
 

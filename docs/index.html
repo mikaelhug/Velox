@@ -117,20 +117,20 @@
       <section class="section" style="padding-top: clamp(48px, 7vw, 84px)">
         <div class="metric-band" aria-label="Velox performance summary">
           <div class="metric">
-            <span class="metric-value">226 MB</span>
+            <span class="metric-value">357 MB</span>
             <span class="metric-label">self-contained app</span>
           </div>
           <div class="metric">
-            <span class="metric-value">1.74 s</span>
+            <span class="metric-value">1.23 s</span>
             <span class="metric-label">warm restart to API-ready</span>
           </div>
           <div class="metric">
-            <span class="metric-value">~70 MB</span>
-            <span class="metric-label">empty idle host footprint</span>
+            <span class="metric-value">373 MB</span>
+            <span class="metric-label">idle host footprint, resource saver on</span>
           </div>
           <div class="metric">
-            <span class="metric-value">88 Gbit/s</span>
-            <span class="metric-label">container network throughput</span>
+            <span class="metric-value">59.8 Gbit/s</span>
+            <span class="metric-label">published-port throughput</span>
           </div>
         </div>
       </section>
@@ -249,28 +249,34 @@ curl http://web.velox.local</code></pre>
         <div class="comparison">
           <div class="comparison-row">
             <span>Install footprint</span>
-            <strong>10x smaller</strong>
+            <strong>6x smaller</strong>
           </div>
           <div class="comparison-row">
-            <span>Idle RAM, loaded benchmark baseline</span>
-            <strong>3.7x less</strong>
+            <span>Idle RAM, whole engine</span>
+            <strong>2.4x less</strong>
           </div>
           <div class="comparison-row">
-            <span>Container launch</span>
-            <strong>1.5x faster</strong>
+            <span>Idle CPU</span>
+            <strong>4.6x less</strong>
           </div>
           <div class="comparison-row">
             <span>Published port throughput</span>
-            <strong>3.3x faster</strong>
+            <strong>2.4x faster</strong>
           </div>
           <div class="comparison-row">
-            <span>Cold image pull</span>
-            <strong>~10% slower</strong>
+            <span>Small-file extract over VirtioFS</span>
+            <strong>25% slower</strong>
+          </div>
+          <div class="comparison-row">
+            <span>compose down, SIGTERM-ignoring services</span>
+            <strong>3x slower</strong>
           </div>
         </div>
         <p class="note">
-          Full methodology, fairness controls, caveats, and the runnable
-          benchmark harness live on the <a href="benchmarks.html">benchmark page</a>.
+          Measured against Docker Desktop 4.88.0 on one Mac, on one day, with both
+          engines running the identical Docker Engine 29.7.2 at matched CPU and
+          memory. Full methodology, every raw value, and the places Docker Desktop
+          wins are on the <a href="benchmarks.html">benchmark page</a>.
         </p>
       </section>
 

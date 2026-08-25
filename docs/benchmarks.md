@@ -11,23 +11,25 @@ results.
 
 ## TL;DR
 
-| | Velox | Docker Desktop |
-| --- | --- | --- |
-| 🟢 **Wins** | install 10× smaller, idle RAM ~2.6× less, startup 1.5× faster, **container launch 1.2–1.3×**, container→host net ~2×, **published ports 3.0–3.7×**, VirtioFS write 1.5×, **durable commit 1.5× (0.31 ms vs 0.47 ms)**, named-volume write ~1.1× | |
-| ⚪ **Par** | VirtioFS read, container-overlay write, pgbench TPS / init | |
-| 🔴 **Trails** | small-file extract (~0.9×) | |
+| | Velox vs Docker Desktop 4.88.0 |
+| --- | --- |
+| 🟢 **Wins** | install 6× smaller, idle RAM 2.4× less, idle CPU 4.6× less, startup 1.6× faster, container launch 1.2×, published ports 2.4–3.4×, `docker cp` ~2.4×, container→container net 1.4×, 1.5× more disk handed back after a delete |
+| ⚪ **Par** | VirtioFS bind read, named-volume write, overlay write, `docker load`, cold/incremental build, compose up, emulation tax, pgbench |
+| 🔴 **Trails** | `compose down` on SIGTERM-ignoring services (3× slower), small-file extract over VirtioFS (25% slower), no per-container host-IP publishing |
 
-Full numbers in [Results](#results). The data disk is raw + durable `.fsync`
-([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published ports now ride a VZNAT conduit
-pool; launch is `HZ_1000` + expedited RCU ([Launch](#launch-expedited-rcu-2026-06-09)).
+Full numbers and raw values: **[REPORT-2026-08-25.md](bench/REPORT-2026-08-25.md)**. The data
+disk is raw + durable `.fsync` ([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published
+ports ride a VZNAT conduit pool; launch is `HZ_1000` + expedited RCU
+([Launch](#launch-expedited-rcu-2026-06-09)).
 
 ## Test environment (recorded run)
 
-- **Host:** Apple M4 Pro (8 performance + 4 efficiency cores), 24 GB RAM, macOS 26.5.1
-- **Velox:** 0.1.11 — guest kernel 6.18.34, dockerd 29.5.3
-- **Docker Desktop:** dockerd 29.4.3, `Virtualization.framework` backend
-- **Both engines:** **8 vCPU / 8 GB**, idle baseline, 0 containers, same containerd image store
-- **Date:** 2026-06-08
+- **Host:** Apple M4 Pro (8 performance + 4 efficiency cores), 24 GB RAM, macOS 26.6.2
+- **Velox:** 1.2.0 — guest kernel 7.2, dockerd 29.7.2
+- **Docker Desktop:** 4.88.0 — dockerd 29.7.2, `Virtualization.framework` backend
+- **Both engines:** **8 vCPU / ~8 GB** (verified in-guest), 0 containers, same containerd
+  image store, same `docker` CLI and compose plugin, one engine resident at a time
+- **Date:** 2026-08-25 (`./run.sh campaign`, run id `2026-08-24`)
 
 Set Docker Desktop's allocation in **Settings → Resources** and Velox's in **Settings →
 Resources** so the two match before running.
@@ -84,40 +86,81 @@ These are what make the numbers comparable rather than anecdotal:
 
 ## Results
 
+Medians over five order-balanced rounds (three for build/compose); `±` is the inter-quartile
+spread. Metrics whose spread was too wide to call are published without a verdict in the
+[report](bench/REPORT-2026-08-25.md#appendix-a--unreliable-metrics) rather than summarised here.
+
 ```
-Metric                                 Velox  Docker Desktop        Δ  Verdict
+Metric                                      Velox    Docker Desktop        Δ  Verdict
 ----------------------------------------------------------------------------------------
-Installed footprint                   226 MB         2,328 MB   10.30x  WIN
-Idle RAM (host RSS, all procs)        ~0.9 GB          ~3.3 GB    3.71x  WIN
-Startup: restart→API-ready            1.74 s           2.55 s    1.47x  WIN
-Container launch (run true)           0.104 s          0.160 s    1.54x  WIN
-Sequential churn (per container)      0.104 s          0.170 s    1.63x  WIN
-Parallel launch x20 (total)           0.97 s           1.11 s    1.14x  WIN
-Network: container→host           88.77 Gbps       27.00 Gbps    3.29x  WIN
-Net: published port (1 stream)    38.38 Gbps       13.00 Gbps    2.95x  WIN
-Net: published port (4 streams)   59.17 Gbps       18.00 Gbps    3.29x  WIN
-FS: VirtioFS bind write           1,030 MB/s         692 MB/s    1.49x  WIN
-FS: VirtioFS bind read            2,135 MB/s       2,163 MB/s    0.99x  par
-FS: extract 4000 files (bind)         3.40 s           3.14 s    0.92x  par
-FS: named-volume write (in-VM)    1,630 MB/s       1,500 MB/s    1.09x  WIN
-FS: container-overlay write       1,695 MB/s       1,217 MB/s    1.39x  WIN
-Durable commit (fio fsync, 4K)     0.31 ms          0.47 ms      1.52x  WIN
-pgbench init (scale 50)               2.18 s           2.88 s    1.32x  WIN
-pgbench TPS (8 clients, 30s)         13,318           11,690     1.14x  WIN
+Installed footprint (shipped)              357 MB          2,193 MB    6.14x  WIN
+Idle RAM (host RSS, whole engine)          734 MB          1,771 MB    2.41x  WIN
+Idle RAM after resource saver              373 MB            847 MB    2.27x  WIN
+Idle CPU (4 min, whole engine)              0.76 %           3.52 %    4.63x  WIN
+RAM under load (21 containers)           1,949 MB          2,991 MB    1.53x  WIN
+Startup: restart→API-ready                 1.23 s            1.99 s    1.62x  WIN
+Container launch (run true)                0.11 s            0.13 s    1.21x  WIN
+Sequential churn (per container)           0.11 s            0.14 s    1.21x  WIN
+Parallel launch x20 (total)                0.86 s            1.01 s    1.17x  WIN
+Net: container→container               130 Gbps        96.37 Gbps    1.35x  WIN
+Net: published port (1 stream)       43.36 Gbps        12.68 Gbps    3.42x  WIN
+Net: published port (4 streams)      59.77 Gbps        25.29 Gbps    2.36x  WIN
+docker cp out / in (1 GiB)          540 / 373 MB/s   225 / 154 MB/s   ~2.4x  WIN
+Disk returned after rm (~5 GB)           5,295 MB          3,594 MB    1.47x  WIN
+FS: VirtioFS bind read (cached)        2,452 MB/s        2,180 MB/s    1.12x  par
+FS: named-volume write (in-VM)         2,115 MB/s        1,840 MB/s    1.15x  par
+Image extraction (docker load)             6.70 s            6.38 s    0.95x  par
+Build: cold / incremental           1.60 / 1.52 s     1.77 / 1.56 s    ~1.1x  par
+Compose up→healthy (3 services)            3.57 s            3.54 s    0.99x  par
+Emulation tax (amd64÷native)               4.89 x            4.82 x    0.99x  par
+pgbench init / TPS                  2.21 s / 13,796   2.38 s / 12,372  ~1.1x  par
+FS: extract 4000 files (bind)              3.21 s            2.56 s    0.80x  TRAIL
+Compose down -v                           10.36 s            3.49 s    0.34x  TRAIL
 ```
 
-The harness appends to `results.csv` (`./run.sh report` prints the scorecard). The figures
-above are the latest clean **single-engine** measurements — each engine measured with the
-other stopped, since Docker Desktop's daemon proved unstable when both VMs were co-resident.
+Both engines also passed every functional probe that was run — bind mounts,
+`host.docker.internal`, TCP/UDP/IPv6 publishing, privileged ports, BuildKit with
+attestations, `linux/amd64` + `linux/arm/v7` + `linux/386` emulation, `exec`, `stats`,
+`logs -f`, `events`. Velox adds `<name>.velox.local`; Docker Desktop supports per-container
+host-IP publishing, which Velox does not.
 
-> **Footprint note (2026-08-24, multi-arch emulation).** Baking the three static QEMU
-> user-mode emulators (arm, i386, x86_64) into the guest grew `root.img` from **78.8 MB to
-> 91.4 MB (+12.7 MB)**, so the installed footprint above moves ~226 MB → **~239 MB** — still
-> ~9.7× smaller than Docker Desktop, which ships the same emulators in a far larger VM image.
-> The cost is disk only: the erofs root is demand-paged, so an emulator that is never used is
-> never read into RAM.
->
-> The rest of the scorecard was **A/B'd guest-vs-guest** rather than re-run against the table
+### Running the annual comparison
+
+`./run.sh campaign` takes about 2.5 hours, bounces both applications repeatedly, and needs the
+Mac to itself — so it is **an annual exercise**, not a per-commit or per-release one. Run it
+when a Docker Desktop major lands, before putting a performance claim on the website, or once
+a year to keep this page honest. The quick pre-release regression check is `./run.sh all`
+(~12 minutes, single round); see the header of [`bench/run.sh`](bench/run.sh).
+
+Preconditions the harness enforces, each of which was bought with a wrong number:
+
+- **On AC power.** Preflight blocks and waits. The first attempt at this run degraded to
+  battery, macOS began sleeping the machine between measurements, and wall-clock timings that
+  span a sleep are fiction — `docker load` "took" 945 s instead of 7 s. A wake-event counter
+  now discards any round that spans a sleep, and the campaign should be run under
+  `caffeinate -dimsu`.
+- **Nothing else running**, thermals unthrottled, ≥40 GB free, no containers on the engine
+  under test.
+- **Both engines at matched CPU/RAM**, verified in-guest and aborted on mismatch.
+- **One engine resident at a time**, the other fully quit including its GUI.
+- **Nothing network-dependent on a timed path** — every fixture is pre-pulled untimed. A cold
+  `docker pull` metric was deliberately deleted: the same image measured 4.1 s and 20.0 s
+  forty minutes apart, which is a CDN reading, not an engine property.
+- **Order-balanced rounds and n≥5.** Single-shot numbers on this workload are worthless;
+  container→host throughput alone ranges 51–94 Gbit/s across identical runs.
+
+Results land in `results.csv` with a timestamp, run id, round and both version strings;
+`./run.sh report` prints the scorecard with medians, spreads and verdicts. Per-run artifacts
+(settings snapshots, `docker info`, matrix output) are written to `bench/runs/<run-id>/` and
+are git-ignored, because they capture the hostname and whatever real containers happen to be
+on the machine.
+
+> **Footprint note (multi-arch emulation).** Baking the three static QEMU user-mode emulators
+> (arm, i386, x86_64) into the guest grew `root.img` from **78.8 MB to 91.4 MB (+12.7 MB)**.
+> That is included in the 357 MB above — still ~6× smaller than Docker Desktop, which ships
+> the same emulators in a far larger VM image. The cost is disk only: the erofs root is
+> demand-paged, so an emulator that is never used is never read into RAM.
+> The rest of that change was **A/B'd guest-vs-guest** rather than re-run against the table
 > above (that baseline was measured on a different machine state): the pre-change `root.img`
 > and the new one, same host, same hour, zero containers. **No regression attributable to the
 > change** — and a caution for whoever benchmarks next: *single-shot suite numbers on a busy
@@ -176,11 +219,11 @@ latency-bound on the host round-trip. Swept in a live guest (caches dropped, 3 r
 pages are wasted work. `vinit` now sets it on every VirtioFS mount
 (`tune_virtiofs_readahead`), worth **+27%** and closing the gap.
 
-> **Baseline caveat.** Docker Desktop is no longer installed on the reference Mac, so the
-> DD column is the June 2026 recording — measured against Velox 0.1.11 (kernel 6.18.34,
-> dockerd 29.5.3, 8 GB) rather than the current build. The large structural wins (footprint,
-> RAM, startup, published ports) are far outside that uncertainty; the filesystem deltas
-> are not. Treat those rows as provisional until a same-day head-to-head is re-run.
+> **Baseline note.** The filesystem rows above were re-measured same-day against Docker
+> Desktop 4.88.0 on 2026-08-25, which resolves the provisional status they carried while the
+> DD column was a June 2026 recording. VirtioFS bind read and named-volume write came out par
+> or better; small-file extract remains the one filesystem path that trails, now measured at
+> 0.80× with a tight ±4% spread — a real result rather than a noisy one.
 
 ## Disk: raw image + durable `.fsync` (2026-06-09)
 
@@ -209,10 +252,19 @@ Apple Virtualization.framework, one engine at a time):
 | pgbench TPS | 5,524 | **10,948** | 11,184 |
 | named-volume bulk write | — | **1,012 MB/s** | 655 MB/s |
 
-Raw still reclaims host space: `vinit`'s periodic `FITRIM` hole-punches the raw backing file
-(verified — a deleted 4 GiB file is reclaimed after a trim pass), so the image doesn't grow
-forever like DD's `Docker.raw`. So raw beats ASIF on every axis that mattered (commit latency,
-durability, *and* reclaim), which is why ASIF was dropped entirely.
+> **Two caveats on the table above.** Its **Docker Desktop column is the June 2026
+> recording**, superseded by the [2026-08-25 report](bench/REPORT-2026-08-25.md) — which
+> measured named-volume write at 2,115 MB/s vs 1,840 MB/s and pgbench at 13,796 vs 12,372 TPS
+> on current builds of both. And the **fsync-latency and durable-commits rows are not
+> reproducible from this repo**: they came from a hand-run `fio`, which no script here
+> installs or invokes. Treat those two rows as a historical note on the ASIF→raw decision
+> (where the guest-vs-guest comparison is what mattered), not as a current DD claim.
+
+Raw still reclaims host space: `vinit`'s periodic `FITRIM` hole-punches the raw backing file,
+so the image doesn't grow forever. Measured 2026-08-25 with a real engine restart to trigger
+the trim pass: of ~5.5 GB freed, Velox handed **5,295 MB (96%) back to macOS**, against
+Docker Desktop's 3,594 MB of 5,210 MB (69%). So raw beats ASIF on every axis that mattered
+(commit latency, durability, *and* reclaim), which is why ASIF was dropped entirely.
 
 ## Launch: expedited RCU (2026-06-09)
 
