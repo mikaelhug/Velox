@@ -193,13 +193,13 @@ final class EngineController {
         catch { workspacePanel.fail(Self.message(error)) }
     }
 
-    func performCreate(name: String) {
-        do { try createWorkspace(name: name) }
+    func performCreate(name: String) async {
+        do { try await createWorkspace(name: name) }
         catch { workspacePanel.fail(Self.message(error)) }
     }
 
-    func performRename(_ workspace: Workspace, to name: String) {
-        do { try renameWorkspace(workspace, to: name) }
+    func performRename(_ workspace: Workspace, to name: String) async {
+        do { try await renameWorkspace(workspace, to: name) }
         catch { workspacePanel.fail(Self.message(error)) }
     }
 
@@ -208,8 +208,8 @@ final class EngineController {
         catch { workspacePanel.fail(Self.message(error)) }
     }
 
-    func performDelete(_ workspace: Workspace) {
-        do { try deleteWorkspace(workspace) }
+    func performDelete(_ workspace: Workspace) async {
+        do { try await deleteWorkspace(workspace) }
         catch { workspacePanel.fail(Self.message(error)) }
     }
 
@@ -767,7 +767,7 @@ final class EngineController {
         // Land any debounced settings write first: a disk-size drag within 400 ms of
         // switching would otherwise persist AFTER the switch repoints everything — against
         // the wrong workspace, or not at all.
-        flushPendingSave()
+        await flushPendingSave()
 
         if wasRunning, await performStop() == false {
             throw VeloxError.workspace("The engine did not shut down, so Velox can't switch "
@@ -776,7 +776,10 @@ final class EngineController {
         guard !isTerminating else { return }
 
         do {
-            try WorkspaceStore.activate(id: target.id)
+            let id = target.id
+            try await Task.detached(priority: .userInitiated) {
+                try WorkspaceStore.activate(id: id)
+            }.value
         } catch {
             // The stop released the engine lock, so another process had a window to delete
             // or rename the target. Every sibling operation restores the engine on failure;
@@ -797,11 +800,18 @@ final class EngineController {
     }
 
     /// Create an empty workspace. Doesn't touch the engine — a new disk is just a new file.
+    ///
+    /// Async because every manifest mutation takes the cross-process `flock`, which can wait
+    /// out another process's write — a wait that must never happen ON the main actor, where
+    /// the bounded 5 s worst case is a beachball. The guards run main-side; the file work
+    /// hops off. Same shape for rename, delete, activate and the debounced size write.
     @discardableResult
-    func createWorkspace(name: String, diskGiB: Int? = nil) throws -> Workspace {
+    func createWorkspace(name: String, diskGiB: Int? = nil) async throws -> Workspace {
         try requireIdleEngine("create a workspace")
         let size = diskGiB ?? activeWorkspace?.diskGiB ?? config.diskGiB
-        let workspace = try WorkspaceStore.create(name: name, diskGiB: size)
+        let workspace = try await Task.detached(priority: .userInitiated) {
+            try WorkspaceStore.create(name: name, diskGiB: size)
+        }.value
         reloadWorkspaces()
         return workspace
     }
@@ -868,8 +878,11 @@ final class EngineController {
         scheduleSave()
     }
 
-    func renameWorkspace(_ workspace: Workspace, to newName: String) throws {
-        try WorkspaceStore.rename(id: workspace.id, to: newName)
+    func renameWorkspace(_ workspace: Workspace, to newName: String) async throws {
+        let id = workspace.id
+        try await Task.detached(priority: .userInitiated) {
+            try WorkspaceStore.rename(id: id, to: newName)
+        }.value
         reloadWorkspaces()
     }
 
@@ -878,10 +891,13 @@ final class EngineController {
     /// Refused on the active workspace and on the last one (`WorkspaceStore.delete` re-checks
     /// both under the manifest lock). Only `data.img` is unlinked — never a folder the user
     /// chose, which could be anything from `~/Documents` to a drive root.
-    func deleteWorkspace(_ workspace: Workspace) throws {
+    func deleteWorkspace(_ workspace: Workspace) async throws {
         try requireIdleEngine("delete a workspace")
         try requireDetached(workspace, "delete it")
-        try WorkspaceStore.delete(id: workspace.id)
+        let id = workspace.id
+        try await Task.detached(priority: .userInitiated) {
+            try WorkspaceStore.delete(id: id)
+        }.value
         reloadWorkspaces()
     }
 
@@ -1055,14 +1071,16 @@ final class EngineController {
 
     /// Land the debounced write NOW. Called before a workspace switch, where "within the
     /// next 400 ms" means "after the world has changed underneath it".
-    private func flushPendingSave() {
+    private func flushPendingSave() async {
         guard let task = configSaveTask else { return }
         task.cancel()
         configSaveTask = nil
         saveConfig()
-        if let active = activeWorkspace {
-            try? WorkspaceStore.setDiskGiB(id: active.id, active.diskGiB)
-        }
+        guard let active = activeWorkspace else { return }
+        let (id, gib) = (active.id, active.diskGiB)
+        await Task.detached(priority: .userInitiated) {
+            try? WorkspaceStore.setDiskGiB(id: id, gib)
+        }.value
     }
 
     /// Trailing-debounced persistence for the slider-driven settings.

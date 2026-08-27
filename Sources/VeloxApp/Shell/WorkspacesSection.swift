@@ -143,9 +143,9 @@ private struct WorkspaceRow: View {
 
     var body: some View {
         Button {
-            // `isActive` here is the effective active. Clicking the fallback-active row
-            // still offers the switch (isActive true suppresses it) — repairing the dangling
-            // pointer is done by switching to any row, which rewrites it.
+            // `isActive` is the EFFECTIVE active, so the fallback workspace's row is inert
+            // like any active row. A dangling pointer is repaired by switching to any other
+            // row — `activate` rewrites it to a valid id.
             guard !isActive, !engine.isEngineOwned else { return }
             engine.workspacePanel.begin(.confirmSwitch(workspace))
         } label: {
@@ -339,14 +339,14 @@ private struct WorkspacePrompts: ViewModifier {
     private func confirmCreate() {
         guard let name = panel.proposedName else { return }
         panel.dismiss()
-        engine.performCreate(name: name)
+        Task { await engine.performCreate(name: name) }
     }
 
     private func confirmRename() {
         guard case .rename(let workspace)? = panel.prompt, let name = panel.proposedName
         else { return }
         panel.dismiss()
-        engine.performRename(workspace, to: name)
+        Task { await engine.performRename(workspace, to: name) }
     }
 
     private func confirmDuplicate() {
@@ -359,6 +359,6 @@ private struct WorkspacePrompts: ViewModifier {
     private func confirmDelete() {
         guard case .delete(let workspace)? = panel.prompt, panel.deleteConfirmed else { return }
         panel.dismiss()
-        engine.performDelete(workspace)
+        Task { await engine.performDelete(workspace) }
     }
 }

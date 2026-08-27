@@ -163,7 +163,6 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             + fileShares.sorted()
     }
 
-    public var bootSignature: [String] { bootSignature() }
 
     // MARK: - Persistence
 

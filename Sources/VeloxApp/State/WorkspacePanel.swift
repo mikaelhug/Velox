@@ -22,32 +22,14 @@ import VeloxCore
 @MainActor
 @Observable
 final class WorkspacePanel {
-    /// The prompt currently on screen. Exactly one at a time.
-    enum Prompt: Equatable, Identifiable {
+    /// The prompt currently on screen. Exactly one at a time. (Presentation is driven by
+    /// per-kind `isPresented` bindings in `WorkspacePrompts`, so no `Identifiable` needed.)
+    enum Prompt: Equatable {
         case create
         case rename(Workspace)
         case duplicate(Workspace)
         case delete(Workspace)
         case confirmSwitch(Workspace)
-
-        var id: String {
-            switch self {
-            case .create:                  return "create"
-            case .rename(let w):           return "rename-\(w.id)"
-            case .duplicate(let w):        return "duplicate-\(w.id)"
-            case .delete(let w):           return "delete-\(w.id)"
-            case .confirmSwitch(let w):    return "switch-\(w.id)"
-            }
-        }
-
-        /// The workspace this prompt is about, if any.
-        var workspace: Workspace? {
-            switch self {
-            case .create:                                             return nil
-            case .rename(let w), .duplicate(let w),
-                 .delete(let w), .confirmSwitch(let w):               return w
-            }
-        }
     }
 
     private(set) var prompt: Prompt?
