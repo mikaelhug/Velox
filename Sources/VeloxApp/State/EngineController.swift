@@ -602,8 +602,8 @@ final class EngineController {
         // Timed out: the VM is STILL ALIVE and still attached to data.img. Do not fall into
         // the normal path — `cleanup()` releases the instance lock, which would let a second
         // engine attach the same ext4 image (the corruption `InstanceLock` exists to
-        // prevent), and `moveDataDisk` would go on to copy a live disk and unlink the
-        // original. Surface it and leave the lock held.
+        // prevent), and a workspace move or duplicate would go on to copy a live disk —
+        // and a move unlinks the original afterwards. Surface it and leave the lock held.
         guard confirmed else {
             // The VM is still alive on `data.img` and nothing manages it any more. Latch it:
             // every disk-touching action must now refuse, and the instance lock must stay
