@@ -25,19 +25,15 @@ struct WorkspacesSection: View {
         } header: {
             HStack(spacing: 4) {
                 Text("Workspaces")
-                Spacer()
-                Button {
-                    engine.workspacePanel.begin(.create)
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.caption.weight(.semibold))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("New workspace")
-                .disabled(engine.isEngineOwned)
+                Spacer(minLength: 8)
+                AddWorkspaceButton { engine.workspacePanel.begin(.create) }
+                    .disabled(engine.isEngineOwned)
             }
+            // A section header stretches to the row's trailing edge, so a bare `Spacer()`
+            // parks the glyph flush against it. The button carries its own padding (which is
+            // also what gives it a usable hit target), and this trims the rest so the plus
+            // sits off the edge rather than on it.
+            .padding(.trailing, 2)
         }
     }
 
@@ -86,27 +82,63 @@ struct WorkspacesSection: View {
     }
 }
 
+/// The "+" in the section header.
+///
+/// Split out because a bare `Image` in a `.plain` button is a ~10pt hit target with no
+/// feedback — it reads as decoration rather than a control. The padding gives it a real
+/// target, and the hover fill is what tells you it is one.
+private struct AddWorkspaceButton: View {
+    let action: () -> Void
+    @State private var hovering = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "plus")
+                .font(.caption.weight(.semibold))
+                .frame(width: 13, height: 13)          // square, so the hover fill isn't oblong
+                .padding(3)
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(hovering && isEnabled ? AnyShapeStyle(.quaternary)
+                                                    : AnyShapeStyle(.clear)))
+                .contentShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .onHover { hovering = $0 }
+        .help("New workspace")
+    }
+}
+
 /// One workspace row: a button, not a navigation item (see `WorkspacesSection`).
 private struct WorkspaceRow: View {
     let workspace: Workspace
     let isActive: Bool
 
     @Environment(EngineController.self) private var engine
+    @State private var hovering = false
 
     var body: some View {
         Button {
             guard !isActive, !engine.isEngineOwned else { return }
             engine.workspacePanel.begin(.confirmSwitch(workspace))
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
-                    .font(.caption)
-                    .foregroundStyle(isActive ? Color.accentColor : .secondary)
-                Text(workspace.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .fontWeight(isActive ? .semibold : .regular)
-                Spacer(minLength: 0)
+            HStack(spacing: 0) {
+                // `Label`, not a hand-rolled HStack: it puts the icon in the same column the
+                // sidebar's navigation rows use, so Workspaces lines up with Resources and
+                // System instead of sitting a few points off.
+                Label {
+                    Text(workspace.name)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .fontWeight(isActive ? .semibold : .regular)
+                } icon: {
+                    Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
+                        .foregroundStyle(isActive ? AnyShapeStyle(.tint)
+                                                  : AnyShapeStyle(.secondary))
+                }
+                Spacer(minLength: 4)
                 if missing {
                     // The entry is real but its disk isn't there — an unplugged drive, most
                     // likely. Flagged rather than hidden, because starting it will (rightly)
@@ -116,11 +148,31 @@ private struct WorkspaceRow: View {
                         .foregroundStyle(.orange)
                 }
             }
+            // The whole row is the target, including the gap after a short name.
             .contentShape(Rectangle())
+            // Radius matches the selection capsule the navigation rows draw, so hovering a
+            // workspace and hovering a nav item feel like the same control.
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(highlight))
+            // Without this the separator is inset to the text, while every navigation row's
+            // starts at the row edge — a seam that reads as two different lists.
+            .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
         }
         .buttonStyle(.plain)
         .disabled(engine.isEngineOwned)
+        .onHover { hovering = $0 }
         .help(helpText)
+        // NO custom padding or row insets on purpose: the defaults are what put `Label`'s
+        // icon in the same column as Overview/Containers/Engine Logs. Adding padding here
+        // shifted the whole section ~25pt right of the rest of the sidebar.
+    }
+
+    /// Hover feedback only — the active workspace is marked by its filled icon and weight, not
+    /// by a persistent fill, so it can't be mistaken for the navigation selection.
+    private var highlight: AnyShapeStyle {
+        hovering && !isActive && !engine.isEngineOwned
+            ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear)
     }
 
     private var missing: Bool { workspace.firstBootedAt != nil && !workspace.diskExists }
