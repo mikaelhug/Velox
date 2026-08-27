@@ -53,7 +53,8 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
             return "socket setup failed at \(op)\(detail)"
         case .dataDiskMissing(let url):
             return "Velox data disk not found at \(url.path). The drive holding it may be "
-                + "disconnected — reconnect it, or move the disk in Settings › Resources."
+                + "disconnected — reconnect it, or switch to another workspace and use "
+                + "Change Location… on this one (right-click it in the sidebar)."
         case .diskMove(let message):
             return message
         case .engineAlreadyRunning:

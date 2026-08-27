@@ -877,6 +877,115 @@ do {
     check(probe.cancelled, "a @MainActor-formed cancel handler fires off-main without trapping")
 }
 
+section("Workspace.deleteConfirmationMatches")
+do {
+    let now = Date()
+    let w = Workspace(id: "x", name: "Staging", diskGiB: 8, created: now, lastUsed: now)
+    check(w.deleteConfirmationMatches("Staging"), "the exact name arms the delete")
+    check(w.deleteConfirmationMatches("  staging  "), "case and surrounding space are forgiven")
+    check(!w.deleteConfirmationMatches(""), "an EMPTY confirmation never arms it")
+    check(!w.deleteConfirmationMatches("   "), "…nor whitespace only")
+    check(!w.deleteConfirmationMatches("Stagin"), "a near miss does not arm it")
+    check(!w.deleteConfirmationMatches("Staging2"), "a longer name does not arm it")
+    let blank = Workspace(id: "y", name: "  ", diskGiB: 8, created: now, lastUsed: now)
+    check(!blank.deleteConfirmationMatches(""),
+          "a blank-named workspace can't be armed by an empty box")
+}
+
+section("Workspace.diskGiB clamping")
+do {
+    let now = Date()
+    equal(Workspace.clampDiskGiB(4), 8, "below the range clamps up")
+    equal(Workspace.clampDiskGiB(512), 256, "above the range clamps down")
+    equal(Workspace.clampDiskGiB(64), 64, "inside the range is untouched")
+    // A hand-edited or older manifest must not be able to put the Settings slider outside
+    // its bounds, which is undefined behaviour for a SwiftUI Slider.
+    let json = Data("""
+    {"id":"z","name":"Huge","diskGiB":4096,"created":"2026-01-01T00:00:00Z",
+     "lastUsed":"2026-01-01T00:00:00Z"}
+    """.utf8)
+    let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
+    if let decoded = try? d.decode(Workspace.self, from: json) {
+        equal(decoded.diskGiB, 256, "decoding clamps an out-of-range size")
+    } else { check(false, "decode failed") }
+    _ = now
+}
+
+section("WorkspaceCapabilities")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-caps-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+    let now = Date()
+    func ws(_ id: String, _ name: String, dir: URL) -> Workspace {
+        Workspace(id: id, name: name, directory: dir.path, diskGiB: 8,
+                  created: now, lastUsed: now, firstBootedAt: now)
+    }
+    let aDir = base.appendingPathComponent("a"), bDir = base.appendingPathComponent("b")
+    let a = ws("a", "Alpha", dir: aDir), b = ws("b", "Beta", dir: bDir)
+    try? Storage.createWorkspaceDisk(at: a.dataDiskURL, sizeGiB: 1)
+    try? Storage.createWorkspaceDisk(at: b.dataDiskURL, sizeGiB: 1)
+
+    func caps(_ w: Workspace, active: String?, count: Int = 2,
+              busy: Bool = false, attached: URL? = nil) -> WorkspaceCapabilities {
+        WorkspaceCapabilities(workspace: w, activeID: active, workspaceCount: count,
+                              engineBusy: busy, attachedDiskURL: attached)
+    }
+
+    // The active workspace can't be deleted — that would hide an engine restart in a delete.
+    let activeCaps = caps(a, active: "a")
+    check(activeCaps.isActive, "the active workspace is marked active")
+    check(!activeCaps.canDelete, "the active workspace can't be deleted")
+    check(!activeCaps.canSwitch, "…and can't be switched to (already there)")
+    check(activeCaps.canDuplicate, "…but CAN be duplicated (the op stops the engine first)")
+
+    let idleCaps = caps(b, active: "a")
+    check(idleCaps.canDelete && idleCaps.canSwitch, "an inactive workspace can be deleted and switched to")
+
+    // The last workspace must survive.
+    check(!caps(a, active: "a", count: 1).canDelete, "the last workspace can't be deleted")
+    check(!caps(b, active: "a", count: 1).canDelete, "…even when it isn't the active one")
+
+    // THE important one: a disk the VM actually has open is off limits, even when the
+    // manifest says a different workspace is active (another process can rewrite activeID).
+    let attachedButNotActive = caps(b, active: "a", attached: b.dataDiskURL)
+    check(!attachedButNotActive.canDelete,
+          "a disk the VM HAS OPEN can't be deleted even if activeID says otherwise")
+    equal(attachedButNotActive.deleteBlockedReason ?? "",
+          "This is the active workspace — switch to another first.",
+          "…and says why")
+
+    // Path comparison must survive a non-standardized URL.
+    let messy = URL(fileURLWithPath: bDir.path + "/./data.img")
+    check(!caps(b, active: "a", attached: messy).canDelete,
+          "attachment matching standardizes the path first")
+
+    // Busy engine locks everything down.
+    let busy = caps(b, active: "a", busy: true)
+    check(!busy.canDelete && !busy.canSwitch && !busy.canDuplicate && !busy.canRename,
+          "nothing is offered while an operation owns the engine")
+
+    // A workspace whose disk is gone can't be duplicated or revealed.
+    let ghost = ws("g", "Ghost", dir: base.appendingPathComponent("gone"))
+    let ghostCaps = caps(ghost, active: "a")
+    check(!ghostCaps.canDuplicate, "a workspace with no disk can't be duplicated")
+    check(!ghostCaps.canRevealInFinder, "…nor revealed in Finder")
+    check(ghostCaps.canDelete, "…but can still be deleted (to clear a dead entry)")
+
+    // A filesystem with recorded errors must not be propagated into a copy.
+    let broken = ws("x", "Broken", dir: base.appendingPathComponent("x"))
+    try? Storage.createWorkspaceDisk(at: broken.dataDiskURL, sizeGiB: 1)
+    let fd = open(broken.dataDiskURL.path, O_WRONLY)
+    if fd >= 0 {
+        let sb: [UInt8] = [0x53, 0xEF, 0x03, 0x00]   // ext4 magic, VALID_FS | ERROR_FS
+        sb.withUnsafeBytes { _ = pwrite(fd, $0.baseAddress, 4, 1080) }
+        close(fd)
+    }
+    check(!caps(broken, active: "a").canDuplicate,
+          "a filesystem with recorded errors can't be duplicated")
+}
+
 // MARK: Updater semver ordering
 
 section("Updater.compareSemver")

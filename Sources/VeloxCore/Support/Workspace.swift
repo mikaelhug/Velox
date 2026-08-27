@@ -20,6 +20,16 @@ public struct Workspace: Codable, Sendable, Equatable, Identifiable {
     public static let defaultID = "default"
     public static let defaultName = "Default"
 
+    /// Allowed data-disk sizes, in GiB. Defined once here because both front ends must agree:
+    /// the Settings slider is bound to this range, and a SwiftUI `Slider` whose value sits
+    /// outside its bounds is undefined — so a workspace created with `velox workspace new
+    /// --size 512` would otherwise put the GUI in an invalid state. Every write clamps.
+    public static let diskGiBRange = 8...256
+
+    public static func clampDiskGiB(_ gib: Int) -> Int {
+        min(max(gib, diskGiBRange.lowerBound), diskGiBRange.upperBound)
+    }
+
     /// Stable identity. A UUID for everything created after migration, so a user-supplied
     /// name never reaches the filesystem — no sanitising, no path traversal, and renaming
     /// is free.
@@ -63,8 +73,9 @@ public struct Workspace: Codable, Sendable, Equatable, Identifiable {
         id = try c.decode(String.self, forKey: .id)
         name = try c.decode(String.self, forKey: .name)
         directory = try c.decodeIfPresent(String.self, forKey: .directory)
-        diskGiB = try c.decodeIfPresent(Int.self, forKey: .diskGiB)
-            ?? Int(VMConfiguration.Resources.default.diskGiB)
+        diskGiB = Workspace.clampDiskGiB(
+            try c.decodeIfPresent(Int.self, forKey: .diskGiB)
+                ?? Int(VMConfiguration.Resources.default.diskGiB))
         let now = Date()
         created = try c.decodeIfPresent(Date.self, forKey: .created) ?? now
         lastUsed = try c.decodeIfPresent(Date.self, forKey: .lastUsed) ?? now
@@ -141,6 +152,16 @@ public struct Workspace: Codable, Sendable, Equatable, Identifiable {
     /// "Staging" and "staging" can't both exist and confuse `velox workspace use`.
     public static func normalized(_ name: String) -> String {
         name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether a typed confirmation matches this workspace's name closely enough to arm a
+    /// delete.
+    ///
+    /// Case- and whitespace-insensitive on purpose: the point of typing the name is to make
+    /// someone stop and read *which* workspace they are about to destroy, not to test their
+    /// typing. A rule that is too strict just trains people to copy-paste, which defeats it.
+    public func deleteConfirmationMatches(_ typed: String) -> Bool {
+        !Self.normalized(typed).isEmpty && Self.normalized(typed) == Self.normalized(name)
     }
 
     /// Validate a user-supplied display name. The name never touches the filesystem (the id

@@ -2,33 +2,24 @@ import AppKit
 import SwiftUI
 import VeloxCore
 
-/// The sidebar's Workspaces list: every workspace, which one is active, and the actions
-/// that create, duplicate, rename, relocate and delete them.
+/// The sidebar's Workspaces list: every workspace, which one is active, and a "+" to add one.
 ///
-/// The rows are deliberately **not** `List` selection items. Clicking one switches the
-/// engine — it does not navigate — so tagging them would make the detail pane follow a
-/// click that was never about the detail pane. They are plain buttons inside the section,
-/// which also keeps the sidebar's `selection` binding meaning exactly what it did before.
+/// This renders **only** the section. Every dialog it can raise is attached to the sidebar
+/// `List` by `RootView` via `.workspacePrompts()`, because presentation modifiers hung off a
+/// `Section` are unreliable — the alert can silently never appear. The state they share lives
+/// in `EngineController.workspacePanel`.
+///
+/// The rows are deliberately **not** `List` selection items either. Clicking one switches the
+/// engine; it does not navigate. Tagging them would make the detail pane follow a click that
+/// was never about the detail pane.
 struct WorkspacesSection: View {
     @Environment(EngineController.self) private var engine
 
-    @State private var pendingSwitch: Workspace?
-    @State private var creating = false
-    @State private var newName = ""
-    @State private var renaming: Workspace?
-    @State private var renameText = ""
-    @State private var duplicating: Workspace?
-    @State private var duplicateName = ""
-    @State private var pendingDelete: Workspace?
-    @State private var deleteConfirmation = ""
-    @State private var actionError: String?
-
     var body: some View {
         Section {
-            ForEach(engine.workspaces?.workspaces.sorted(by: { $0.created < $1.created }) ?? []) { workspace in
+            ForEach(engine.sortedWorkspaces) { workspace in
                 WorkspaceRow(workspace: workspace,
-                             isActive: workspace.id == engine.workspaces?.activeID,
-                             action: { requestSwitch(to: workspace) })
+                             isActive: workspace.id == engine.workspaces?.activeID)
                     .contextMenu { menu(for: workspace) }
             }
         } header: {
@@ -36,8 +27,7 @@ struct WorkspacesSection: View {
                 Text("Workspaces")
                 Spacer()
                 Button {
-                    newName = ""
-                    creating = true
+                    engine.workspacePanel.begin(.create)
                 } label: {
                     Image(systemName: "plus")
                         .font(.caption.weight(.semibold))
@@ -49,161 +39,41 @@ struct WorkspacesSection: View {
                 .disabled(engine.isEngineOwned)
             }
         }
-        .confirmationDialog(
-            "Switch to “\(pendingSwitch?.name ?? "")”?",
-            isPresented: Binding(get: { pendingSwitch != nil },
-                                 set: { if !$0 { pendingSwitch = nil } }),
-            presenting: pendingSwitch
-        ) { workspace in
-            Button("Switch") { performSwitch(to: workspace) }
-            Button("Cancel", role: .cancel) { pendingSwitch = nil }
-        } message: { workspace in
-            Text("The engine restarts with \(workspace.name)'s containers, images and "
-                + "volumes. Anything running now keeps its state and comes back when you "
-                + "switch back.")
-        }
-        .alert("New Workspace", isPresented: $creating) {
-            TextField("Name", text: $newName)
-            Button("Create") { create() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("An empty workspace with its own containers, images and volumes. "
-                + "It starts at \(engine.activeWorkspace?.diskGiB ?? 64) GB, and takes up "
-                + "no space on your Mac until you use it.")
-        }
-        .alert("Rename Workspace", isPresented: Binding(
-            get: { renaming != nil }, set: { if !$0 { renaming = nil } })
-        ) {
-            TextField("Name", text: $renameText)
-            Button("Rename") { rename() }
-            Button("Cancel", role: .cancel) { renaming = nil }
-        }
-        .alert("Duplicate “\(duplicating?.name ?? "")”", isPresented: Binding(
-            get: { duplicating != nil }, set: { if !$0 { duplicating = nil } })
-        ) {
-            TextField("Name", text: $duplicateName)
-            Button("Duplicate") { duplicate() }
-            Button("Cancel", role: .cancel) { duplicating = nil }
-        } message: {
-            // The APFS clone shares every block until the two copies diverge, so this is
-            // instant and initially free — worth saying, because "duplicate my 40 GB
-            // workspace" otherwise sounds like something you'd avoid doing.
-            Text("Copies every container, image and volume. On an Apple File System disk "
-                + "this is instant and uses no extra space until the two workspaces "
-                + "diverge.")
-        }
-        .alert("Delete “\(pendingDelete?.name ?? "")”?", isPresented: Binding(
-            get: { pendingDelete != nil },
-            set: { if !$0 { pendingDelete = nil; deleteConfirmation = "" } })
-        ) {
-            TextField("Type the workspace name", text: $deleteConfirmation)
-            Button("Delete Permanently", role: .destructive) { delete() }
-                .disabled(!deleteConfirmationMatches)
-            Button("Cancel", role: .cancel) { pendingDelete = nil; deleteConfirmation = "" }
-        } message: {
-            if let workspace = pendingDelete {
-                Text("This permanently deletes every container, image, volume and network in "
-                    + "“\(workspace.name)”, and its \(workspace.allocatedDescription) disk at "
-                    + "\(workspace.dataDiskURL.path). This can't be undone.\n\n"
-                    + "Type “\(workspace.name)” to confirm.")
-            }
-        }
-        .alert("Action failed", isPresented: Binding(
-            get: { actionError != nil }, set: { if !$0 { actionError = nil } })
-        ) { Button("OK", role: .cancel) {} } message: { Text(actionError ?? "") }
     }
-
-    // MARK: - Menu
 
     @ViewBuilder
     private func menu(for workspace: Workspace) -> some View {
-        let isActive = workspace.id == engine.workspaces?.activeID
-        let busy = engine.isEngineOwned
-        if !isActive {
-            Button("Switch to This Workspace") { requestSwitch(to: workspace) }
-                .disabled(busy)
+        let state = engine.capabilities(for: workspace)
+        let panel = engine.workspacePanel
+
+        if !state.isActive {
+            Button("Switch to This Workspace") { panel.begin(.confirmSwitch(workspace)) }
+                .disabled(!state.canSwitch)
             Divider()
         }
         Button("Duplicate…") {
-            duplicateName = "\(workspace.name) copy"
-            duplicating = workspace
+            panel.begin(.duplicate(workspace), suggesting: "\(workspace.name) copy")
         }
-        // Duplicating the ACTIVE workspace is allowed — `cloneWorkspace` stops the engine
-        // first, which is what actually makes the copy safe. The disk check here only
-        // catches a filesystem that has recorded errors (see `Storage.dataDiskIsClean`).
-        .disabled(busy || !workspace.diskExists
-                  || !Storage.dataDiskIsClean(at: workspace.dataDiskURL))
+        .disabled(!state.canDuplicate)
         Button("Rename…") {
-            renameText = workspace.name
-            renaming = workspace
+            panel.begin(.rename(workspace), suggesting: workspace.name)
         }
+        .disabled(!state.canRename)
         Button("Change Location…") { relocate(workspace) }
-            .disabled(busy)
+            .disabled(!state.canRelocate)
         Divider()
         Button("Show in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([workspace.dataDiskURL])
         }
-        .disabled(!workspace.diskExists)
+        .disabled(!state.canRevealInFinder)
         Divider()
-        Button("Delete…", role: .destructive) {
-            deleteConfirmation = ""
-            pendingDelete = workspace
-        }
-        // Deleting the active workspace would mean an implicit engine restart hidden inside
-        // a delete; deleting the last one would leave Velox with nothing to boot.
-        .disabled(busy || isActive || (engine.workspaces?.workspaces.count ?? 0) <= 1)
+        Button("Delete…", role: .destructive) { panel.begin(.delete(workspace)) }
+            .disabled(!state.canDelete)
+            .help(state.deleteBlockedReason ?? "")
     }
 
-    private var deleteConfirmationMatches: Bool {
-        guard let pendingDelete else { return false }
-        return Workspace.normalized(deleteConfirmation) == Workspace.normalized(pendingDelete.name)
-    }
-
-    // MARK: - Actions
-
-    private func requestSwitch(to workspace: Workspace) {
-        guard workspace.id != engine.workspaces?.activeID, !engine.isEngineOwned else { return }
-        pendingSwitch = workspace
-    }
-
-    private func performSwitch(to workspace: Workspace) {
-        pendingSwitch = nil
-        Task {
-            do { try await engine.switchWorkspace(to: workspace) }
-            catch { actionError = message(error) }
-        }
-    }
-
-    private func create() {
-        do { try engine.createWorkspace(name: newName) }
-        catch { actionError = message(error) }
-    }
-
-    private func rename() {
-        guard let workspace = renaming else { return }
-        renaming = nil
-        do { try engine.renameWorkspace(workspace, to: renameText) }
-        catch { actionError = message(error) }
-    }
-
-    private func duplicate() {
-        guard let workspace = duplicating else { return }
-        duplicating = nil
-        let name = duplicateName
-        Task {
-            do { _ = try await engine.cloneWorkspace(workspace, newName: name) }
-            catch { actionError = message(error) }
-        }
-    }
-
-    private func delete() {
-        guard let workspace = pendingDelete, deleteConfirmationMatches else { return }
-        pendingDelete = nil
-        deleteConfirmation = ""
-        do { try engine.deleteWorkspace(workspace) }
-        catch { actionError = message(error) }
-    }
-
+    /// The folder picker is the one action that can't be driven from the panel state: it must
+    /// run its modal before there is anything to confirm.
     private func relocate(_ workspace: Workspace) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -212,14 +82,7 @@ struct WorkspacesSection: View {
         panel.prompt = "Choose"
         panel.message = "Choose a folder to hold “\(workspace.name)” (data.img)"
         guard panel.runModal() == .OK, let dir = panel.url else { return }
-        Task {
-            do { try await engine.moveWorkspace(workspace, to: dir) }
-            catch { actionError = message(error) }
-        }
-    }
-
-    private func message(_ error: Error) -> String {
-        (error as? LocalizedError)?.errorDescription ?? "\(error)"
+        Task { await engine.performMove(workspace, to: dir) }
     }
 }
 
@@ -227,12 +90,14 @@ struct WorkspacesSection: View {
 private struct WorkspaceRow: View {
     let workspace: Workspace
     let isActive: Bool
-    let action: () -> Void
 
     @Environment(EngineController.self) private var engine
 
     var body: some View {
-        Button(action: action) {
+        Button {
+            guard !isActive, !engine.isEngineOwned else { return }
+            engine.workspacePanel.begin(.confirmSwitch(workspace))
+        } label: {
             HStack(spacing: 6) {
                 Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
                     .font(.caption)
@@ -245,12 +110,10 @@ private struct WorkspaceRow: View {
                 if missing {
                     // The entry is real but its disk isn't there — an unplugged drive, most
                     // likely. Flagged rather than hidden, because starting it will (rightly)
-                    // fail loudly instead of quietly creating an empty one.
+                    // fail loudly instead of quietly creating an empty one in its place.
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
-                        .help("This workspace's disk is missing — is the drive it lives on "
-                            + "connected?\n\(workspace.dataDiskURL.path)")
                 }
             }
             .contentShape(Rectangle())
@@ -263,12 +126,155 @@ private struct WorkspaceRow: View {
     private var missing: Bool { workspace.firstBootedAt != nil && !workspace.diskExists }
 
     private var helpText: String {
-        let where_ = (workspace.dataDiskURL.deletingLastPathComponent().path as NSString)
+        if missing {
+            return "This workspace's disk is missing — is the drive it lives on connected?\n"
+                 + workspace.dataDiskURL.path
+        }
+        let folder = (workspace.dataDiskURL.deletingLastPathComponent().path as NSString)
             .abbreviatingWithTildeInPath
         let size = workspace.diskExists
             ? "\(workspace.allocatedDescription) used of \(workspace.diskGiB) GB"
             : "not created yet · \(workspace.diskGiB) GB max"
-        return isActive ? "Active · \(size)\n\(where_)"
-                        : "Click to switch · \(size)\n\(where_)"
+        return (isActive ? "Active · \(size)" : "Click to switch · \(size)") + "\n\(folder)"
+    }
+}
+
+// MARK: - Prompts
+
+extension View {
+    /// Host every workspace dialog on a stable view (the sidebar `List`), not on the section
+    /// that raises them. See `WorkspacePanel` for why this separation exists.
+    func workspacePrompts(_ engine: EngineController) -> some View {
+        modifier(WorkspacePrompts(engine: engine))
+    }
+}
+
+private struct WorkspacePrompts: ViewModifier {
+    let engine: EngineController
+
+    private var panel: WorkspacePanel { engine.workspacePanel }
+
+    /// One binding per prompt kind: `.alert` needs an `isPresented` it can clear itself when
+    /// the user dismisses with Esc or a Cancel button.
+    private func presenting(_ match: @escaping (WorkspacePanel.Prompt) -> Bool) -> Binding<Bool> {
+        Binding(
+            get: { panel.prompt.map(match) ?? false },
+            set: { if !$0 { panel.dismiss() } })
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .confirmationDialog(
+                switchTitle,
+                isPresented: presenting { if case .confirmSwitch = $0 { return true }; return false }
+            ) {
+                Button("Switch") { confirmSwitch() }
+                Button("Cancel", role: .cancel) { panel.dismiss() }
+            } message: {
+                Text("The engine restarts with this workspace's containers, images and "
+                    + "volumes. Anything running now keeps its state and comes back when you "
+                    + "switch back.")
+            }
+            .alert("New Workspace",
+                   isPresented: presenting { $0 == .create }) {
+                TextField("Name", text: Bindable(panel).text)
+                Button("Create") { confirmCreate() }.disabled(!panel.primaryEnabled)
+                Button("Cancel", role: .cancel) { panel.dismiss() }
+            } message: {
+                Text("An empty workspace with its own containers, images and volumes. It "
+                    + "starts at \(engine.activeWorkspace?.diskGiB ?? 64) GB and takes up no "
+                    + "space on your Mac until you use it.")
+            }
+            .alert("Rename Workspace",
+                   isPresented: presenting { if case .rename = $0 { return true }; return false }) {
+                TextField("Name", text: Bindable(panel).text)
+                Button("Rename") { confirmRename() }.disabled(!panel.primaryEnabled)
+                Button("Cancel", role: .cancel) { panel.dismiss() }
+            }
+            .alert(duplicateTitle,
+                   isPresented: presenting { if case .duplicate = $0 { return true }; return false }) {
+                TextField("Name", text: Bindable(panel).text)
+                Button("Duplicate") { confirmDuplicate() }.disabled(!panel.primaryEnabled)
+                Button("Cancel", role: .cancel) { panel.dismiss() }
+            } message: {
+                // Worth saying: "duplicate my 40 GB workspace" otherwise sounds expensive.
+                Text("Copies every container, image and volume. On an Apple File System disk "
+                    + "this is instant and uses no extra space until the two diverge.")
+            }
+            .alert(deleteTitle,
+                   isPresented: presenting { if case .delete = $0 { return true }; return false }) {
+                TextField("Type the workspace name", text: Bindable(panel).text)
+                Button("Delete Permanently", role: .destructive) { confirmDelete() }
+                    .disabled(!panel.primaryEnabled)
+                Button("Cancel", role: .cancel) { panel.dismiss() }
+            } message: {
+                Text(deleteMessage)
+            }
+            .alert("Action failed", isPresented: Binding(
+                get: { panel.error != nil },
+                set: { if !$0 { panel.error = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(panel.error ?? "")
+            }
+    }
+
+    // MARK: Titles
+
+    private var switchTitle: String {
+        guard case .confirmSwitch(let w)? = panel.prompt else { return "Switch workspace?" }
+        return "Switch to “\(w.name)”?"
+    }
+
+    private var duplicateTitle: String {
+        guard case .duplicate(let w)? = panel.prompt else { return "Duplicate Workspace" }
+        return "Duplicate “\(w.name)”"
+    }
+
+    private var deleteTitle: String {
+        guard case .delete(let w)? = panel.prompt else { return "Delete workspace?" }
+        return "Delete “\(w.name)”?"
+    }
+
+    private var deleteMessage: String {
+        guard case .delete(let w)? = panel.prompt else { return "" }
+        return "This permanently deletes every container, image, volume and network in "
+            + "“\(w.name)”, and its \(w.allocatedDescription) disk at \(w.dataDiskURL.path). "
+            + "This can't be undone.\n\nType “\(w.name)” to confirm."
+    }
+
+    // MARK: Confirmations
+
+    private func confirmSwitch() {
+        guard case .confirmSwitch(let workspace)? = panel.prompt else { return }
+        panel.dismiss()
+        Task { await engine.performSwitch(to: workspace) }
+    }
+
+    private func confirmCreate() {
+        guard let name = panel.proposedName else { return }
+        panel.dismiss()
+        engine.performCreate(name: name)
+    }
+
+    private func confirmRename() {
+        guard case .rename(let workspace)? = panel.prompt, let name = panel.proposedName
+        else { return }
+        panel.dismiss()
+        engine.performRename(workspace, to: name)
+    }
+
+    private func confirmDuplicate() {
+        guard case .duplicate(let workspace)? = panel.prompt, let name = panel.proposedName
+        else { return }
+        panel.dismiss()
+        Task { await engine.performDuplicate(workspace, newName: name) }
+    }
+
+    private func confirmDelete() {
+        guard case .delete(let workspace)? = panel.prompt, panel.deleteConfirmed else { return }
+        panel.dismiss()
+        engine.performDelete(workspace)
     }
 }

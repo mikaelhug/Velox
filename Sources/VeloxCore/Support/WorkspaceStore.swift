@@ -66,6 +66,14 @@ public enum WorkspaceStore {
     /// `config.json` can't be trusted (see `migrate`).
     public static func load() throws -> WorkspaceManifest {
         if let manifest = try loadExisting() { return manifest }
+        // First run: migrate under the lock, and look again inside it. Two processes can
+        // reach this at once (the app autostarting while `velox workspace ls` runs), and
+        // without the re-check both would synthesize a Default and the second would overwrite
+        // the first — harmless today, since they'd agree, but only by luck.
+        try Paths.ensureRoot()
+        let lock = try FileLock(at: Paths.workspaceLock)
+        defer { lock.release() }
+        if let manifest = try loadExisting() { return manifest }
         let migrated = try migrate()
         try writeDurably(migrated)
         Log.info("workspaces: created \(Paths.workspaceManifest.lastPathComponent) with "
@@ -245,14 +253,15 @@ public enum WorkspaceStore {
         let now = Date()
         let workspace = Workspace(
             id: UUID().uuidString.lowercased(), name: clean,
-            directory: directory?.standardizedFileURL.path, diskGiB: max(1, diskGiB),
+            directory: directory?.standardizedFileURL.path,
+            diskGiB: Workspace.clampDiskGiB(diskGiB),
             created: now, lastUsed: now)
         try mutate { manifest in
             manifest.workspaces.append(workspace)
         }
         do {
             try Storage.createWorkspaceDisk(at: workspace.dataDiskURL,
-                                            sizeGiB: UInt64(max(1, diskGiB)))
+                                            sizeGiB: UInt64(workspace.diskGiB))
         } catch {
             // Roll the entry back so a failed create can't leave a workspace that points at
             // nothing — the user would see it in the list and be unable to use or remove it.
@@ -289,10 +298,16 @@ public enum WorkspaceStore {
                 + "duplicate it.")
         }
         let now = Date()
+        // `firstBootedAt` is set HERE, in the same write that inserts the entry — not after
+        // the copy. The clone carries the source's filesystem, so it counts as already
+        // booted, and that flag is what makes a later missing disk fail loudly instead of
+        // being silently re-created blank. Setting it in a follow-up write meant a crash
+        // between the two left the entry unprotected. Recording it before the copy can only
+        // err toward "fail loudly", which is the safe direction.
         let workspace = Workspace(
             id: UUID().uuidString.lowercased(), name: clean,
             directory: directory?.standardizedFileURL.path, diskGiB: source.diskGiB,
-            created: now, lastUsed: now)
+            created: now, lastUsed: now, firstBootedAt: source.firstBootedAt ?? now)
         try mutate { manifest in
             manifest.workspaces.append(workspace)
         }
@@ -302,13 +317,6 @@ public enum WorkspaceStore {
         } catch {
             _ = try? mutate { $0.workspaces.removeAll { $0.id == workspace.id } }
             throw error
-        }
-        // The copy carries the source's filesystem, so it has effectively already booted —
-        // a later missing disk is a fault, not an invitation to create a blank one.
-        try mutate { manifest in
-            guard let i = manifest.workspaces.firstIndex(where: { $0.id == workspace.id })
-            else { return }
-            manifest.workspaces[i].firstBootedAt = source.firstBootedAt ?? now
         }
         return workspace
     }
@@ -353,9 +361,21 @@ public enum WorkspaceStore {
             }
             m.workspaces.removeAll { $0.id == id }
         }
-        try Storage.deleteWorkspaceDisk(at: workspace.dataDiskURL,
-                                        mayRemoveDirectory: workspace.ownsDirectory)
-        Log.info("workspace: deleted “\(workspace.name)” (\(workspace.dataDiskURL.path))")
+        // The entry is already gone, so a failure here can't be undone by throwing — the
+        // workspace has vanished from the list either way. Report what actually happened,
+        // naming the file the user now has to remove by hand, instead of a bare error that
+        // leaves them wondering whether the delete worked.
+        do {
+            try Storage.deleteWorkspaceDisk(at: workspace.dataDiskURL,
+                                            mayRemoveDirectory: workspace.ownsDirectory)
+            Log.info("workspace: deleted “\(workspace.name)” (\(workspace.dataDiskURL.path))")
+        } catch {
+            Log.warn("workspace: removed “\(workspace.name)” from the list but its disk "
+                     + "could not be deleted: \(error.localizedDescription)")
+            throw VeloxError.workspace(
+                "“\(workspace.name)” was removed, but its disk file couldn't be deleted. "
+                + "Remove it by hand to reclaim the space:\n\(workspace.dataDiskURL.path)")
+        }
     }
 
     /// Point the manifest at a different workspace. Persisting this is all a switch *is*;
@@ -385,7 +405,7 @@ public enum WorkspaceStore {
     public static func setDiskGiB(id: String, _ gib: Int) throws {
         try mutate { manifest in
             guard let i = manifest.workspaces.firstIndex(where: { $0.id == id }) else { return }
-            manifest.workspaces[i].diskGiB = max(1, gib)
+            manifest.workspaces[i].diskGiB = Workspace.clampDiskGiB(gib)
         }
     }
 

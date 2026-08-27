@@ -230,7 +230,7 @@ private struct ResourcesPane: View {
                 Text("Disk-backed swap inside the guest, on the data disk. Lets memory-hungry builds spill over instead of being OOM-killed.")
             }
             Section {
-                IntSlider(value: activeDiskGiB, range: 8...256, step: 8, unit: "GB")
+                IntSlider(value: activeDiskGiB, range: Workspace.diskGiBRange, step: 8, unit: "GB")
                 if let workspace = engine.activeWorkspace {
                     DiskUsageRow(allocatedGiB: workspace.diskGiB,
                                  dataDiskURL: workspace.dataDiskURL)

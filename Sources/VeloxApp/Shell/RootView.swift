@@ -11,7 +11,12 @@ struct RootView: View {
     var body: some View {
         @Bindable var engine = engine
         return NavigationSplitView {
-            List(selection: $selection) {
+            // The selection binding refuses nil. Workspace rows are plain buttons inside the
+            // list, and a click that lands on one would otherwise clear the navigation
+            // selection as a side effect — bouncing the detail pane to Overview for an action
+            // that was never about navigation.
+            List(selection: Binding(get: { selection },
+                                    set: { if let new = $0 { selection = new } })) {
                 row(.overview)
                 Section("Resources") {
                     row(.containers)
@@ -29,6 +34,10 @@ struct RootView: View {
             // its rows are briefly wider than the shrinking clip and AppKit
             // flashes a horizontal scroller — same glitch the dashboards had.
             .suppressHorizontalScroller()
+            // Every workspace dialog is hosted HERE, on the list, not on the section that
+            // raises it: presentation modifiers attached to a `Section` are unreliable and
+            // can silently never appear. See `WorkspacePanel`.
+            .workspacePrompts(engine)
             .safeAreaInset(edge: .bottom) {
                 EngineStatusBar()
                     .padding(10)
@@ -109,7 +118,13 @@ struct EngineStatusBar: View {
                 .shadow(color: engine.state.tint.opacity(0.6), radius: engine.state.isRunning ? 2.5 : 0)
             Text(engine.engineOwner?.label ?? engine.state.label)
                 .font(.callout.weight(.medium))
-            if engine.isEngineOwned || engine.state.isBusy {
+            if let fraction = engine.engineOwner?.progress {
+                // A cross-volume move or duplicate copies every used byte and can run for
+                // minutes; a bare spinner there is indistinguishable from a hang.
+                ProgressView(value: fraction)
+                    .progressViewStyle(.linear)
+                    .frame(width: 54)
+            } else if engine.isEngineOwned || engine.state.isBusy {
                 ProgressView().controlSize(.small)
             } else if engine.state.isRunning {
                 Button("Stop") { Task { await engine.stop() } }
@@ -140,7 +155,11 @@ struct EngineDownView: View {
             Label(item.title, systemImage: item.systemImage)
         } description: {
             if let owner = engine.engineOwner {
-                Text(owner.explanation)
+                if let fraction = owner.progress {
+                    Text("\(owner.explanation) (\(Int(fraction * 100))%)")
+                } else {
+                    Text(owner.explanation)
+                }
             } else if let workspaceError = engine.workspaceError {
                 Text(workspaceError)
             } else if let failure = engine.state.failureMessage {

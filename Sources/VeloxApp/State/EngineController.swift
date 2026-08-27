@@ -155,6 +155,71 @@ final class EngineController {
     /// The active workspace, or nil if the manifest is unreadable.
     var activeWorkspace: Workspace? { workspaces?.active }
 
+    /// Which workspace dialog is on screen. Owned here, like `paneUI`, so the sidebar can
+    /// raise a prompt while `RootView` hosts it — see `WorkspacePanel`.
+    let workspacePanel = WorkspacePanel()
+
+    /// Workspaces in a stable display order. Creation order, so a switch never reshuffles
+    /// the sidebar under the pointer.
+    var sortedWorkspaces: [Workspace] {
+        (workspaces?.workspaces ?? []).sorted { $0.created < $1.created }
+    }
+
+    /// What may be done to `workspace` right now, and why not.
+    func capabilities(for workspace: Workspace) -> WorkspaceCapabilities {
+        WorkspaceCapabilities(
+            workspace: workspace,
+            activeID: workspaces?.activeID,
+            workspaceCount: workspaces?.workspaces.count ?? 0,
+            engineBusy: isEngineOwned,
+            attachedDiskURL: attachedDiskURL)
+    }
+
+    // MARK: - Workspace actions (UI entry points)
+    //
+    // Thin wrappers that run the operation and route any failure into `workspacePanel`, so
+    // every error reaches the user through one alert instead of each call site inventing its
+    // own. They also keep the views free of `do/catch`.
+    //
+    // They all report through `fail`, which defers presentation: each of these is invoked
+    // from inside the button of a prompt that was dismissed a moment earlier, and a second
+    // alert raised while the first is still dismissing is simply dropped — losing exactly the
+    // errors that matter most (a duplicate name, a delete the store refused).
+
+    func performSwitch(to workspace: Workspace) async {
+        do { try await switchWorkspace(to: workspace) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    func performCreate(name: String) {
+        do { try createWorkspace(name: name) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    func performRename(_ workspace: Workspace, to name: String) {
+        do { try renameWorkspace(workspace, to: name) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    func performDuplicate(_ workspace: Workspace, newName: String) async {
+        do { _ = try await cloneWorkspace(workspace, newName: newName) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    func performDelete(_ workspace: Workspace) {
+        do { try deleteWorkspace(workspace) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    func performMove(_ workspace: Workspace, to directory: URL) async {
+        do { try await moveWorkspace(workspace, to: directory) }
+        catch { workspacePanel.fail(Self.message(error)) }
+    }
+
+    private static func message(_ error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? "\(error)"
+    }
+
     /// Crash notifications (opt-in) — fed by the resource store's die events.
     private let crashNotifier = CrashNotifier()
 
@@ -672,7 +737,7 @@ final class EngineController {
         guard target.id != workspaces?.activeID else { return }
 
         let wasRunning = state.isRunning || state.isBusy
-        engineOwner = .switchingWorkspace(target.name)
+        engineOwner = .switchingWorkspace(name: target.name)
         defer { engineOwner = nil }
 
         // Flush and release the VZ file handle on the CURRENT workspace's disk. A stop that
@@ -719,7 +784,7 @@ final class EngineController {
             == source.dataDiskURL.standardizedFileURL
         let wasRunning = isActive && (state.isRunning || state.isBusy)
 
-        engineOwner = .cloningWorkspace(source.name)
+        engineOwner = .cloningWorkspace(name: source.name, progress: 0)
         defer { engineOwner = nil }
 
         if wasRunning, await performStop() == false {
@@ -734,8 +799,13 @@ final class EngineController {
 
         do {
             let id = source.id
-            let copy = try await Task.detached(priority: .userInitiated) {
-                try WorkspaceStore.clone(id: id, newName: newName)
+            let copy = try await Task.detached(priority: .userInitiated) { [weak self] in
+                try WorkspaceStore.clone(id: id, newName: newName) { frac in
+                    Task { @MainActor in
+                        guard let self, let owner = self.engineOwner else { return }
+                        self.engineOwner = owner.advanced(to: frac)
+                    }
+                }
             }.value
             reloadWorkspaces()
             if wasRunning { await performStart() }
@@ -815,7 +885,7 @@ final class EngineController {
         let isActive = attachedDiskURL?.standardizedFileURL == src.standardizedFileURL
             || workspace.id == workspaces?.activeID
         let wasRunning = isActive && (state.isRunning || state.isBusy)
-        engineOwner = .movingDisk(0)
+        engineOwner = .movingDisk(name: workspace.name, progress: 0)
         defer { engineOwner = nil }
 
         // Flush + release the VZ file handle. If the engine won't stop, abort: copying a disk
@@ -836,8 +906,8 @@ final class EngineController {
                 // manifest pointing at a disk that exists.
                 try WorkspaceStore.relocate(id: id, to: destinationDir) { [weak self] frac in
                     Task { @MainActor in
-                        guard let self, case .movingDisk = self.engineOwner else { return }
-                        self.engineOwner = .movingDisk(frac)
+                        guard let self, let owner = self.engineOwner else { return }
+                        self.engineOwner = owner.advanced(to: frac)
                     }
                 }
             }.value
