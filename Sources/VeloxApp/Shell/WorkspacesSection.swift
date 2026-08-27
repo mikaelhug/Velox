@@ -34,11 +34,18 @@ struct WorkspacesSection: View {
                         + "workspaces will clear this.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        // A List row is a single truncating line by default, which cut this
+                        // to "The saved selection i…" and lost the entire message — the one
+                        // thing a banner exists to deliver. `fixedSize` vertically is what
+                        // lets the row grow to fit the wrapped text in a ~160pt sidebar.
+                        .lineLimit(nil)
+                        .fixedSize(horizontal: false, vertical: true)
                 } icon: {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 }
+                .padding(.vertical, 2)
             }
         } header: {
             HStack(spacing: 4) {
