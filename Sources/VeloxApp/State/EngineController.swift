@@ -169,7 +169,9 @@ final class EngineController {
     func capabilities(for workspace: Workspace) -> WorkspaceCapabilities {
         WorkspaceCapabilities(
             workspace: workspace,
-            activeID: workspaces?.activeID,
+            // The EFFECTIVE active id — with a dangling pointer, `active` falls back, and
+            // the fallback workspace must be protected (and marked) as the active one.
+            activeID: activeWorkspace?.id,
             workspaceCount: workspaces?.workspaces.count ?? 0,
             engineBusy: isEngineOwned,
             attachedDiskURL: attachedDiskURL)
@@ -255,6 +257,17 @@ final class EngineController {
         }
         if config.checkUpdatesOnStartup && !isPreview {
             Task { await self.checkForUpdates() }
+        }
+        // Refresh the workspace list whenever the app comes to the front. While the GUI is
+        // open with the engine STOPPED, the engine lock is free, so `velox workspace
+        // new/rename/rm` in a terminal succeeds — and nothing else would tell this process.
+        // Activation is the moment the user cmd-tabs back to look at the sidebar, and it is
+        // a push, not a poll (CLAUDE.md §8; same pattern as ClockSync's didWake).
+        // `reloadWorkspaces` only publishes on a real change, so the common case is free.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reloadWorkspaces() }
         }
     }
 
@@ -738,6 +751,10 @@ final class EngineController {
     /// is what makes this feel like switching rather than reinstalling.
     func switchWorkspace(to target: Workspace) async throws {
         try requireIdleEngine("switch")
+        // The RAW id on purpose, unlike every other comparison: when the stored pointer
+        // dangles, `active` falls back — and switching to the fallback workspace is then the
+        // repair (activate rewrites `activeID` to a valid id). Comparing the effective id
+        // would swallow that click as "already there" and leave the manifest broken.
         guard target.id != workspaces?.activeID else { return }
 
         let wasRunning = state.isRunning || state.isBusy
@@ -900,7 +917,7 @@ final class EngineController {
         }
 
         let isActive = attachedDiskURL?.standardizedFileURL == src.standardizedFileURL
-            || workspace.id == workspaces?.activeID
+            || workspace.id == activeWorkspace?.id
         let wasRunning = isActive && (state.isRunning || state.isBusy)
         engineOwner = .movingDisk(name: workspace.name, progress: 0)
         defer { engineOwner = nil }

@@ -18,9 +18,27 @@ struct WorkspacesSection: View {
     var body: some View {
         Section {
             ForEach(engine.sortedWorkspaces) { workspace in
+                // Effective active, not the raw `activeID`: with a dangling pointer the
+                // fallback workspace is what will boot, and it must wear the marker.
                 WorkspaceRow(workspace: workspace,
-                             isActive: workspace.id == engine.workspaces?.activeID)
+                             isActive: workspace.id == engine.activeWorkspace?.id)
                     .contextMenu { menu(for: workspace) }
+            }
+            if engine.workspaces?.activeIsFallback == true {
+                // The stored pointer names a workspace that isn't in the list (a hand-edited
+                // or restored manifest). Say so rather than silently booting the fallback —
+                // switching to any workspace rewrites the pointer and clears this.
+                Label {
+                    Text("The saved selection is missing — using "
+                        + "\(engine.activeWorkspace?.name ?? "Default"). Switching "
+                        + "workspaces will clear this.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
         } header: {
             HStack(spacing: 4) {
@@ -125,6 +143,9 @@ private struct WorkspaceRow: View {
 
     var body: some View {
         Button {
+            // `isActive` here is the effective active. Clicking the fallback-active row
+            // still offers the switch (isActive true suppresses it) — repairing the dangling
+            // pointer is done by switching to any row, which rewrites it.
             guard !isActive, !engine.isEngineOwned else { return }
             engine.workspacePanel.begin(.confirmSwitch(workspace))
         } label: {
@@ -227,9 +248,16 @@ private struct WorkspacePrompts: ViewModifier {
                 Button("Switch") { confirmSwitch() }
                 Button("Cancel", role: .cancel) { panel.dismiss() }
             } message: {
-                Text("The engine restarts with this workspace's containers, images and "
-                    + "volumes. Anything running now keeps its state and comes back when you "
-                    + "switch back.")
+                // Tell the truth for both engine states: a running engine restarts; a
+                // stopped one just repoints and boots this workspace on the next start.
+                if engine.state.isRunning || engine.state.isBusy {
+                    Text("The engine restarts with this workspace's containers, images and "
+                        + "volumes. Anything running now keeps its state and comes back when "
+                        + "you switch back.")
+                } else {
+                    Text("This workspace's containers, images and volumes will be used when "
+                        + "the engine next starts.")
+                }
             }
             .alert("New Workspace",
                    isPresented: presenting { $0 == .create }) {

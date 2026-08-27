@@ -1034,6 +1034,56 @@ do {
           "…while any real file beside the disk still blocks it")
 }
 
+section("Dangling activeID (fallback semantics)")
+do {
+    let fm = FileManager.default
+    let sandbox = fm.temporaryDirectory.appendingPathComponent("velox-fb-\(getpid())")
+    try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+    setenv("VELOX_HOME", sandbox.path, 1)
+    defer { unsetenv("VELOX_HOME"); try? fm.removeItem(at: sandbox) }
+    try? Data("{}".utf8).write(to: Paths.config)
+    _ = try? WorkspaceStore.load()                       // migrate
+    let extra = try! WorkspaceStore.create(name: "Extra", diskGiB: 8)
+
+    // Point the manifest at an id that isn't in the list.
+    var manifest = try! WorkspaceStore.loadExisting()!
+    manifest = WorkspaceManifest(version: manifest.version, revision: manifest.revision,
+                                 activeID: "gone", workspaces: manifest.workspaces)
+    try! WorkspaceStore.writeDurably(manifest)
+
+    let loaded = try! WorkspaceStore.load()
+    check(loaded.activeIsFallback, "a dangling pointer is reported as a fallback")
+    equal(loaded.active.id, Workspace.defaultID, "…and Default is the effective active")
+
+    // THE hole this section exists for: the workspace that will actually boot must be
+    // protected by the delete guard even though the raw activeID names something else.
+    var refused = false
+    do { try WorkspaceStore.delete(id: Workspace.defaultID) } catch { refused = true }
+    check(refused, "the EFFECTIVE active workspace can't be deleted while the pointer dangles")
+
+    // Mutations must keep working while the pointer dangles — a frozen manifest would make
+    // "switch" the only working verb without ever saying so.
+    check((try? WorkspaceStore.create(name: "WhileDangling", diskGiB: 8)) != nil,
+          "create still works with a dangling pointer")
+    check((try? WorkspaceStore.rename(id: extra.id, to: "Extra2")) != nil,
+          "rename still works with a dangling pointer")
+    check((try? WorkspaceStore.loadExisting())??.activeIsFallback == true,
+          "…and the dangling pointer is preserved through those writes, not silently repaired")
+
+    // Switching is the repair: activate rewrites the pointer to a valid id.
+    try? WorkspaceStore.activate(id: extra.id)
+    check((try? WorkspaceStore.loadExisting())??.activeIsFallback == false,
+          "activate repairs the pointer")
+
+    // Capabilities fed the EFFECTIVE id mark the fallback workspace as active.
+    let def = loaded.workspace(id: Workspace.defaultID)!
+    let caps = WorkspaceCapabilities(workspace: def, activeID: loaded.active.id,
+                                     workspaceCount: loaded.workspaces.count,
+                                     engineBusy: false, attachedDiskURL: nil)
+    check(caps.isActive && !caps.canDelete,
+          "capabilities built from the effective id protect and mark the fallback workspace")
+}
+
 // MARK: Updater semver ordering
 
 section("Updater.compareSemver")

@@ -190,8 +190,15 @@ public enum WorkspaceStore {
         guard !manifest.workspaces.isEmpty else {
             throw VeloxError.workspace("There must always be at least one workspace.")
         }
-        guard manifest.workspace(id: manifest.activeID) != nil else {
-            throw VeloxError.workspace("The active workspace is not in the list.")
+        // A dangling `activeID` is tolerated, not fatal: the read side deliberately falls
+        // back (see `WorkspaceManifest.active`) and preserves the pointer so a restored
+        // manifest entry can reclaim it. Throwing here would freeze EVERY mutation while the
+        // pointer dangles — create and rename would fail with a baffling error, and
+        // `recordBoot`'s try? would go silently dead — leaving "switch" as the only working
+        // verb without ever saying so. The load path already warns once.
+        if manifest.workspace(id: manifest.activeID) == nil {
+            Log.warn("workspace manifest: keeping dangling active id \(manifest.activeID) "
+                     + "through a write (effective active: \(manifest.active.name))")
         }
         var seenIDs = Set<String>(), seenNames = Set<String>()
         for w in manifest.workspaces {
@@ -382,13 +389,17 @@ public enum WorkspaceStore {
             throw VeloxError.workspace(
                 "“\(workspace.name)” is the only workspace — Velox needs at least one.")
         }
-        guard manifest.activeID != id else {
+        // `active.id`, NOT the raw `activeID`: when the stored pointer dangles (a
+        // hand-edited or restored manifest), `active` falls back to Default — and Default is
+        // then the workspace that will actually boot. Comparing the raw id would let exactly
+        // that workspace be deleted, disk and all, while it is the effective active one.
+        guard manifest.active.id != id else {
             throw VeloxError.workspace(
                 "“\(workspace.name)” is the active workspace. Switch to another one first.")
         }
         try mutate { m in
             // Re-check under the lock: another process may have switched to it since.
-            guard m.activeID != id else {
+            guard m.active.id != id else {   // effective active — see the guard above
                 throw VeloxError.workspace(
                     "“\(workspace.name)” has become the active workspace. Switch away first.")
             }
@@ -527,7 +538,9 @@ public enum WorkspaceStore {
     /// Temp file → fsync → `rename(2)` → fsync the directory. `Data.write(.atomic)` gets the
     /// rename but not the directory fsync, and losing this file loses the only record of
     /// where a relocated workspace lives.
-    static func writeDurably(_ manifest: WorkspaceManifest) throws {
+    /// Public so `velox-selftest` can construct edge-case manifests (a dangling activeID)
+    /// directly, the way `validateDiskPaths` is exercised.
+    public static func writeDurably(_ manifest: WorkspaceManifest) throws {
         try Paths.ensureRoot()
         let target = Paths.workspaceManifest
         let tmp = target.appendingPathExtension("tmp")
