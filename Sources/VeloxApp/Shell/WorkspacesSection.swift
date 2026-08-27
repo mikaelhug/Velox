@@ -30,10 +30,14 @@ struct WorkspacesSection: View {
                     .disabled(engine.isEngineOwned)
             }
             // A section header stretches to the row's trailing edge, so a bare `Spacer()`
-            // parks the glyph flush against it. The button carries its own padding (which is
-            // also what gives it a usable hit target), and this trims the rest so the plus
-            // sits off the edge rather than on it.
-            .padding(.trailing, 2)
+            // parks the glyph almost flush against it.
+            //
+            // 8, not a smaller "just off the edge" value: the header's own text sits ~14.5pt
+            // in from the leading edge, and the eye reads the difference. With the button's
+            // 3pt of internal padding this lands the glyph ~13pt from the trailing edge, so
+            // the two ends of the header balance. Measured off a render at 2 / 8 / 14 — 2 is
+            // visibly crowded and 14 makes the plus look detached from the edge.
+            .padding(.trailing, 8)
         }
     }
 
