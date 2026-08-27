@@ -26,12 +26,25 @@ func printUsage() {
     Velox \(Versions.velox) — lightweight Docker engine host for macOS
 
     Usage:
-      velox start [--bind none|docker]
+      velox start [--bind none|docker] [--workspace <name>]
                       Boot the Linux guest engine (serial console on this terminal)
       velox status    Show host/environment info
+      velox workspace Manage workspaces (see below)
       velox version   Show Velox and component versions
       velox update    Check GitHub for a newer Velox (--apply to install)
       velox help      Show this help
+
+    Workspaces — each one is a complete, isolated engine state (its own containers,
+    images, volumes, networks and build cache). Exactly one is active at a time:
+      velox workspace ls                     List workspaces (* marks the active one)
+      velox workspace info [<name>]          Show one workspace in detail
+      velox workspace new <name> [--size N]  Create an empty workspace (N in GB)
+      velox workspace clone <name> <new>     Duplicate one (instant on APFS, no extra space)
+      velox workspace use <name>             Make it active (takes effect on next start)
+      velox workspace rename <old> <new>     Rename one
+      velox workspace rm <name>              Delete one and its data, permanently
+    Everything except container data is shared: the docker socket path never changes,
+    so `docker` follows the active workspace with no reconfiguration.
 
     Velox is a standard Docker engine on a unix socket. Reach it with the plain
     `docker` CLI via the `velox` Docker context (created on start):
@@ -48,6 +61,7 @@ func printUsage() {
       VELOX_KERNEL    path to guest kernel       (default ~/.velox/kernel)
       VELOX_ROOT      path to erofs root image   (default ~/.velox/root.img)
       VELOX_CMDLINE   kernel command line        (default "console=hvc0")
+      VELOX_HOME      state directory            (default ~/.velox)
     """)
 }
 
@@ -74,7 +88,7 @@ func runStatus() {
     #endif
 }
 
-func runStart(bind: BindMode) -> Never {
+func runStart(bind: BindMode, workspaceName: String?) -> Never {
     do {
         // The CLI honors the same ~/.velox/config.json the GUI writes, so
         // resources, swap, and file shares are consistent across both front ends.
@@ -83,13 +97,32 @@ func runStart(bind: BindMode) -> Never {
         // Refuse to boot a second engine (the app or another `velox start`): two would
         // attach the same data.img read-write and corrupt it. Held for the whole process.
         try InstanceLock.acquireForProcess(at: Paths.engineLock)
-        let dataDisk = prefs.dataDiskURL
-        // A relocated data disk that's gone (drive unplugged / deleted) must fail loudly, not be
-        // silently recreated empty. A missing disk at the DEFAULT location is a legit first run.
-        if prefs.dataDirectory != nil && !FileManager.default.fileExists(atPath: dataDisk.path) {
+
+        // `--workspace` sets the active one persistently rather than booting it just for
+        // this run: a one-shot would leave the GUI's sidebar showing a different workspace
+        // than the one actually running, which is worse than an explicit switch.
+        if let workspaceName {
+            guard let target = try WorkspaceStore.load().workspace(named: workspaceName) else {
+                throw VeloxError.workspace("No workspace named “\(workspaceName)”. "
+                    + "Run `velox workspace ls` to see them.")
+            }
+            try WorkspaceStore.activate(id: target.id)
+        }
+        let manifest = try WorkspaceStore.load()
+        let workspace = manifest.active
+        let resources = prefs.resources(diskGiB: workspace.diskGiB)
+        let dataDisk = workspace.dataDiskURL
+        // A disk that's gone (drive unplugged / deleted) must fail loudly, not be silently
+        // recreated empty. A missing disk for a workspace that has NEVER booted is a legit
+        // first run — that distinction, not "did the user relocate it", is what tells a
+        // brand-new workspace apart from a broken one.
+        if workspace.firstBootedAt != nil,
+           !FileManager.default.fileExists(atPath: dataDisk.path) {
             throw VeloxError.dataDiskMissing(dataDisk)
         }
-        try Storage.ensureDataDisk(at: dataDisk, sizeGiB: prefs.resources.diskGiB)
+        try Storage.ensureDataDisk(at: dataDisk, sizeGiB: resources.diskGiB)
+        WorkspaceStore.recordBoot(id: workspace.id)
+        Log.info("workspace: \(workspace.name) (\(dataDisk.path))")
         // After an app update, refresh the installed guest from the (newer) bundled copy so we
         // never boot a stale ~/.velox kernel/rootfs against a new host.
         GuestInstall.refreshFromBundleIfNeeded()
@@ -97,7 +130,7 @@ func runStart(bind: BindMode) -> Never {
         let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
         let config = try VMConfiguration.build(
             image: image, dataDisk: dataDisk,
-            resources: prefs.resources, extraShares: prefs.shareURLs,
+            resources: resources, extraShares: prefs.shareURLs,
             nestedVirtualization: prefs.nestedVirtualization)
         Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
                  + "root=\(image.rootDiskURL.lastPathComponent) "
@@ -199,6 +232,149 @@ func runStart(bind: BindMode) -> Never {
     }
 }
 
+// MARK: - Workspaces
+
+/// Whether an engine (the app, or another `velox start`) currently holds the instance lock.
+///
+/// Probed by taking the lock and immediately releasing it — the same `flock` the engine
+/// itself uses, so the answer is authoritative at the instant it is asked.
+func engineIsRunning() -> Bool {
+    let fd = open(Paths.engineLock.path, O_RDONLY | O_CREAT | O_CLOEXEC, 0o644)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return true }
+    flock(fd, LOCK_UN)
+    return false
+}
+
+/// Refuse a mutating workspace command while an engine is running.
+///
+/// Not merely conservative. There is no `velox stop` — a `velox start` process *is* the
+/// engine and is stopped with a signal — so this process cannot restart a running one to
+/// apply a switch. And the GUI holds the workspace list in memory, so a write landing
+/// underneath it would be overwritten by its next save. (Correctness against genuinely
+/// concurrent writers comes from the manifest lock inside `WorkspaceStore`; this is the
+/// friendlier refusal that keeps users out of that situation in the first place.)
+func requireStoppedEngine(_ action: String) throws {
+    guard !engineIsRunning() else {
+        throw VeloxError.workspace(
+            "Velox is running, so it can't \(action) right now. Stop the engine first "
+            + "(quit the Velox app, or press Ctrl-C in the terminal running `velox start`).")
+    }
+}
+
+func workspaceNamed(_ name: String, in manifest: WorkspaceManifest) throws -> Workspace {
+    guard let w = manifest.workspace(named: name) else {
+        throw VeloxError.workspace("No workspace named “\(name)”. "
+            + "Run `velox workspace ls` to see them.")
+    }
+    return w
+}
+
+func runWorkspace(_ args: [String]) -> Never {
+    do {
+        let manifest = try WorkspaceStore.load()
+        switch args.first {
+        case "ls", "list", .none:
+            // Allocated (not apparent) size: the images are sparse, and on APFS a clone
+            // shares its blocks, so this is what the workspace actually occupies today.
+            let width = max(4, manifest.workspaces.map(\.name.count).max() ?? 4)
+            print("  \("NAME".padding(toLength: width, withPad: " ", startingAt: 0))  "
+                  + "\("SIZE".padding(toLength: 9, withPad: " ", startingAt: 0))  MAX   LOCATION")
+            for w in manifest.workspaces.sorted(by: { $0.created < $1.created }) {
+                let marker = w.id == manifest.activeID ? "*" : " "
+                let name = w.name.padding(toLength: width, withPad: " ", startingAt: 0)
+                let size = w.allocatedDescription.padding(toLength: 9, withPad: " ", startingAt: 0)
+                let max = "\(w.diskGiB)G".padding(toLength: 5, withPad: " ", startingAt: 0)
+                let dir = (w.dataDiskURL.deletingLastPathComponent().path as NSString)
+                    .abbreviatingWithTildeInPath
+                print("\(marker) \(name)  \(size)  \(max) \(dir)")
+            }
+
+        case "info":
+            let w = args.count > 1 ? try workspaceNamed(args[1], in: manifest) : manifest.active
+            print("Name        \(w.name)")
+            print("Active      \(w.id == manifest.activeID ? "yes" : "no")")
+            print("Disk        \(w.dataDiskURL.path)")
+            print("Used        \(w.allocatedDescription) of \(w.diskGiB) GB max")
+            print("Created     \(w.created.formatted())")
+            print("Last used   \(w.lastUsed.formatted())")
+            print("First boot  \(w.firstBootedAt?.formatted() ?? "never started")")
+            if w.diskExists && !Storage.dataDiskIsClean(at: w.dataDiskURL) {
+                print("State       not cleanly shut down — start it once before duplicating")
+            }
+
+        case "new", "create":
+            guard args.count > 1 else { throw VeloxError.workspace("Usage: velox workspace new <name> [--size N]") }
+            try requireStoppedEngine("create a workspace")
+            var size = manifest.active.diskGiB
+            if let i = args.firstIndex(of: "--size"), i + 1 < args.count,
+               let n = Int(args[i + 1]) { size = n }
+            let created = try WorkspaceStore.create(name: args[1], diskGiB: size)
+            print("Created workspace “\(created.name)” (\(size) GB max) at "
+                  + "\(created.dataDiskURL.path)")
+            print("Run `velox workspace use \(created.name)` to switch to it.")
+
+        case "clone", "duplicate":
+            guard args.count > 2 else { throw VeloxError.workspace("Usage: velox workspace clone <name> <new-name>") }
+            try requireStoppedEngine("duplicate a workspace")
+            let source = try workspaceNamed(args[1], in: manifest)
+            let copy = try WorkspaceStore.clone(id: source.id, newName: args[2])
+            print("Duplicated “\(source.name)” → “\(copy.name)” at \(copy.dataDiskURL.path)")
+
+        case "use", "switch":
+            guard args.count > 1 else { throw VeloxError.workspace("Usage: velox workspace use <name>") }
+            try requireStoppedEngine("switch workspaces")
+            let target = try workspaceNamed(args[1], in: manifest)
+            try WorkspaceStore.activate(id: target.id)
+            print("Active workspace is now “\(target.name)”. Start Velox to use it.")
+
+        case "rename":
+            guard args.count > 2 else { throw VeloxError.workspace("Usage: velox workspace rename <old> <new>") }
+            let target = try workspaceNamed(args[1], in: manifest)
+            try WorkspaceStore.rename(id: target.id, to: args[2])
+            print("Renamed “\(target.name)” → “\(args[2])”")
+
+        case "rm", "remove", "delete":
+            guard args.count > 1 else { throw VeloxError.workspace("Usage: velox workspace rm <name>") }
+            try requireStoppedEngine("delete a workspace")
+            let target = try workspaceNamed(args[1], in: manifest)
+            // Check what would refuse the delete BEFORE asking the user to type the name.
+            // `WorkspaceStore.delete` re-checks both under the manifest lock; this is only so
+            // nobody is made to confirm a deletion that was never going to happen.
+            guard manifest.workspaces.count > 1 else {
+                throw VeloxError.workspace(
+                    "“\(target.name)” is the only workspace — Velox needs at least one.")
+            }
+            guard manifest.activeID != target.id else {
+                throw VeloxError.workspace("“\(target.name)” is the active workspace. "
+                    + "Switch to another one first: velox workspace use <other>")
+            }
+            // Deleting a workspace destroys its containers, images and volumes with no way
+            // back, so make the user type the name rather than accept a bare `-f`.
+            print("This permanently deletes “\(target.name)” and everything in it "
+                  + "(\(target.allocatedDescription) at \(target.dataDiskURL.path)).")
+            print("Type the workspace name to confirm: ", terminator: "")
+            let typed = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard Workspace.normalized(typed) == Workspace.normalized(target.name) else {
+                print("Not deleted.")
+                exit(1)
+            }
+            try WorkspaceStore.delete(id: target.id)
+            print("Deleted “\(target.name)”.")
+
+        default:
+            Log.error("unknown workspace command: \(args[0])")
+            printUsage()
+            exit(2)
+        }
+        exit(0)
+    } catch {
+        Log.error("\(error)")
+        exit(1)
+    }
+}
+
 // MARK: - Dispatch
 
 func parseBind(_ args: [String]) -> BindMode {
@@ -209,6 +385,12 @@ func parseBind(_ args: [String]) -> BindMode {
     return .none
 }
 
+/// `--workspace <name>` for `velox start`.
+func parseWorkspace(_ args: [String]) -> String? {
+    guard let i = args.firstIndex(of: "--workspace"), i + 1 < args.count else { return nil }
+    return args[i + 1]
+}
+
 // Ignore SIGPIPE: writing to a socket whose peer has closed must surface as an
 // EPIPE error, not terminate the process. Essential for the proxy/relay/watcher.
 signal(SIGPIPE, SIG_IGN)
@@ -216,9 +398,11 @@ signal(SIGPIPE, SIG_IGN)
 let arguments = Array(CommandLine.arguments.dropFirst())
 switch arguments.first {
 case "start":
-    runStart(bind: parseBind(arguments))
+    runStart(bind: parseBind(arguments), workspaceName: parseWorkspace(arguments))
 case "status":
     runStatus()
+case "workspace", "workspaces", "ws":
+    runWorkspace(Array(arguments.dropFirst()))
 case "version", "--version", "-v":
     runVersion()
 case "update":

@@ -358,7 +358,7 @@ struct ContainersView: View {
                     // Named access — the engine's flagship: the container's real IP by
                     // name, any protocol, no -p. Click → browser; copy lives in the menu.
                     if let domain = c.namedAccessDomain {
-                        Button(domain) { WorkspaceActions.openDomain(domain) }
+                        Button(domain) { RowActions.openDomain(domain) }
                             .buttonStyle(.plain)
                             .font(.caption2)
                             .foregroundStyle(.link)
@@ -518,31 +518,31 @@ struct ContainersView: View {
         Divider()
         Button("View Logs") { openLogs(c) }
         if c.isRunning {
-            Button("Open in Terminal") { WorkspaceActions.openShell(containerID: c.shortID) }
-            if WorkspaceActions.vsCodeAvailable {
-                Button("Open in VS Code") { WorkspaceActions.openInVSCode(containerName: c.displayName) }
+            Button("Open in Terminal") { RowActions.openShell(containerID: c.shortID) }
+            if RowActions.vsCodeAvailable {
+                Button("Open in VS Code") { RowActions.openInVSCode(containerName: c.displayName) }
             }
         }
         // No "Open <domain>" here — the clickable domain link under the name IS that
         // affordance; duplicating it in the menu just lengthens it.
         Menu("Copy") {
-            Button("Name") { WorkspaceActions.copy(c.displayName) }
-            Button("Container ID") { WorkspaceActions.copy(c.id) }
+            Button("Name") { RowActions.copy(c.displayName) }
+            Button("Container ID") { RowActions.copy(c.id) }
             Button("As docker run Command") {
                 let docker = model.docker
                 Task {
                     if let inspect = try? await docker.inspectContainer(c.id) {
-                        WorkspaceActions.copy(DockerRunCommand.build(from: inspect))
+                        RowActions.copy(DockerRunCommand.build(from: inspect))
                     }
                 }
             }
-            if let ip = c.directIP { Button("IP (\(ip))") { WorkspaceActions.copy(ip) } }
-            if let domain = c.namedAccessDomain { Button("Domain") { WorkspaceActions.copy(domain) } }
+            if let ip = c.directIP { Button("IP (\(ip))") { RowActions.copy(ip) } }
+            if let domain = c.namedAccessDomain { Button("Domain") { RowActions.copy(domain) } }
             ForEach(c.publishedBindings, id: \.self) { p in
                 if let pub = p.publicPort {
                     // String-built (a literal's Int interpolation is locale-formatted).
                     let title = "URL (localhost:" + String(pub) + ")"
-                    Button(title) { WorkspaceActions.copy("http://localhost:" + String(pub) + "/") }
+                    Button(title) { RowActions.copy("http://localhost:" + String(pub) + "/") }
                 }
             }
         }
@@ -648,7 +648,7 @@ private struct ContainerInspector: View {
                 Section("Network") {
                     if let domain = c.namedAccessDomain {
                         LabeledContent("Domain") {
-                            Button(domain) { WorkspaceActions.openDomain(domain) }
+                            Button(domain) { RowActions.openDomain(domain) }
                                 .buttonStyle(.plain).foregroundStyle(.link)
                         }
                     }
@@ -663,7 +663,7 @@ private struct ContainerInspector: View {
                             VStack(alignment: .trailing, spacing: 2) {
                                 ForEach(c.publishedBindings, id: \.self) { p in
                                     if let pub = p.publicPort {
-                                        Button(p.label) { WorkspaceActions.openPort(pub) }
+                                        Button(p.label) { RowActions.openPort(pub) }
                                             .buttonStyle(.plain).foregroundStyle(.link)
                                             .font(.callout.monospaced())
                                     }
@@ -739,7 +739,7 @@ private struct PortLink: View {
 
     var body: some View {
         let portText = String(port)
-        Button(label) { WorkspaceActions.openPort(port) }
+        Button(label) { RowActions.openPort(port) }
             .buttonStyle(.plain)
             .font(.caption.monospaced())
             .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.link))

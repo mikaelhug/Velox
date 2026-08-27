@@ -19,6 +19,7 @@ struct RootView: View {
                     row(.volumes)
                     row(.networks)
                 }
+                WorkspacesSection()
                 Section("System") {
                     row(.engineLogs)
                 }
@@ -35,6 +36,12 @@ struct RootView: View {
         } detail: {
             detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
+                // Rebuild the detail pane when the workspace changes. `OverviewModel`
+                // captures the data-disk URL at init, so a pane that survived a switch
+                // would keep gauging the OLD workspace's disk. A switch normally destroys
+                // this view anyway (the engine leaves `.running`), but that is incidental,
+                // and this makes it impossible rather than merely unlikely.
+                .id(engine.workspaces?.activeID ?? "")
         }
         .toolbar(removing: .sidebarToggle)
         .navigationTitle(selection?.title ?? "Velox")
@@ -75,7 +82,8 @@ struct RootView: View {
                let stats = engine.stats {
                 switch item {
                 case .overview:   OverviewView(store: store, stats: stats,
-                                               dataDiskURL: engine.config.dataDiskURL)
+                                               dataDiskURL: engine.activeWorkspace?.dataDiskURL
+                                                   ?? engine.config.dataDiskURL)
                 case .containers: ContainersView(docker: docker, store: store, stats: stats,
                                                  ui: engine.paneUI, issues: engine.portIssues)
                 case .images:     ImagesView(docker: docker, store: store, ui: engine.paneUI)
@@ -99,9 +107,9 @@ struct EngineStatusBar: View {
                 .fill(engine.state.tint)
                 .frame(width: 8, height: 8)
                 .shadow(color: engine.state.tint.opacity(0.6), radius: engine.state.isRunning ? 2.5 : 0)
-            Text(engine.isRelocatingDisk ? "Moving disk…" : engine.state.label)
+            Text(engine.engineOwner?.label ?? engine.state.label)
                 .font(.callout.weight(.medium))
-            if engine.isRelocatingDisk || engine.state.isBusy {
+            if engine.isEngineOwned || engine.state.isBusy {
                 ProgressView().controlSize(.small)
             } else if engine.state.isRunning {
                 Button("Stop") { Task { await engine.stop() } }
@@ -131,8 +139,10 @@ struct EngineDownView: View {
         ContentUnavailableView {
             Label(item.title, systemImage: item.systemImage)
         } description: {
-            if engine.isRelocatingDisk {
-                Text("Moving the data disk… the engine will restart when it's done.")
+            if let owner = engine.engineOwner {
+                Text(owner.explanation)
+            } else if let workspaceError = engine.workspaceError {
+                Text(workspaceError)
             } else if let failure = engine.state.failureMessage {
                 Text(failure)
             } else if engine.needsOnboarding {
@@ -141,7 +151,7 @@ struct EngineDownView: View {
                 Text("The Velox engine is \(engine.state.label.lowercased()). Start it to see \(item.title.lowercased()).")
             }
         } actions: {
-            if !engine.needsOnboarding && !engine.isRelocatingDisk {
+            if !engine.needsOnboarding && !engine.isEngineOwned && engine.workspaceError == nil {
                 Button(engine.state.isBusy ? "Starting…" : "Start Engine") {
                     Task { await engine.start() }
                 }

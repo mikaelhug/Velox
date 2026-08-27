@@ -28,10 +28,42 @@ final class EngineController {
     /// consult this instead. Only a relaunch clears it.
     private(set) var vmUnreachable = false
 
-    /// True while a data-disk relocation is in flight (stop → move → restart). Gates the UI so
-    /// Start/Restart/Move can't interleave; `moveProgress` (0…1) drives the move sheet.
-    private(set) var isRelocatingDisk = false
-    private(set) var moveProgress: Double = 0
+    /// The long-running operation that currently *owns* the engine — it drives the stop and
+    /// restart itself, so `start()`/`stop()`/`restart()` must stay out of its way.
+    ///
+    /// One value rather than a flag per operation. The same "is something holding the
+    /// engine?" ladder is hand-written in three places (the sidebar status bar, the
+    /// engine-down pane, the menu-bar control), and with a boolean per operation each new
+    /// one has to be threaded through all three — which is how they drift. Adding a case
+    /// here updates every ladder at once.
+    private(set) var engineOwner: EngineOwner?
+
+    /// True while any operation owns the engine.
+    var isEngineOwned: Bool { engineOwner != nil }
+
+    /// True once the app has begun terminating.
+    ///
+    /// Deliberately separate from `state`. `beginTerminating()` only advances `state` when
+    /// the engine is running or busy — but a workspace switch (or a disk move) sits in
+    /// `.stopped` between its own `performStop` and `performStart`, so a ⌘Q landing in that
+    /// window leaves `state` untouched, `performStart`'s entry guard passes, and the switch
+    /// boots a VM the process is already killing. On a brand-new workspace that means a
+    /// half-run `mkfs.ext4`: `is_ext4` then reports true while `disk_is_blank` reports false,
+    /// so vinit refuses to format it *and* can't mount it, and the workspace is permanently
+    /// unbootable. Checked at the top of `performStart` and after every `await` in an
+    /// engine-owning operation.
+    private(set) var isTerminating = false
+
+    /// The data disk the running VM actually has open, set beside `instanceLock` and cleared
+    /// in `cleanup()`.
+    ///
+    /// Workspace operations guard on **this**, never on "is it the active workspace?". The
+    /// manifest's `activeID` is a separate mutable file that another process can move, and
+    /// `InstanceLock` is per-user rather than per-disk, so neither answers "does a VM have
+    /// this file open?". Getting that wrong means unlinking a disk out from under a live
+    /// guest: on macOS the unlink succeeds, the VM keeps writing to an inode with no name,
+    /// and every image, container and volume disappears when it stops.
+    private(set) var attachedDiskURL: URL?
 
     /// Wall-clock time the engine reached `.running`, for the Overview uptime
     /// readout. Cleared whenever the engine stops or fails.
@@ -55,9 +87,12 @@ final class EngineController {
     private var appliedSignature: [String]?
 
     /// True when the running engine's resources/shares no longer match `config`.
+    ///
+    /// Compared against the ACTIVE workspace's disk size, since that — not the mirrored
+    /// global — is what the running VM booted with.
     var needsRestart: Bool {
         guard state.isRunning, let applied = appliedSignature else { return false }
-        return applied != config.bootSignature
+        return applied != config.bootSignature(diskGiB: activeWorkspace?.diskGiB)
     }
 
     // Engine plumbing — created on `start`, torn down on stop. All the wiring shared
@@ -109,6 +144,17 @@ final class EngineController {
     /// pane switches (the dashboard views themselves are recreated per switch).
     let paneUI = PaneUIState()
 
+    /// The workspace list and which one is active. Re-read from disk on every start, so the
+    /// CLI and this process can't diverge about which disk is booting.
+    private(set) var workspaces: WorkspaceManifest?
+    /// Set when the manifest can't be read (or a pre-Workspaces migration was refused).
+    /// The engine won't start while this is non-nil — it's better to say so than to boot the
+    /// wrong disk or format a blank one over a user's real data.
+    private(set) var workspaceError: String?
+
+    /// The active workspace, or nil if the manifest is unreadable.
+    var activeWorkspace: Workspace? { workspaces?.active }
+
     /// Crash notifications (opt-in) — fed by the resource store's die events.
     private let crashNotifier = CrashNotifier()
 
@@ -133,6 +179,9 @@ final class EngineController {
         // needs to know whether a guest is *available* (installed or bundled), which
         // `guestAvailable` answers without copying.
         needsOnboarding = !(VZVirtualMachine.isSupported && GuestInstall.guestAvailable)
+        // Load (or, on the first run after upgrading, create) the workspace list. Must come
+        // after the stored properties above are initialized.
+        reloadWorkspaces()
         // Autostart the engine on app launch (unless onboarding is needed). Skipped
         // under SwiftUI previews so the canvas doesn't try to boot a VM.
         let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
@@ -250,6 +299,7 @@ final class EngineController {
         // description, so re-acquiring throws even inside this same process — and the catch
         // below calls `cleanup()`, which would release the lock the LIVE VM depends on and
         // let a second engine attach the same ext4 image.
+        guard !isTerminating else { return }
         guard !vmUnreachable, instanceLock == nil else {
             state = .failed("A previous engine is still holding the data disk. Quit and "
                             + "reopen Velox.")
@@ -262,21 +312,41 @@ final class EngineController {
         // live guest to stop. Inferring it from `state` is exactly what went wrong before.
         var vmStarted = false
         do {
-            let resources = config.resources
+            // Re-read the manifest from disk on every start: `velox workspace use` may have
+            // repointed it since this process loaded it, and booting the workspace the user
+            // did *not* select is the one outcome worth failing to avoid.
+            reloadWorkspaces()
+            if let workspaceError {
+                throw VeloxError.workspace(workspaceError)
+            }
+            guard let workspace = activeWorkspace else {
+                throw VeloxError.workspace("No workspace is available.")
+            }
+            let resources = config.resources(diskGiB: workspace.diskGiB)
             let shareURLs = config.shareURLs
             try Paths.ensureRoot()
             // Refuse to boot if another engine (a `velox start` in a terminal) already
             // holds the lock — two engines on one data.img would corrupt it. Released in
             // cleanup(). Acquired before any disk/VM work so a conflict fails fast.
             instanceLock = try InstanceLock(at: Paths.engineLock)
-            let dataDisk = config.dataDiskURL
-            // A missing disk is a legitimate first-run create only at the DEFAULT location. At a
-            // user-chosen location it means the drive is unplugged / the file is gone — fail loudly
-            // rather than silently format a fresh empty disk (which would look like total data loss).
-            if config.dataDirectory != nil && !FileManager.default.fileExists(atPath: dataDisk.path) {
+            let dataDisk = workspace.dataDiskURL
+            // A missing disk is a legitimate first-run create only for a workspace that has
+            // never booted. Once one has, its disk going missing means the drive is unplugged
+            // or the file is gone — fail loudly rather than silently format a fresh empty one
+            // in its place, which would look exactly like total data loss.
+            //
+            // The old test for this was "did the user relocate the disk?", which does not
+            // generalise: every non-default workspace has a resolved path, and a brand-new
+            // workspace's disk is *supposed* to be absent. "Has it ever booted?" is the
+            // question that actually separates the two.
+            if workspace.firstBootedAt != nil,
+               !FileManager.default.fileExists(atPath: dataDisk.path) {
                 throw VeloxError.dataDiskMissing(dataDisk)
             }
             try Storage.ensureDataDisk(at: dataDisk, sizeGiB: resources.diskGiB)
+            // Record what this VM actually attached. Workspace operations guard on this
+            // rather than on the manifest's `activeID`, which another process can move.
+            attachedDiskURL = dataDisk
             // After an app update, refresh the installed guest from the (newer) bundled copy so we
             // never boot a stale ~/.velox kernel/rootfs against a new host.
             // Off the main actor: this copies the kernel (~10 MB) and rootfs (~80 MB) after
@@ -338,7 +408,7 @@ final class EngineController {
             resourceStore.start()
             self.resources = resourceStore
             self.stats = StatsStore(docker: runtime.docker, resources: resourceStore)
-            appliedSignature = config.bootSignature
+            appliedSignature = config.bootSignature(diskGiB: workspace.diskGiB)
             bootedMemoryBytes = resources.memoryBytes
             startResourceSaver()
             // The VM has booted, but dockerd needs a few more seconds inside the
@@ -378,7 +448,11 @@ final class EngineController {
                 reason: "Velox container engine is running")
             startedAt = Date()
             state = .running
-            Log.info("engine started in-process (GUI)")
+            // Stamp the first successful boot. From here on a missing disk for this
+            // workspace is a fault to report, not a blank one to create.
+            WorkspaceStore.recordBoot(id: workspace.id)
+            reloadWorkspaces()
+            Log.info("engine started in-process (GUI) — workspace “\(workspace.name)”")
             // First-run only: install terminal CLIs + the `velox` context and offer to
             // switch if needed. Backgrounded so it never delays the UI flipping to running.
             Task { await self.setUpTerminalAndContext() }
@@ -480,14 +554,14 @@ final class EngineController {
         return true
     }
 
-    // Public lifecycle controls. While a data-disk relocation owns the engine
-    // (`isRelocatingDisk`) these are no-ops: booting a VM mid-move would attach the data disk
-    // that's being copied out from under it (corruption). The move drives the engine itself via
-    // `performStart`/`performStop`.
-    func start() async { guard !isRelocatingDisk else { return }; await performStart() }
-    func stop() async { guard !isRelocatingDisk else { return }; await performStop() }
+    // Public lifecycle controls. While another operation owns the engine (a disk move, a
+    // workspace switch or clone) these are no-ops: booting a VM mid-operation would attach a
+    // data disk that's being copied or swapped out from under it (corruption). Those
+    // operations drive the engine themselves via `performStart`/`performStop`.
+    func start() async { guard !isEngineOwned else { return }; await performStart() }
+    func stop() async { guard !isEngineOwned else { return }; await performStop() }
     func restart() async {
-        guard !isRelocatingDisk else { return }
+        guard !isEngineOwned else { return }
         // Never boot a second VM onto a disk the first one is still holding.
         guard await performStop() else { return }
         await performStart()
@@ -514,20 +588,210 @@ final class EngineController {
 
     /// Best-effort UI bookkeeping for a terminate already under way (see above).
     private func beginTerminating() {
+        // Latch FIRST, unconditionally. The guard below only fires when the engine is
+        // running or busy — but an engine-owning operation (a workspace switch, a disk move)
+        // sits in `.stopped` between its own stop and start, and a ⌘Q landing in that window
+        // would slip past it: `startGeneration` would not be bumped, `performStart`'s entry
+        // guard would pass, and the operation would boot a VM into a process that is already
+        // exiting. On a brand-new workspace that interrupts `mkfs.ext4` and leaves a disk
+        // vinit will neither format nor mount.
+        isTerminating = true
         guard state.isRunning || state.isBusy else { return }
         startGeneration &+= 1
         state = .stopping
     }
 
-    /// Relocate `data.img` into `destinationDir`. Stops the engine first (so the image is flushed
-    /// and its VZ file handle released), moves it sparse-preserving, repoints the config, and
-    /// restarts if it was running. On any failure the original is left intact and the engine is
-    /// restarted at the OLD location, then the error is rethrown. `moveProgress` tracks 0…1.
-    func moveDataDisk(to destinationDir: URL) async throws {
-        let src = config.dataDiskURL
-        let dst = destinationDir.appendingPathComponent("data.img")
-        guard dst.standardizedFileURL != src.standardizedFileURL else {
-            throw VeloxError.diskMove("The data disk is already in that folder.")
+    // MARK: - Workspaces
+    //
+    // A workspace is one complete Docker engine state, and all of it lives in one file —
+    // `data.img`. So switching is just booting against a different one, and every operation
+    // here is the same short sequence the data-disk move was hardened into: refuse if
+    // anything else owns the engine, refuse if a VM might still hold the disk, stop and
+    // *confirm* the stop, mutate, then restart.
+    //
+    // The one rule that must never bend: **never mutate a disk a VM has open.** Operations
+    // on the ACTIVE workspace stop the engine first; operations on an inactive one need no
+    // stop, because its disk isn't attached — but they still check `attachedDiskURL` rather
+    // than trusting the manifest to say which that is.
+
+    /// Re-read the manifest from disk. Cheap, and the reason the CLI and the GUI can't
+    /// disagree about which workspace is booting.
+    func reloadWorkspaces() {
+        do {
+            workspaces = try WorkspaceStore.load()
+            workspaceError = nil
+        } catch {
+            workspaces = nil
+            workspaceError = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            Log.error("workspaces: \(workspaceError ?? "")")
+        }
+    }
+
+    /// Guard shared by every workspace operation.
+    ///
+    /// `vmUnreachable` is checked rather than inferred from `state`, because a stop that
+    /// timed out leaves `.failed` — which reads as "not running" — while the guest is still
+    /// journaling onto the disk.
+    private func requireIdleEngine(_ what: String) throws {
+        guard !isEngineOwned else {
+            throw VeloxError.workspace("Velox is busy — wait for the current operation to "
+                + "finish, then \(what) again.")
+        }
+        guard !isTerminating else {
+            throw VeloxError.workspace("Velox is quitting.")
+        }
+        guard !vmUnreachable else {
+            throw VeloxError.workspace("The engine may still be running and holding a data "
+                + "disk. Quit and reopen Velox, then try again.")
+        }
+    }
+
+    /// Refuse to touch a disk the running VM has open.
+    ///
+    /// Guarding on "is it the active workspace?" would not be enough: `activeID` lives in a
+    /// file another process can rewrite, so it can disagree with what this VM actually
+    /// attached. `attachedDiskURL` is what the VM was given.
+    private func requireDetached(_ workspace: Workspace, _ what: String) throws {
+        guard attachedDiskURL?.standardizedFileURL
+                != workspace.dataDiskURL.standardizedFileURL else {
+            throw VeloxError.workspace(
+                "The engine currently has “\(workspace.name)” open. Stop it first, then "
+                + "\(what).")
+        }
+    }
+
+    /// Switch the engine to another workspace: stop, repoint the manifest, boot.
+    ///
+    /// VZ builds its block-device list when the VM configuration is built and
+    /// `VZDiskImageStorageDeviceAttachment` is immutable, so there is no way to swap the
+    /// disk under a live VM — and dockerd's data-root can't move under a live daemon either.
+    /// A restart is the mechanism, not a shortcut; Velox boots in a couple of seconds, which
+    /// is what makes this feel like switching rather than reinstalling.
+    func switchWorkspace(to target: Workspace) async throws {
+        try requireIdleEngine("switch")
+        guard target.id != workspaces?.activeID else { return }
+
+        let wasRunning = state.isRunning || state.isBusy
+        engineOwner = .switchingWorkspace(target.name)
+        defer { engineOwner = nil }
+
+        // Flush and release the VZ file handle on the CURRENT workspace's disk. A stop that
+        // doesn't confirm means the guest is still writing, so booting a second VM would put
+        // two kernels on one ext4 image.
+        if wasRunning, await performStop() == false {
+            throw VeloxError.workspace("The engine did not shut down, so Velox can't switch "
+                + "workspaces safely. Quit and reopen Velox, then try again.")
+        }
+        guard !isTerminating else { return }
+
+        // Selections in the dashboards are keyed by volume NAME and image digest, both of
+        // which collide across workspaces — a selection carried over from the old workspace
+        // would silently re-target identically-named objects in the new one, and the Volumes
+        // context menu offers "Remove N Volumes" straight off it.
+        paneUI.clearSelections()
+        engineLog.mark("switching to workspace “\(target.name)”")
+
+        try WorkspaceStore.activate(id: target.id)
+        reloadWorkspaces()
+        mirrorActiveWorkspaceIntoConfig()
+        if wasRunning { await performStart() }
+    }
+
+    /// Create an empty workspace. Doesn't touch the engine — a new disk is just a new file.
+    @discardableResult
+    func createWorkspace(name: String, diskGiB: Int? = nil) throws -> Workspace {
+        try requireIdleEngine("create a workspace")
+        let size = diskGiB ?? activeWorkspace?.diskGiB ?? config.diskGiB
+        let workspace = try WorkspaceStore.create(name: name, diskGiB: size)
+        reloadWorkspaces()
+        return workspace
+    }
+
+    /// Duplicate a workspace, sharing its blocks until the copies diverge.
+    ///
+    /// Duplicating the ACTIVE workspace stops the engine first and restarts it after: an
+    /// APFS clone of a mounted filesystem captures a torn journal that preen-`fsck` won't
+    /// repair, which yields a workspace that looks real and can never mount.
+    @discardableResult
+    func cloneWorkspace(_ source: Workspace, newName: String) async throws -> Workspace {
+        try requireIdleEngine("duplicate a workspace")
+        let isActive = attachedDiskURL?.standardizedFileURL
+            == source.dataDiskURL.standardizedFileURL
+        let wasRunning = isActive && (state.isRunning || state.isBusy)
+
+        engineOwner = .cloningWorkspace(source.name)
+        defer { engineOwner = nil }
+
+        if wasRunning, await performStop() == false {
+            throw VeloxError.workspace("The engine did not shut down, so “\(source.name)” "
+                + "can't be duplicated safely. Quit and reopen Velox, then try again.")
+        }
+        guard !isTerminating else {
+            throw VeloxError.workspace("Velox is quitting.")
+        }
+        // Re-check now that the VM is down: the clone must not run against an open file.
+        try requireDetached(source, "duplicate it")
+
+        do {
+            let id = source.id
+            let copy = try await Task.detached(priority: .userInitiated) {
+                try WorkspaceStore.clone(id: id, newName: newName)
+            }.value
+            reloadWorkspaces()
+            if wasRunning { await performStart() }
+            return copy
+        } catch {
+            if wasRunning { await performStart() }   // nothing was mutated; restore as it was
+            throw error
+        }
+    }
+
+    /// Set the active workspace's disk size, debounced like the config write.
+    ///
+    /// Dragging the Settings slider fires on every integer tick, and each manifest write is a
+    /// JSON encode plus an fsync of the directory. This rides the SAME debounce the config
+    /// write already uses rather than adding a second timer — the trailing fire persists both.
+    func setActiveWorkspaceDiskGiB(_ gib: Int) {
+        guard let active = activeWorkspace, active.diskGiB != gib else { return }
+        // Update the in-memory copy immediately so the slider tracks the drag…
+        if var manifest = workspaces,
+           let i = manifest.workspaces.firstIndex(where: { $0.id == active.id }) {
+            manifest.workspaces[i].diskGiB = gib
+            workspaces = manifest
+        }
+        // …and mirror it for a pre-workspaces binary, which also schedules the debounce.
+        config.diskGiB = gib
+        scheduleSave()
+    }
+
+    func renameWorkspace(_ workspace: Workspace, to newName: String) throws {
+        try WorkspaceStore.rename(id: workspace.id, to: newName)
+        reloadWorkspaces()
+    }
+
+    /// Delete a workspace and its disk, permanently.
+    ///
+    /// Refused on the active workspace and on the last one (`WorkspaceStore.delete` re-checks
+    /// both under the manifest lock). Only `data.img` is unlinked — never a folder the user
+    /// chose, which could be anything from `~/Documents` to a drive root.
+    func deleteWorkspace(_ workspace: Workspace) throws {
+        try requireIdleEngine("delete a workspace")
+        try requireDetached(workspace, "delete it")
+        try WorkspaceStore.delete(id: workspace.id)
+        reloadWorkspaces()
+    }
+
+    /// Move a workspace's `data.img` to another folder or disk.
+    ///
+    /// Stops the engine when the workspace is the active one, stages the move
+    /// sparse-preserving, repoints the manifest, and restarts. On any failure the original is
+    /// left intact and the engine restarts where it was.
+    func moveWorkspace(_ workspace: Workspace, to destinationDir: URL) async throws {
+        try requireIdleEngine("move a workspace")
+        let src = workspace.dataDiskURL
+        let dst = destinationDir.standardizedFileURL.appendingPathComponent("data.img")
+        guard dst != src.standardizedFileURL else {
+            throw VeloxError.diskMove("“\(workspace.name)” is already in that folder.")
         }
         guard !FileManager.default.fileExists(atPath: dst.path) else {
             throw VeloxError.diskMove("A data.img already exists in \(destinationDir.path).")
@@ -536,27 +800,24 @@ final class EngineController {
         // (same inode), so it needs no space at all; checking anyway refused the common case
         // outright: a 60 GB-allocated data.img being reorganised on a drive with 40 GB free
         // was rejected with "not enough free space" for an operation that costs zero bytes.
-        if !Storage.moveIsHardLink(from: src, to: destinationDir.appendingPathComponent("data.img")) {
+        if !Storage.moveIsHardLink(from: src, to: dst) {
             let srcAllocated = (try? src.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
                 .totalFileAllocatedSize.map(Int64.init) ?? 0
             if let free = (try? destinationDir.resourceValues(
-                    forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
+                    forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+                    .volumeAvailableCapacityForImportantUsage,
                free > 0, srcAllocated > free {
                 throw VeloxError.diskMove("Not enough free space at the destination "
                     + "(need \(Format.bytes(srcAllocated)), \(Format.bytes(free)) available).")
             }
         }
 
-        // NOT inferred from `state`: a stop-timeout leaves `.failed` with a live VM, which
-        // reads as "not running" here — the move would then copy a disk the guest is still
-        // journaling and `removeMovedSource` would unlink the original.
-        guard !vmUnreachable else {
-            throw VeloxError.diskMove("The engine may still be running and holding the data "
-                + "disk. Quit and reopen Velox, then try again.")
-        }
-        let wasRunning = state.isRunning || state.isBusy
-        isRelocatingDisk = true; moveProgress = 0
-        defer { isRelocatingDisk = false; moveProgress = 0 }
+        let isActive = attachedDiskURL?.standardizedFileURL == src.standardizedFileURL
+            || workspace.id == workspaces?.activeID
+        let wasRunning = isActive && (state.isRunning || state.isBusy)
+        engineOwner = .movingDisk(0)
+        defer { engineOwner = nil }
+
         // Flush + release the VZ file handle. If the engine won't stop, abort: copying a disk
         // the guest is still writing to yields a torn image, and the success path unlinks the
         // original — that's total data loss, not a degraded copy.
@@ -564,26 +825,48 @@ final class EngineController {
             throw VeloxError.diskMove("The engine did not shut down, so the data disk can't be "
                 + "moved safely. Quit and reopen Velox, then try again.")
         }
+        guard !isTerminating else { return }
+        try requireDetached(workspace, "move it")
 
         do {
+            let id = workspace.id
             try await Task.detached(priority: .userInitiated) {
-                try Storage.stageDataDiskMove(from: src, to: dst) { [weak self] frac in
-                    Task { @MainActor in self?.moveProgress = frac }
+                // `relocate` stages the data at the destination, persists the new location,
+                // and only then drops the original — so a crash anywhere in it leaves the
+                // manifest pointing at a disk that exists.
+                try WorkspaceStore.relocate(id: id, to: destinationDir) { [weak self] frac in
+                    Task { @MainActor in
+                        guard let self, case .movingDisk = self.engineOwner else { return }
+                        self.engineOwner = .movingDisk(frac)
+                    }
                 }
             }.value
         } catch {
-            if wasRunning { await performStart() }   // restore at the OLD location; config unchanged
+            if wasRunning { await performStart() }   // restore at the OLD location
             throw error
         }
 
-        // The data now exists at BOTH src and dst. Persist the new location FIRST — a crash
-        // here leaves config→dst with the data present (src just a harmless leftover), never an
-        // orphaned disk — THEN drop the original.
-        config.dataDirectory = (destinationDir.standardizedFileURL == Paths.root.standardizedFileURL)
-            ? nil : destinationDir.standardizedFileURL.path
-        saveConfig()
-        Storage.removeMovedSource(at: src)
+        reloadWorkspaces()
+        mirrorActiveWorkspaceIntoConfig()
         if wasRunning { await performStart() }
+    }
+
+    /// Copy the active workspace's disk location and size back into `config.json`.
+    ///
+    /// Redundant for this build — the manifest is the source of truth — and deliberately
+    /// kept anyway, for a `velox` binary that predates workspaces (an app downgrade, or an
+    /// older CLI still on `PATH`). Such a binary reads only `config.json`; without this
+    /// mirror it would boot the *Default* workspace while the user believes they are on
+    /// another one, and grow that disk to the wrong size. It also keeps the existing disk
+    /// gauges and the `dataDiskMissing` guard correct with no changes.
+    private func mirrorActiveWorkspaceIntoConfig() {
+        guard let active = activeWorkspace else { return }
+        let dir = active.dataDiskURL.deletingLastPathComponent().standardizedFileURL
+        let mirrored = (dir == Paths.root.standardizedFileURL) ? nil : dir.path
+        guard config.dataDirectory != mirrored || config.diskGiB != active.diskGiB else { return }
+        config.dataDirectory = mirrored
+        config.diskGiB = active.diskGiB
+        saveConfig()
     }
 
     // MARK: - Internals
@@ -625,6 +908,8 @@ final class EngineController {
         // until this one has fully torn its plumbing down.
         instanceLock?.release()
         instanceLock = nil
+        // No VM holds a disk any more, so workspace operations are free to touch them.
+        attachedDiskURL = nil
     }
 
     /// (Re)arm Resource Saver from the current config. Called on start and again
@@ -661,11 +946,25 @@ final class EngineController {
         // every integer tick, and each `saveConfig` is a synchronous JSON encode + write.
         crashNotifier.enabled = config.notifyOnCrash
         if state.isRunning { startResourceSaver() }
+        scheduleSave()
+    }
+
+    /// Trailing-debounced persistence for the slider-driven settings.
+    ///
+    /// One timer for both files. The workspace manifest picked up a slider of its own (disk
+    /// size is per-workspace), and giving it a second debounce would mean two timers racing
+    /// to write two files that have to agree — so the single trailing fire writes both.
+    /// Explicit workspace mutations (create, rename, delete, switch) do NOT come through
+    /// here; they persist immediately.
+    private func scheduleSave() {
         configSaveTask?.cancel()
         configSaveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard let self, !Task.isCancelled else { return }
             self.saveConfig()
+            if let active = self.activeWorkspace {
+                try? WorkspaceStore.setDiskGiB(id: active.id, active.diskGiB)
+            }
         }
     }
 

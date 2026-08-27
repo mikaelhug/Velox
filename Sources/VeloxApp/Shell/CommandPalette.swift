@@ -66,12 +66,12 @@ struct CommandPalette: View {
                         Spacer()
                         if c.isRunning {
                             if let pub = c.publishedBindings.first?.publicPort {
-                                inlineAction(":\(pub)") { WorkspaceActions.openPort(pub) }
+                                inlineAction(":\(pub)") { RowActions.openPort(pub) }
                             }
                             if let domain = c.namedAccessDomain {
-                                inlineAction("open") { WorkspaceActions.openDomain(domain) }
+                                inlineAction("open") { RowActions.openDomain(domain) }
                             }
-                            inlineAction("shell") { WorkspaceActions.openShell(containerID: c.shortID) }
+                            inlineAction("shell") { RowActions.openShell(containerID: c.shortID) }
                             inlineAction("stop") {
                                 Task { try? await engine.docker?.stopContainer(c.id) }
                             }
@@ -105,7 +105,7 @@ struct CommandPalette: View {
                         Text("\(img.repository):\(img.tag)").lineLimit(1).truncationMode(.middle)
                         Spacer()
                         inlineAction("copy ref") {
-                            WorkspaceActions.copy("\(img.repository):\(img.tag)")
+                            RowActions.copy("\(img.repository):\(img.tag)")
                             isPresented = false
                         }
                     }
@@ -124,7 +124,7 @@ struct CommandPalette: View {
                         Text(v.name)
                         Spacer()
                         inlineAction("copy path") {
-                            WorkspaceActions.copy(v.mountpoint)
+                            RowActions.copy(v.mountpoint)
                             isPresented = false
                         }
                     }

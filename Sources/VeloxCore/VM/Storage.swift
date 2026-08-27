@@ -75,10 +75,158 @@ public enum Storage {
 
     /// A legacy ASIF image starts with diskutil's `shdw` sparse-container magic. A raw
     /// image starts with the guest's ext4 (zeroed boot block), so this never false-positives.
+    ///
+    /// The ext4 cross-check is belt-and-braces added with Workspaces. This predicate gates a
+    /// **delete** in `ensureDataDisk`, and it now runs against every workspace's disk on
+    /// every boot rather than against one. A file cannot be both an ASIF container and an
+    /// ext4 filesystem, so requiring the absence of an ext4 superblock costs nothing and
+    /// removes the only way a real workspace could be destroyed by a magic-byte collision.
+    ///
+    /// Deliberately NOT gated on "this workspace never booted": a genuine legacy ASIF disk
+    /// *did* boot (it just silently reformatted itself every time, which is why replacing it
+    /// is right), so that gate would leave those users handed a disk the guest can't read.
     private static func isLegacyASIF(_ url: URL) -> Bool {
         guard let fh = try? FileHandle(forReadingFrom: url) else { return false }
         defer { try? fh.close() }
-        return (try? fh.read(upToCount: 4)) == Data("shdw".utf8)
+        guard (try? fh.read(upToCount: 4)) == Data("shdw".utf8) else { return false }
+        return !hasExt4Superblock(at: url)
+    }
+
+    // MARK: - Filesystem probes
+    //
+    // Host-side reads of the guest's ext4 superblock. These mirror `is_ext4` and
+    // `data_disk_clean` in `guest/vinit/src/main.rs` — the same two fields at the same
+    // offsets — because the host has to answer the same questions *before* the guest is
+    // running: is this disk real, and is it safe to clone?
+
+    /// True if `url` carries an ext4 superblock (magic `0xEF53` at byte 1080).
+    public static func hasExt4Superblock(at url: URL) -> Bool {
+        readSuperblockField(at: url, offset: 1080) == 0xEF53
+    }
+
+    /// True unless the ext4 superblock records that the filesystem hit errors — `s_state`
+    /// (the `__le16` at superblock offset 58, i.e. byte 1082) with ERROR_FS clear.
+    ///
+    /// **This does NOT detect a mounted or crashed filesystem, and must not be relied on
+    /// for that.** `ext4_setup_super()` clears VALID_FS on mount only for a journal-*less*
+    /// filesystem; a journaled ext4 — which this always is — leaves VALID_FS set and relies
+    /// on the journal for recovery instead. Measured on a real data disk: `s_state` read
+    /// VALID_FS=1 identically while mounted, after a SIGKILL of the VM, and after a clean
+    /// stop. The same is true of the guest's `data_disk_clean`, which is why its preen-fsck
+    /// almost never runs — harmless there, because the journal is replayed at mount anyway.
+    ///
+    /// What actually protects a clone from being taken of a *live* disk is the engine lock:
+    /// `EngineController.attachedDiskURL` in the app (what the VM was really given) and the
+    /// `flock` probe in the CLI. A clone of a crashed-but-not-live disk is fine on its own —
+    /// it carries a journal, and the guest replays it at mount.
+    ///
+    /// So this is a genuine but narrow signal: a filesystem that has recorded errors is
+    /// worth refusing to duplicate. A disk with no ext4 on it yet, or one we can't read, is
+    /// reported clean — never block on a probe.
+    public static func dataDiskIsClean(at url: URL) -> Bool {
+        guard hasExt4Superblock(at: url) else { return true }
+        guard let state = readSuperblockField(at: url, offset: 1082) else { return true }
+        return (state & 0x0002) == 0   // ERROR_FS clear
+    }
+
+    /// Read a little-endian `UInt16` at an absolute byte offset.
+    private static func readSuperblockField(at url: URL, offset: UInt64) -> UInt16? {
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? fh.close() }
+        guard (try? fh.seek(toOffset: offset)) != nil,
+              let bytes = try? fh.read(upToCount: 2), bytes.count == 2 else { return nil }
+        return UInt16(bytes[bytes.startIndex]) | (UInt16(bytes[bytes.startIndex + 1]) << 8)
+    }
+
+    // MARK: - Workspaces
+
+    /// Create a blank data disk for a new workspace, making its folder first.
+    ///
+    /// That is the entire cost of a new workspace: one sparse file. The guest takes it from
+    /// there — `vinit` formats a positively-blank `/dev/vdb` on first boot and refuses to
+    /// touch anything else.
+    public static func createWorkspaceDisk(at url: URL, sizeGiB: UInt64) throws {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: url.path) else {
+            throw VeloxError.workspace("A data disk already exists at \(url.path).")
+        }
+        try fm.createDirectory(at: url.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+        try createRaw(at: url, bytes: sizeGiB * 1024 * 1024 * 1024)
+        Log.info("workspace: created \(sizeGiB) GiB blank data disk at \(url.path)")
+    }
+
+    /// Copy a workspace's disk, preferring an APFS clone.
+    ///
+    /// `clonefile(2)` makes this instant and free: the copy shares every block with the
+    /// original until one of them is written, so "fork my current workspace for a new
+    /// project, keep all the base images" costs zero bytes. **The caller MUST have stopped
+    /// the engine and checked `dataDiskIsClean`** — see that method for what a clone of a
+    /// live disk gets you.
+    ///
+    /// Falls back to the existing hole-aware cross-volume copy — the same one the data-disk
+    /// move uses — rather than growing a second copy path (CLAUDE.md §10). The fallback is
+    /// needed more often than `EXDEV` alone suggests: cloning is an APFS feature, so any
+    /// non-APFS destination (exFAT, HFS+, SMB) answers `ENOTSUP`.
+    public static func cloneDataDisk(from src: URL, to dst: URL,
+                                     progress: (@Sendable (Double) -> Void)? = nil) throws {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: src.path) else {
+            throw VeloxError.workspace("Source data disk not found at \(src.path).")
+        }
+        guard !fm.fileExists(atPath: dst.path) else {
+            throw VeloxError.workspace("A data disk already exists at \(dst.path).")
+        }
+        try fm.createDirectory(at: dst.deletingLastPathComponent(),
+                               withIntermediateDirectories: true)
+
+        // Push the source's dirty pages to stable storage first. The engine has stopped, so
+        // its data is already durable via the guest flush + `.fsync` attachment; this covers
+        // the host-side tail (e.g. a clone taken right after a move copied the file in).
+        if let fh = try? FileHandle(forReadingFrom: src) {
+            _ = fcntl(fh.fileDescriptor, F_FULLFSYNC)
+            try? fh.close()
+        }
+
+        if clonefile(src.path, dst.path, 0) == 0 {
+            progress?(1.0)
+            Log.info("workspace: cloned \(src.lastPathComponent) → \(dst.path) "
+                     + "(APFS copy-on-write, no extra host space)")
+            return
+        }
+        let err = errno
+        // ENOTSUP/EOPNOTSUPP: destination filesystem has no clone support (any non-APFS
+        // volume). EXDEV: different filesystem. ENOSYS: no clonefile at all. Anything else
+        // is a real failure and must not be papered over with a silent full copy.
+        guard err == ENOTSUP || err == EOPNOTSUPP || err == EXDEV || err == ENOSYS else {
+            throw VeloxError.workspace(
+                "Couldn't clone the data disk: \(String(cString: strerror(err))).")
+        }
+        Log.info("workspace: destination doesn't support cloning "
+                 + "(\(String(cString: strerror(err)))) — copying used blocks instead")
+        try sparseCopyAcrossVolumes(src: src, dst: dst, progress: progress)
+    }
+
+    /// Delete a workspace's disk.
+    ///
+    /// Removes **exactly `data.img`** — never the folder holding it, unless that folder is
+    /// one Velox created for this workspace (`~/.velox/workspaces/<id>/`) and it contains
+    /// nothing else. A relocated workspace's `directory` comes from a folder picker that can
+    /// choose anything, so it is routinely `~/Documents` or a drive root; "delete the
+    /// workspace's folder" there would destroy everything the user keeps beside the disk.
+    public static func deleteWorkspaceDisk(at url: URL, mayRemoveDirectory: Bool) throws {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            try fm.removeItem(at: url)
+        }
+        guard mayRemoveDirectory else { return }
+        let dir = url.deletingLastPathComponent()
+        // Only an owned slot directly under ~/.velox/workspaces/, and only if now empty.
+        guard dir.deletingLastPathComponent().standardizedFileURL
+                == Paths.workspaces.standardizedFileURL,
+              let left = try? fm.contentsOfDirectory(atPath: dir.path), left.isEmpty
+        else { return }
+        try? fm.removeItem(at: dir)
     }
 
     // MARK: - Move
@@ -274,7 +422,10 @@ public enum Storage {
         }
     }
 
-    private static func fsyncDirectory(_ dir: URL) {
+    /// Make a `rename(2)` into `dir` durable. Module-visible (not private) so the workspace
+    /// manifest's atomic write uses this one implementation rather than growing a second
+    /// copy of the same three syscalls (CLAUDE.md §10).
+    static func fsyncDirectory(_ dir: URL) {
         let fd = open(dir.path, O_RDONLY)
         guard fd >= 0 else { return }
         defer { close(fd) }

@@ -153,7 +153,8 @@ struct OverviewView: View {
                      caption: "\(Format.bytes(model.totalVolumeBytes)) stored", tint: .orange)
             StatCard(title: "Disk", systemImage: "internaldrive",
                      value: model.diskUsedBytes.map(Format.bytes) ?? "—",
-                     caption: "of \(engine.config.diskGiB) GB allocated", tint: .purple)
+                     caption: "of \(engine.activeWorkspace?.diskGiB ?? engine.config.diskGiB) GB allocated",
+                     tint: .purple)
         }
     }
 

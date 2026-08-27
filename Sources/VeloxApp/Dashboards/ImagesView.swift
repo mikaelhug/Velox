@@ -141,8 +141,8 @@ struct ImagesView: View {
             if ids.count == 1, let img = model.images.first(where: { ids.contains($0.id) }) {
                 Button("Run…") { runTarget = img }
                 Divider()
-                Button("Copy Reference") { WorkspaceActions.copy("\(img.repository):\(img.tag)") }
-                Button("Copy Image ID") { WorkspaceActions.copy(img.id) }
+                Button("Copy Reference") { RowActions.copy("\(img.repository):\(img.tag)") }
+                Button("Copy Image ID") { RowActions.copy(img.id) }
                 Divider()
                 Button("Remove", role: .destructive) { ui.imageSelection = ids; removeConfirm = true }
             } else if !ids.isEmpty {
@@ -157,7 +157,7 @@ struct ImagesView: View {
             guard let tar = urls.first(where: {
                 ["tar", "tgz", "gz"].contains($0.pathExtension.lowercased())
             }) else { return false }
-            WorkspaceActions.loadImageTar(tar) { failure in
+            RowActions.loadImageTar(tar) { failure in
                 loadMessage = failure.map { "Load failed: \($0)" }
                     ?? "Loaded \(tar.lastPathComponent)"
             }
@@ -285,7 +285,7 @@ private struct RunImageSheet: View {
         let publishes = ports.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        WorkspaceActions.runImage(reference: reference,
+        RowActions.runImage(reference: reference,
                                   name: name.isEmpty ? nil : name,
                                   publishes: publishes, removeOnExit: removeOnExit) { failure in
             starting = false

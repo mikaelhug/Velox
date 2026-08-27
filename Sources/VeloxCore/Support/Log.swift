@@ -29,6 +29,12 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
     case diskMove(String)
     /// Another Velox engine already holds the single-instance lock.
     case engineAlreadyRunning
+    /// A workspace operation couldn't proceed; the string is the user-facing reason.
+    case workspace(String)
+    /// The workspace manifest exists but couldn't be parsed. We refuse rather than
+    /// synthesize a fresh one, which would hide every real workspace behind an empty
+    /// "Default" and boot the legacy disk in their place.
+    case workspaceManifestUnreadable(String)
 
     public var description: String {
         switch self {
@@ -54,6 +60,12 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
             return "Another Velox engine is already running (the Velox app or `velox start`). "
                 + "Stop it before starting a second one — two engines would attach the same "
                 + "data disk and corrupt it."
+        case .workspace(let message):
+            return message
+        case .workspaceManifestUnreadable(let detail):
+            return "The workspace list at \(Paths.workspaceManifest.path) couldn't be read "
+                + "(\(detail)). Velox won't start rather than risk hiding your workspaces. "
+                + "A backup of the last good copy is alongside it as workspaces.json.bak."
         }
     }
 

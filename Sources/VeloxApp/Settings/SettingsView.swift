@@ -165,7 +165,7 @@ private struct GeneralPane: View {
             "— engine log (last 40 lines) —",
         ]
         lines += engine.engineLog.lines.suffix(40).map(\.text)
-        WorkspaceActions.copy(lines.joined(separator: "\n"))
+        RowActions.copy(lines.joined(separator: "\n"))
     }
 
     /// The right-hand control of the "Status" row: either an up-to-date / check
@@ -201,11 +201,6 @@ private struct ResourcesPane: View {
     @Binding var config: VeloxConfig
     @Environment(EngineController.self) private var engine
 
-    // Data-disk move flow.
-    @State private var pendingDestination: URL?   // chosen folder awaiting confirmation
-    @State private var moving = false             // progress sheet shown
-    @State private var moveError: String?
-
     private var maxCores: Int { ProcessInfo.processInfo.activeProcessorCount }
     private var maxMemory: Int { max(2, Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024))) }
 
@@ -235,13 +230,21 @@ private struct ResourcesPane: View {
                 Text("Disk-backed swap inside the guest, on the data disk. Lets memory-hungry builds spill over instead of being OOM-killed.")
             }
             Section {
-                IntSlider(value: $config.diskGiB, range: 8...256, step: 8, unit: "GB")
-                DiskUsageRow(allocatedGiB: config.diskGiB, dataDiskURL: config.dataDiskURL)
-                diskLocationRow
+                IntSlider(value: activeDiskGiB, range: 8...256, step: 8, unit: "GB")
+                if let workspace = engine.activeWorkspace {
+                    DiskUsageRow(allocatedGiB: workspace.diskGiB,
+                                 dataDiskURL: workspace.dataDiskURL)
+                }
             } header: {
                 Text("Disk")
             } footer: {
-                Text("Maximum size of the virtual data disk backing /var/lib/docker. The image is sparse — only the space actually used is allocated on your Mac, and reclaimed when you remove images.")
+                // Size and location are per-workspace, so this section describes the active
+                // one. Location lives on the workspace itself (right-click it in the
+                // sidebar) rather than here, where it would read as a global setting.
+                Text("Maximum size of \(activeName)'s data disk, backing /var/lib/docker. "
+                    + "The image is sparse — only the space actually used is allocated on "
+                    + "your Mac, and reclaimed when you remove images. To move it to another "
+                    + "folder or disk, right-click the workspace in the sidebar.")
             }
             ResourceSaverSection(config: $config)
             NestedVirtualizationSection(config: $config)
@@ -259,81 +262,18 @@ private struct ResourcesPane: View {
                     .overlay(alignment: .top) { Divider() }
             }
         }
-        .confirmationDialog(
-            "Move the data disk?",
-            isPresented: Binding(get: { pendingDestination != nil },
-                                 set: { if !$0 { pendingDestination = nil } }),
-            presenting: pendingDestination
-        ) { dir in
-            Button("Move") { startMove(to: dir) }
-            Button("Cancel", role: .cancel) { pendingDestination = nil }
-        } message: { dir in
-            Text("The engine will stop, the data disk (\(usedSizeText)) will move to “\(dir.path)”, "
-                + "then the engine restarts. Containers and images are preserved.")
-        }
-        .sheet(isPresented: $moving) {
-            VStack(spacing: 16) {
-                Text("Moving data disk…").font(.headline)
-                ProgressView(value: engine.moveProgress).progressViewStyle(.linear)
-                Text("\(Int(engine.moveProgress * 100))%")
-                    .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
-            }
-            .padding(28).frame(width: 340)
-            .interactiveDismissDisabled(true)
-        }
-        .alert("Move failed", isPresented: Binding(
-            get: { moveError != nil }, set: { if !$0 { moveError = nil } })
-        ) { Button("OK", role: .cancel) {} } message: { Text(moveError ?? "") }
     }
 
-    /// Current data-disk folder + a Move… control (and Reset to Default when relocated).
-    private var diskLocationRow: some View {
-        let busy = moving || engine.isRelocatingDisk || engine.state.isBusy
-        return LabeledContent("Location") {
-            HStack(spacing: 10) {
-                Text(locationDisplay)
-                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                Button("Move…") { pickDestination() }.disabled(busy)
-                if config.dataDirectory != nil {
-                    Button("Reset to Default") { pendingDestination = Paths.root }.disabled(busy)
-                }
-            }
-        }
+    /// The disk-size slider edits the ACTIVE workspace, and persists through the same
+    /// debounced writer the rest of Settings uses — dragging a slider must not fsync a
+    /// manifest on every integer tick.
+    private var activeDiskGiB: Binding<Int> {
+        Binding(
+            get: { engine.activeWorkspace?.diskGiB ?? config.diskGiB },
+            set: { engine.setActiveWorkspaceDiskGiB($0) })
     }
 
-    private var locationDisplay: String {
-        let dir = config.dataDiskURL.deletingLastPathComponent().path
-        return (dir as NSString).abbreviatingWithTildeInPath
-    }
-
-    /// On-disk (sparse) footprint of the current data disk, for the confirmation message.
-    private var usedSizeText: String {
-        let bytes = (try? config.dataDiskURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
-            .totalFileAllocatedSize
-        return bytes.map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
-            ?? "its used space"
-    }
-
-    private func pickDestination() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        panel.message = "Choose a folder to hold the Velox data disk (data.img)"
-        guard panel.runModal() == .OK, let dir = panel.url else { return }
-        pendingDestination = dir
-    }
-
-    private func startMove(to dir: URL) {
-        pendingDestination = nil
-        moving = true; moveError = nil
-        Task {
-            do { try await engine.moveDataDisk(to: dir) }
-            catch { moveError = (error as? LocalizedError)?.errorDescription ?? "\(error)" }
-            moving = false   // dismiss the sheet; Location row auto-updates from config
-        }
-    }
+    private var activeName: String { engine.activeWorkspace?.name ?? "the workspace" }
 }
 
 /// Shows the data disk's **actual** on-disk footprint (the raw image is sparse, so

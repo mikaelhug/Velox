@@ -36,9 +36,16 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// setting existed), or a specific host address to pin one interface. Parsed by
     /// `PublishBind`; an unparseable value falls back to host-only.
     public var publishHostIP: String
-    /// Folder holding the data disk (`data.img`), if the user relocated it off the default
-    /// `~/.velox`. `nil` = default location. Set by Settings › Resources › Move…; resolve via
-    /// `dataDiskURL`. Deliberately NOT in `bootSignature` — the move restarts the engine itself.
+    /// Folder holding the active workspace's data disk, or `nil` for `~/.velox`.
+    ///
+    /// **No longer the source of truth** — `Workspace.dataDiskURL` is, via the manifest in
+    /// `~/.velox/workspaces.json`. This is kept as a *mirror* of the active workspace,
+    /// rewritten on every switch, for exactly one reason: a `velox` binary that predates
+    /// workspaces (an app downgrade, or an older CLI still on `PATH`) reads only this file.
+    /// Without the mirror it would boot the Default workspace while the user believes they
+    /// are on another one. Migration seeds the Default workspace from it.
+    ///
+    /// Deliberately NOT in `bootSignature` — a relocation restarts the engine itself.
     public var dataDirectory: String?
 
     public init(cpuCount: Int, memoryGiB: Int, diskGiB: Int, swapGiB: Int, fileShares: [String],
@@ -99,20 +106,31 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     // MARK: - Derived
 
     /// Resource allocation for `VMConfiguration.build`, clamped to sane bounds.
-    public var resources: VMConfiguration.Resources {
+    ///
+    /// `diskGiB` is per-workspace (a workspace created at 64 GiB and one at 128 GiB can't
+    /// share a global value — `velox.disk` drives a `resize2fs` on every boot), so callers
+    /// that know the active workspace pass its size in. The parameterless form keeps using
+    /// `config.diskGiB`, which is maintained as a mirror of the active workspace for the
+    /// benefit of an older `velox` binary that predates workspaces.
+    public func resources(diskGiB overrideGiB: Int? = nil) -> VMConfiguration.Resources {
         VMConfiguration.Resources(
             cpuCount: max(1, cpuCount),
             memoryBytes: UInt64(max(1, memoryGiB)) * 1024 * 1024 * 1024,
-            diskGiB: UInt64(max(1, diskGiB)),
+            diskGiB: UInt64(max(1, overrideGiB ?? diskGiB)),
             swapMiB: UInt64(max(0, swapGiB)) * 1024)
     }
+
+    /// Resource allocation using the mirrored global `diskGiB`.
+    public var resources: VMConfiguration.Resources { resources() }
 
     public var shareURLs: [URL] {
         fileShares.map { URL(fileURLWithPath: $0, isDirectory: true) }
     }
 
-    /// Where `data.img` actually lives — the configured `dataDirectory`, or the default
-    /// `~/.velox`. The single resolver used by start, the CLI, and the disk gauges.
+    /// Where the mirrored `dataDirectory` points. Prefer `Workspace.dataDiskURL`: this
+    /// resolves the *mirror*, so it is only correct for the active workspace and only
+    /// between switches. Retained because it is what a pre-workspaces binary would compute,
+    /// and the self-test pins that equivalence.
     public var dataDiskURL: URL {
         let dir = dataDirectory.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? Paths.root
         return dir.appendingPathComponent("data.img")
@@ -133,11 +151,19 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
     /// Resource Saver settings apply live, so they are deliberately excluded.
     /// `publishHostIP` is included: the forwarders bind it when they're constructed, so
     /// a change only lands once they're rebuilt.
-    public var bootSignature: [String] {
-        ["\(cpuCount)", "\(memoryGiB)", "\(diskGiB)", "\(swapGiB)", "\(nestedVirtualization)",
-         publishHostIP]
+    /// The active workspace's disk size is passed in, because that — not the mirrored
+    /// global — is what the running VM booted with.
+    ///
+    /// The active workspace's *identity* is deliberately absent, for the same reason
+    /// `dataDirectory` is: a switch restarts the engine itself, so including it would light
+    /// up the "restart to apply" banner during every switch.
+    public func bootSignature(diskGiB overrideGiB: Int? = nil) -> [String] {
+        ["\(cpuCount)", "\(memoryGiB)", "\(overrideGiB ?? diskGiB)", "\(swapGiB)",
+         "\(nestedVirtualization)", publishHostIP]
             + fileShares.sorted()
     }
+
+    public var bootSignature: [String] { bootSignature() }
 
     // MARK: - Persistence
 
@@ -147,6 +173,33 @@ public struct VeloxConfig: Codable, Sendable, Equatable {
             return .default
         }
         return config
+    }
+
+    /// Like `load()`, but tells "no file yet" apart from "the file is corrupt".
+    ///
+    /// `load()` collapses both into `.default`, which silently sets `dataDirectory` to nil —
+    /// i.e. "the data disk is at ~/.velox/data.img". That is survivable while it's only a
+    /// runtime guess, but **workspace migration writes it down**: a user whose disk lives on
+    /// an external volume would get a Default workspace pointing at a path that doesn't
+    /// exist, `ensureDataDisk` would create a blank one there, vinit would format it, and
+    /// the pointer to the real disk would be gone from both files. Migration must therefore
+    /// refuse on a corrupt config rather than guess. Returns nil when the file is absent
+    /// (a genuine first run); throws when it exists but can't be decoded.
+    public static func loadStrict() throws -> VeloxConfig? {
+        guard FileManager.default.fileExists(atPath: Paths.config.path) else { return nil }
+        let data = try Data(contentsOf: Paths.config)
+        return try JSONDecoder().decode(VeloxConfig.self, from: data)
+    }
+
+    /// `dataDirectory` and `diskGiB` lifted straight out of the raw JSON, bypassing the
+    /// `Codable` model entirely. Belt-and-braces for migration: if some *other* key in
+    /// `config.json` ever fails to decode, the two fields that decide where the user's data
+    /// lives are still recovered instead of silently becoming defaults.
+    public static func rawDiskSettings() -> (dataDirectory: String?, diskGiB: Int?)? {
+        guard let data = try? Data(contentsOf: Paths.config),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return (object["dataDirectory"] as? String, object["diskGiB"] as? Int)
     }
 
     public func save() throws {

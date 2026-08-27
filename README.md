@@ -36,6 +36,11 @@ below, with the methodology, the raw values and a runnable harness in
   `docker compose` / `docker buildx` work on a clean Mac with no Docker Desktop —
   and it never overwrites a compose/buildx you already have.
 - **Reach containers by name** at `<name>.velox.local` — details below.
+- **Switchable workspaces.** Park a whole project — containers, images, volumes,
+  networks, build cache — and switch to a clean or cloned one in a couple of
+  seconds, then switch back with everything as you left it. Duplicating a
+  workspace is instant and takes no extra disk (APFS copy-on-write). Docker
+  Desktop's only equivalent is its one-way "Clean / Purge data".
 - **A native Mac app.** Compose-grouped containers, images, volumes and
   networks with live CPU/MEM, streaming logs, a ⌘K command palette, a menu-bar
   quick panel, crash notifications, and one-click Reclaim Space.
@@ -101,6 +106,33 @@ Compose services resolve as `<service>.<project>.velox.local`. This needs a
 one-time admin grant on first launch (a tiny root helper installs a route and
 an `/etc/resolver` entry — control-plane only, it never touches connection
 data); decline it and everything else still works.
+
+## Workspaces
+
+Each project accumulates its own containers, images, volumes and networks. A
+**workspace** keeps them apart: it is one complete, isolated engine state, and
+exactly one is active at a time.
+
+```bash
+velox workspace ls                    # * marks the active one
+velox workspace new client-a          # an empty workspace
+velox workspace clone client-a demo   # instant, no extra disk until they diverge
+velox workspace use client-a          # takes effect on the next start
+```
+
+In the app, workspaces live in the sidebar: **+** creates one, clicking one
+switches to it, and right-click offers Duplicate, Rename, Change Location and
+Delete.
+
+Switching restarts the engine (a couple of seconds) — the containers in the
+workspace you leave keep their state and come back when you switch back. Only
+container data is per-workspace; the Docker socket path never changes, so the
+`docker` CLI, published ports and `<name>.velox.local` all follow the active
+workspace with no reconfiguration.
+
+Each workspace is a single sparse disk image, so an empty one costs nothing until
+you use it. Images are not shared between workspaces — clone one if you want its
+base images to start with. Deleting a workspace deletes its data permanently.
 
 ## Published ports
 

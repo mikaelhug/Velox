@@ -88,6 +88,16 @@ final class EngineLogStore {
         generation += 1
     }
 
+    /// Insert a separator line of our own into the console stream.
+    ///
+    /// The buffer deliberately survives a stop, so the user can still read why the engine
+    /// went down — which means a workspace switch would otherwise run two workspaces' boot
+    /// logs together with nothing marking the seam.
+    func mark(_ text: String) {
+        appendLine("── velox: \(text) ──")
+        scheduleFlush()
+    }
+
     // MARK: - Ingest
 
     private func ingest(_ chunk: String) {

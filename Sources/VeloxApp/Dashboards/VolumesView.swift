@@ -270,7 +270,7 @@ struct VolumesView: View {
             Button("Import") {
                 guard let tar = importTar, !importName.isEmpty else { return }
                 importTar = nil
-                WorkspaceActions.importVolume(importName, from: tar) { failure in
+                RowActions.importVolume(importName, from: tar) { failure in
                     transferMessage = failure.map { "Import failed: \($0)" }
                         ?? "Imported \(tar.lastPathComponent) into volume “\(importName)”"
                     Task { await model.perform { _ in } } // refresh the list
@@ -323,7 +323,7 @@ extension VolumesView {
         panel.nameFieldStringValue = "\(v.name).tar"
         panel.allowedContentTypes = [Self.tarType]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        WorkspaceActions.exportVolume(v.name, to: url) { failure in
+        RowActions.exportVolume(v.name, to: url) { failure in
             transferMessage = failure.map { "Export failed: \($0)" }
                 ?? "Exported “\(v.name)” to \(url.lastPathComponent)"
         }
@@ -444,8 +444,8 @@ extension VolumesView {
 
     @ViewBuilder
     private func volumeContext(_ v: Volume) -> some View {
-        Button("Copy Name") { WorkspaceActions.copy(v.name) }
-        Button("Copy Mountpoint") { WorkspaceActions.copy(v.mountpoint) }
+        Button("Copy Name") { RowActions.copy(v.name) }
+        Button("Copy Mountpoint") { RowActions.copy(v.mountpoint) }
         Divider()
         Button("Export as tar…") { exportVolume(v) }
         Divider()

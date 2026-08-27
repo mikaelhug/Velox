@@ -2,12 +2,20 @@ import AppKit
 import VeloxCore
 
 /// Row affordances that terminate in the user's world — browser, terminal,
-/// clipboard — instead of in-app re-implementations. The lean answer to Docker
+/// clipboard — instead of in-app re-implementations.
+///
+/// (Named for what it does, not for `NSWorkspace`, which is merely how it does it. The old
+/// name collided with the Workspaces feature — a workspace is an isolated engine state — and
+/// two unrelated meanings of the same word in one module is one too many.)
+///
+/// (Named for what it does, not for `NSWorkspace`, which is merely how it does it. The old
+/// name collided with the Workspaces feature — a workspace is an isolated engine state — and
+/// two unrelated meanings of the same word in one module is one too many.) The lean answer to Docker
 /// Desktop's embedded everything: a published port opens in the default browser, a
 /// shell opens in the user's own Terminal (their fonts, their profile, their PATH),
 /// and everything else is a copy away.
 @MainActor
-enum WorkspaceActions {
+enum RowActions {
     /// Open a published port in the default browser (`http://localhost:<port>`).
     /// Plain http on purpose: TLS-fronted containers redirect themselves, and a
     /// non-HTTP port just produces a connection error tab — harmless and obvious.

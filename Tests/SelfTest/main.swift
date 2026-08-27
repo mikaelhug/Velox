@@ -517,6 +517,325 @@ do {
     }
 }
 
+// MARK: Workspaces
+
+section("Workspace.dataDiskURL")
+do {
+    let now = Date()
+    let def = Workspace(id: Workspace.defaultID, name: "Default", diskGiB: 64,
+                        created: now, lastUsed: now)
+    equal(def.dataDiskURL.path, Paths.dataDisk.path,
+          "Default keeps the legacy ~/.velox/data.img slot")
+    check(!def.ownsDirectory, "Default's folder is ~/.velox — not ours to delete")
+
+    let fresh = Workspace(id: "abc-123", name: "Work", diskGiB: 64, created: now, lastUsed: now)
+    equal(fresh.dataDiskURL.path,
+          Paths.workspaces.appendingPathComponent("abc-123").appendingPathComponent("data.img").path,
+          "a new workspace lands in workspaces/<id>/data.img")
+    check(fresh.ownsDirectory, "an owned slot may have its folder removed")
+
+    let moved = Workspace(id: "abc-123", name: "Work", directory: "/Volumes/Ext/Velox",
+                          diskGiB: 64, created: now, lastUsed: now)
+    equal(moved.dataDiskURL.path, "/Volumes/Ext/Velox/data.img",
+          "a relocated workspace resolves under its directory")
+    check(!moved.ownsDirectory,
+          "a user-chosen folder is NEVER removed on delete (it could be ~/Documents)")
+}
+
+section("Workspace.validate")
+do {
+    check((try? Workspace.validate(name: "  Staging  ")) == "Staging", "names are trimmed")
+    check((try? Workspace.validate(name: "   ")) == nil, "blank name rejected")
+    check((try? Workspace.validate(name: String(repeating: "x", count: 65))) == nil,
+          "over-long name rejected")
+    check((try? Workspace.validate(name: "a\nb")) == nil, "newline in name rejected")
+    equal(Workspace.normalized(" Staging "), "staging", "names compare case-insensitively")
+}
+
+section("WorkspaceStore.validateDiskPaths")
+do {
+    let now = Date()
+    func ws(_ id: String, _ name: String, _ dir: String?) -> Workspace {
+        Workspace(id: id, name: name, directory: dir, diskGiB: 64, created: now, lastUsed: now)
+    }
+    // Two entries resolving to the same file must be refused: they would share one inode,
+    // and deleting either would destroy the other.
+    var threw = false
+    do { try WorkspaceStore.validateDiskPaths([ws("a", "A", "/tmp/velox-x"),
+                                               ws("b", "B", "/tmp/velox-x")]) }
+    catch { threw = true }
+    check(threw, "two workspaces in one folder are rejected")
+
+    // The legacy slot belongs to Default alone.
+    threw = false
+    do { try WorkspaceStore.validateDiskPaths([ws("other", "Other", Paths.root.path)]) }
+    catch { threw = true }
+    check(threw, "a non-default workspace may not claim ~/.velox/data.img")
+
+    threw = false
+    do { try WorkspaceStore.validateDiskPaths([ws(Workspace.defaultID, "Default", nil),
+                                               ws("b", "B", "/tmp/velox-y")]) }
+    catch { threw = true }
+    check(!threw, "distinct locations are accepted")
+}
+
+section("Storage ext4 probes")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-sb-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+
+    // A blank workspace disk: no ext4 yet, and — critically — not mistaken for a legacy
+    // ASIF image, whose detection DELETES the file.
+    let blank = base.appendingPathComponent("blank.img")
+    try? Storage.createWorkspaceDisk(at: blank, sizeGiB: 1)
+    check(fm.fileExists(atPath: blank.path), "createWorkspaceDisk makes the file")
+    equal(logicalBytes(blank), 1 << 30, "…at the requested logical size")
+    check(allocBytes(blank) < (1 << 20), "…and sparse (allocates ~nothing)")
+    check(!Storage.hasExt4Superblock(at: blank), "a blank disk has no ext4 superblock")
+    check(Storage.dataDiskIsClean(at: blank), "a never-formatted disk counts as clean")
+
+    // Synthesize a superblock: magic 0xEF53 at 1080, s_state at 1082.
+    func writeSuperblock(_ url: URL, state: UInt16) {
+        let fd = open(url.path, O_WRONLY)
+        guard fd >= 0 else { return }
+        let bytes: [UInt8] = [0x53, 0xEF, UInt8(state & 0xFF), UInt8(state >> 8)]
+        bytes.withUnsafeBytes { _ = pwrite(fd, $0.baseAddress, 4, 1080) }
+        close(fd)
+    }
+    let clean = base.appendingPathComponent("clean.img")
+    try? Storage.createWorkspaceDisk(at: clean, sizeGiB: 1)
+    writeSuperblock(clean, state: 0x0001)                   // VALID_FS
+    check(Storage.hasExt4Superblock(at: clean), "ext4 magic is detected")
+    check(Storage.dataDiskIsClean(at: clean), "VALID_FS set, ERROR_FS clear ⇒ clean")
+
+    // VALID_FS clear is NOT a dirtiness signal for a journaled ext4: the kernel only
+    // clears it on mount when there is no journal. Measured on a real data disk, s_state
+    // read VALID_FS=1 identically while mounted, after SIGKILL, and after a clean stop —
+    // so this predicate must not claim to detect that.
+    let mounted = base.appendingPathComponent("mounted.img")
+    try? Storage.createWorkspaceDisk(at: mounted, sizeGiB: 1)
+    writeSuperblock(mounted, state: 0x0000)
+    check(Storage.dataDiskIsClean(at: mounted),
+          "VALID_FS clear is NOT treated as unclean (journaled ext4 leaves it set)")
+
+    let errored = base.appendingPathComponent("errored.img")
+    try? Storage.createWorkspaceDisk(at: errored, sizeGiB: 1)
+    writeSuperblock(errored, state: 0x0003)                 // VALID_FS | ERROR_FS
+    check(!Storage.dataDiskIsClean(at: errored),
+          "ERROR_FS set ⇒ refuse to duplicate (the one thing s_state really does tell us)")
+}
+
+section("Storage.cloneDataDisk")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-clone-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+
+    let src = base.appendingPathComponent("src.img")
+    mkSparse(at: src, logical: 256 << 20, dataAt: [0, 64 << 20, 200 << 20])
+    let srcAlloc = allocBytes(src)
+    let dst = base.appendingPathComponent("dst.img")
+    do {
+        try Storage.cloneDataDisk(from: src, to: dst)
+        equal(logicalBytes(dst), 256 << 20, "clone preserves the logical size")
+        check(allocBytes(dst) <= srcAlloc + (4 << 20), "clone preserves sparseness")
+        check(fm.fileExists(atPath: src.path), "clone leaves the source in place")
+
+        // Copy-on-write independence: writing through one must not disturb the other.
+        let fd = open(dst.path, O_WRONLY)
+        if fd >= 0 {
+            var byte: UInt8 = 0x5A
+            _ = pwrite(fd, &byte, 1, 0)
+            close(fd)
+        }
+        let srcFD = open(src.path, O_RDONLY)
+        var first: UInt8 = 0
+        if srcFD >= 0 { _ = pread(srcFD, &first, 1, 0); close(srcFD) }
+        equal(first, 0xAB, "writing the clone leaves the SOURCE unchanged (COW, not a link)")
+
+        // Two names on one inode would make deleting either destroy both.
+        var a = stat(), b = stat()
+        stat(src.path, &a); stat(dst.path, &b)
+        check(a.st_ino != b.st_ino, "clone is a distinct inode (NOT the move's hard link)")
+    } catch { check(false, "clone threw: \(error)") }
+
+    var refused = false
+    do { try Storage.cloneDataDisk(from: src, to: dst) } catch { refused = true }
+    check(refused, "refuses to clone onto an existing disk")
+}
+
+section("Storage.deleteWorkspaceDisk")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-del-\(getpid())")
+    // A user-chosen folder holding the disk AND the user's own files — the ~/Documents case.
+    let userDir = base.appendingPathComponent("Documents")
+    try? fm.createDirectory(at: userDir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+    let precious = userDir.appendingPathComponent("taxes.pdf")
+    fm.createFile(atPath: precious.path, contents: Data("keep me".utf8))
+    let disk = userDir.appendingPathComponent("data.img")
+    try? Storage.createWorkspaceDisk(at: disk, sizeGiB: 1)
+
+    try? Storage.deleteWorkspaceDisk(at: disk, mayRemoveDirectory: false)
+    check(!fm.fileExists(atPath: disk.path), "the disk is removed")
+    check(fm.fileExists(atPath: precious.path),
+          "the user's OWN files beside it survive (delete is never rm -rf on a chosen folder)")
+    check(fm.fileExists(atPath: userDir.path), "…and so does their folder")
+
+    // Even asked to, it refuses on a folder that isn't a Velox-owned workspace slot.
+    let disk2 = userDir.appendingPathComponent("data.img")
+    try? Storage.createWorkspaceDisk(at: disk2, sizeGiB: 1)
+    try? Storage.deleteWorkspaceDisk(at: disk2, mayRemoveDirectory: true)
+    check(fm.fileExists(atPath: precious.path),
+          "mayRemoveDirectory still won't touch a folder outside ~/.velox/workspaces")
+}
+
+section("WorkspaceStore (sandboxed VELOX_HOME)")
+do {
+    // `Paths.root` reads VELOX_HOME on every access, so the whole store can be exercised
+    // against a throwaway tree. NSHomeDirectory() ignores $HOME on macOS, so this env
+    // override is the only way to test these paths without writing to the real ~/.velox.
+    let fm = FileManager.default
+    let sandbox = fm.temporaryDirectory.appendingPathComponent("velox-ws-\(getpid())")
+    try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+    setenv("VELOX_HOME", sandbox.path, 1)
+    defer { unsetenv("VELOX_HOME"); try? fm.removeItem(at: sandbox) }
+    equal(Paths.root.path, sandbox.path, "VELOX_HOME redirects Paths.root")
+
+    func resetSandbox() {
+        try? fm.removeItem(at: sandbox)
+        try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+    }
+
+    // --- Migration: an existing install's data.img is adopted, never moved. ---
+    resetSandbox()
+    let legacy = Paths.dataDisk
+    mkSparse(at: legacy, logical: 8 << 20, dataAt: [0])
+    var legacyStat = stat(); stat(legacy.path, &legacyStat)
+    let legacyInode = legacyStat.st_ino
+    try? Data("{\"diskGiB\": 96}".utf8).write(to: Paths.config)
+
+    if let m = try? WorkspaceStore.load() {
+        equal(m.workspaces.count, 1, "migration produces exactly one workspace")
+        equal(m.active.id, Workspace.defaultID, "…which is the Default one")
+        equal(m.active.diskGiB, 96, "…carrying the existing diskGiB")
+        equal(m.active.dataDiskURL.path, legacy.path, "…pointing at the existing data.img")
+        check(m.active.firstBootedAt != nil,
+              "an adopted disk counts as already-booted (a later disappearance is a fault)")
+        var after = stat(); stat(legacy.path, &after)
+        equal(after.st_ino, legacyInode, "migration does NOT move or recreate data.img")
+        check(fm.fileExists(atPath: Paths.workspaceManifest.path), "the manifest is written")
+    } else { check(false, "migration failed") }
+
+    // --- Migration honours a relocated dataDirectory. ---
+    resetSandbox()
+    let ext = sandbox.appendingPathComponent("FakeVolume")
+    try? fm.createDirectory(at: ext, withIntermediateDirectories: true)
+    try? Data("{\"dataDirectory\":\"\(ext.path)\",\"diskGiB\":32}".utf8).write(to: Paths.config)
+    if let m = try? WorkspaceStore.load() {
+        equal(m.active.dataDiskURL.path, ext.appendingPathComponent("data.img").path,
+              "a relocated dataDirectory carries straight over")
+    } else { check(false, "relocated migration failed") }
+
+    // --- M1: a corrupt config.json must NOT be migrated into a wrong pointer. ---
+    resetSandbox()
+    try? Data("{ this is not json".utf8).write(to: Paths.config)
+    var refused = false
+    do { _ = try WorkspaceStore.load() } catch { refused = true }
+    check(refused, "migration REFUSES on an unreadable config.json (never guesses ~/.velox)")
+    check(!fm.fileExists(atPath: Paths.workspaceManifest.path),
+          "…and writes no manifest, so the real location is still recoverable")
+
+    // --- A corrupt manifest fails loudly instead of synthesizing a fresh Default. ---
+    resetSandbox()
+    try? Data("{}".utf8).write(to: Paths.config)
+    try? Data("{ broken".utf8).write(to: Paths.workspaceManifest)
+    refused = false
+    do { _ = try WorkspaceStore.load() } catch { refused = true }
+    check(refused, "a corrupt manifest throws (it never hides real workspaces behind a new Default)")
+
+    // --- Create / rename / activate / delete. ---
+    resetSandbox()
+    try? Data("{}".utf8).write(to: Paths.config)
+    _ = try? WorkspaceStore.load()
+    let made = try! WorkspaceStore.create(name: "Staging", diskGiB: 8)
+    check(made.diskExists, "create makes the workspace's blank disk")
+    check(!Storage.hasExt4Superblock(at: made.dataDiskURL),
+          "…blank, for vinit to format on first boot")
+    equal((try? WorkspaceStore.load())?.workspaces.count ?? 0, 2, "the list now has two")
+
+    var dup = false
+    do { _ = try WorkspaceStore.create(name: "staging", diskGiB: 8) } catch { dup = true }
+    check(dup, "a duplicate name (case-insensitively) is rejected")
+
+    try? WorkspaceStore.rename(id: made.id, to: "Prod")
+    equal((try? WorkspaceStore.load())?.workspace(id: made.id)?.name ?? "", "Prod", "rename works")
+    check((try? WorkspaceStore.load())?.workspace(named: "prod") != nil,
+          "name lookup is case-insensitive")
+
+    // Deleting the ACTIVE workspace is refused — no implicit switch hidden in a delete.
+    var blocked = false
+    do { try WorkspaceStore.delete(id: Workspace.defaultID) } catch { blocked = true }
+    check(blocked, "the active workspace can't be deleted")
+
+    try? WorkspaceStore.activate(id: made.id)
+    equal((try? WorkspaceStore.load())?.activeID ?? "", made.id, "activate repoints the manifest")
+
+    blocked = false
+    do { try WorkspaceStore.delete(id: made.id) } catch { blocked = true }
+    check(blocked, "…and it's still refused after it BECOMES active")
+
+    try? WorkspaceStore.activate(id: Workspace.defaultID)
+    let deletedDisk = made.dataDiskURL
+    try? WorkspaceStore.delete(id: made.id)
+    equal((try? WorkspaceStore.load())?.workspaces.count ?? 0, 1, "delete removes the entry")
+    check(!fm.fileExists(atPath: deletedDisk.path), "…and its disk")
+    check(!fm.fileExists(atPath: deletedDisk.deletingLastPathComponent().path),
+          "…and its now-empty owned slot folder")
+
+    // The last workspace can never be removed.
+    blocked = false
+    do { try WorkspaceStore.delete(id: Workspace.defaultID) } catch { blocked = true }
+    check(blocked, "the last workspace can't be deleted")
+
+    // --- revision bumps on every write (stale-writer detection). ---
+    let before = (try? WorkspaceStore.load())?.revision ?? -1
+    try? WorkspaceStore.activate(id: Workspace.defaultID)
+    let bumped = (try? WorkspaceStore.load())?.revision ?? -1
+    check(bumped > before, "every mutation bumps revision (\(before) → \(bumped))")
+
+    // --- mutate() re-reads from disk, so a stale in-memory copy can't clobber. ---
+    let stale = try? WorkspaceStore.load()
+    _ = try? WorkspaceStore.create(name: "FromElsewhere", diskGiB: 8)   // "another process"
+    try? WorkspaceStore.rename(id: Workspace.defaultID, to: "Renamed")  // stale caller writes
+    let merged = try? WorkspaceStore.load()
+    check(merged?.workspace(named: "FromElsewhere") != nil,
+          "a concurrent workspace SURVIVES a later write (read-modify-write under flock)")
+    equal(merged?.workspace(id: Workspace.defaultID)?.name ?? "", "Renamed",
+          "…and the later write still lands")
+    check(stale != nil, "sanity: the stale snapshot existed")
+
+    // --- Clone through the store: refuses an unclean source. ---
+    let src = merged?.workspace(id: Workspace.defaultID)
+    if let src {
+        mkSparse(at: src.dataDiskURL, logical: 8 << 20, dataAt: [0])
+        let fd = open(src.dataDiskURL.path, O_WRONLY)
+        if fd >= 0 {
+            let sb: [UInt8] = [0x53, 0xEF, 0x03, 0x00]   // ext4 magic, VALID_FS | ERROR_FS
+            sb.withUnsafeBytes { _ = pwrite(fd, $0.baseAddress, 4, 1080) }
+            close(fd)
+        }
+        var refusedClone = false
+        do { _ = try WorkspaceStore.clone(id: src.id, newName: "Copy") }
+        catch { refusedClone = true }
+        check(refusedClone, "cloning a disk with recorded filesystem errors is refused")
+    }
+}
+
 // MARK: Updater semver ordering
 
 section("Updater.compareSemver")

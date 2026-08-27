@@ -113,8 +113,9 @@ struct MenuBarContentView: View {
 
     @ViewBuilder
     private var engineControl: some View {
-        if engine.isRelocatingDisk {
-            ProgressView().controlSize(.small)   // a data-disk move owns the engine
+        if engine.isEngineOwned {
+            // A disk move, workspace switch or clone owns the engine and drives it itself.
+            ProgressView().controlSize(.small)
         } else if engine.needsOnboarding {
             Button("Finish Setup…") { openDashboard() }.controlSize(.small)
         } else if engine.state.isRunning {
@@ -205,7 +206,7 @@ private struct ContainerQuickRow: View {
                 HStack(spacing: 8) {
                     if let domain = container.namedAccessDomain {
                         Button {
-                            WorkspaceActions.openDomain(domain)
+                            RowActions.openDomain(domain)
                         } label: {
                             Text(domain).lineLimit(1).truncationMode(.middle)
                         }
@@ -221,7 +222,7 @@ private struct ContainerQuickRow: View {
                     ForEach(bindings.prefix(3), id: \.self) { p in
                         if let pub = p.publicPort {
                             Button {
-                                WorkspaceActions.openPort(pub)
+                                RowActions.openPort(pub)
                             } label: {
                                 Text(":" + String(pub))
                                     .font(.caption2.monospaced())

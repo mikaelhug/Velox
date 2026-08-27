@@ -380,6 +380,61 @@ When you find yourself about to write "a simpler/faster version of X for this on
 that is the moment this rule is for: make X serve the case, or explain in the commit why the
 capability is genuinely different in kind.
 
+## 11. Workspaces: one workspace = one `data.img`, one engine at a time
+
+A **Workspace** is one complete, isolated Docker engine state (containers, images, volumes,
+networks, build cache). The feature is cheap for exactly one reason and stays cheap only
+while these hold:
+
+- **A workspace IS a `data.img`.** All that state already lives in the single raw sparse
+  ext4 image attached as `/dev/vdb`. `Workspace.dataDiskURL` is the one resolver; nothing
+  else may compose that path. **The guest knows nothing about workspaces** — `vinit` formats
+  a positively-blank `/dev/vdb` and never reformats anything else, so a new workspace is one
+  sparse file and zero guest changes. A proposed `vinit` change here is a red flag: justify
+  it loudly.
+- **`~/.velox/data.img` is reserved to the migrated "Default" workspace and is never moved.**
+  Migration is one file *created* (`workspaces.json`), so an existing user's containers
+  survive an upgrade by construction rather than by care. `docs/bench/run.sh` hardcodes that
+  path too.
+- **One active workspace, one engine.** The global `InstanceLock` on `~/.velox/engine.lock`
+  stays global. Concurrent workspaces would mean concurrent VMs fighting over one
+  `docker.sock`, one published-port range and one fixed DNS port. Out of scope.
+- **Switching restarts the engine.** VZ builds its block-device list at
+  `VMConfiguration.build()` and `VZDiskImageStorageDeviceAttachment` is immutable, so there
+  is no hot-swap; dockerd's data-root can't move under a live daemon either. Don't
+  re-litigate pre-attached "slots" + a vinit unmount/remount: it buys ~2 s and costs a
+  second lifecycle mechanism inside the guest (§10).
+- **Never mutate a disk a VM has open.** Operations guard on `EngineController.attachedDiskURL`
+  — what the VM was actually given — never on the manifest's `activeID`, which another
+  process can rewrite. Unlinking a live disk succeeds silently on macOS and loses everything
+  when the guest stops.
+- **"Has this workspace ever booted?" decides a missing disk**, not "did the user relocate
+  it". `firstBootedAt == nil` ⇒ creating the disk is a legitimate first run; otherwise a
+  missing disk is an unplugged drive and start must **fail loudly** (`dataDiskMissing`).
+  Never fall back to another workspace's data: the user would believe they are in project A,
+  be in project B, and `docker rm` the wrong things.
+- **The manifest fails loudly and is written under a lock.** `WorkspaceStore.load()` throws
+  on a corrupt `workspaces.json` — it never synthesizes a fresh one, which would hide every
+  real workspace behind an empty Default. Every mutation is a read-modify-write under
+  `~/.velox/workspaces.lock` (**not** `engine.lock`, which means "an engine is running"), so
+  the GUI and a concurrent `velox workspace` can't drop each other's entries.
+- **Delete removes `data.img`, never a folder the user chose.** A relocated workspace's
+  directory comes from a folder picker and is routinely `~/Documents` or a drive root. Only
+  a Velox-owned `~/.velox/workspaces/<id>/` slot may have its folder removed, and only when
+  empty.
+- **Clone is `clonefile(2)`, not a hard link.** `Storage.stageDataDiskMove`'s same-volume
+  path is a hard link — correct for a *move*, catastrophic for a copy. Clone only a cleanly
+  unmounted disk (`Storage.dataDiskIsClean`): a clone of a live one captures a journal that
+  vinit's preen-`fsck` won't repair, producing a workspace that looks real and never mounts.
+- **`VeloxConfig.dataDirectory`/`diskGiB` are now MIRRORS of the active workspace**, kept
+  only so a `velox` binary predating workspaces boots the right disk. The manifest is the
+  source of truth.
+
+Per-workspace: `data.img`, `diskGiB`, name, timestamps. Global and shared: kernel, `root.img`,
+`~/.velox/docker.sock` (so `docker` follows the active workspace with no reconfiguration),
+the `velox` context, the porthelper, `/etc/resolver/velox.local`, `publishHostIP`, file
+shares, CPU/RAM.
+
 ## Build / run quick reference
 
 ```bash

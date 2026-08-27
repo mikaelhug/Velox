@@ -7,8 +7,17 @@ public enum Paths {
     }
 
     /// ~/.velox — owns runtime state, guest artifacts, and the Docker socket.
+    ///
+    /// `VELOX_HOME` overrides it, in the same spirit as `VELOX_KERNEL` / `VELOX_ROOT`. This
+    /// is the only way to exercise the workspace manifest without writing to the developer's
+    /// own `~/.velox`: `NSHomeDirectory()` reads the passwd entry, not `$HOME`, so a test
+    /// process cannot relocate itself any other way.
     public static var root: URL {
-        home.appendingPathComponent(".velox", isDirectory: true)
+        if let override = ProcessInfo.processInfo.environment["VELOX_HOME"],
+           !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        return home.appendingPathComponent(".velox", isDirectory: true)
     }
 
     public static var kernel: URL { root.appendingPathComponent("kernel") }
@@ -22,6 +31,23 @@ public enum Paths {
     public static var engineLock: URL { root.appendingPathComponent("engine.lock") }
     /// User preferences persisted by the GUI (resources, file shares, etc.).
     public static var config: URL { root.appendingPathComponent("config.json") }
+
+    /// Parent of every non-default workspace's disk: `~/.velox/workspaces/<id>/data.img`.
+    /// The **Default** workspace deliberately keeps the legacy `dataDisk` slot above
+    /// instead — migrating an existing user must never move their `data.img`.
+    public static var workspaces: URL {
+        root.appendingPathComponent("workspaces", isDirectory: true)
+    }
+    /// The workspace manifest (`{version, revision, activeID, workspaces}`).
+    public static var workspaceManifest: URL {
+        root.appendingPathComponent("workspaces.json")
+    }
+    /// Serializes manifest read-modify-write across processes. Deliberately NOT
+    /// `engineLock`: that one means "an engine is running", so reusing it would make the
+    /// GUI unable to write its own manifest while its own engine is up.
+    public static var workspaceLock: URL {
+        root.appendingPathComponent("workspaces.lock")
+    }
 
     @discardableResult
     public static func ensureRoot() throws -> URL {
