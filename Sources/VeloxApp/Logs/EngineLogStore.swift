@@ -75,7 +75,16 @@ final class EngineLogStore {
             Task { @MainActor in self?.ingest(chunk) }
         }
         src.setEventHandler(handler: handler)
-        src.setCancelHandler { close(fd) }
+        // `@Sendable` for the same reason as the event handler above, and it is NOT optional:
+        // a cancel handler always runs on the source's queue, but written inline it inherits
+        // `@MainActor` from this `@MainActor` method — and the SDK's `@convention(block)`
+        // parameter accepts that silently, so the mismatch only shows up as a runtime
+        // `swift_task_isCurrentExecutor` trap when the handler actually fires. Which it does
+        // on **every engine stop** that the process outlives: `cleanup()` → `detach()` →
+        // `cancel()`. Quitting the app hid it (the process exits first); a workspace switch
+        // stops and keeps running, so it crashed every time.
+        let onCancel: @Sendable () -> Void = { close(fd) }
+        src.setCancelHandler(handler: onCancel)
         src.resume()
         source = src
     }

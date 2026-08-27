@@ -836,6 +836,47 @@ do {
     }
 }
 
+// MARK: Dispatch-source handler isolation
+
+section("DispatchSource handlers from a @MainActor context")
+@MainActor
+final class CancelHandlerProbe {
+    private var source: DispatchSourceRead?
+    private(set) var cancelled = false
+
+    /// Mirrors `EngineLogStore.attach` exactly. A cancel handler ALWAYS runs on the
+    /// source's own queue, but written inline inside a `@MainActor` method it inherits
+    /// `@MainActor` — which `@convention(block)` accepts silently and the runtime then traps
+    /// on (`swift_task_isCurrentExecutor` → `dispatch_assert_queue`) when it fires. That is a
+    /// hard SIGTRAP on every engine stop the process outlives, so if this regresses the
+    /// self-test dies here rather than reporting a failure. That is the intended signal.
+    func attach(_ fd0: Int32) {
+        let fd = dup(fd0)
+        let src = DispatchSource.makeReadSource(
+            fileDescriptor: fd, queue: DispatchQueue(label: "velox.selftest.isolation"))
+        let handler: @Sendable () -> Void = {
+            var b = [UInt8](repeating: 0, count: 8); _ = read(fd, &b, 8)
+        }
+        src.setEventHandler(handler: handler)
+        let onCancel: @Sendable () -> Void = { close(fd) }
+        src.setCancelHandler(handler: onCancel)
+        src.resume()
+        source = src
+    }
+
+    func detach() { source?.cancel(); source = nil; cancelled = true }
+}
+
+do {
+    let pipe = Pipe()
+    let probe = CancelHandlerProbe()
+    probe.attach(pipe.fileHandleForReading.fileDescriptor)
+    usleep(150_000)
+    probe.detach()          // fires the cancel handler on the source's queue
+    usleep(300_000)         // give it time to run (and trap, if it ever regresses)
+    check(probe.cancelled, "a @MainActor-formed cancel handler fires off-main without trapping")
+}
+
 // MARK: Updater semver ordering
 
 section("Updater.compareSemver")
