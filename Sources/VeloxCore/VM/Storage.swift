@@ -222,9 +222,13 @@ public enum Storage {
         guard mayRemoveDirectory else { return }
         let dir = url.deletingLastPathComponent()
         // Only an owned slot directly under ~/.velox/workspaces/, and only if now empty.
+        // ".DS_Store" doesn't count as content: the sidebar offers "Show in Finder" on a
+        // workspace, and Finder drops one into any folder it opens — without this tolerance
+        // every workspace ever revealed would leave an orphan directory behind on delete.
         guard dir.deletingLastPathComponent().standardizedFileURL
                 == Paths.workspaces.standardizedFileURL,
-              let left = try? fm.contentsOfDirectory(atPath: dir.path), left.isEmpty
+              let left = try? fm.contentsOfDirectory(atPath: dir.path),
+              left.allSatisfy({ $0 == ".DS_Store" })
         else { return }
         try? fm.removeItem(at: dir)
     }

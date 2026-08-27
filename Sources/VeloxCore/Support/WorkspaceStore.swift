@@ -36,12 +36,19 @@ public struct WorkspaceManifest: Codable, Sendable, Equatable {
     /// reconnect), and silently rewriting it throws that away. Note the fallback covers a
     /// missing *entry* only — a workspace whose entry exists but whose disk file is gone is
     /// a hard failure at boot, never a quiet switch to someone else's data.
+    /// Deliberately silent: this is a computed property that SwiftUI re-evaluates on every
+    /// render (`needsRestart`, the Overview caption, Settings all read it), so logging here
+    /// floods stderr at render frequency the moment `activeID` dangles. The one-time warning
+    /// lives in `WorkspaceStore.loadExisting`, where a dangling pointer is discovered.
     public var active: Workspace {
-        if let w = workspace(id: activeID) { return w }
-        Log.warn("workspace manifest: active id \(activeID) is not in the list — "
-                 + "falling back for this boot (the manifest is left untouched)")
-        return workspace(id: Workspace.defaultID) ?? workspaces[0]
+        workspace(id: activeID)
+            ?? workspace(id: Workspace.defaultID)
+            ?? workspaces[0]
     }
+
+    /// True when `activeID` names an entry that isn't in the list (so `active` is falling
+    /// back). Surfaced by the UI as a banner rather than inferred by comparing ids.
+    public var activeIsFallback: Bool { workspace(id: activeID) == nil }
 }
 
 /// Reads and writes the workspace manifest.
@@ -93,6 +100,12 @@ public enum WorkspaceStore {
             let manifest = try decoder.decode(WorkspaceManifest.self, from: data)
             guard !manifest.workspaces.isEmpty else {
                 throw VeloxError.workspaceManifestUnreadable("it lists no workspaces")
+            }
+            if manifest.activeIsFallback {
+                // Once per load, not in `active` itself — see the note there.
+                Log.warn("workspace manifest: active id \(manifest.activeID) is not in the "
+                         + "list — falling back to \(manifest.active.name) for this boot "
+                         + "(the manifest is left untouched)")
             }
             return manifest
         } catch let error as VeloxError {
@@ -210,13 +223,13 @@ public enum WorkspaceStore {
         for w in workspaces {
             let url = w.dataDiskURL
             // The legacy slot belongs to the migrated workspace alone.
-            if url.standardizedFileURL == Paths.dataDisk.standardizedFileURL,
+            if Self.comparablePath(url) == Self.comparablePath(Paths.dataDisk),
                w.id != Workspace.defaultID {
                 throw VeloxError.workspace(
                     "“\(w.name)” can't live in \(Paths.root.path) — that folder holds the "
                     + "Default workspace's disk. Pick another folder.")
             }
-            let path = url.standardizedFileURL.path
+            let path = Self.comparablePath(url)
             if let other = byPath[path] {
                 throw VeloxError.workspace(
                     "“\(w.name)” and “\(other)” would share the same disk at \(path).")
@@ -233,6 +246,29 @@ public enum WorkspaceStore {
                 byInode[key] = w.name
             }
         }
+    }
+
+    /// Canonical form of a disk path for collision comparison, with symlinks resolved in
+    /// every component that exists.
+    ///
+    /// Not `resolvingSymlinksInPath()` alone: measured, that resolves NOTHING when the final
+    /// component doesn't exist — and a disk that hasn't been created yet is exactly the case
+    /// this guards, because the `(st_dev, st_ino)` cross-check in `validateDiskPaths` can
+    /// only see files that exist. Two never-booted workspaces reaching one folder through a
+    /// symlink would otherwise pass validation and collide at first boot. So: walk up to the
+    /// deepest ancestor that exists, resolve that, and re-append the rest.
+    static func comparablePath(_ url: URL) -> String {
+        var dir = url.standardizedFileURL.deletingLastPathComponent()
+        var tail = [url.lastPathComponent]
+        while !FileManager.default.fileExists(atPath: dir.path), dir.path != "/" {
+            tail.append(dir.lastPathComponent)
+            dir = dir.deletingLastPathComponent()
+        }
+        var resolved = dir.resolvingSymlinksInPath()
+        for component in tail.reversed() {
+            resolved.appendPathComponent(component)
+        }
+        return resolved.standardizedFileURL.path
     }
 
     // MARK: - Operations

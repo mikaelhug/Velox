@@ -683,7 +683,11 @@ final class EngineController {
     /// disagree about which workspace is booting.
     func reloadWorkspaces() {
         do {
-            workspaces = try WorkspaceStore.load()
+            let loaded = try WorkspaceStore.load()
+            // Only publish a real change. This is also called on every app activation, and
+            // reassigning an identical manifest would invalidate every view observing it
+            // each time the user cmd-tabs back to Velox.
+            if workspaces != loaded { workspaces = loaded }
             workspaceError = nil
         } catch {
             workspaces = nil
@@ -743,22 +747,35 @@ final class EngineController {
         // Flush and release the VZ file handle on the CURRENT workspace's disk. A stop that
         // doesn't confirm means the guest is still writing, so booting a second VM would put
         // two kernels on one ext4 image.
+        // Land any debounced settings write first: a disk-size drag within 400 ms of
+        // switching would otherwise persist AFTER the switch repoints everything — against
+        // the wrong workspace, or not at all.
+        flushPendingSave()
+
         if wasRunning, await performStop() == false {
             throw VeloxError.workspace("The engine did not shut down, so Velox can't switch "
                 + "workspaces safely. Quit and reopen Velox, then try again.")
         }
         guard !isTerminating else { return }
 
-        // Selections in the dashboards are keyed by volume NAME and image digest, both of
-        // which collide across workspaces — a selection carried over from the old workspace
-        // would silently re-target identically-named objects in the new one, and the Volumes
-        // context menu offers "Remove N Volumes" straight off it.
-        paneUI.clearSelections()
-        engineLog.mark("switching to workspace “\(target.name)”")
-
-        try WorkspaceStore.activate(id: target.id)
+        do {
+            try WorkspaceStore.activate(id: target.id)
+        } catch {
+            // The stop released the engine lock, so another process had a window to delete
+            // or rename the target. Every sibling operation restores the engine on failure;
+            // a switch must too — the user clicked a row, not "stop my engine".
+            if wasRunning { await performStart() }
+            throw error
+        }
         reloadWorkspaces()
         mirrorActiveWorkspaceIntoConfig()
+
+        // Only once the switch is real. Selections are keyed by volume NAME and image
+        // digest, both of which collide across workspaces — carried over, they silently
+        // re-target identically-named objects in the new one, and the Volumes context menu
+        // offers "Remove N Volumes" straight off the selection.
+        paneUI.clearSelections()
+        engineLog.mark("switching to workspace “\(target.name)”")
         if wasRunning { await performStart() }
     }
 
@@ -1017,6 +1034,18 @@ final class EngineController {
         crashNotifier.enabled = config.notifyOnCrash
         if state.isRunning { startResourceSaver() }
         scheduleSave()
+    }
+
+    /// Land the debounced write NOW. Called before a workspace switch, where "within the
+    /// next 400 ms" means "after the world has changed underneath it".
+    private func flushPendingSave() {
+        guard let task = configSaveTask else { return }
+        task.cancel()
+        configSaveTask = nil
+        saveConfig()
+        if let active = activeWorkspace {
+            try? WorkspaceStore.setDiskGiB(id: active.id, active.diskGiB)
+        }
     }
 
     /// Trailing-debounced persistence for the slider-driven settings.

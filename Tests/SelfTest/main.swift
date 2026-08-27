@@ -986,6 +986,54 @@ do {
           "a filesystem with recorded errors can't be duplicated")
 }
 
+section("Review pass: symlink aliasing + .DS_Store cleanup")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-review-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+    let now = Date()
+
+    // Two never-booted workspaces whose folders alias through a symlink: neither disk
+    // exists, so the (st_dev, st_ino) cross-check can't see them — only path resolution can.
+    let real = base.appendingPathComponent("real")
+    try? fm.createDirectory(at: real, withIntermediateDirectories: true)
+    let link = base.appendingPathComponent("link")
+    try? fm.createSymbolicLink(at: link, withDestinationURL: real)
+    let a = Workspace(id: "a", name: "A", directory: real.path, diskGiB: 8,
+                      created: now, lastUsed: now)
+    let b = Workspace(id: "b", name: "B", directory: link.path, diskGiB: 8,
+                      created: now, lastUsed: now)
+    var threw = false
+    do { try WorkspaceStore.validateDiskPaths([a, b]) } catch { threw = true }
+    check(threw, "two DISKLESS workspaces aliasing through a symlink are rejected")
+
+    // Finder drops a .DS_Store into any folder it opens (the sidebar offers Show in
+    // Finder), and that must not turn every delete into an orphaned slot directory.
+    let sandbox = fm.temporaryDirectory.appendingPathComponent("velox-review-home-\(getpid())")
+    try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+    setenv("VELOX_HOME", sandbox.path, 1)
+    defer { unsetenv("VELOX_HOME"); try? fm.removeItem(at: sandbox) }
+    let slot = Paths.workspaces.appendingPathComponent("some-id", isDirectory: true)
+    let disk = slot.appendingPathComponent("data.img")
+    try? Storage.createWorkspaceDisk(at: disk, sizeGiB: 1)
+    fm.createFile(atPath: slot.appendingPathComponent(".DS_Store").path,
+                  contents: Data([0x00]))
+    try? Storage.deleteWorkspaceDisk(at: disk, mayRemoveDirectory: true)
+    check(!fm.fileExists(atPath: slot.path),
+          "an owned slot holding only .DS_Store is still removed on delete")
+
+    // But real content beside the disk still blocks the directory removal.
+    let slot2 = Paths.workspaces.appendingPathComponent("other-id", isDirectory: true)
+    let disk2 = slot2.appendingPathComponent("data.img")
+    try? Storage.createWorkspaceDisk(at: disk2, sizeGiB: 1)
+    fm.createFile(atPath: slot2.appendingPathComponent("notes.txt").path,
+                  contents: Data("mine".utf8))
+    try? Storage.deleteWorkspaceDisk(at: disk2, mayRemoveDirectory: true)
+    check(fm.fileExists(atPath: slot2.appendingPathComponent("notes.txt").path),
+          "…while any real file beside the disk still blocks it")
+}
+
 // MARK: Updater semver ordering
 
 section("Updater.compareSemver")

@@ -121,7 +121,6 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
             throw VeloxError.dataDiskMissing(dataDisk)
         }
         try Storage.ensureDataDisk(at: dataDisk, sizeGiB: resources.diskGiB)
-        WorkspaceStore.recordBoot(id: workspace.id)
         Log.info("workspace: \(workspace.name) (\(dataDisk.path))")
         // After an app update, refresh the installed guest from the (newer) bundled copy so we
         // never boot a stale ~/.velox kernel/rootfs against a new host.
@@ -187,6 +186,12 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
         manager.start(configuration: config) { result in
             switch result {
             case .success:
+                // Stamp the first successful boot only now that there IS one — the flag is
+                // what turns a later missing disk into a loud failure instead of a silent
+                // blank re-create, so stamping before the VM starts would also protect
+                // workspaces whose first boot never happened. (The GUI stamps at the same
+                // point: when the engine reaches running.)
+                WorkspaceStore.recordBoot(id: workspace.id)
                 // All the engine plumbing (Docker socket proxy, port forwarders, events
                 // watcher, named access, clock sync, conduit pool) is shared with the
                 // GUI via EngineRuntime — one wiring, no CLI/GUI drift.
@@ -308,8 +313,15 @@ func runWorkspace(_ args: [String]) -> Never {
             guard args.count > 1 else { throw VeloxError.workspace("Usage: velox workspace new <name> [--size N]") }
             try requireStoppedEngine("create a workspace")
             var size = manifest.active.diskGiB
-            if let i = args.firstIndex(of: "--size"), i + 1 < args.count,
-               let n = Int(args[i + 1]) { size = n }
+            if let i = args.firstIndex(of: "--size") {
+                guard i + 1 < args.count, let n = Int(args[i + 1]) else {
+                    throw VeloxError.workspace(
+                        "--size needs a whole number of GB (e.g. --size 64).")
+                }
+                // Clamped to the same range the Settings slider offers, so the two front
+                // ends can't disagree about what a legal size is.
+                size = Workspace.clampDiskGiB(n)
+            }
             let created = try WorkspaceStore.create(name: args[1], diskGiB: size)
             print("Created workspace “\(created.name)” (\(size) GB max) at "
                   + "\(created.dataDiskURL.path)")
@@ -331,6 +343,7 @@ func runWorkspace(_ args: [String]) -> Never {
 
         case "rename":
             guard args.count > 2 else { throw VeloxError.workspace("Usage: velox workspace rename <old> <new>") }
+            try requireStoppedEngine("rename a workspace")
             let target = try workspaceNamed(args[1], in: manifest)
             try WorkspaceStore.rename(id: target.id, to: args[2])
             print("Renamed “\(target.name)” → “\(args[2])”")
