@@ -794,8 +794,11 @@ mod dhcp {
         }
         /// Every IPv4 address packed into an option (e.g. the DNS server list).
         fn addrs(&self, code: u8) -> Vec<u32> {
+            // `as_chunks` over `chunks_exact`: a newer clippy flags a constant chunk size,
+            // and this one gives the compiler the `[u8; 4]` directly instead of indexing a
+            // slice it can't prove the length of.
             self.option(code)
-                .map(|v| v.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .map(|v| v.as_chunks::<4>().0.iter().map(|c| u32::from_be_bytes(*c)).collect())
                 .unwrap_or_default()
         }
         /// A 4-byte option read as a big-endian u32 (e.g. the lease time).
