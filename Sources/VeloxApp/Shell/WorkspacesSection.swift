@@ -246,6 +246,12 @@ private struct WorkspacePrompts: ViewModifier {
             set: { if !$0 { panel.dismiss() } })
     }
 
+    /// True while any *text-entry* prompt is up (create / rename / duplicate / delete).
+    /// They share a single `.alert` — see `body`.
+    private var editorPresented: Binding<Bool> {
+        presenting { if case .confirmSwitch = $0 { return false }; return true }
+    }
+
     func body(content: Content) -> some View {
         content
             .confirmationDialog(
@@ -267,40 +273,25 @@ private struct WorkspacePrompts: ViewModifier {
                     Text("Takes effect on the next start.")
                 }
             }
-            .alert("New Workspace",
-                   isPresented: presenting { $0 == .create }) {
-                TextField("Name", text: Bindable(panel).text)
-                Button("Create") { confirmCreate() }.disabled(!panel.primaryEnabled)
+            // ONE alert for all four text-entry prompts, switched on `panel.prompt`, rather
+            // than four `.alert` modifiers on the same view.
+            //
+            // Stacking presentation modifiers is the pattern that has already bitten this
+            // feature once (they were hung off a `Section`, where they can silently never
+            // appear), and multiple alerts on a single view is the same family of
+            // not-quite-guaranteed behaviour. There is no way to test it from here, so the
+            // fix is to not rely on it: one alert can only ever present the one prompt that
+            // is set. Fewer moving parts, and it collapses four near-identical text fields
+            // into one.
+            .alert(editorTitle, isPresented: editorPresented) {
+                TextField(editorFieldLabel, text: Bindable(panel).text)
+                Button(editorConfirmLabel, role: editorIsDestructive ? .destructive : nil) {
+                    confirmEditor()
+                }
+                .disabled(!panel.primaryEnabled)
                 Button("Cancel", role: .cancel) { panel.dismiss() }
             } message: {
-                Text("An empty workspace with its own containers, images and volumes. It "
-                    + "starts at \(engine.activeWorkspace?.diskGiB ?? 64) GB and takes up no "
-                    + "space on your Mac until you use it.")
-            }
-            .alert("Rename Workspace",
-                   isPresented: presenting { if case .rename = $0 { return true }; return false }) {
-                TextField("Name", text: Bindable(panel).text)
-                Button("Rename") { confirmRename() }.disabled(!panel.primaryEnabled)
-                Button("Cancel", role: .cancel) { panel.dismiss() }
-            }
-            .alert(duplicateTitle,
-                   isPresented: presenting { if case .duplicate = $0 { return true }; return false }) {
-                TextField("Name", text: Bindable(panel).text)
-                Button("Duplicate") { confirmDuplicate() }.disabled(!panel.primaryEnabled)
-                Button("Cancel", role: .cancel) { panel.dismiss() }
-            } message: {
-                // Worth saying: "duplicate my 40 GB workspace" otherwise sounds expensive.
-                Text("Copies every container, image and volume. On an Apple File System disk "
-                    + "this is instant and uses no extra space until the two diverge.")
-            }
-            .alert(deleteTitle,
-                   isPresented: presenting { if case .delete = $0 { return true }; return false }) {
-                TextField("Type the workspace name", text: Bindable(panel).text)
-                Button("Delete Permanently", role: .destructive) { confirmDelete() }
-                    .disabled(!panel.primaryEnabled)
-                Button("Cancel", role: .cancel) { panel.dismiss() }
-            } message: {
-                Text(deleteMessage)
+                Text(editorMessage)
             }
             .alert("Action failed", isPresented: Binding(
                 get: { panel.error != nil },
@@ -312,28 +303,67 @@ private struct WorkspacePrompts: ViewModifier {
             }
     }
 
-    // MARK: Titles
+    // MARK: Prompt text
+    //
+    // One prompt is set at a time, so each of these switches on it. The fallbacks are
+    // unreachable in practice (the alert is only presented when a prompt exists) and exist
+    // so a missing case can never crash a dialog.
 
     private var switchTitle: String {
         guard case .confirmSwitch(let w)? = panel.prompt else { return "Switch workspace?" }
         return "Switch to “\(w.name)”?"
     }
 
-    private var duplicateTitle: String {
-        guard case .duplicate(let w)? = panel.prompt else { return "Duplicate Workspace" }
-        return "Duplicate “\(w.name)”"
+    private var editorTitle: String {
+        switch panel.prompt {
+        case .create:             return "New Workspace"
+        case .rename:             return "Rename Workspace"
+        case .duplicate(let w):   return "Duplicate “\(w.name)”"
+        case .delete(let w):      return "Delete “\(w.name)”?"
+        case .confirmSwitch, .none: return ""
+        }
     }
 
-    private var deleteTitle: String {
-        guard case .delete(let w)? = panel.prompt else { return "Delete workspace?" }
-        return "Delete “\(w.name)”?"
+    private var editorFieldLabel: String {
+        if case .delete = panel.prompt { return "Type the workspace name" }
+        return "Name"
     }
 
-    private var deleteMessage: String {
-        guard case .delete(let w)? = panel.prompt else { return "" }
-        return "This permanently deletes every container, image, volume and network in "
-            + "“\(w.name)”, and its \(w.allocatedDescription) disk at \(w.dataDiskURL.path). "
-            + "This can't be undone.\n\nType “\(w.name)” to confirm."
+    private var editorConfirmLabel: String {
+        switch panel.prompt {
+        case .create:    return "Create"
+        case .rename:    return "Rename"
+        case .duplicate: return "Duplicate"
+        case .delete:    return "Delete Permanently"
+        case .confirmSwitch, .none: return "OK"
+        }
+    }
+
+    private var editorIsDestructive: Bool {
+        if case .delete = panel.prompt { return true }
+        return false
+    }
+
+    private var editorMessage: String {
+        switch panel.prompt {
+        case .create:
+            return "An empty workspace with its own containers, images and volumes. It "
+                + "starts at \(engine.activeWorkspace?.diskGiB ?? 64) GB and takes up no "
+                + "space on your Mac until you use it."
+        case .rename:
+            return ""
+        case .duplicate:
+            // Worth saying: "duplicate my 40 GB workspace" otherwise sounds expensive.
+            return "Copies every container, image and volume. On an Apple File System disk "
+                + "this is instant and uses no extra space until the two diverge."
+        case .delete(let w):
+            return "This permanently deletes every container, image, volume and network in "
+                + "“\(w.name)”, and its \(w.allocatedDescription) disk at "
+                + "\(w.dataDiskURL.path). This can't be undone.\n\nType “\(w.name)” to "
+                + "confirm."
+        case .confirmSwitch, .none:
+            return ""
+        }
     }
 
     // MARK: Confirmations
@@ -344,29 +374,28 @@ private struct WorkspacePrompts: ViewModifier {
         Task { await engine.performSwitch(to: workspace) }
     }
 
-    private func confirmCreate() {
-        guard let name = panel.proposedName else { return }
-        panel.dismiss()
-        Task { await engine.performCreate(name: name) }
-    }
-
-    private func confirmRename() {
-        guard case .rename(let workspace)? = panel.prompt, let name = panel.proposedName
-        else { return }
-        panel.dismiss()
-        Task { await engine.performRename(workspace, to: name) }
-    }
-
-    private func confirmDuplicate() {
-        guard case .duplicate(let workspace)? = panel.prompt, let name = panel.proposedName
-        else { return }
-        panel.dismiss()
-        Task { await engine.performDuplicate(workspace, newName: name) }
-    }
-
-    private func confirmDelete() {
-        guard case .delete(let workspace)? = panel.prompt, panel.deleteConfirmed else { return }
-        panel.dismiss()
-        Task { await engine.performDelete(workspace) }
+    /// Single dispatch for the shared editor alert. Reads the prompt BEFORE dismissing it,
+    /// because `dismiss()` clears both the prompt and the typed text.
+    private func confirmEditor() {
+        guard let prompt = panel.prompt, let name = panel.proposedName else { return }
+        switch prompt {
+        case .create:
+            panel.dismiss()
+            Task { await engine.performCreate(name: name) }
+        case .rename(let workspace):
+            panel.dismiss()
+            Task { await engine.performRename(workspace, to: name) }
+        case .duplicate(let workspace):
+            panel.dismiss()
+            Task { await engine.performDuplicate(workspace, newName: name) }
+        case .delete(let workspace):
+            // Re-check rather than trust the disabled state: the button is the last gate on
+            // an unrecoverable action.
+            guard panel.deleteConfirmed else { return }
+            panel.dismiss()
+            Task { await engine.performDelete(workspace) }
+        case .confirmSwitch:
+            break   // not presented by this alert
+        }
     }
 }
