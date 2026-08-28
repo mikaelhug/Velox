@@ -255,15 +255,16 @@ private struct WorkspacePrompts: ViewModifier {
                 Button("Switch") { confirmSwitch() }
                 Button("Cancel", role: .cancel) { panel.dismiss() }
             } message: {
-                // Tell the truth for both engine states: a running engine restarts; a
-                // stopped one just repoints and boots this workspace on the next start.
+                // One short line. This dialog is on the path of a routine action, and what a
+                // workspace holds is self-evident from the sidebar — spelling out
+                // "containers, images and volumes … comes back when you switch back" every
+                // time is a wall of text the user stops reading by the third switch. The only
+                // non-obvious fact is the restart, so that is all it says. Still branched:
+                // promising a restart when the engine is stopped would just be wrong.
                 if engine.state.isRunning || engine.state.isBusy {
-                    Text("The engine restarts with this workspace's containers, images and "
-                        + "volumes. Anything running now keeps its state and comes back when "
-                        + "you switch back.")
+                    Text("The engine will restart.")
                 } else {
-                    Text("This workspace's containers, images and volumes will be used when "
-                        + "the engine next starts.")
+                    Text("Takes effect on the next start.")
                 }
             }
             .alert("New Workspace",
