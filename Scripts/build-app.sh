@@ -153,7 +153,7 @@ EOF
 # `velox` runs the VM, so it needs the virtualization entitlement; the stock
 # `docker` client does not. Hardened runtime + timestamp for Developer ID; the
 # fallback covers ad-hoc (`-`), which cannot use a secure timestamp.
-sign() {  # <path> [entitlements-file]
+codesign_once() {  # <path> [entitlements-file]
     local path="$1" ent="${2:-}"
     if [ "$SIGN_IDENTITY" = "-" ]; then
         # Ad-hoc: PLAIN signature, never the hardened runtime. An ad-hoc, non-notarized
@@ -168,6 +168,36 @@ sign() {  # <path> [entitlements-file]
         else                   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$path"; fi
     fi
 }
+
+# Retry a transient "Operation not permitted".
+#
+# Measured on macOS 26: signing a bundle whose ~250 MB of binaries were written seconds
+# earlier fails roughly half the time, while re-signing the same settled bundle succeeded
+# 8/8. The file is fine — nothing holds it, no flags, no quarantine, and the retry produces
+# a signature that verifies. It is a race against whatever scans a freshly written Mach-O
+# (XProtect is the obvious candidate), and it only became visible because this script
+# started being run many times a day instead of once a release.
+#
+# The retry is bounded and the result is VERIFIED below, so a genuine denial still fails the
+# build loudly rather than shipping an unsigned app.
+sign() {  # <path> [entitlements-file]
+    local path="$1" ent="${2:-}" attempt out
+    for attempt in 1 2 3 4 5; do
+        if out=$(codesign_once "$path" "$ent" 2>&1); then
+            [ -n "$out" ] && echo "$out"
+            return 0
+        fi
+        echo "$out"
+        case "$out" in
+            *"Operation not permitted"*|*"resource temporarily unavailable"*|*"resource busy"*)
+                echo "    (transient — retrying in ${attempt}s, attempt $attempt/5)"
+                sleep "$attempt" ;;
+            *)  echo "error: codesign failed on $path" >&2; return 1 ;;
+        esac
+    done
+    echo "error: codesign kept failing on $path after 5 attempts" >&2
+    return 1
+}
 echo "==> codesign ($SIGN_IDENTITY)"
 sign "$APP/Contents/Resources/bin/docker"
 # The compose/buildx CLI plugins are pure clients like `docker` — no entitlements.
@@ -178,6 +208,12 @@ sign "$APP/Contents/Resources/bin/docker-buildx"
 sign "$APP/Contents/Resources/bin/velox-porthelper"
 sign "$APP/Contents/Resources/bin/velox" "$ENTITLEMENTS"
 sign "$APP" "$ENTITLEMENTS"
+
+# Prove the seal is real. `sign` retries a transient failure, so this is what makes that
+# retry safe: if the signature is somehow still bad, the build stops here instead of
+# producing a bundle that fails to launch on someone else's Mac.
+codesign --verify --deep --strict "$APP" || {
+    echo "error: $APP failed signature verification after signing" >&2; exit 1; }
 
 # --- package: a single .zip ---------------------------------------------------
 # One artifact serves both paths: the in-app updater unpacks it (ditto -x -k) to
