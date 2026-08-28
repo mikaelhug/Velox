@@ -291,7 +291,9 @@ private struct WorkspacePrompts: ViewModifier {
                 .disabled(!panel.primaryEnabled)
                 Button("Cancel", role: .cancel) { panel.dismiss() }
             } message: {
-                Text(editorMessage)
+                // Omitted entirely for Rename, which has nothing worth saying — an empty
+                // `Text` still reserves the message area and leaves a blank gap.
+                if !editorMessage.isEmpty { Text(editorMessage) }
             }
             .alert("Action failed", isPresented: Binding(
                 get: { panel.error != nil },
