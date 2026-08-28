@@ -422,6 +422,13 @@ h3 {
   gap: 16px;
 }
 
+/* A fifth card would sit alone in a row of four with three empty columns. Spanning
+   the row reads as deliberate emphasis instead of an orphan, and keeps the grid
+   balanced at every breakpoint (4-up, 2-up and 1-up all end on a full-width card). */
+.feature--wide {
+  grid-column: 1 / -1;
+}
+
 .feature {
   border: 1px solid var(--border);
   border-radius: 16px;

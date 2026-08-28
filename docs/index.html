@@ -201,6 +201,23 @@
               always-on background daemons.
             </p>
           </article>
+          <article class="feature feature--wide">
+            <div class="feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="13" height="10" rx="1.6"></rect>
+                <path d="M8 18h13"></path>
+                <path d="M8 18l3-3"></path>
+                <path d="M8 18l3 3"></path>
+              </svg>
+            </div>
+            <h3>Switchable workspaces</h3>
+            <p>
+              Park a whole project — containers, images, volumes and networks —
+              and switch to a clean or cloned one in seconds, then switch back
+              with everything as you left it. Duplicating a workspace is instant
+              and takes no extra disk.
+            </p>
+          </article>
         </div>
       </section>
 
@@ -227,7 +244,11 @@ curl -fsSL https://raw.githubusercontent.com/mikaelhug/Velox/main/install.sh | b
 
 <span class="tok-cmt"># reach a container by name — no -p needed</span>
 <span class="tok-cmd">docker</span> run -d --name web nginx
-curl http://web.velox.local</code></pre>
+curl http://web.velox.local
+
+<span class="tok-cmt"># park a project and switch to a clean one</span>
+<span class="tok-cmd">velox</span> workspace new client-a
+<span class="tok-cmd">velox</span> workspace use client-a</code></pre>
         </div>
       </section>
 
