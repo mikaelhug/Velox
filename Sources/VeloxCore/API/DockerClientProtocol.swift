@@ -21,6 +21,8 @@ public protocol DockerClientProtocol: Sendable {
     func pruneContainers() async throws -> UInt64
     func pruneBuildCache() async throws -> UInt64
     func systemDiskUsage() async throws -> DiskUsage
+    /// `GET /info` — the daemon's host: CPU count, RAM, OS, engine version.
+    func systemInfo() async throws -> SystemInfo
 
     // Image actions
     func pullImage(_ reference: String) -> AsyncThrowingStream<String, Error>

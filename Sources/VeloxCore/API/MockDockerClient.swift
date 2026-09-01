@@ -185,4 +185,10 @@ public final class MockDockerClient: DockerClientProtocol, @unchecked Sendable {
             }
         }
     }
+
+    public func systemInfo() async throws -> SystemInfo {
+        SystemInfo(cpus: 8, memoryBytes: 16 << 30, operatingSystem: "Debian GNU/Linux 13",
+                   kernelVersion: "6.12.0", architecture: "aarch64",
+                   serverVersion: "29.7.2", name: "mock")
+    }
 }

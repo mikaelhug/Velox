@@ -1,10 +1,12 @@
 import SwiftUI
+import VeloxCore
 
 /// The dashboard window: a sidebar of resource views and a detail pane. The
 /// detail adapts to engine state — when the VM is down, every dashboard shows a
 /// single "start the engine" affordance instead of an empty table.
 struct RootView: View {
     @Environment(EngineController.self) private var engine
+    @Environment(RemoteHostController.self) private var remotes
     @State private var selection: SidebarItem? = .overview
     @State private var showPalette = false
 
@@ -24,6 +26,7 @@ struct RootView: View {
                     row(.volumes)
                     row(.networks)
                 }
+                HostsSection()
                 WorkspacesSection()
                 Section("System") {
                     row(.engineLogs)
@@ -38,6 +41,7 @@ struct RootView: View {
             // raises it: presentation modifiers attached to a `Section` are unreliable and
             // can silently never appear. See `WorkspacePanel`.
             .workspacePrompts(engine)
+            .remoteHostPrompts(remotes)
             .safeAreaInset(edge: .bottom) {
                 EngineStatusBar()
                     .padding(10)
@@ -45,34 +49,117 @@ struct RootView: View {
         } detail: {
             detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
-                // Rebuild the detail pane when the workspace changes. `OverviewModel`
-                // captures the data-disk URL at init, so a pane that survived a switch
-                // would keep gauging the OLD workspace's disk. A switch normally destroys
-                // this view anyway (the engine leaves `.running`), but that is incidental,
-                // and this makes it impossible rather than merely unlikely.
-                .id(engine.workspaces?.activeID ?? "")
+                // Row affordances several view types deep (port links, the shell hand-off)
+                // need to know which daemon they act on. See `EnvironmentValues.dockerTarget`.
+                .environment(\.dockerTarget, dashboard?.target ?? .local)
+                // Rebuild the detail pane when the workspace OR the host changes.
+                // `OverviewModel` captures the data-disk URL at init, so a pane that
+                // survived a switch would keep gauging the OLD workspace's disk — and a
+                // pane that survived a host switch would keep every model bound to the
+                // previous daemon's stores.
+                .id(paneIdentity)
         }
         .toolbar(removing: .sidebarToggle)
-        .navigationTitle(selection?.title ?? "Velox")
-        // ⌘K command palette — type-to-find anything, act inline.
+        .navigationTitle(navigationTitle)
+        // ⌘K command palette — type-to-find anything, act inline. Gated on a dashboard
+        // being available, since it now acts on whichever daemon that pane is showing.
         .background(
-            Button("") { if engine.state.isRunning { showPalette = true } }
+            Button("") { if dashboard != nil { showPalette = true } }
                 .keyboardShortcut("k")
                 .hidden()
         )
-        .sheet(isPresented: $showPalette) {
-            CommandPalette(isPresented: $showPalette) { id in
-                selection = .containers
-                engine.paneUI.containerSelection = [id]
-            }
-            .environment(engine)
-        }
+        .sheet(isPresented: $showPalette) { palette }
         .alert("Switch Docker context to Velox?", isPresented: $engine.showContextPrompt) {
             Button("Switch") { engine.adoptVeloxContext() }
             Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
         } message: {
             Text("Your active Docker context isn't `velox`, so `docker` commands won't reach Velox. Switch now? You can also change this any time in Settings → General.")
         }
+    }
+
+    /// What the detail pane is currently able to show: the store trio for whichever engine
+    /// is selected, plus the bits that differ between a local VM and a remote daemon.
+    ///
+    /// Assembling it in one place is what keeps `detail(for:)` a plain dispatch table — the
+    /// dashboards themselves are entirely unaware there is more than one engine, because
+    /// they were already written against `any DockerClientProtocol`.
+    private struct Dashboard {
+        let docker: any DockerClientProtocol
+        let store: DockerResourceStore
+        let stats: StatsStore
+        let ui: PaneUIState
+        let issues: PortIssues
+        let target: DockerTarget
+        /// nil for a remote host — its storage is on another machine.
+        let dataDiskURL: URL?
+        let remote: RemoteHostSession?
+        /// Freshly resolved from the manifest each time, so a rename shows immediately.
+        let remoteHost: RemoteHost?
+    }
+
+    private var dashboard: Dashboard? {
+        switch remotes.selection {
+        case .local:
+            guard engine.state.isRunning, let docker = engine.docker,
+                  let store = engine.resources, let stats = engine.stats else { return nil }
+            return Dashboard(docker: docker, store: store, stats: stats,
+                             ui: engine.paneUI, issues: engine.portIssues, target: .local,
+                             dataDiskURL: engine.activeWorkspace?.dataDiskURL
+                                 ?? engine.config.dataDiskURL,
+                             remote: nil, remoteHost: nil)
+        case .remote(let id):
+            guard let host = remotes.host(id: id), let session = remotes.session(for: id)
+            else { return nil }
+            // Show the dashboards once the daemon has answered, and keep showing the
+            // last-known lists across a redial so a brief drop doesn't blank the pane.
+            // But a FAILED tunnel must fall through to `HostDownView`: `containersLoaded`
+            // latches true forever, so gating on it alone meant a host that died after one
+            // successful load could never show its error again — the pane just kept
+            // rendering hours-old data as if it were live.
+            let showsData = session.state == .connected
+                || (session.state == .connecting && session.resources.containersLoaded)
+            guard showsData else { return nil }
+            return Dashboard(docker: session.docker, store: session.resources,
+                             stats: session.stats, ui: session.paneUI,
+                             issues: session.portIssues,
+                             target: .remote(id: host.id, socket: host.localSocketURL,
+                                             user: host.user, hostname: host.hostname,
+                                             port: host.port),
+                             dataDiskURL: nil,
+                             remote: session, remoteHost: host)
+        }
+    }
+
+    /// Forces a fresh detail pane per (host, workspace). A workspace only scopes the local
+    /// engine, so it is deliberately not part of a remote host's identity.
+    private var paneIdentity: String {
+        switch remotes.selection {
+        case .local:            return "local:\(engine.workspaces?.activeID ?? "")"
+        case .remote(let id):   return "remote:\(id)"
+        }
+    }
+
+    /// The ⌘K palette, bound to the daemon currently on screen. Extracted from `body`
+    /// because inlining it made the view expression too large for the type checker.
+    @ViewBuilder
+    private var palette: some View {
+        if let d = dashboard {
+            CommandPalette(store: d.store, docker: d.docker, isPresented: $showPalette) { id in
+                selection = .containers
+                d.ui.containerSelection = [id]
+            }
+            .environment(\.dockerTarget, d.target)
+        }
+    }
+
+    /// The window title names the pane *and* the engine. With more than one daemon on
+    /// screen the single most costly mistake is acting on the wrong one, and the title bar
+    /// is the one piece of chrome that is always visible.
+    private var navigationTitle: String {
+        let pane = selection?.title ?? "Velox"
+        guard let id = remotes.selection.remoteID,
+              let host = remotes.host(id: id) else { return pane }
+        return "\(pane) — \(host.name)"
     }
 
     /// One selectable sidebar row.
@@ -84,21 +171,36 @@ struct RootView: View {
     private func detail(for item: SidebarItem) -> some View {
         switch item {
         case .engineLogs:
-            // Always available — also shows the boot log and why a start failed.
-            EngineLogsView(store: engine.engineLog)
-        case .overview, .containers, .images, .volumes, .networks:
-            if engine.state.isRunning, let docker = engine.docker, let store = engine.resources,
-               let stats = engine.stats {
-                switch item {
-                case .overview:   OverviewView(store: store, stats: stats,
-                                               dataDiskURL: engine.activeWorkspace?.dataDiskURL
-                                                   ?? engine.config.dataDiskURL)
-                case .containers: ContainersView(docker: docker, store: store, stats: stats,
-                                                 ui: engine.paneUI, issues: engine.portIssues)
-                case .images:     ImagesView(docker: docker, store: store, ui: engine.paneUI)
-                case .volumes:    VolumesView(docker: docker, store: store, ui: engine.paneUI)
-                default:          NetworksView(docker: docker, store: store)
+            if remotes.selection.isLocal {
+                // Always available — also shows the boot log and why a start failed.
+                EngineLogsView(store: engine.engineLog)
+            } else {
+                // This is Velox's own guest serial console. A remote host doesn't have one
+                // and never will — its daemon logs live in that machine's journal.
+                ContentUnavailableView {
+                    Label("Engine Logs", systemImage: SidebarItem.engineLogs.systemImage)
+                } description: {
+                    Text("These are the Velox engine's own boot and daemon logs on this Mac. "
+                         + "Select This Mac to see them.")
+                } actions: {
+                    Button("Show This Mac") { remotes.select(.local) }
                 }
+            }
+        case .overview, .containers, .images, .volumes, .networks:
+            if let d = dashboard {
+                switch item {
+                case .overview:   OverviewView(store: d.store, stats: d.stats, docker: d.docker,
+                                               dataDiskURL: d.dataDiskURL,
+                                               remoteHost: d.remoteHost,
+                                               remoteState: d.remote?.state)
+                case .containers: ContainersView(docker: d.docker, store: d.store, stats: d.stats,
+                                                 ui: d.ui, issues: d.issues)
+                case .images:     ImagesView(docker: d.docker, store: d.store, ui: d.ui)
+                case .volumes:    VolumesView(docker: d.docker, store: d.store, ui: d.ui)
+                default:          NetworksView(docker: d.docker, store: d.store)
+                }
+            } else if let id = remotes.selection.remoteID {
+                HostDownView(item: item, hostID: id)
             } else {
                 EngineDownView(item: item)
             }
@@ -180,11 +282,71 @@ struct EngineDownView: View {
     }
 }
 
+/// Shown in the detail pane while a selected remote host isn't answering yet — connecting,
+/// never connected, or failed.
+///
+/// The failure text is ssh's own diagnostic, translated by `SSHTunnel.explain`. That
+/// matters more here than for the local engine: the three things that actually go wrong
+/// (an unverified host key, a key the agent doesn't hold, a user who can't reach the
+/// docker socket) are all fixed on the *server* or in `~/.ssh`, and none of them are
+/// guessable from a spinner.
+struct HostDownView: View {
+    @Environment(RemoteHostController.self) private var remotes
+    let item: SidebarItem
+    let hostID: String
+
+    var body: some View {
+        let host = remotes.host(id: hostID)
+        let session = remotes.session(for: hostID)
+        let state = session?.state ?? .stopped
+
+        ContentUnavailableView {
+            Label(host?.name ?? item.title, systemImage: "server.rack")
+        } description: {
+            VStack(spacing: 6) {
+                Text(state.failureMessage ?? description(for: state))
+                if let host {
+                    Text(host.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        } actions: {
+            if let host {
+                HStack {
+                    Button("Reconnect") {
+                        remotes.disconnect(id: host.id)
+                        remotes.select(.remote(host.id))
+                    }
+                    Button("Open SSH Session") {
+                        RowActions.openSSH(user: host.user, hostname: host.hostname, port: host.port)
+                    }
+                }
+            }
+        }
+    }
+
+    private func description(for state: SSHTunnel.State) -> String {
+        switch state {
+        case .connecting:
+            return "Connecting over SSH…"
+        case .connected:
+            // The tunnel is up but the daemon hasn't answered a list yet.
+            return "Connected — waiting for the Docker daemon to respond."
+        case .stopped:
+            return "Not connected."
+        case .failed(let message):
+            return message
+        }
+    }
+}
+
 #if DEBUG
 struct RootView_Previews: PreviewProvider {
     static var previews: some View {
         RootView()
             .environment(EngineController())
+            .environment(RemoteHostController())
             .frame(width: 820, height: 480)
     }
 }

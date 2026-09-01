@@ -25,24 +25,11 @@ public final class DockerSocketProxy: @unchecked Sendable {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw VeloxError.socketSetupFailed("socket()", errno) }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
-        guard pathBytes.count < capacity else {
+        guard let bound = UnixSocketAddress.withSockaddr(path: socketPath, { addr, len in
+            bind(fd, addr, len)
+        }) else {
             close(fd)
             throw VeloxError.socketSetupFailed("socket path too long", 0)
-        }
-        withUnsafeMutablePointer(to: &addr.sun_path) { tuplePtr in
-            tuplePtr.withMemoryRebound(to: CChar.self, capacity: capacity) { dst in
-                for (i, b) in pathBytes.enumerated() { dst[i] = CChar(bitPattern: b) }
-                dst[pathBytes.count] = 0
-            }
-        }
-
-        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
         }
         guard bound == 0 else {
             close(fd)

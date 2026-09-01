@@ -49,6 +49,22 @@ public enum Paths {
         root.appendingPathComponent("workspaces.lock")
     }
 
+    /// Parent of every remote host's forwarded socket: `~/.velox/hosts/<id>.sock`.
+    /// An `SSHTunnel` binds one of these per connected host; `sun_path` is only 104
+    /// bytes, which is why a host id is short.
+    public static var remoteHosts: URL {
+        root.appendingPathComponent("hosts", isDirectory: true)
+    }
+    /// The remote-host manifest (`{version, revision, hosts}`).
+    public static var remoteHostManifest: URL {
+        root.appendingPathComponent("hosts.json")
+    }
+    /// Serializes remote-host manifest read-modify-write across processes. Separate from
+    /// `workspaceLock` so editing hosts and editing workspaces never block each other.
+    public static var remoteHostLock: URL {
+        root.appendingPathComponent("hosts.lock")
+    }
+
     @discardableResult
     public static func ensureRoot() throws -> URL {
         try FileManager.default.createDirectory(

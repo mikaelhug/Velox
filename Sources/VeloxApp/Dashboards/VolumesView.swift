@@ -166,6 +166,7 @@ fileprivate struct VolumeLayout {
 }
 
 struct VolumesView: View {
+    @Environment(\.dockerTarget) private var dockerTarget
     @State private var model: VolumesModel
     /// Selection + inspector visibility survive pane switches (see PaneUIState).
     @Bindable private var ui: PaneUIState
@@ -270,7 +271,7 @@ struct VolumesView: View {
             Button("Import") {
                 guard let tar = importTar, !importName.isEmpty else { return }
                 importTar = nil
-                RowActions.importVolume(importName, from: tar) { failure in
+                RowActions.importVolume(importName, from: tar, target: dockerTarget) { failure in
                     transferMessage = failure.map { "Import failed: \($0)" }
                         ?? "Imported \(tar.lastPathComponent) into volume “\(importName)”"
                     Task { await model.perform { _ in } } // refresh the list
@@ -278,7 +279,12 @@ struct VolumesView: View {
             }
             Button("Cancel", role: .cancel) { importTar = nil }
         } message: {
-            Text("The archive's contents become the volume's contents. An existing volume with this name is merged into.")
+            Text("The archive's contents become the volume's contents. An existing volume "
+                 + "with this name is merged into."
+                 + (dockerTarget.isRemote
+                    ? " The transfer runs a helper container on the server, pulling the "
+                      + "`alpine` image there if it isn't already present."
+                    : ""))
         }
         .alert("Volume Transfer", isPresented: Binding(
             get: { transferMessage != nil }, set: { if !$0 { transferMessage = nil } })
@@ -288,12 +294,16 @@ struct VolumesView: View {
                 .inspectorColumnWidth(min: 220, ideal: 260, max: 360)
         }
         .persistTableLayout(tableLayout, "volumes")
-        .confirmationDialog("Prune unused volumes?", isPresented: $pruneConfirm) {
+        // Names the daemon, for the same reason `ReclaimSpaceSheet` does: this dialog is
+        // byte-identical for the local engine and a remote server, and prune is irreversible.
+        .confirmationDialog(dockerTarget.pruneTitle("Prune unused volumes"),
+                            isPresented: $pruneConfirm) {
             Button("Prune Volumes", role: .destructive) {
                 Task { await model.perform { _ = try await $0.pruneVolumes() } }
             }
         } message: {
-            Text("Removes every volume not used by at least one container. Data is deleted permanently.")
+            Text("Removes every volume not used by at least one container. Data is deleted "
+                 + "permanently\(dockerTarget.isRemote ? " on the server" : "").")
         }
         .confirmationDialog(
             "Remove \(selectedVolumes.count) selected volume\(selectedVolumes.count == 1 ? "" : "s")?",
@@ -320,10 +330,17 @@ extension VolumesView {
 
     fileprivate func exportVolume(_ v: Volume) {
         let panel = NSSavePanel()
+        // The export streams through a helper container, which on a remote target means
+        // pulling `alpine` onto the user's server. The save panel is the only surface before
+        // it happens, so it is where that gets said.
+        if dockerTarget.isRemote {
+            panel.message = "The export runs a helper container on the server, pulling the "
+                + "alpine image there if it isn't already present."
+        }
         panel.nameFieldStringValue = "\(v.name).tar"
         panel.allowedContentTypes = [Self.tarType]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        RowActions.exportVolume(v.name, to: url) { failure in
+        RowActions.exportVolume(v.name, to: url, target: dockerTarget) { failure in
             transferMessage = failure.map { "Export failed: \($0)" }
                 ?? "Exported “\(v.name)” to \(url.lastPathComponent)"
         }

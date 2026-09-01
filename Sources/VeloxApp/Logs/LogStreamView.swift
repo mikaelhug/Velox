@@ -8,6 +8,10 @@ struct LogWindowTarget: Codable, Hashable, Identifiable {
     let id: String          // container id
     let name: String
     let image: String
+    /// `RemoteHost.id` when this container lives on a remote host; nil for the local
+    /// engine. Optional so a window restored from before remote hosts existed still
+    /// decodes (synthesized `Codable` uses `decodeIfPresent` for optionals).
+    var hostID: String?
     var shortID: String { String(id.prefix(12)) }
 }
 
@@ -16,11 +20,17 @@ struct LogWindowTarget: Codable, Hashable, Identifiable {
 struct LogWindowHost: View {
     let target: LogWindowTarget
     @Environment(EngineController.self) private var engine
+    /// Optional so SwiftUI previews (and any scene that doesn't inject it) don't trap.
+    @Environment(RemoteHostController.self) private var remotes: RemoteHostController?
 
     var body: some View {
         Group {
-            if let docker = engine.docker {
+            if let docker = client {
                 LogStreamView(docker: docker, target: target)
+            } else if target.hostID != nil {
+                ContentUnavailableView("Host not connected",
+                                       systemImage: "exclamationmark.triangle",
+                                       description: Text("Reconnect this host to view its logs."))
             } else {
                 ContentUnavailableView("Engine not running",
                                        systemImage: "exclamationmark.triangle",
@@ -28,6 +38,13 @@ struct LogWindowHost: View {
             }
         }
         .navigationTitle("\(target.name) — Logs")
+    }
+
+    /// A logs window outlives the pane that opened it and can be restored at launch, so it
+    /// resolves its client from the target rather than from whatever is selected now.
+    private var client: (any DockerClientProtocol)? {
+        guard let hostID = target.hostID else { return engine.docker }
+        return remotes?.session(for: hostID)?.docker
     }
 }
 

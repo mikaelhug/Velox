@@ -8,8 +8,17 @@ import Foundation
 /// multi-element entrypoint has no exact CLI form (the first element becomes
 /// `--entrypoint`, the rest prefix the command).
 public enum DockerRunCommand {
+    /// The `docker` **subcommand** only — `run -d …` — with every value quoted for exactly
+    /// one shell.
+    ///
+    /// It deliberately does not name a daemon or prepend `docker`. A bare `docker run`
+    /// targets whatever context the user's shell is on, which is neither the Velox engine
+    /// (behind the non-default `velox` context) nor a remote host; and the remote form is
+    /// re-parsed by a *second* shell on the far side of ssh, so it needs a second level of
+    /// quoting that only the caller can apply. `DockerTarget.pasteableCommand(_:)` owns
+    /// both decisions, so neither can be forgotten at a call site.
     public static func build(from inspect: ContainerInspect) -> String {
-        var parts = ["docker", "run", "-d"]
+        var parts = ["run", "-d"]
         let name = inspect.name.hasPrefix("/") ? String(inspect.name.dropFirst()) : inspect.name
         if !name.isEmpty { parts += ["--name", quote(name)] }
 

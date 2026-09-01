@@ -52,6 +52,7 @@ final class DockerResourceStore {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.refreshAll()
+                await self.refreshSystemInfo()
                 for await event in self.docker.events() {
                     if Task.isCancelled { return }
                     self.handle(event)
@@ -81,6 +82,12 @@ final class DockerResourceStore {
     /// Fired on container `die` events with the name and exit code — the crash
     /// notifier hangs off this so it shares the one events stream (CLAUDE.md §8).
     var onContainerDied: ((String, Int) -> Void)?
+
+    /// Fired whenever a container list actually comes back from the daemon. For a remote
+    /// host this is the readiness signal its `SSHTunnel` reports as "connected": the
+    /// daemon answering *is* the event, so nothing has to poll `/_ping` or watch for the
+    /// forwarded socket file to appear (CLAUDE.md §8).
+    var onReachable: (() -> Void)?
 
     /// Route an event to the resource(s) it can change.
     private func handle(_ event: DockerEvent) {
@@ -145,6 +152,7 @@ final class DockerResourceStore {
             do {
                 containers = try await docker.containers()
                 containersError = nil; containersLoaded = true
+                onReachable?()
                 await refreshAnchors()
             }
             catch { if containersLoaded { containersError = "\(error)" } }
@@ -165,6 +173,17 @@ final class DockerResourceStore {
     func refreshImages() async { await refresh(.images) }
     func refreshVolumes() async { await refresh(.volumes) }
     func refreshNetworks() async { await refresh(.networks) }
+
+    // MARK: - Host info (/info)
+
+    /// What machine is running this daemon — CPU count, RAM, OS, engine version. Refreshed
+    /// on every (re)connect rather than on a timer: it cannot change under a live daemon,
+    /// and a daemon restart re-runs this path anyway.
+    private(set) var systemInfo: SystemInfo?
+
+    func refreshSystemInfo() async {
+        systemInfo = try? await docker.systemInfo()
+    }
 
     // MARK: - Disk usage (/system/df)
 

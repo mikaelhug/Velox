@@ -14,6 +14,15 @@ import VeloxCore
 /// was never about the detail pane.
 struct WorkspacesSection: View {
     @Environment(EngineController.self) private var engine
+    @Environment(RemoteHostController.self) private var remotes
+
+    /// Workspaces scope the Mac's own engine only — a workspace *is* a `data.img`
+    /// attached to Velox's VM (CLAUDE.md §11), while a remote host runs its own dockerd
+    /// against its own `/var/lib/docker`. So while a remote host is selected these rows
+    /// describe something you aren't looking at. They stay visible and dimmed rather than
+    /// disappearing (which would make the sidebar reflow on every host switch), and a
+    /// click switches back to This Mac first — never a dead end.
+    private var scopedAway: Bool { !remotes.selection.isLocal }
 
     var body: some View {
         Section {
@@ -146,10 +155,18 @@ private struct WorkspaceRow: View {
     let isActive: Bool
 
     @Environment(EngineController.self) private var engine
+    @Environment(RemoteHostController.self) private var remotes
     @State private var hovering = false
+
+    private var scopedAway: Bool { !remotes.selection.isLocal }
 
     var body: some View {
         Button {
+            // Viewing a remote host? Come back to This Mac first — the click plainly means
+            // "show me this workspace", and a workspace only exists on this Mac. This half
+            // works even while the engine is owned by a long operation, which is why the
+            // row stays enabled in that case.
+            if scopedAway { remotes.select(.local) }
             // `isActive` is the EFFECTIVE active, so the fallback workspace's row is inert
             // like any active row. A dangling pointer is repaired by switching to any other
             // row — `activate` rewrites it to a valid id.
@@ -164,11 +181,13 @@ private struct WorkspaceRow: View {
                     Text(workspace.name)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .fontWeight(isActive ? .semibold : .regular)
+                        .fontWeight(isActive && !scopedAway ? .semibold : .regular)
                 } icon: {
-                    Image(systemName: isActive ? "largecircle.fill.circle" : "circle")
-                        .foregroundStyle(isActive ? AnyShapeStyle(.tint)
-                                                  : AnyShapeStyle(.secondary))
+                    // While a remote host is selected no workspace is "what you are
+                    // looking at", so the active marker is drawn unfilled.
+                    Image(systemName: isActive && !scopedAway ? "largecircle.fill.circle" : "circle")
+                        .foregroundStyle(isActive && !scopedAway ? AnyShapeStyle(.tint)
+                                                                 : AnyShapeStyle(.secondary))
                 }
                 Spacer(minLength: 4)
                 if missing {
@@ -192,7 +211,9 @@ private struct WorkspaceRow: View {
             .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
         }
         .buttonStyle(.plain)
-        .disabled(engine.isEngineOwned)
+        .disabled(engine.isEngineOwned && !scopedAway)
+        // Dimmed, not disabled: the row must stay clickable so it can bring you back.
+        .opacity(scopedAway ? 0.5 : 1)
         .onHover { hovering = $0 }
         .help(helpText)
         // NO custom padding or row insets on purpose: the defaults are what put `Label`'s
@@ -203,13 +224,17 @@ private struct WorkspaceRow: View {
     /// Hover feedback only — the active workspace is marked by its filled icon and weight, not
     /// by a persistent fill, so it can't be mistaken for the navigation selection.
     private var highlight: AnyShapeStyle {
-        hovering && !isActive && !engine.isEngineOwned
+        hovering && !(isActive && !scopedAway) && (!engine.isEngineOwned || scopedAway)
             ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear)
     }
 
     private var missing: Bool { workspace.firstBootedAt != nil && !workspace.diskExists }
 
     private var helpText: String {
+        if scopedAway {
+            return "Workspaces apply to the Velox engine on this Mac.\n"
+                 + "Click to switch back to This Mac and use “\(workspace.name)”."
+        }
         if missing {
             return "This workspace's disk is missing — is the drive it lives on connected?\n"
                  + workspace.dataDiskURL.path

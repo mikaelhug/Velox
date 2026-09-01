@@ -158,6 +158,8 @@ private enum TopLevelEntry: Identifiable {
 }
 
 struct ContainersView: View {
+    /// Which daemon this pane is showing — set once by `RootView` on the detail pane.
+    @Environment(\.dockerTarget) private var dockerTarget
     let stats: StatsStore
     @Environment(\.openWindow) private var openWindow
     @State private var model: ContainersModel
@@ -342,7 +344,8 @@ struct ContainersView: View {
     /// Open a free-floating logs window for `c` (reuses the existing one if already open).
     private func openLogs(_ c: ContainerSummary) {
         openWindow(id: WindowID.logs,
-                   value: LogWindowTarget(id: c.id, name: c.displayName, image: c.image))
+                   value: LogWindowTarget(id: c.id, name: c.displayName, image: c.image,
+                                          hostID: dockerTarget.remoteID))
     }
 
     // MARK: Cells
@@ -357,7 +360,9 @@ struct ContainersView: View {
                     Text(c.displayName).fontWeight(.medium)
                     // Named access — the engine's flagship: the container's real IP by
                     // name, any protocol, no -p. Click → browser; copy lives in the menu.
-                    if let domain = c.namedAccessDomain {
+                    // Named access is a local-engine feature (a `.velox.local` responder
+                    // plus a host route to Velox's own VM); a remote host has neither.
+                    if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
                         Button(domain) { RowActions.openDomain(domain) }
                             .buttonStyle(.plain)
                             .font(.caption2)
@@ -518,8 +523,12 @@ struct ContainersView: View {
         Divider()
         Button("View Logs") { openLogs(c) }
         if c.isRunning {
-            Button("Open in Terminal") { RowActions.openShell(containerID: c.shortID) }
-            if RowActions.vsCodeAvailable {
+            Button("Open in Terminal") {
+                RowActions.openShell(containerID: c.shortID, target: dockerTarget)
+            }
+            // VS Code's Dev Containers attach resolves the container through the editor's
+            // own local Docker context, so it can't reach a remote host's container.
+            if RowActions.vsCodeAvailable, !dockerTarget.isRemote {
                 Button("Open in VS Code") { RowActions.openInVSCode(containerName: c.displayName) }
             }
         }
@@ -530,19 +539,23 @@ struct ContainersView: View {
             Button("Container ID") { RowActions.copy(c.id) }
             Button("As docker run Command") {
                 let docker = model.docker
+                let target = dockerTarget
                 Task {
                     if let inspect = try? await docker.inspectContainer(c.id) {
-                        RowActions.copy(DockerRunCommand.build(from: inspect))
+                        RowActions.copy(target.pasteableCommand(DockerRunCommand.build(from: inspect)))
                     }
                 }
             }
             if let ip = c.directIP { Button("IP (\(ip))") { RowActions.copy(ip) } }
-            if let domain = c.namedAccessDomain { Button("Domain") { RowActions.copy(domain) } }
+            if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
+                Button("Domain") { RowActions.copy(domain) }
+            }
             ForEach(c.publishedBindings, id: \.self) { p in
                 if let pub = p.publicPort {
                     // String-built (a literal's Int interpolation is locale-formatted).
-                    let title = "URL (localhost:" + String(pub) + ")"
-                    Button(title) { RowActions.copy("http://localhost:" + String(pub) + "/") }
+                    let host = dockerTarget.portHost
+                    let title = "URL (" + host + ":" + String(pub) + ")"
+                    Button(title) { RowActions.copy("http://" + host + ":" + String(pub) + "/") }
                 }
             }
         }
@@ -580,6 +593,7 @@ struct ContainersView: View {
 /// table column already shows live usage. List data renders instantly; one
 /// `inspect` call per selection enriches the rest.
 private struct ContainerInspector: View {
+    @Environment(\.dockerTarget) private var dockerTarget
     let container: ContainerSummary?
     let docker: any DockerClientProtocol
 
@@ -646,7 +660,7 @@ private struct ContainerInspector: View {
                     if let env = cfg.env, !env.isEmpty { environmentSection(env) }
                 }
                 Section("Network") {
-                    if let domain = c.namedAccessDomain {
+                    if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
                         LabeledContent("Domain") {
                             Button(domain) { RowActions.openDomain(domain) }
                                 .buttonStyle(.plain).foregroundStyle(.link)
@@ -663,7 +677,7 @@ private struct ContainerInspector: View {
                             VStack(alignment: .trailing, spacing: 2) {
                                 ForEach(c.publishedBindings, id: \.self) { p in
                                     if let pub = p.publicPort {
-                                        Button(p.label) { RowActions.openPort(pub) }
+                                        Button(p.label) { RowActions.openPort(pub, target: dockerTarget) }
                                             .buttonStyle(.plain).foregroundStyle(.link)
                                             .font(.callout.monospaced())
                                     }
@@ -733,19 +747,28 @@ private struct ContainerInspector: View {
 /// literal's Int interpolation becomes a LocalizedStringKey and locale number
 /// grouping renders port 3000 as "3 000".
 private struct PortLink: View {
+    @Environment(\.dockerTarget) private var dockerTarget
+
+    /// Names the machine actually being opened. `blocked` is a local-only concept (it
+    /// records THIS Mac's failed binds), so only the healthy half varies. Held as a stored
+    /// property because inlining it exceeded the type checker's budget for that expression.
+    private var openHint: String {
+        "Open http://" + dockerTarget.portHost + ":" + String(port) + "/"
+    }
+
     let label: String
     let port: Int
     let blocked: Bool
 
     var body: some View {
         let portText = String(port)
-        Button(label) { RowActions.openPort(port) }
+        Button(label) { RowActions.openPort(port, target: dockerTarget) }
             .buttonStyle(.plain)
             .font(.caption.monospaced())
             .foregroundStyle(blocked ? AnyShapeStyle(.red) : AnyShapeStyle(.link))
             .help(blocked
                   ? "localhost:" + portText + " is unavailable — another app holds it"
-                  : "Open http://localhost:" + portText + "/")
+                  : openHint)
     }
 }
 

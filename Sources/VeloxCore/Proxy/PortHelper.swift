@@ -211,21 +211,9 @@ package enum PortHelperClient {
         var tv = timeval(tv_sec: 3, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
-        withUnsafeMutablePointer(to: &addr.sun_path) { p in
-            p.withMemoryRebound(to: CChar.self, capacity: pathBytes.count + 1) { dst in
-                for (i, b) in pathBytes.enumerated() { dst[i] = CChar(bitPattern: b) }
-                dst[pathBytes.count] = 0
-            }
-        }
-        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let connected = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
-        }
-        guard connected == 0 else { return nil }
+        guard let connected = UnixSocketAddress.withSockaddr(path: socketPath, { addr, len in
+            connect(fd, addr, len)
+        }), connected == 0 else { return nil }
         let verb = (proto == .tcp ? "tcp" : "udp") + (ipv6 ? "6" : "")
         let request = "\(verb) \(port)\(wildcard ? " any" : "")\n"
         guard FDIO.writeAll(fd, Array(request.utf8)) else { return nil }
@@ -273,21 +261,9 @@ package enum PortHelperClient {
         var tv = timeval(tv_sec: 3, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { close(fd); return nil }
-        withUnsafeMutablePointer(to: &addr.sun_path) { p in
-            p.withMemoryRebound(to: CChar.self, capacity: pathBytes.count + 1) { dst in
-                for (i, b) in pathBytes.enumerated() { dst[i] = CChar(bitPattern: b) }
-                dst[pathBytes.count] = 0
-            }
-        }
-        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let connected = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
-        }
-        guard connected == 0 else { close(fd); return nil }
+        guard let connected = UnixSocketAddress.withSockaddr(path: socketPath, { addr, len in
+            connect(fd, addr, len)
+        }), connected == 0 else { close(fd); return nil }
         return fd
     }
 

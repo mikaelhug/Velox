@@ -6,8 +6,14 @@ import VeloxCore
 /// already-loaded stores, only while open — no index, no background work. Enter runs
 /// the first container hit's default action (reveal in the Containers pane).
 struct CommandPalette: View {
-    @Environment(EngineController.self) private var engine
     @Environment(\.openWindow) private var openWindow
+    /// Which daemon the palette acts on — the one whose pane is on screen, NOT always the
+    /// local engine. Without this the palette silently searched and mutated this Mac while
+    /// the window said "Containers — prod-server", so ⌘K → "stop" on a name that exists on
+    /// both machines stopped the container on the wrong one.
+    @Environment(\.dockerTarget) private var dockerTarget
+    let store: DockerResourceStore
+    let docker: any DockerClientProtocol
     @Binding var isPresented: Bool
     /// Reveal a container in the Containers pane (select + navigate).
     var reveal: (String) -> Void
@@ -25,13 +31,9 @@ struct CommandPalette: View {
                 .onSubmit { runDefault() }
             Divider()
             List {
-                if let store = engine.resources {
-                    containerResults(store)
-                    imageResults(store)
-                    volumeResults(store)
-                } else {
-                    Text("Engine is not running").foregroundStyle(.secondary)
-                }
+                containerResults(store)
+                imageResults(store)
+                volumeResults(store)
             }
             .listStyle(.plain)
             .frame(minHeight: 240, maxHeight: 360)
@@ -46,7 +48,7 @@ struct CommandPalette: View {
     }
 
     private func runDefault() {
-        if let c = (engine.resources?.containers ?? []).first(where: { matches($0.displayName) }) {
+        if let c = store.containers.first(where: { matches($0.displayName) }) {
             reveal(c.id)
         }
         isPresented = false
@@ -66,25 +68,32 @@ struct CommandPalette: View {
                         Spacer()
                         if c.isRunning {
                             if let pub = c.publishedBindings.first?.publicPort {
-                                inlineAction(":\(pub)") { RowActions.openPort(pub) }
+                                inlineAction(":\(pub)") {
+                                    RowActions.openPort(pub, target: dockerTarget)
+                                }
                             }
-                            if let domain = c.namedAccessDomain {
+                            // Named access resolves through this Mac's own DNS responder, so
+                            // it is meaningless for a container on another machine.
+                            if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
                                 inlineAction("open") { RowActions.openDomain(domain) }
                             }
-                            inlineAction("shell") { RowActions.openShell(containerID: c.shortID) }
+                            inlineAction("shell") {
+                                RowActions.openShell(containerID: c.shortID, target: dockerTarget)
+                            }
                             inlineAction("stop") {
-                                Task { try? await engine.docker?.stopContainer(c.id) }
+                                Task { try? await docker.stopContainer(c.id) }
                             }
                         } else {
                             inlineAction("start") {
-                                Task { try? await engine.docker?.startContainer(c.id) }
+                                Task { try? await docker.startContainer(c.id) }
                             }
                         }
                         inlineAction("logs") {
                             NSApp.activate(ignoringOtherApps: true)
                             openWindow(id: WindowID.logs,
                                        value: LogWindowTarget(id: c.id, name: c.displayName,
-                                                              image: c.image))
+                                                              image: c.image,
+                                                              hostID: dockerTarget.remoteID))
                             isPresented = false
                         }
                     }

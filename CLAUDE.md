@@ -435,6 +435,82 @@ Per-workspace: `data.img`, `diskGiB`, name, timestamps. Global and shared: kerne
 the `velox` context, the porthelper, `/etc/resolver/velox.local`, `publishHostIP`, file
 shares, CPU/RAM.
 
+## 12. Remote hosts: SSH only, no stored credentials, one `ssh` child per host
+
+A **Remote Host** is a Docker Engine someone else runs — typically a headless Linux server
+— shown in the same GUI as the Mac's own engine. The feature is cheap for one reason and
+stays cheap only while these hold:
+
+- **A remote host is a `DockerConnector`, not a second Docker client.** `DockerClient`
+  speaks HTTP/1.1 on a bare `Int32` fd and never cared where the fd came from;
+  `DockerConnector` names that seam (`VsockConnector` for the guest, `UnixSocketConnector`
+  for a host). Every dashboard, `DockerResourceStore` and `StatsStore` was already typed
+  against `any DockerClientProtocol`, so they serve remote hosts **unchanged**. Do not add a
+  remote-specific client, store, or view (§10) — if a pane needs to differ, branch inside it
+  on `DockerTarget`.
+- **SSH only, via `ssh -L <local.sock>:<remote.sock>`.** One `/usr/bin/ssh` child per
+  *connected* host multiplexes every request, stream and log tail. `ssh(1)` is a system
+  binary, transient and per-host — not a helper daemon (pillar #2) — and it carries the
+  user's `~/.ssh/config`, keys, `known_hosts` and agent for free. **Don't** add a Swift SSH
+  implementation (a large dependency in a package that has *zero*) or a per-request
+  `ssh … docker system dial-stdio` (a process spawn per API call).
+- **TCP/TLS is deliberately not supported.** TLS has no fd to wrap: it would need
+  `NWConnection`, which cannot produce one, so `SocketChannel`, the blocking `ioQueue`
+  model and the `shutdown()`-to-cancel trick would all need re-expressing — a second
+  transport mechanism for a case SSH already covers with no server-side setup.
+- **Velox stores no credentials. Ever.** `RemoteHost` holds user/hostname/port/socket path
+  and an optional *path* to a key — never a password, key or passphrase. `SSHTunnel` runs
+  with `BatchMode=yes`, so a host that would prompt fails with a message instead of hanging
+  on a prompt nobody can see. The repo has no secret-storage mechanism, and under §10
+  whatever were added here would become *the* mechanism for the whole project. Host-key
+  checking stays at the user's own setting: an unknown host fails with "Host key
+  verification failed" and we tell them which `ssh` command to run. **Never** add
+  `StrictHostKeyChecking=accept-new` to trust a key on the user's behalf.
+- **Readiness is "the daemon answered".** `DockerResourceStore.onReachable` fires on a
+  successful `containers()` and flips the tunnel to `.connected`. Reconnection is driven by
+  `Process.terminationHandler` — the child's exit *is* the event (§8). Nothing polls
+  `/_ping` or watches for the forwarded socket to appear. The informer is **gated on the
+  tunnel's state**, not started independently: its own loop retries every second forever,
+  so an unreachable host otherwise cost a permanent background probe alongside the tunnel's
+  bounded backoff — two retry policies for one connection (§10).
+- **Every value that reaches a shell is `SSHTunnel.shellQuoted`.** The Terminal hand-offs
+  are re-parsed up to three times (AppleScript literal → local shell → the shell on the far
+  side of ssh). Container ids come from the *daemon* and hostnames survive a hand-edited
+  `hosts.json` that never passes field validation, so neither is trusted. Escaping only the
+  AppleScript layer is not enough and was a live injection hole.
+- **All tunnel supervision runs on ONE serial queue.** A host's socket path is a pure
+  function of its id, so a tunnel being torn down and one being started for the same host
+  contend for it; per-instance queues let a Reconnect unlink the new tunnel's live socket,
+  leaving an `ssh` that never exits and a pane wedged on "Connecting…".
+- **Workspaces are local-only.** A workspace *is* a `data.img` attached to Velox's VM
+  (§11); a remote box runs its own dockerd against its own `/var/lib/docker`. The sidebar
+  scopes the section to "Workspaces · This Mac" and dims it while a remote host is
+  selected. A remote host takes **no** `InstanceLock` — it attaches no disk and boots no VM.
+- **Host specs come from `/info`, disk usage from `/system/df`.** A remote host's CPU
+  count, RAM, OS and engine version fill the same Overview slot the local engine uses for
+  its configured vCPU/RAM. The Docker API reports no filesystem *capacity*, so the Disk
+  card shows what the daemon is using rather than "x of y" — do **not** add a `df` over the
+  SSH tunnel to invent the missing number: that is a second data source and a poll (§8).
+  Both are fetched once per (re)connect by the informer, never on a timer.
+- **Velox never changes anything on the server.** Removing a host removes a row from
+  `hosts.json`; nothing is stopped, formatted or deleted on the far side. Provisioning or
+  installing anything remotely is out of scope.
+- **Sessions are lazy and per-host.** A session (tunnel + client + stores + `PaneUIState`)
+  is created on first selection, so launching Velox does not dial every configured server,
+  and torn down on quit — `AppTerminationDelegate` must keep calling `disconnectAll()`, or
+  `ssh` children are orphaned and their stale sockets block the next connect.
+
+Per-host: name, `user@hostname:port`, remote socket path, optional identity file, and a
+forwarded socket at `~/.velox/hosts/<id>.sock` (ids are 8 hex chars because `sun_path` is
+104 bytes). The manifest is `~/.velox/hosts.json` under `~/.velox/hosts.lock`, using the
+same `FileLock` + durable-write discipline as the workspace manifest.
+
+Row actions route through `DockerTarget` (carried in the SwiftUI environment): the docker
+CLI hand-offs swap `--context velox` for `-H unix://<sock>`, published-port links use the
+server's hostname, and "Open in Terminal" deliberately spawns its **own** `ssh -t` so the
+shell outlives Velox. `.velox.local` named access and the VS Code Dev Containers attach are
+local-engine features and are hidden for remote hosts.
+
 ## Build / run quick reference
 
 ```bash

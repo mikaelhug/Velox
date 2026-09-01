@@ -35,6 +35,11 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
     /// synthesize a fresh one, which would hide every real workspace behind an empty
     /// "Default" and boot the legacy disk in their place.
     case workspaceManifestUnreadable(String)
+    /// A remote-host operation couldn't proceed; the string is the user-facing reason.
+    case remoteHost(String)
+    /// The remote-host manifest exists but couldn't be parsed. Same reasoning as the
+    /// workspace manifest: refuse rather than silently present an empty host list.
+    case remoteHostManifestUnreadable(String)
 
     public var description: String {
         switch self {
@@ -67,6 +72,12 @@ public enum VeloxError: Error, CustomStringConvertible, LocalizedError {
             return "The workspace list at \(Paths.workspaceManifest.path) couldn't be read "
                 + "(\(detail)). Velox won't start rather than risk hiding your workspaces. "
                 + "A backup of the last good copy is alongside it as workspaces.json.bak."
+        case .remoteHost(let message):
+            return message
+        case .remoteHostManifestUnreadable(let detail):
+            return "The remote host list at \(Paths.remoteHostManifest.path) couldn't be read "
+                + "(\(detail)). A backup of the last good copy is alongside it as "
+                + "hosts.json.bak."
         }
     }
 

@@ -56,6 +56,13 @@ func parseUID() -> uid_t? {
 
 /// Create the root-owned control socket: unlink any stale one, bind, restrict it to
 /// the served uid (0600 + chown), and listen.
+///
+/// The `sockaddr_un` construction below deliberately does NOT use
+/// `VeloxCore.UnixSocketAddress`, which is the single shared copy for everything else
+/// (CLAUDE.md §10). This target declares no dependency on VeloxCore — see `Package.swift`,
+/// "pure Darwin — no VeloxCore/Virtualization — to stay minimal" — because it is the one
+/// privileged component and linking the whole core into a root daemon to save a dozen lines
+/// would be the wrong trade. Same boundary carve-out §10 already allows for the guest relay.
 func bindControlSocket(_ allowedUID: uid_t) -> Int32 {
     unlink(SOCKET_PATH)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)

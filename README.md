@@ -134,6 +134,34 @@ Each workspace is a single sparse disk image, so an empty one costs nothing unti
 you use it. Images are not shared between workspaces — clone one if you want its
 base images to start with. Deleting a workspace deletes its data permanently.
 
+## Remote hosts
+
+Docker Engines running on other machines — headless Linux servers, a NAS, a build
+box — appear in the same window as the Mac's own engine. Add one with **+** beside
+**Hosts** in the sidebar; click a host to point the Containers, Images, Volumes and
+Networks panes at it. Everything works the same as it does locally: start and stop
+containers, follow logs, inspect, pull, prune, live CPU and memory.
+
+Velox connects over **SSH**, using your existing keys, `ssh-agent` and
+`~/.ssh/config`. It never asks for a password and **stores no credentials** — a
+host record is just a username, a hostname and a socket path. Under the hood it is
+one `ssh -L` per connected host forwarding the server's `/var/run/docker.sock`;
+nothing is installed or changed on the server.
+
+Two things are needed on the server:
+
+- SSH access with a key (`ssh you@server` already works from your Mac), and
+- your user in the `docker` group, so it can reach the daemon socket.
+
+If a host has never been connected to before, verify it once in Terminal
+(`ssh you@server`) so its key lands in `known_hosts` — Velox will not accept an
+unknown host key on your behalf.
+
+Workspaces stay a *this Mac* feature: a workspace is Velox's own data disk, while a
+remote host runs its own engine against its own storage. Removing a host from Velox
+removes it from the sidebar and nothing else — its containers, images and volumes
+are untouched.
+
 ## Published ports
 
 `-p` follows Docker's own default: a published port binds **all interfaces**,

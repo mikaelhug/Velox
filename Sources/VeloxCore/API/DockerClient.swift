@@ -1,16 +1,21 @@
 import Foundation
 
-/// Talks to the guest's `dockerd` over the Docker Engine HTTP API — but without
-/// any external socket file, subprocess, or third-party HTTP stack.
+/// Talks to a `dockerd` over the Docker Engine HTTP API — without any third-party
+/// HTTP stack.
 ///
-/// Because the GUI process embeds the engine, the client opens an **in-process**
-/// VSOCK connection straight to the guest (the same `VMManager.connectToGuestPort`
-/// the proxy uses) and speaks HTTP/1.1 on that fd itself (see `HTTPCodec`). One
-/// connection is used per request; streaming endpoints (logs/events/stats) hold
-/// their connection open for the life of the stream. Blocking socket I/O runs on
-/// a dedicated dispatch queue so it never stalls the actor or main thread.
+/// The client obtains a connected fd from a `DockerConnector` and speaks HTTP/1.1 on it
+/// itself (see `HTTPCodec`). For the embedded engine that connector opens an
+/// **in-process** VSOCK connection straight to the guest (the same
+/// `VMManager.connectToGuestPort` the proxy uses); for a remote host it connects to the
+/// local unix socket an `SSHTunnel` forwards to that server's daemon. Nothing below the
+/// connector knows the difference. One connection is used per request; streaming
+/// endpoints (logs/events/stats) hold their connection open for the life of the stream.
+/// Blocking socket I/O runs on a dedicated dispatch queue so it never stalls the actor
+/// or main thread.
 public actor DockerClient: DockerClientProtocol {
-    private nonisolated let manager: VMManager
+    /// Where the fd comes from — VSOCK to the guest, or a unix socket for a remote host
+    /// reached through an `SSHTunnel`. Everything below this line is transport-agnostic.
+    private nonisolated let connector: any DockerConnector
     /// Docker Engine API version pinned in the request path (`/v1.47/…`).
     /// 1.47 is within every modern daemon's supported range (Docker 27 max,
     /// well above Docker 29's minimum), so it works without per-connection
@@ -23,9 +28,14 @@ public actor DockerClient: DockerClientProtocol {
     /// (CLAUDE.md §8's "one persistent VSOCK connection"). See `DockerEventHub`.
     private nonisolated let eventHub: DockerEventHub
 
+    public init(connector: any DockerConnector) {
+        self.connector = connector
+        self.eventHub = DockerEventHub { DockerClient.rawEventsStream(connector: connector) }
+    }
+
+    /// The embedded engine — the overwhelmingly common case.
     public init(manager: VMManager) {
-        self.manager = manager
-        self.eventHub = DockerEventHub { DockerClient.rawEventsStream(manager: manager) }
+        self.init(connector: VsockConnector(manager: manager))
     }
 
     private static func path(_ suffix: String) -> String { "/\(apiVersion)\(suffix)" }
@@ -34,7 +44,7 @@ public actor DockerClient: DockerClientProtocol {
 
     private func openConnection() async throws -> Int32 {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int32, Error>) in
-            manager.connectToGuestPort(VsockPort.docker) { result in
+            connector.connect { result in
                 cont.resume(with: result)
             }
         }
@@ -190,6 +200,12 @@ public actor DockerClient: DockerClientProtocol {
         _ = try await send("DELETE", Self.path("/containers/\(id)?force=\(force ? 1 : 0)&v=1"))
     }
 
+    /// `GET /info`. Cheap and effectively static for a given daemon, so it is fetched once
+    /// per (re)connect by the informer rather than refreshed on a timer.
+    public func systemInfo() async throws -> SystemInfo {
+        try decode(SystemInfo.self, from: await send("GET", Self.path("/info"), readTimeout: 30))
+    }
+
     // MARK: - Image actions
 
     public func removeImage(_ id: String, force: Bool) async throws {
@@ -230,11 +246,11 @@ public actor DockerClient: DockerClientProtocol {
     public nonisolated func pullImage(_ reference: String) -> AsyncThrowingStream<String, Error> {
         let (image, tag) = Self.splitReference(reference)
         let path = Self.path("/images/create?fromImage=\(image.urlEncoded)&tag=\(tag.urlEncoded)")
-        let manager = self.manager
+        let connector = self.connector
         return AsyncThrowingStream { continuation in
             let conn = StreamConnection()
             continuation.onTermination = { _ in conn.cancel() }
-            manager.connectToGuestPort(VsockPort.docker) { result in
+            connector.connect { result in
                 switch result {
                 case .failure(let error):
                     continuation.finish(throwing: error)
@@ -282,8 +298,8 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     /// One raw `/events` connection — used only by the hub to feed all subscribers.
-    nonisolated static func rawEventsStream(manager: VMManager) -> AsyncStream<DockerEvent> {
-        makeStream(manager: manager, method: "GET", path: path("/events")) { bytes, acc, yield in
+    nonisolated static func rawEventsStream(connector: any DockerConnector) -> AsyncStream<DockerEvent> {
+        makeStream(connector: connector, method: "GET", path: path("/events")) { bytes, acc, yield in
             acc.append(bytes)
             for line in acc.takeLines() {
                 if let event = try? JSONDecoder().decode(DockerEvent.self, from: line) { yield(event) }
@@ -294,7 +310,7 @@ public actor DockerClient: DockerClientProtocol {
     public nonisolated func stats(container id: String) -> AsyncStream<ContainerStatsSample> {
         // Only the freshest sample matters, so drop backlog if a consumer (a paused
         // table) falls behind — a slow UI can't grow an unbounded queue of stale samples.
-        Self.makeStream(manager: manager, method: "GET", path: Self.path("/containers/\(id)/stats?stream=1"),
+        Self.makeStream(connector: connector, method: "GET", path: Self.path("/containers/\(id)/stats?stream=1"),
                         bufferingPolicy: .bufferingNewest(2)) { bytes, acc, yield in
             acc.append(bytes)
             for line in acc.takeLines() {
@@ -312,19 +328,19 @@ public actor DockerClient: DockerClientProtocol {
         // Cap the backlog: a container logging faster than a backgrounded log view drains
         // must not grow host memory without bound. Keep the newest frames (like `tail`) —
         // the view holds its own scrollback, so dropping the oldest un-drained lines is fine.
-        return Self.makeStream(manager: manager, method: "GET", path: path,
+        return Self.makeStream(connector: connector, method: "GET", path: path,
                                bufferingPolicy: .bufferingNewest(4096)) { bytes, acc, yield in
             acc.append(bytes)
             parser.parse(&acc, yield: yield)
         }
     }
 
-    /// Generic streaming helper: open a VSOCK connection, run the blocking HTTP
+    /// Generic streaming helper: open a connection, run the blocking HTTP
     /// stream on `ioQueue`, and feed body bytes through `parse`, which yields
     /// decoded items into the AsyncStream. Cancellation shuts the fd down via
     /// `StreamConnection` so a reader blocked in `read()` unwinds promptly.
     private nonisolated static func makeStream<T: Sendable>(
-        manager: VMManager,
+        connector: any DockerConnector,
         method: String,
         path: String,
         bufferingPolicy: AsyncStream<T>.Continuation.BufferingPolicy = .unbounded,
@@ -333,7 +349,7 @@ public actor DockerClient: DockerClientProtocol {
         return AsyncStream(bufferingPolicy: bufferingPolicy) { continuation in
             let conn = StreamConnection()
             continuation.onTermination = { _ in conn.cancel() }
-            manager.connectToGuestPort(VsockPort.docker) { result in
+            connector.connect { result in
                 switch result {
                 case .failure:
                     continuation.finish()

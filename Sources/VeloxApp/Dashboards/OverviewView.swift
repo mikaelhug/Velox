@@ -10,10 +10,13 @@ final class OverviewModel {
     let store: DockerResourceStore
     /// Resolved location of `data.img` (honors a relocated data disk). The model is recreated
     /// on every pane switch, so capturing it at init stays correct after a move.
-    private let dataDiskURL: URL
+    ///
+    /// **nil for a remote host** — the daemon's storage lives on a machine this process
+    /// can't stat. The Disk card falls back to dockerd's own `/system/df` total there.
+    private let dataDiskURL: URL?
     private(set) var diskUsedBytes: Int64?
 
-    init(store: DockerResourceStore, dataDiskURL: URL) {
+    init(store: DockerResourceStore, dataDiskURL: URL?) {
         self.store = store
         self.dataDiskURL = dataDiskURL
         // Synchronous metadata read — fill the disk gauge BEFORE the first frame so
@@ -37,8 +40,16 @@ final class OverviewModel {
     /// Host-side read of the data disk's actual (sparse) footprint. Cheap; refreshed
     /// on appear and when the container set changes.
     func refreshDiskUsage() {
+        guard let dataDiskURL else { diskUsedBytes = nil; return }
         let vals = try? dataDiskURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey])
         diskUsedBytes = vals?.totalFileAllocatedSize.map(Int64.init)
+    }
+
+    /// What dockerd itself reports as in use — the only storage figure available for a
+    /// remote host, and a sane fallback before the local stat lands.
+    var reportedUsedBytes: Int64? {
+        guard let df = store.diskUsage else { return nil }
+        return (df.layersSize ?? 0) + totalVolumeBytes
     }
 }
 
@@ -46,6 +57,12 @@ final class OverviewModel {
 /// usage section. Shown by the shell only while the engine is running.
 struct OverviewView: View {
     let stats: StatsStore
+    let docker: any DockerClientProtocol
+    /// Non-nil when this pane is showing a remote host rather than the Mac's own engine.
+    /// Resolved fresh by `RootView` rather than read off the session, whose `host` is a
+    /// snapshot taken at connect time and goes stale the moment the host is renamed.
+    let remoteHost: RemoteHost?
+    let remoteState: SSHTunnel.State?
     @Environment(EngineController.self) private var engine
     @State private var model: OverviewModel
     @State private var showReclaim = false
@@ -54,8 +71,13 @@ struct OverviewView: View {
     // in. Refreshed with the disk gauge (on appear + when the container set changes;
     // no timer); a failure keeps the snapshot and surfaces the error in the banner.
 
-    init(store: DockerResourceStore, stats: StatsStore, dataDiskURL: URL) {
+    init(store: DockerResourceStore, stats: StatsStore, docker: any DockerClientProtocol,
+         dataDiskURL: URL?, remoteHost: RemoteHost? = nil,
+         remoteState: SSHTunnel.State? = nil) {
         self.stats = stats
+        self.docker = docker
+        self.remoteHost = remoteHost
+        self.remoteState = remoteState
         _model = State(initialValue: OverviewModel(store: store, dataDiskURL: dataDiskURL))
     }
 
@@ -90,19 +112,79 @@ struct OverviewView: View {
             }
         }
         .sheet(isPresented: $showReclaim) {
-            if let docker = engine.docker {
-                ReclaimSpaceSheet(docker: docker, seed: model.store.diskUsage,
-                                  isPresented: $showReclaim) {
-                    model.refreshDiskUsage()
-                    Task { await model.store.refreshDiskUsage() }
-                }
+            ReclaimSpaceSheet(docker: docker, seed: model.store.diskUsage,
+                              isPresented: $showReclaim,
+                              remoteHostName: remoteHost?.name) {
+                model.refreshDiskUsage()
+                Task { await model.store.refreshDiskUsage() }
             }
         }
     }
 
     // MARK: Hero
 
+    @ViewBuilder
     private var hero: some View {
+        if let remoteHost { remoteHero(remoteHost, remoteState ?? .stopped) } else { localHero }
+    }
+
+    /// A remote host's hero: who we're connected to, not what this Mac is running. There is
+    /// no uptime, vCPU or RAM line — those describe Velox's VM, and claiming them for a
+    /// server we only hold a socket to would be a lie.
+    private func remoteHero(_ host: RemoteHost, _ state: SSHTunnel.State) -> some View {
+        DashboardCard {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle().fill(remoteTint(state).opacity(0.18)).frame(width: 46, height: 46)
+                    Image(systemName: "server.rack")
+                        .font(.title2)
+                        .foregroundStyle(remoteTint(state))
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(host.name).font(.headline)
+                        Text("· \(state.label.lowercased())")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
+                    // The same slot the local engine uses for "8 vCPU · 8 GB RAM · …",
+                    // filled from the remote daemon's own `/info`.
+                    Text(remoteSummary(host)).font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(model.store.systemInfo?.serverVersion.map { "Docker \($0)" }
+                         ?? "over SSH")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text(model.store.systemInfo?.operatingSystem ?? host.subtitle)
+                        .font(.caption).foregroundStyle(.tertiary)
+                        .lineLimit(1).truncationMode(.tail)
+                }
+            }
+        }
+    }
+
+    /// CPU / RAM / architecture from the remote daemon, falling back to who we are talking
+    /// to until `/info` lands. Every field is optional on purpose — one missing key in a
+    /// version-dependent document must not blank the whole line.
+    private func remoteSummary(_ host: RemoteHost) -> String {
+        guard let info = model.store.systemInfo else { return host.subtitle }
+        var parts: [String] = []
+        if let cpus = info.cpus { parts.append("\(cpus) CPU\(cpus == 1 ? "" : "s")") }
+        if let mem = info.memoryDescription { parts.append("\(mem) RAM") }
+        if let arch = info.architecture { parts.append(arch) }
+        return parts.isEmpty ? host.subtitle : parts.joined(separator: " · ")
+    }
+
+    private func remoteTint(_ state: SSHTunnel.State) -> Color {
+        switch state {
+        case .connected:  return .green
+        case .connecting: return .yellow
+        case .failed:     return .red
+        case .stopped:    return .secondary
+        }
+    }
+
+    private var localHero: some View {
         DashboardCard {
             HStack(spacing: 14) {
                 ZStack {
@@ -132,6 +214,18 @@ struct OverviewView: View {
         }
     }
 
+    /// Local: the data disk's real sparse footprint. Remote: what dockerd reports, since
+    /// the storage is on another machine.
+    private var diskValue: String {
+        let bytes = remoteHost == nil ? model.diskUsedBytes : model.reportedUsedBytes
+        return bytes.map(Format.bytes) ?? "—"
+    }
+
+    private var diskCaption: String {
+        if remoteHost != nil { return "images + volumes on the host" }
+        return "of \(engine.activeWorkspace?.diskGiB ?? engine.config.diskGiB) GB allocated"
+    }
+
     private var dfError: String? {
         model.store.diskUsageError.map { "Disk breakdown unavailable: \($0)" }
     }
@@ -152,8 +246,8 @@ struct OverviewView: View {
             StatCard(title: "Volumes", systemImage: "externaldrive", value: "\(model.volumes.count)",
                      caption: "\(Format.bytes(model.totalVolumeBytes)) stored", tint: .orange)
             StatCard(title: "Disk", systemImage: "internaldrive",
-                     value: model.diskUsedBytes.map(Format.bytes) ?? "—",
-                     caption: "of \(engine.activeWorkspace?.diskGiB ?? engine.config.diskGiB) GB allocated",
+                     value: diskValue,
+                     caption: diskCaption,
                      tint: .purple)
         }
     }
@@ -326,6 +420,10 @@ private struct DiskBreakdownCard: View {
 /// hole-punches the raw data disk, so reclaimed bytes return to macOS by themselves.
 private struct ReclaimSpaceSheet: View {
     let docker: any DockerClientProtocol
+    /// Name of the host being pruned when it isn't this Mac. Prune is irreversible and
+    /// this sheet is byte-identical for both engines, so the one thing it must not do is
+    /// leave the user unsure which machine they are about to delete data on.
+    let remoteHostName: String?
     @Binding var isPresented: Bool
     /// Called after a successful run so the disk gauge refreshes.
     var onReclaimed: () -> Void = {}
@@ -343,8 +441,9 @@ private struct ReclaimSpaceSheet: View {
     @State private var usage: DiskUsage?
 
     init(docker: any DockerClientProtocol, seed: DiskUsage?, isPresented: Binding<Bool>,
-         onReclaimed: @escaping () -> Void = {}) {
+         remoteHostName: String? = nil, onReclaimed: @escaping () -> Void = {}) {
         self.docker = docker
+        self.remoteHostName = remoteHostName
         self.onReclaimed = onReclaimed
         _isPresented = isPresented
         _usage = State(initialValue: seed)
@@ -368,9 +467,11 @@ private struct ReclaimSpaceSheet: View {
                     }
                     .tint(.red)
                 } header: {
-                    Text("Reclaim Space")
+                    Text(remoteHostName.map { "Reclaim Space on \($0)" } ?? "Reclaim Space")
                 } footer: {
-                    Text("Removes Docker data nothing references. Volumes hold real data — leave them off unless you're sure. Freed space returns to macOS automatically (the data disk is TRIMmed).")
+                    Text(remoteHostName == nil
+                         ? "Removes Docker data nothing references. Volumes hold real data — leave them off unless you're sure. Freed space returns to macOS automatically (the data disk is TRIMmed)."
+                         : "Removes Docker data nothing references on this server. This deletes data on the remote machine and cannot be undone. Volumes hold real data — leave them off unless you're sure.")
                 }
                 if let reclaimed {
                     Section {
@@ -442,6 +543,7 @@ struct OverviewView_Previews: PreviewProvider {
         OverviewView(store: DockerResourceStore(docker: MockDockerClient()),
                      stats: StatsStore(docker: MockDockerClient(),
                                        resources: DockerResourceStore(docker: MockDockerClient())),
+                     docker: MockDockerClient(),
                      dataDiskURL: Paths.dataDisk)
             .environment(EngineController())
             .frame(width: 820, height: 560)

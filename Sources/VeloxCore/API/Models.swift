@@ -639,3 +639,78 @@ public struct LogFrame: Sendable, Hashable {
     public let text: String
     public init(stream: Stream, text: String) { self.stream = stream; self.text = text }
 }
+
+/// The subset of `GET /info` worth showing: what machine is actually running this daemon.
+///
+/// For the embedded engine these numbers are already known (the user chose them in
+/// Settings), but for a **remote host** this is the only way to answer "what am I looking
+/// at" — the box's CPU count, RAM, OS and engine version. Every field is optional: `/info`
+/// is a large, version-dependent document, and one missing key must never cost the rest.
+///
+/// Note there is deliberately no disk *capacity* here — the Docker API does not report the
+/// filesystem's size, only what the engine is using (`/system/df`). Shelling out to `df`
+/// over the SSH tunnel would be a second data source and a poll, so the Disk card shows
+/// usage rather than inventing a capacity.
+public struct SystemInfo: Decodable, Sendable, Equatable {
+    public let cpus: Int?
+    public let memoryBytes: Int64?
+    public let operatingSystem: String?
+    public let kernelVersion: String?
+    public let architecture: String?
+    public let serverVersion: String?
+    public let name: String?
+
+    enum CodingKeys: String, CodingKey {
+        case cpus = "NCPU"
+        case memoryBytes = "MemTotal"
+        case operatingSystem = "OperatingSystem"
+        case kernelVersion = "KernelVersion"
+        case architecture = "Architecture"
+        case serverVersion = "ServerVersion"
+        case name = "Name"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cpus = try c.decodeIfPresent(Int.self, forKey: .cpus)
+        memoryBytes = try c.decodeIfPresent(Int64.self, forKey: .memoryBytes)
+        operatingSystem = try c.decodeIfPresent(String.self, forKey: .operatingSystem)
+        kernelVersion = try c.decodeIfPresent(String.self, forKey: .kernelVersion)
+        architecture = try c.decodeIfPresent(String.self, forKey: .architecture)
+        serverVersion = try c.decodeIfPresent(String.self, forKey: .serverVersion)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+    }
+
+    /// RAM as reported by the daemon's host, in binary GB (the unit RAM is always quoted
+    /// in, and the one the rest of the app uses).
+    ///
+    /// This is `MemTotal` — what the **kernel can allocate**, which is not what is
+    /// installed: firmware, the kernel image and reservations like an integrated GPU
+    /// aperture are already subtracted, so a 12 GiB machine reports ~11.58. That gap is
+    /// real and machine-specific.
+    ///
+    /// It is deliberately **not** rounded up to the nearest power of two to guess the
+    /// installed size. The Docker API cannot report installed RAM (that needs `dmidecode`
+    /// as root), so rounding would state a number no source ever gave us — and on a host
+    /// with a large reservation it would state the wrong one. One decimal is enough
+    /// precision for a spec line without looking like a measurement error.
+    public var memoryDescription: String? {
+        guard let memoryBytes, memoryBytes > 0 else { return nil }
+        let gb = Double(memoryBytes) / 1_073_741_824
+        // Trim a trailing ".0" so an exact 16 GiB reads "16 GB", not "16.0 GB".
+        let text = String(format: "%.1f", gb)
+        return (text.hasSuffix(".0") ? String(text.dropLast(2)) : text) + " GB"
+    }
+
+    public init(cpus: Int?, memoryBytes: Int64?, operatingSystem: String? = nil,
+                kernelVersion: String? = nil, architecture: String? = nil,
+                serverVersion: String? = nil, name: String? = nil) {
+        self.cpus = cpus
+        self.memoryBytes = memoryBytes
+        self.operatingSystem = operatingSystem
+        self.kernelVersion = kernelVersion
+        self.architecture = architecture
+        self.serverVersion = serverVersion
+        self.name = name
+    }
+}

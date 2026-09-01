@@ -25,6 +25,10 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     /// a nil here silently skips the guest flush this whole class exists to guarantee,
     /// and the controller lives for the process anyway.
     static var engine: EngineController?
+    /// Set alongside `engine`. Remote hosts own `ssh` child processes and unix sockets in
+    /// `~/.velox/hosts/`; both must go when the app does, or the children are orphaned and
+    /// their stale sockets block the next connect.
+    static var remotes: RemoteHostController?
     private var stopping = false
     private var replied = false
     private var watchdog: Timer?
@@ -38,6 +42,9 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     private static let stopDeadline: TimeInterval = 90
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Cheap, synchronous, and independent of the VM shutdown below — do it first so it
+        // happens even on the `.terminateNow` paths.
+        MainActor.assumeIsolated { Self.remotes?.disconnectAll() }
         guard let engine = Self.engine else { return .terminateNow }
         // A second request — an impatient ⌘Q, or a logout/restart arriving while a ⌘Q
         // shutdown is still in flight (the guest `sync()` alone gets up to 60 s). Neither
@@ -106,6 +113,10 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
 @main
 struct VeloxApp: App {
     @State private var engine = EngineController()
+    /// Remote Docker hosts. Deliberately a *sibling* of `engine`, not a member: a remote
+    /// host has no VM, no data disk and no instance lock, and folding it into the engine
+    /// controller would blur exactly the line that keeps this feature cheap.
+    @State private var remotes = RemoteHostController()
     @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var appDelegate
 
     init() {
@@ -115,7 +126,10 @@ struct VeloxApp: App {
         // a BuildKit build (devcontainers `up`) half-closes its hijacked `/session`
         // stream and the next proxy write kills the whole GUI app.
         signal(SIGPIPE, SIG_IGN)
-        MainActor.assumeIsolated { AppTerminationDelegate.engine = engine }
+        MainActor.assumeIsolated {
+            AppTerminationDelegate.engine = engine
+            AppTerminationDelegate.remotes = remotes
+        }
     }
 
     var body: some Scene {
@@ -133,6 +147,7 @@ struct VeloxApp: App {
         Window("Velox", id: WindowID.dashboard) {
             RootView()
                 .environment(engine)
+                .environment(remotes)
                 .sheet(isPresented: Binding(
                     get: { engine.needsOnboarding },
                     set: { if !$0 { engine.completeOnboarding() } }
@@ -172,6 +187,7 @@ struct VeloxApp: App {
             if let target {
                 LogWindowHost(target: target)
                     .environment(engine)
+                    .environment(remotes)
             }
         }
         .windowResizability(.contentMinSize)
