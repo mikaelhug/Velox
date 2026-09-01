@@ -129,7 +129,7 @@ public struct RemoteHost: Codable, Sendable, Equatable, Identifiable {
 
     /// A leading `-` makes ssh read the value as an option rather than a destination or a
     /// path — and `-oProxyCommand=…` is executed through `/bin/sh`.
-    public static func optionLikeComplaint(_ text: String, field: String) -> String? {
+    static func optionLikeComplaint(_ text: String, field: String) -> String? {
         text.hasPrefix("-") ? "\(field) can't start with a dash." : nil
     }
 

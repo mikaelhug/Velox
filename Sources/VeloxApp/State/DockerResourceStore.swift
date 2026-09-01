@@ -152,7 +152,10 @@ final class DockerResourceStore {
             do {
                 containers = try await docker.containers()
                 containersError = nil; containersLoaded = true
-                onReachable?()
+                // Not after cancellation: an in-flight request completes even once the
+                // informer is stopped (the client has no cancellation handler), and firing
+                // this then would report a dead tunnel as reachable on a stale result.
+                if !Task.isCancelled { onReachable?() }
                 await refreshAnchors()
             }
             catch { if containersLoaded { containersError = "\(error)" } }

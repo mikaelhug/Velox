@@ -200,8 +200,16 @@ public final class SSHTunnel: @unchecked Sendable {
             return
         }
         do {
-            try FileManager.default.createDirectory(at: Paths.remoteHosts,
-                                                    withIntermediateDirectories: true)
+            // 0700: each socket in here is unauthenticated access to a remote Docker daemon
+            // — root-equivalent on that machine. OpenSSH's `StreamLocalBindMask` already
+            // makes the socket itself 0600; this closes the directory on a shared Mac too.
+            let fm = FileManager.default
+            try fm.createDirectory(at: Paths.remoteHosts, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            // Set it explicitly as well: `createDirectory`'s attributes apply only when it
+            // actually creates the directory, so an install that already has one from an
+            // earlier build would otherwise keep the old 0755 forever.
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: Paths.remoteHosts.path)
         } catch {
             publish(.failed("Couldn't create \(Paths.remoteHosts.path): \(error.localizedDescription)"))
             return
@@ -261,7 +269,15 @@ public final class SSHTunnel: @unchecked Sendable {
 
         process.terminationHandler = { [weak self] proc in
             guard let self else { return }
-            self.queue.async { self.handleExit(of: proc, drained: drained) }
+            // ssh writes its diagnostic immediately before exiting, and termination can be
+            // observed before the reader has seen those bytes — so wait, briefly and
+            // bounded, for EOF. Deliberately waited HERE, on the termination handler's own
+            // thread, and not inside `handleExit`: that runs on the single queue every
+            // tunnel shares, which `drainPendingWork()` must drain within `settle`'s 5s
+            // budget at app quit. Blocking it per flapping host would eat that budget and
+            // orphan `ssh` children — the exact failure `drainPendingWork` exists to stop.
+            _ = drained.wait(timeout: .now() + .milliseconds(250))
+            self.queue.async { self.handleExit(of: proc) }
         }
 
         // Cleared BEFORE launch: the reader thread is already running, so clearing after
@@ -286,7 +302,7 @@ public final class SSHTunnel: @unchecked Sendable {
         Log.info("ssh tunnel \(host.name): \(host.sshDestination) → \(host.localSocketURL.lastPathComponent)")
     }
 
-    private func handleExit(of process: Process, drained: DispatchSemaphore) {
+    private func handleExit(of process: Process) {
         let shouldRetry: Bool = box.withLock { s in
             // A deliberate stop, or the exit of a child we already replaced.
             guard !s.stopping, s.process === process else { return false }
@@ -298,11 +314,6 @@ public final class SSHTunnel: @unchecked Sendable {
         guard shouldRetry else { return }
         removeSocket()
 
-        // ssh writes its diagnostic immediately before exiting, and termination can be
-        // observed before the reader has seen those bytes. Wait — briefly, and bounded — for
-        // EOF, or the message gets composed from a half-drained buffer and a precise
-        // "Permission denied (publickey)" degrades to a bare exit code.
-        _ = drained.wait(timeout: .now() + .milliseconds(250))
         let diagnostics = box.value.stderr
         let reason = Self.explain(diagnostics: diagnostics,
                                   status: process.terminationStatus,
@@ -331,11 +342,11 @@ public final class SSHTunnel: @unchecked Sendable {
 
     // MARK: - Command construction (pure — exercised by velox-selftest)
 
-    public static let sshPath = "/usr/bin/ssh"
+    private static let sshPath = "/usr/bin/ssh"
 
     /// `sockaddr_un.sun_path` is 104 bytes on Darwin, and OpenSSH applies the same bound
     /// when parsing a `-L` unix-socket forward.
-    public static let maxSocketPathBytes = 104
+    private static let maxSocketPathBytes = 104
 
     /// Why this host's forwarded socket path can't be used, or nil when it's fine.
     /// Pure, so `velox-selftest` can pin the boundary without spawning ssh.

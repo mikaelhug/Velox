@@ -57,9 +57,16 @@ final class RemoteHostSession {
     func start() {
         // The tunnel publishes from a background queue; hop to the main actor to touch
         // observable state.
-        tunnel.onStateChange = { [weak self] state in
+        tunnel.onStateChange = { [weak self, weak tunnel] _ in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, let tunnel else { return }
+                // Read the tunnel's CURRENT state rather than the value this notification
+                // carried. Two `Task { @MainActor }` hops enqueued from the tunnel's queue
+                // have no ordering guarantee between them, so a stale one could otherwise
+                // leave the informer stopped while the tunnel is connecting — and with
+                // nothing calling `containers()`, `markReachable` would never fire and the
+                // session would sit wedged. Converging on the live value is order-free.
+                let state = tunnel.state
                 self.state = state
                 // The informer's own reconnect loop retries every second, forever, and a
                 // session is only torn down by an explicit Disconnect — so a host that is
