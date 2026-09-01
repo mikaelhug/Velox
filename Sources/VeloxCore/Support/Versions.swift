@@ -4,7 +4,7 @@
 /// Version numbers surfaced to the host (CLI, status, updater).
 public enum Versions {
     /// Velox release version.
-    public static let velox = "1.3.2"
+    public static let velox = "1.4.0"
     /// GitHub repo (owner/name) the updater checks for new releases.
     public static let githubRepo = "mikaelhug/Velox"
     /// Privileged-port-helper revision. The helper is (re)installed (one admin prompt) only when
