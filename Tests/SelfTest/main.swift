@@ -6,6 +6,13 @@ import VeloxCore
 // available under Command Line Tools (this repo's toolchain), so we assert by
 // hand and exit non-zero on the first failure. Run: `swift run velox-selftest`.
 
+// Ignore SIGPIPE, exactly as `velox` and `VeloxApp` do at startup. Several tests drive real
+// sockets, and writing to one whose peer has already closed must surface as EPIPE rather
+// than kill the process. Without this the socket tests are timing-dependent: they passed on
+// a developer's Mac and killed the runner with signal 13 (exit 141) in CI, producing a
+// failure with no output at all.
+signal(SIGPIPE, SIG_IGN)
+
 var failures = 0
 @MainActor func check(_ condition: Bool, _ message: String) {
     if condition {
@@ -999,6 +1006,11 @@ do {
     let server = Thread {
         let client = accept(listener, nil, nil)
         guard client >= 0 else { return }
+        // Read the request FIRST. Replying and closing immediately can win the race against
+        // the client's write, which then lands on a closed peer — an EPIPE the test has no
+        // reason to exercise.
+        var scratch = [UInt8](repeating: 0, count: 4096)
+        _ = scratch.withUnsafeMutableBytes { read(client, $0.baseAddress, $0.count) }
         let body = "[{\"Id\":\"abc\"}]"
         let response = "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\n\r\n" + body
         _ = Array(response.utf8).withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
