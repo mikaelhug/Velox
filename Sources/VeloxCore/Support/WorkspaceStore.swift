@@ -180,7 +180,7 @@ public enum WorkspaceStore {
         try body(&manifest)
         try validate(manifest)
         manifest.revision &+= 1
-        try backup()
+        backup()
         try writeDurably(manifest)
         return manifest
     }
@@ -512,50 +512,25 @@ public enum WorkspaceStore {
 
     // MARK: - Persistence
 
-    private static var decoder: JSONDecoder {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }
 
-    private static var encoder: JSONEncoder {
-        let e = JSONEncoder()
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        e.dateEncodingStrategy = .iso8601
-        return e
-    }
 
-    /// Keep the last good manifest alongside the live one. Cheap insurance: this file is the
-    /// only thing that knows where a relocated workspace's disk is.
-    private static func backup() throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: Paths.workspaceManifest.path) else { return }
-        let bak = Paths.workspaceManifest.appendingPathExtension("bak")
-        try? fm.removeItem(at: bak)
-        try? fm.copyItem(at: Paths.workspaceManifest, to: bak)
-    }
 
     /// Temp file → fsync → `rename(2)` → fsync the directory. `Data.write(.atomic)` gets the
-    /// rename but not the directory fsync, and losing this file loses the only record of
-    /// where a relocated workspace lives.
+    // MARK: - Persistence
+    //
+    // The encoder, the backup copy and the durable-write sequence are shared with
+    // `RemoteHostStore` via `JSONManifest` (CLAUDE.md §10) — they were byte-identical, and
+    // the tmp→fsync→rename→dir-fsync ordering is exactly the kind of thing two copies
+    // eventually disagree about. What stays here is what genuinely differs: this manifest's
+    // type, its path, and the rule that a missing or empty one is a fault.
+
+    private static var decoder: JSONDecoder { JSONManifest.decoder }
+
+    private static func backup() { JSONManifest.backup(Paths.workspaceManifest) }
+
     /// Public so `velox-selftest` can construct edge-case manifests (a dangling activeID)
     /// directly, the way `validateDiskPaths` is exercised.
     public static func writeDurably(_ manifest: WorkspaceManifest) throws {
-        try Paths.ensureRoot()
-        let target = Paths.workspaceManifest
-        let tmp = target.appendingPathExtension("tmp")
-        let data = try encoder.encode(manifest)
-        try? FileManager.default.removeItem(at: tmp)
-        try data.write(to: tmp)
-        if let handle = try? FileHandle(forWritingTo: tmp) {
-            try? handle.synchronize()
-            try? handle.close()
-        }
-        guard Darwin.rename(tmp.path, target.path) == 0 else {
-            let err = errno
-            try? FileManager.default.removeItem(at: tmp)
-            throw VeloxError.socketSetupFailed("rename(\(target.lastPathComponent))", err)
-        }
-        Storage.fsyncDirectory(target.deletingLastPathComponent())
+        try JSONManifest.writeDurably(manifest, to: Paths.workspaceManifest)
     }
 }

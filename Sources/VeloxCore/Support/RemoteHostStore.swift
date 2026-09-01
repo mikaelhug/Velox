@@ -112,7 +112,7 @@ public enum RemoteHostStore {
         try body(&manifest)
         try validate(manifest)
         manifest.revision &+= 1
-        try backup()
+        backup()
         try writeDurably(manifest)
         return manifest
     }
@@ -187,46 +187,19 @@ public enum RemoteHostStore {
 
     // MARK: - Persistence
 
-    private static var decoder: JSONDecoder {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }
 
-    private static var encoder: JSONEncoder {
-        let e = JSONEncoder()
-        e.outputFormatting = [.prettyPrinted, .sortedKeys]
-        e.dateEncodingStrategy = .iso8601
-        return e
-    }
 
-    private static func backup() throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: Paths.remoteHostManifest.path) else { return }
-        let bak = Paths.remoteHostManifest.appendingPathExtension("bak")
-        try? fm.removeItem(at: bak)
-        try? fm.copyItem(at: Paths.remoteHostManifest, to: bak)
-    }
 
-    /// Temp file → fsync → `rename(2)` → fsync the directory, matching
-    /// `WorkspaceStore.writeDurably`. Public so `velox-selftest` can plant edge-case
-    /// manifests directly.
+    // MARK: - Persistence
+    //
+    // Shared with `WorkspaceStore` through `JSONManifest` — see the note there.
+
+    private static var decoder: JSONDecoder { JSONManifest.decoder }
+
+    private static func backup() { JSONManifest.backup(Paths.remoteHostManifest) }
+
+    /// Public so `velox-selftest` can plant edge-case manifests directly.
     public static func writeDurably(_ manifest: RemoteHostManifest) throws {
-        try Paths.ensureRoot()
-        let target = Paths.remoteHostManifest
-        let tmp = target.appendingPathExtension("tmp")
-        let data = try encoder.encode(manifest)
-        try? FileManager.default.removeItem(at: tmp)
-        try data.write(to: tmp)
-        if let handle = try? FileHandle(forWritingTo: tmp) {
-            try? handle.synchronize()
-            try? handle.close()
-        }
-        guard Darwin.rename(tmp.path, target.path) == 0 else {
-            let err = errno
-            try? FileManager.default.removeItem(at: tmp)
-            throw VeloxError.socketSetupFailed("rename(\(target.lastPathComponent))", err)
-        }
-        Storage.fsyncDirectory(target.deletingLastPathComponent())
+        try JSONManifest.writeDurably(manifest, to: Paths.remoteHostManifest)
     }
 }
