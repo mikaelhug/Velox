@@ -384,7 +384,9 @@ public final class UDPForwarder: @unchecked Sendable {
     private func connect(_ flow: Flow, port: UInt16, key: FlowKey) {
         manager.connectToGuestPort(VsockPort.reverse) { [weak self] result in
             guard let self else { return }
-            self.queue.async {
+            // Strong for this one queue hop; the relay callbacks registered below are
+            // long-lived and stay weak.
+            self.queue.async { [self] in
                 // Flow may have been reclaimed while connecting.
                 guard let listener = self.listeners[port], listener.flows[key] === flow else {
                     if case .success(let fd) = result { Darwin.close(fd) }

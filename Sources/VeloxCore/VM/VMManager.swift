@@ -33,7 +33,9 @@ public final class VMManager: NSObject, VZVirtualMachineDelegate, @unchecked Sen
         // The configuration is only ever touched on the VM queue (where the machine is created
         // and runs) and the caller hands it off without reusing it — safe to carry into the queue.
         nonisolated(unsafe) let configuration = configuration
-        queue.async {
+        // Strong for this one queue hop; the machine's start completion below is stored by VZ
+        // and stays weak.
+        queue.async { [self] in
             // Defense-in-depth against a double-start orphaning a live VM onto the same
             // data disk (the EngineController state machine + the process-wide InstanceLock
             // are the primary guards; this makes VMManager itself refuse).

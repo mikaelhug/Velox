@@ -115,7 +115,11 @@ final class StatsStore {
         guard tracking, gen == trackGeneration else { return }
         let running = withObservationTracking {
             runningIDs()
-        } onChange: {
+        } onChange: { [weak self] in
+            // Weak from the outer closure on. `resources` holds this closure until its NEXT
+            // change, and we hold `resources` — so an implicit strong capture here was a cycle:
+            // after an engine stop or a remote-host disconnect both stores stayed alive, since
+            // a dead store's list never changes again (measured with the real stores).
             Task { @MainActor [weak self] in self?.trackRunning(gen: gen) }
         }
         syncStreams(running: running)

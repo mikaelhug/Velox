@@ -950,7 +950,9 @@ final class EngineController {
 
         do {
             let id = workspace.id
-            try await Task.detached(priority: .userInitiated) {
+            // Weak from the outer closure on, as in `cloneWorkspace`: the detached task only
+            // forwards `self` to the progress callback and has no reason to own the controller.
+            try await Task.detached(priority: .userInitiated) { [weak self] in
                 // `relocate` stages the data at the destination, persists the new location,
                 // and only then drops the original — so a crash anywhere in it leaves the
                 // manifest pointing at a disk that exists.
