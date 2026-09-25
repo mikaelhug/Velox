@@ -350,8 +350,40 @@ struct ContainersView: View {
 
     // MARK: Cells
 
-    @ViewBuilder
+    /// Named access is a local-engine feature (a `.velox.local` responder plus a host route
+    /// to Velox's own VM); a remote host has neither, so its rows never carry a domain line.
+    private var showsDomainLine: Bool { !dockerTarget.isRemote }
+
+    private static let projectSymbol = "square.stack.3d.up.fill"
+
+    /// Every row — running, stopped or a Compose header — is exactly this tall, whatever
+    /// it shows. Not just for looks: the AppKit table under `Table` sizes rows from
+    /// RECYCLED cells, so with mixed heights an insert/remove (`docker run`/`rm` from the
+    /// CLI) left rows at the previous occupant's height — two-line rows squeezed, one-line
+    /// rows padded. Measured in a harness mirroring this table: most add/remove rounds left
+    /// a stale height; none once every row measured the same. The template is the union of
+    /// both row kinds (the header's symbol stands half a point taller than a name line), so
+    /// nothing can outgrow it.
+    private var rowHeightTemplate: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(spacing: 6) {
+                Image(systemName: Self.projectSymbol)
+                Text(verbatim: " ").fontWeight(.semibold)
+            }
+            if showsDomainLine { Text(verbatim: " ").font(.caption2) }
+        }
+        .hidden()
+    }
+
     private func nameCell(_ row: ContainerRow) -> some View {
+        ZStack(alignment: .leading) {
+            rowHeightTemplate
+            nameContent(row)
+        }
+    }
+
+    @ViewBuilder
+    private func nameContent(_ row: ContainerRow) -> some View {
         switch row {
         case .container(let c):
             HStack(spacing: 6) {
@@ -360,20 +392,24 @@ struct ContainersView: View {
                     Text(c.displayName).fontWeight(.medium)
                     // Named access — the engine's flagship: the container's real IP by
                     // name, any protocol, no -p. Click → browser; copy lives in the menu.
-                    // Named access is a local-engine feature (a `.velox.local` responder
-                    // plus a host route to Velox's own VM); a remote host has neither.
-                    if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
-                        Button(domain) { RowActions.openDomain(domain) }
-                            .buttonStyle(.plain)
-                            .font(.caption2)
-                            .foregroundStyle(.link)
-                            .help("Open http://\(domain)/")
+                    if showsDomainLine {
+                        if let domain = c.namedAccessDomain {
+                            Button(domain) { RowActions.openDomain(domain) }
+                                .buttonStyle(.plain)
+                                .font(.caption2)
+                                .foregroundStyle(.link)
+                                .help("Open http://\(domain)/")
+                        } else {
+                            // Keeps a stopped container's name on the same line as a
+                            // running one's (the template already fixes the height).
+                            Text(verbatim: " ").font(.caption2).hidden()
+                        }
                     }
                 }
             }
         case .project(let g):
             HStack(spacing: 6) {
-                Image(systemName: "square.stack.3d.up.fill").foregroundStyle(.blue)
+                Image(systemName: Self.projectSymbol).foregroundStyle(.blue)
                 Text(g.name).fontWeight(.semibold)
             }
         }
