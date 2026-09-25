@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-release}"
+. ./Scripts/toolchain.sh   # the bin path below must come from the same toolchain
 ./Scripts/build.sh "$CONFIG"
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/velox"
 exec "$BIN" "$@"

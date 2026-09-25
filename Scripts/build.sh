@@ -9,7 +9,7 @@ ENTITLEMENTS="Resources/Entitlements/velox.entitlements"
 
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
-. ./Scripts/swift-sdk.sh
+. ./Scripts/toolchain.sh
 
 # Build every product (velox CLI + VeloxApp GUI + velox-porthelper) so a break in any
 # target is caught in the dev loop — not only the CLI (a GUI-only break once shipped silently).

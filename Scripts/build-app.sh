@@ -42,7 +42,7 @@ DIST="${DIST:-dist}"
 
 echo "==> regenerate Versions.swift from versions.env"
 ./Scripts/gen-versions.sh
-. ./Scripts/swift-sdk.sh
+. ./Scripts/toolchain.sh
 
 echo "==> swift build -c $CONFIG (VeloxApp + velox CLI + porthelper)"
 swift build -c "$CONFIG" --product VeloxApp

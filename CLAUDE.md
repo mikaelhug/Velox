@@ -521,5 +521,12 @@ docker context use velox    # point the stock docker CLI at Velox
 docker ps                   # talk to it
 ```
 
+Host builds use **Xcode `XCODE_MAJOR`** (versions.env) — its macOS SDK, exactly like the
+release CI's `xcode-<N>` runner. Every script that runs `swift` sources `Scripts/toolchain.sh`,
+which selects Xcode even when `xcode-select` points at the Command Line Tools and **refuses**
+an older SDK or a CLT-only toolchain (the SDK's SwiftUI macros ship only with Xcode). Never
+reintroduce a quiet fallback to an older SDK: a local build that differs from the shipped one
+hid a SwiftUI behaviour change (`App.init` running twice) that only the SDK-27 build had.
+
 Only `com.apple.security.virtualization` is required for signing (NOT
 `com.apple.security.hypervisor`, which is for raw Hypervisor.framework).

@@ -288,8 +288,9 @@ runs on macOS 15, not just 26.
 
 ## Build from source
 
-Needs Docker (guest builds run in `linux/arm64` containers) and a Swift 6
-toolchain (Command Line Tools are enough).
+Needs Docker (guest builds run in `linux/arm64` containers) and Xcode 27 — the
+Command Line Tools alone can't compile the app against the macOS 27 SDK. The build
+scripts use Xcode's toolchain automatically and refuse an older one.
 
 ```bash
 ./Scripts/build-kernel.sh   # one-time: compile the kernel from source (long)
