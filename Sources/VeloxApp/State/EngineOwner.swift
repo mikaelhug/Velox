@@ -19,6 +19,8 @@ enum EngineOwner: Equatable {
     /// Duplicating a workspace's disk. An APFS clone is instant; the cross-volume fallback
     /// copies used bytes and reports progress like a move.
     case cloningWorkspace(name: String, progress: Double)
+    /// Installing a downloaded Velox update: stop the engine, swap the app, relaunch.
+    case updating
 
     /// Status text while this operation runs, including a percentage once there is one worth
     /// showing. A long copy with no readout is indistinguishable from a hang.
@@ -30,6 +32,8 @@ enum EngineOwner: Equatable {
             return "Switching to \(name)…"
         case .cloningWorkspace(let name, let p):
             return "Duplicating \(name)…" + Self.percent(p)
+        case .updating:
+            return "Installing update…"
         }
     }
 
@@ -43,6 +47,9 @@ enum EngineOwner: Equatable {
                  + "containers, images and volumes."
         case .cloningWorkspace(let name, _):
             return "Duplicating \(name)… every container, image and volume is being copied."
+        case .updating:
+            return "Installing the Velox update… the engine stops now and starts again in "
+                 + "the new version."
         }
     }
 
@@ -55,7 +62,7 @@ enum EngineOwner: Equatable {
         switch self {
         case .movingDisk(_, let p), .cloningWorkspace(_, let p):
             return p > 0 ? p : nil
-        case .switchingWorkspace:
+        case .switchingWorkspace, .updating:
             return nil
         }
     }
@@ -65,7 +72,7 @@ enum EngineOwner: Equatable {
         switch self {
         case .movingDisk(let name, _):      return .movingDisk(name: name, progress: fraction)
         case .cloningWorkspace(let name, _): return .cloningWorkspace(name: name, progress: fraction)
-        case .switchingWorkspace:            return self
+        case .switchingWorkspace, .updating: return self
         }
     }
 

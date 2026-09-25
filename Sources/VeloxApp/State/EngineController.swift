@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import Virtualization
@@ -281,60 +282,57 @@ final class EngineController {
         availableUpdate = await Updater.checkForUpdate()
     }
 
-    /// Download the latest release and replace the running app in place, then
-    /// relaunch. Runs off the main actor (it blocks on the download and exits the
-    /// process on success); `updateInProgress` only clears if it falls back.
+    /// Download the latest release, stop the engine the ordinary way, swap the new build in,
+    /// then quit and relaunch it.
+    ///
+    /// The order is the point. The update used to stop the engine through the terminate path
+    /// and `exit(0)`: that powered the VM off but never ran `cleanup()`, so the instance lock
+    /// lived until the old process finished dying — and the relaunched app, racing that exit,
+    /// found it held and refused to start ("Another Velox engine is already running"). Now
+    /// `performStop()` confirms the VM is down and releases the lock BEFORE the new build is
+    /// launched, and the app leaves through `NSApp.terminate`, so the termination delegate
+    /// still disconnects remote hosts (§12) instead of orphaning their `ssh` children.
+    ///
+    /// A failure at any step costs nothing it doesn't have to: the download and checks run
+    /// while the engine keeps serving; a stop that can't be confirmed abandons the update
+    /// (never swap under a live VM); a failed swap restarts the engine on the old build.
     func applyUpdate() {
-        guard !updateInProgress else { return }
+        guard !updateInProgress, !isEngineOwned, !isTerminating else { return }
         updateInProgress = true
-        // A GCD queue, not `Task.detached`: `applyLatestUpdate` blocks (download, then the
-        // shutdown wait below), and blocking a Swift-concurrency cooperative thread — of
-        // which there are only as many as there are cores — can starve every other task in
-        // the process. GCD grows its pool instead.
-        // Records whether the pre-relaunch shutdown actually confirmed. The fallback path
-        // below must not "finish" a stop that never happened (see the guard there).
-        let stopStalled = Locked(false)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            Updater.applyLatestUpdate(beforeRelaunch: { [weak self] in
-                // The updater is about to exit(0) to relaunch, which tears down this VM. Block
-                // here until the guest has flushed (sync over the control channel) and the VM has
-                // cleanly stopped, so the data disk isn't left torn (which would be
-                // reformatted on next boot, losing all containers/images).
-                //
-                // Via the nonisolated teardown, never `await stop()`: this thread is blocked,
-                // so a main-actor-bound stop that can't be scheduled would park it forever and
-                // the relaunch would never happen. Bounded for the same reason.
-                guard let self else { return }
-                let sem = DispatchSemaphore(value: 0)
-                self.shutdownForTerminate { sem.signal() }
-                if sem.wait(timeout: .now() + Self.stopDeadline) == .timedOut {
-                    Log.warn("engine did not stop before the update relaunch; continuing")
-                    stopStalled.value = true
-                }
-            })
-            // Only reached if the update fell back (success calls exit(0)). `beforeRelaunch`
-            // stopped the engine through the terminate path, which deliberately skips the UI
-            // state machine — so finish it here, or the app is stuck in `.stopping` holding
-            // the instance lock with `performStart` refusing to run.
-            Task { @MainActor in
-                guard let self else { return }
-                self.updateInProgress = false
-                // The update FELL BACK, so this process keeps running — and if the stop above
-                // timed out, the VM is still alive on `data.img`. `handleGuestStopped` runs
-                // `cleanup()`, which releases the instance lock: exactly the "second engine
-                // attaches the same ext4 image" corruption `vmUnreachable` was added to
-                // prevent in `performStop`. The update path reached the same state by a
-                // different route, so it has to latch it the same way.
-                guard !stopStalled.value else {
-                    self.vmUnreachable = true
-                    self.state = .failed("The engine did not shut down for the update and may "
-                                         + "still be running. Quit and reopen Velox before "
-                                         + "starting it again.")
-                    return
-                }
-                if self.state == .stopping { self.handleGuestStopped(nil) }
-            }
+        Task { await runUpdate() }
+    }
+
+    private func runUpdate() async {
+        // Blocking (a download of up to ~130 MB, then an unpack) — on GCD, not a cooperative
+        // thread, so a slow network can't starve every other task in the process.
+        let staged = await withCheckedContinuation { (cont: CheckedContinuation<Updater.StagedUpdate?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async { cont.resume(returning: Updater.stageLatestUpdate()) }
         }
+        guard let staged else { updateInProgress = false; return }
+        // Re-check: the download can take minutes, and the user may have started a workspace
+        // operation or quit meanwhile.
+        guard !isEngineOwned, !isTerminating else {
+            Updater.discard(staged); updateInProgress = false; return
+        }
+        engineOwner = .updating
+        // Every way out except the relaunch hands the controls back. Not a `defer`: after
+        // `NSApp.terminate` the app is still shutting down, and must not show Start again.
+        func abandon() { engineOwner = nil; updateInProgress = false }
+        let wasRunning = state.isRunning || state.isBusy
+        guard await performStop() else {
+            // The VM is still alive on its data disk; performStop latched the failure.
+            Updater.discard(staged); abandon(); return
+        }
+        let installed = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async { cont.resume(returning: Updater.install(staged)) }
+        }
+        guard installed else {
+            abandon()
+            if wasRunning { await performStart() }
+            return
+        }
+        Updater.relaunch(staged)
+        NSApp.terminate(nil)
     }
 
     /// Persist preferences to disk.

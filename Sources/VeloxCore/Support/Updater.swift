@@ -73,7 +73,12 @@ public enum Updater {
         print("Update available: v\(latest)  (you have v\(Versions.velox))")
         print("  \(release.htmlURL)")
         if apply {
-            applyUpdate(release)
+            // The CLI process runs no engine of its own, so there is nothing to stop between
+            // staging and the swap.
+            if let staged = stage(release), install(staged) {
+                relaunch(staged)
+                exit(0)
+            }
         } else {
             print("Run `velox update --apply` to download and install it.")
         }
@@ -107,29 +112,37 @@ public enum Updater {
         return release
     }
 
-    /// GUI "Update" entry point: check the configured repo and, if a newer release
-    /// exists, download + self-replace. Same code path as `velox update --apply`
-    /// (CLAUDE.md §3). Blocking — call off the main thread.
-    /// `beforeRelaunch` runs after the new build is staged but before the in-place swap + the
-    /// `exit(0)` relaunch — the GUI uses it to gracefully stop the engine (flush the data disk
-    /// + cleanly stop the VM) so the imminent process exit can't tear the filesystem.
-    public static func applyLatestUpdate(beforeRelaunch: (@Sendable () -> Void)? = nil) {
+    /// GUI "Update" entry point, step 1 of 3: check the configured repo and, if a newer
+    /// release exists, download, verify and unpack it beside the installed app — without
+    /// touching the running app or its engine. Same code path as `velox update --apply`
+    /// (CLAUDE.md §3). Blocking — call off the main thread. The GUI then stops its engine
+    /// the normal way, `install`s, and `relaunch`es; see `EngineController.applyUpdate`.
+    public static func stageLatestUpdate() -> StagedUpdate? {
         let repo = Versions.githubRepo
         guard repo.contains("/"),
               let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest"),
               let release = fetchLatest(url) else {
-            Log.error("update: no release found or repo unreachable"); return
+            Log.error("update: no release found or repo unreachable"); return nil
         }
         let latest = release.tag.hasPrefix("v") ? String(release.tag.dropFirst()) : release.tag
         guard compareSemver(latest, Versions.velox) > 0 else {
-            print("Velox is up to date (v\(Versions.velox))."); return
+            print("Velox is up to date (v\(Versions.velox))."); return nil
         }
-        applyUpdate(release, beforeRelaunch: beforeRelaunch)
+        return stage(release)
     }
 
-    /// Download the new release's macOS `.zip`, replace the installed `Velox.app` in
-    /// place, and relaunch. Falls back to revealing the download in Finder if the app
-    /// can't be replaced automatically (e.g. it lives somewhere read-only).
+    /// A verified, unpacked build waiting beside the installed app for `install`.
+    public struct StagedUpdate: Sendable {
+        public let tag: String
+        /// The downloaded archive — revealed in Finder whenever the automatic path gives up.
+        let archive: URL
+        /// `.velox-update-<tag>` beside the app: same volume, so the swap is a rename.
+        let staging: URL
+        let newApp: URL
+        /// The installed `Velox.app` this process is running from.
+        let target: URL
+    }
+
     /// Safe to use as a single path component? `tag` and `asset.name` arrive in the release
     /// JSON, which is read *before* any signature check, and both are used to build paths
     /// (`updates/<tag>/<name>`, `.velox-update-<tag>` beside the app) that are then created,
@@ -139,16 +152,20 @@ public enum Updater {
             && s.allSatisfy { $0.isLetter || $0.isNumber || "._-+".contains($0) }
     }
 
-    private static func applyUpdate(_ release: Release, beforeRelaunch: (@Sendable () -> Void)? = nil) {
+    /// Download the new release's macOS `.zip`, verify it, and unpack it beside the installed
+    /// `Velox.app`. Returns nil — revealing the download in Finder where a manual install is
+    /// still possible — if any gate refuses or the app can't be replaced automatically (e.g.
+    /// it lives somewhere read-only).
+    private static func stage(_ release: Release) -> StagedUpdate? {
         // The macOS release asset is the programmatically-unpackable .zip (build-app.sh
         // ships no .dmg — see the release workflow).
         guard let asset = release.assets.first(where: { $0.name.hasSuffix(".zip") }),
               let assetURL = URL(string: asset.url) else {
-            Log.error("update: release \(release.tag) has no macOS .zip asset"); return
+            Log.error("update: release \(release.tag) has no macOS .zip asset"); return nil
         }
         guard safePathComponent(release.tag), safePathComponent(asset.name) else {
             Log.error("update: refusing release \(release.tag) — tag or asset name is not a "
-                      + "safe path component"); return
+                      + "safe path component"); return nil
         }
         let fm = FileManager.default
         let dir = Paths.root.appendingPathComponent("updates/\(release.tag)", isDirectory: true)
@@ -166,17 +183,17 @@ public enum Updater {
             saved = (try? FileManager.default.moveItem(at: tmp, to: dest)) != nil
         }.resume()
         _ = sem.wait(timeout: .now() + 600)
-        guard saved else { Log.error("update: download failed"); return }
+        guard saved else { Log.error("update: download failed"); return nil }
         print("Saved \(dest.lastPathComponent).")
 
         // Integrity gate: the CI signs each release .zip with Ed25519 (release-sign.swift);
         // the matching public key is baked into this build (versions.env → Versions.swift).
         // No/invalid signature ⇒ never auto-install — reveal the download for a manual call.
         guard verifyReleaseSignature(of: dest, assetName: asset.name, in: release) else {
-            reveal(dest); return
+            reveal(dest); return nil
         }
         guard let target = runningAppBundle() else {
-            print("Could not locate the installed Velox.app — open \(dest.path) to install."); reveal(dest); return
+            print("Could not locate the installed Velox.app — open \(dest.path) to install."); reveal(dest); return nil
         }
         // Preflight the install location BEFORE unpacking or stopping the engine: a
         // read-only volume, SIP-protected path, or /Applications without admin can't be
@@ -184,15 +201,15 @@ public enum Updater {
         // will fail. Reveal the download for a manual install instead.
         guard fm.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
             Log.error("update: \(target.deletingLastPathComponent().path) is not writable — open \(dest.path) to install manually.")
-            print("Open \(dest.path) to install the update manually."); reveal(dest); return
+            print("Open \(dest.path) to install the update manually."); reveal(dest); return nil
         }
-        // Unpack beside the target (same volume → atomic replace works), then swap.
+        // Unpack beside the target: same volume, so the swap in `install` is an atomic rename.
         let staging = target.deletingLastPathComponent().appendingPathComponent(".velox-update-\(release.tag)")
         try? fm.removeItem(at: staging)
         guard run(["/usr/bin/ditto", "-x", "-k", dest.path, staging.path]) == 0,
               let newApp = (try? fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil))?
                 .first(where: { $0.pathExtension == "app" }) else {
-            Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return
+            Log.error("update: could not unpack \(asset.name)"); try? fm.removeItem(at: staging); reveal(dest); return nil
         }
         // Version binding. The Ed25519 signature covers the zip BYTES, while the version we
         // compared against came from the unsigned `tag_name`. Anyone able to control the
@@ -207,37 +224,51 @@ public enum Updater {
             Log.error("update: staged bundle reports v\(stagedVersion.isEmpty ? "?" : stagedVersion)"
                       + ", which is not newer than v\(Versions.velox) — refusing "
                       + "(advertised \(release.tag)). Possible downgrade or replay.")
-            try? fm.removeItem(at: staging); reveal(dest); return
+            try? fm.removeItem(at: staging); reveal(dest); return nil
         }
+        return StagedUpdate(tag: release.tag, archive: dest, staging: staging,
+                            newApp: newApp, target: target)
+    }
+
+    /// Step 2: swap the staged build in for the installed one. Returns false — having logged
+    /// the reason and revealed the download — if it could not; the installed app is then
+    /// untouched. Call only once nothing needs the old bundle any more: the GUI stops its
+    /// engine first.
+    public static func install(_ update: StagedUpdate) -> Bool {
+        let fm = FileManager.default
         do {
-            _ = try fm.replaceItemAt(target, withItemAt: newApp)
-            try? fm.removeItem(at: staging)
-            // The swap is committed. The relaunch below ends in exit(0), which destroys this
-            // process and with it the running VM, so flush + cleanly stop the guest now (the
-            // GUI passes a hook that does this) — skipping it tore the ext4 and got it
-            // reformatted on the next boot. Deferred until AFTER the swap on purpose: a failed
-            // swap (the catch below) must leave the engine running with the old app, never
-            // stopped with the old app and nothing to restart it.
-            beforeRelaunch?()
-            // Re-register the new bundle with LaunchServices so its icon + Info.plist
-            // changes take effect immediately, rather than from a stale icon cache.
-            let lsregister = "/System/Library/Frameworks/CoreServices.framework"
-                + "/Frameworks/LaunchServices.framework/Support/lsregister"
-            _ = run([lsregister, "-f", target.path])
-            print("Updated \(target.lastPathComponent) → \(release.tag). Relaunching…")
-            let open = Process(); open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            open.arguments = ["-n", target.path]
-            do { try open.run() } catch {
-                // The swap already succeeded — don't die silently with the old build running.
-                Log.error("update: relaunch failed (\(error.localizedDescription)) — open \(target.path) manually")
-                reveal(target)
-            }
-            exit(0)
+            _ = try fm.replaceItemAt(update.target, withItemAt: update.newApp)
+            try? fm.removeItem(at: update.staging)
         } catch {
-            Log.error("update: could not replace \(target.path): \(error.localizedDescription)")
-            print("Open \(dest.path) to install the update manually.")
-            try? fm.removeItem(at: staging); reveal(dest)
+            Log.error("update: could not replace \(update.target.path): \(error.localizedDescription)")
+            print("Open \(update.archive.path) to install the update manually.")
+            discard(update); reveal(update.archive)
+            return false
         }
+        // Re-register the new bundle with LaunchServices so its icon + Info.plist
+        // changes take effect immediately, rather than from a stale icon cache.
+        let lsregister = "/System/Library/Frameworks/CoreServices.framework"
+            + "/Frameworks/LaunchServices.framework/Support/lsregister"
+        _ = run([lsregister, "-f", update.target.path])
+        print("Updated \(update.target.lastPathComponent) → \(update.tag).")
+        return true
+    }
+
+    /// Step 3: start the freshly installed build. The caller quits right after.
+    public static func relaunch(_ update: StagedUpdate) {
+        print("Relaunching…")
+        let open = Process(); open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-n", update.target.path]
+        do { try open.run() } catch {
+            // The swap already succeeded — don't die silently with nothing relaunched.
+            Log.error("update: relaunch failed (\(error.localizedDescription)) — open \(update.target.path) manually")
+            reveal(update.target)
+        }
+    }
+
+    /// Drop a staged build that will not be installed.
+    public static func discard(_ update: StagedUpdate) {
+        try? FileManager.default.removeItem(at: update.staging)
     }
 
     // MARK: Release signature verification
