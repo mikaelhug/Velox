@@ -48,10 +48,19 @@ public struct ContainerSummary: Decodable, Sendable, Identifiable, Hashable {
         image = try c.decodeIfPresent(String.self, forKey: .image) ?? "<none>"
         state = try c.decodeIfPresent(String.self, forKey: .state) ?? "unknown"
         status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
-        ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+        // dockerd builds this array by ranging over a Go map, whose iteration order is
+        // randomized per call — so every re-list reshuffled a multi-port container's
+        // links, the menu bar's first three and the palette's "first" port. Sort once
+        // here, low to high, so every consumer sees one stable order and an unchanged
+        // container compares equal across refreshes.
+        ports = (try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []).sorted()
         labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
         let ns = try c.decodeIfPresent(NetworkSettings.self, forKey: .networkSettings)
-        networkIPs = (ns?.networks?.values.compactMap { $0.ipAddress } ?? [])
+        // By network name: a Swift dictionary's iteration order differs per instance (its
+        // hash seed is per storage), so `.values` shuffled a multi-network container's IPs
+        // on every decode — measured, up to all 24 orders of four networks in one process.
+        networkIPs = (ns?.networks ?? [:]).sorted { $0.key < $1.key }
+            .compactMap { $0.value.ipAddress }
             .filter { !$0.isEmpty }
         mounts = try c.decodeIfPresent([MountPoint].self, forKey: .mounts) ?? []
     }
@@ -146,6 +155,16 @@ public struct PortMapping: Codable, Sendable, Hashable {
     public var label: String {
         if let publicPort { return "\(publicPort):\(privatePort)/\(type)" }
         return "\(privatePort)/\(type)"
+    }
+}
+
+extension PortMapping: Comparable {
+    /// Host port low → high (published before EXPOSE-only), then container port, then
+    /// protocol and bind address — a total order, so ties can't shuffle either.
+    public static func < (a: PortMapping, b: PortMapping) -> Bool {
+        let ka = (a.publicPort ?? Int.max, a.privatePort, a.type, a.ip ?? "")
+        let kb = (b.publicPort ?? Int.max, b.privatePort, b.type, b.ip ?? "")
+        return ka < kb
     }
 }
 

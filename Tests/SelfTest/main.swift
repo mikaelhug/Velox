@@ -332,6 +332,35 @@ do {
     let multi = ContainerSummary(id: "ccc", names: ["web"], image: "nginx", state: "running",
                                  status: "", networkIPs: ["172.17.0.2", "172.18.0.2"])
     check(multi.namedAccessDomain == nil, "multi-network (ambiguous IP) → no domain")
+
+    // dockerd emits Ports in Go-map order (random per call): decoding must sort them so
+    // the UI's port links don't swap places on every re-list.
+    let shuffled = """
+    [{"Id":"ddd","Names":["/api"],"State":"running","Status":"Up","Ports":[
+      {"IP":"::","PrivatePort":443,"PublicPort":8443,"Type":"tcp"},
+      {"PrivatePort":9000,"Type":"tcp"},
+      {"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"},
+      {"IP":"0.0.0.0","PrivatePort":443,"PublicPort":8443,"Type":"tcp"},
+      {"IP":"0.0.0.0","PrivatePort":53,"PublicPort":5353,"Type":"udp"}]}]
+    """
+    let a = try JSONDecoder().decode([ContainerSummary].self, from: Data(shuffled.utf8))[0]
+    equal(a.publishedBindings.map(\.label).joined(separator: " "),
+          "5353:53/udp 8080:80/tcp 8443:443/tcp", "published ports listed low → high")
+    equal(a.ports.last?.label ?? "", "9000/tcp", "EXPOSE-only ports sort after published")
+    equal(Array(a.ports.reversed()).sorted(), a.ports, "port order is total (ties can't shuffle)")
+
+    // A Swift dictionary's iteration order differs per instance, so one decode can pass by
+    // luck — decode repeatedly and require the network-name order every time.
+    let multiNet = """
+    [{"Id":"eee","Names":["/db"],"State":"running","Status":"Up","NetworkSettings":{"Networks":{
+      "zeta":{"IPAddress":"172.23.0.2"},"alpha":{"IPAddress":"172.20.0.2"},
+      "mid":{"IPAddress":"172.21.0.2"},"bridge":{"IPAddress":"172.17.0.2"}}}}]
+    """
+    let orders = try Set((0..<50).map { _ in
+        try JSONDecoder().decode([ContainerSummary].self, from: Data(multiNet.utf8))[0].networkIPs
+    })
+    equal(orders, [["172.20.0.2", "172.17.0.2", "172.21.0.2", "172.23.0.2"]],
+          "network IPs in network-name order on every decode")
 }
 
 // MARK: DockerRunCommand reconstruction
