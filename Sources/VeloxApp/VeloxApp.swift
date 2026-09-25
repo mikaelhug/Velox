@@ -110,13 +110,30 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
-struct VeloxApp: App {
-    @State private var engine = EngineController()
+/// The app's two controllers — exactly one of each per process.
+///
+/// They used to be `@State` initial values on `VeloxApp`. SwiftUI may run an `App`'s `init`
+/// more than once, and every run evaluates those initializers again; built against the
+/// macOS 27 SDK it does (measured: two of each in one process). `EngineController.init`
+/// auto-starts the engine, so the second controller booted the VM while the first failed on
+/// the instance lock — and the window showed "Another Velox engine is already running" over
+/// an engine it could not see, and quit could flush the wrong one. A `static let` is
+/// initialized once, lazily and thread-safely, whatever SwiftUI does with `init`.
+@MainActor
+private enum AppControllers {
+    static let engine = EngineController()
     /// Remote Docker hosts. Deliberately a *sibling* of `engine`, not a member: a remote
     /// host has no VM, no data disk and no instance lock, and folding it into the engine
     /// controller would blur exactly the line that keeps this feature cheap.
-    @State private var remotes = RemoteHostController()
+    static let remotes = RemoteHostController()
+}
+
+@main
+struct VeloxApp: App {
+    // Plain references, not `@State`: the controllers are @Observable, so `body` tracks what
+    // it reads without SwiftUI owning them, and ownership is `AppControllers`'.
+    private let engine = AppControllers.engine
+    private let remotes = AppControllers.remotes
     @NSApplicationDelegateAdaptor(AppTerminationDelegate.self) private var appDelegate
 
     init() {
