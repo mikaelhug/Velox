@@ -68,8 +68,13 @@ if [ "$isize" -lt 5242880 ]; then
     echo "error: $OUT/root.img is only ${isize}B — build failed" >&2; exit 1
 fi
 
-cp "$KERNEL_ARTIFACT" "$DEST/kernel"
-cp "$OUT/root.img" "$DEST/root.img"
+# Temp file + rename, like the app's GuestInstall.replace — never `cp` over the live file. A
+# running engine demand-pages its erofs root straight out of root.img, so overwriting it in
+# place swaps bytes under a live guest; a rename leaves the VM on the old inode it holds open
+# and the new image takes effect at the next boot.
+install_atomic() { cp "$1" "$2.tmp" && mv -f "$2.tmp" "$2"; }
+install_atomic "$KERNEL_ARTIFACT" "$DEST/kernel"
+install_atomic "$OUT/root.img" "$DEST/root.img"
 # Stamp the installed guest with this version so a same-version Velox.app launch leaves this
 # dev build in place (GuestInstall only refreshes from the bundle when the stamp differs).
 echo "$VELOX_VERSION" > "$DEST/guest.version"

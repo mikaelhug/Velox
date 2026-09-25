@@ -218,7 +218,9 @@ fi
 
 # === Phase 4: install + Phase 5: verify the artifact on the host ===========
 mkdir -p "$(dirname "$INSTALL_DEST")"
-cp "$OUTPUT" "$INSTALL_DEST"
+# Temp + rename (as make-guest.sh / GuestInstall do): never rewrite a file in place under a
+# running engine.
+cp "$OUTPUT" "$INSTALL_DEST.tmp" && mv -f "$INSTALL_DEST.tmp" "$INSTALL_DEST"
 echo "==> installed kernel → $INSTALL_DEST"
 
 echo "==> verifying artifact"

@@ -149,7 +149,7 @@ jobs:
   # ---------------------------------------------------------------------------
   app:
     needs: [guest, lint-guest]
-    runs-on: macos-26
+    runs-on: xcode-27     # macOS 27 + Xcode 27 (GitHub preview label; the SDK needs Xcode's SwiftUIMacros plugin)
     permissions:
       contents: write     # creates the GitHub Release
     # `secrets` can't be referenced in `if:` (it isn't a valid context there), so surface

@@ -227,7 +227,7 @@ jobs:
   validate-host:
     needs: prepare
     if: needs.prepare.outputs.changed == 'true'
-    runs-on: macos-26
+    runs-on: xcode-27     # macOS 27 + Xcode 27 (GitHub preview label; the SDK needs Xcode's SwiftUIMacros plugin)
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         # The pinned commit, not the branch name — see prepare.outputs.bump_sha. An empty
@@ -242,7 +242,7 @@ jobs:
           [ -n "$want" ] || { echo "::error::prepare exported no bump_sha — refusing to validate the wrong tree"; exit 1; }
           got="$(git rev-parse HEAD)"
           [ "$got" = "$want" ] || { echo "::error::checked out $got, expected $want"; exit 1; }
-      - run: swift --version
+      - run: swift --version && xcode-select -p && xcrun --sdk macosx --show-sdk-version
       - name: Build (all targets)
         run: |
           ./Scripts/gen-versions.sh
