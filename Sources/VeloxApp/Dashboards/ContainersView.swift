@@ -170,6 +170,8 @@ struct ContainersView: View {
     @State private var pendingDelete: ContainerSummary?
     @State private var pendingBulkDelete: [ContainerSummary] = []
     @State private var tableLayout: TableColumnCustomization<ContainerRow>
+    /// Survives the `.id(heightPattern)` rebuilds of the table (it lives outside them).
+    @State private var scrollMemory = TableScrollMemory()
 
     /// Published ports whose localhost bind failed — their links render red.
     private let issues: PortIssues
@@ -243,13 +245,15 @@ struct ContainersView: View {
                 }
             }
         }
-        .suppressHorizontalScroller()
+        .suppressHorizontalScroller(keepingScrollIn: scrollMemory)
         // Uniform rows: the alternating stripes repaint out of sync with the clip
         // during inspector-resize animations and read as flicker.
         .alternatingRowBackgrounds(.disabled)
         .contextMenu(forSelectionType: ContainerRow.ID.self) { ids in
             contextMenu(for: ids)
         }
+        // Rebuild the table when its row heights change shape — see `heightPattern`.
+        .id(heightPattern)
         .searchable(text: $ui.containerSearch, placement: .toolbar, prompt: "Filter containers")
         // Keyboard-first: ⌘L logs, ⌘I inspector, ⌘⌫ delete — for the selection.
         .background(Group {
@@ -350,40 +354,37 @@ struct ContainersView: View {
 
     // MARK: Cells
 
-    /// Named access is a local-engine feature (a `.velox.local` responder plus a host route
-    /// to Velox's own VM); a remote host has neither, so its rows never carry a domain line.
-    private var showsDomainLine: Bool { !dockerTarget.isRemote }
-
-    private static let projectSymbol = "square.stack.3d.up.fill"
-
-    /// Every row — running, stopped or a Compose header — is exactly this tall, whatever
-    /// it shows. Not just for looks: the AppKit table under `Table` sizes rows from
-    /// RECYCLED cells, so with mixed heights an insert/remove (`docker run`/`rm` from the
-    /// CLI) left rows at the previous occupant's height — two-line rows squeezed, one-line
-    /// rows padded. Measured in a harness mirroring this table: most add/remove rounds left
-    /// a stale height; none once every row measured the same. The template is the union of
-    /// both row kinds (the header's symbol stands half a point taller than a name line), so
-    /// nothing can outgrow it.
-    private var rowHeightTemplate: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(spacing: 6) {
-                Image(systemName: Self.projectSymbol)
-                Text(verbatim: " ").fontWeight(.semibold)
+    /// The shape of the table's row heights, top to bottom: `2` for a container showing its
+    /// domain line, `1` for one without, `p` for a Compose header (children only while expanded).
+    ///
+    /// The table is rebuilt (`.id`) whenever this changes, because SwiftUI's `Table` cannot
+    /// shrink a row by itself: its cells compute their natural height with the row's current
+    /// height on offer, so a row that was ever two lines stays two lines — after a container
+    /// stops, or when a cell is reused for another row after a `docker run`/`rm` (measured:
+    /// most such updates left a stale height; neither re-measuring nor per-cell identity
+    /// helped). A freshly built table measures every row correctly — 0 stale rows in 600
+    /// mixed updates — and column widths, selection and (via `scrollMemory`) the scroll
+    /// position carry over. It changes only on a start/stop, add/remove or expand/collapse,
+    /// never on a stats tick or an uptime label.
+    private var heightPattern: String {
+        let domains = !dockerTarget.isRemote
+        func kind(_ c: ContainerSummary) -> Character { domains && c.namedAccessDomain != nil ? "2" : "1" }
+        var pattern = ""
+        for entry in topLevel {
+            switch entry {
+            case .standalone(let c):
+                pattern.append(kind(c))
+            case .group(let g):
+                pattern.append("p")
+                if !ui.containerCollapsed.contains(g.name) { pattern += g.containers.map(kind) }
             }
-            if showsDomainLine { Text(verbatim: " ").font(.caption2) }
         }
-        .hidden()
+        return pattern
     }
 
-    private func nameCell(_ row: ContainerRow) -> some View {
-        ZStack(alignment: .leading) {
-            rowHeightTemplate
-            nameContent(row)
-        }
-    }
 
     @ViewBuilder
-    private func nameContent(_ row: ContainerRow) -> some View {
+    private func nameCell(_ row: ContainerRow) -> some View {
         switch row {
         case .container(let c):
             HStack(spacing: 6) {
@@ -392,24 +393,20 @@ struct ContainersView: View {
                     Text(c.displayName).fontWeight(.medium)
                     // Named access — the engine's flagship: the container's real IP by
                     // name, any protocol, no -p. Click → browser; copy lives in the menu.
-                    if showsDomainLine {
-                        if let domain = c.namedAccessDomain {
-                            Button(domain) { RowActions.openDomain(domain) }
-                                .buttonStyle(.plain)
-                                .font(.caption2)
-                                .foregroundStyle(.link)
-                                .help("Open http://\(domain)/")
-                        } else {
-                            // Keeps a stopped container's name on the same line as a
-                            // running one's (the template already fixes the height).
-                            Text(verbatim: " ").font(.caption2).hidden()
-                        }
+                    // Named access is a local-engine feature (a `.velox.local` responder
+                    // plus a host route to Velox's own VM); a remote host has neither.
+                    if let domain = c.namedAccessDomain, !dockerTarget.isRemote {
+                        Button(domain) { RowActions.openDomain(domain) }
+                            .buttonStyle(.plain)
+                            .font(.caption2)
+                            .foregroundStyle(.link)
+                            .help("Open http://\(domain)/")
                     }
                 }
             }
         case .project(let g):
             HStack(spacing: 6) {
-                Image(systemName: Self.projectSymbol).foregroundStyle(.blue)
+                Image(systemName: "square.stack.3d.up.fill").foregroundStyle(.blue)
                 Text(g.name).fontWeight(.semibold)
             }
         }

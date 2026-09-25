@@ -30,13 +30,26 @@ extension View {
     /// columns genuinely overflow; only the indicator and the sideways rubber-band
     /// are suppressed. (SwiftUI's `.scrollIndicators` doesn't reach Table's
     /// underlying scroll view, hence the introspection.)
-    func suppressHorizontalScroller() -> some View {
-        background(HorizontalScrollerSuppressor())
+    ///
+    /// With `memory`, it also carries the table's scroll position across a rebuild of the table
+    /// itself — a table re-created by `.id` (see `ContainersView.heightPattern`) otherwise opens
+    /// scrolled to the top. The memory must live OUTSIDE the rebuilt subtree; this probe lives
+    /// inside it, records every scroll, and restores the last one onto the new table.
+    func suppressHorizontalScroller(keepingScrollIn memory: TableScrollMemory? = nil) -> some View {
+        background(HorizontalScrollerSuppressor(memory: memory))
     }
 }
 
+/// A table's last scroll position, held across a rebuild of the table (see above).
+@MainActor
+final class TableScrollMemory {
+    fileprivate var origin: NSPoint?
+}
+
 private struct HorizontalScrollerSuppressor: NSViewRepresentable {
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    let memory: TableScrollMemory?
+
+    func makeCoordinator() -> Coordinator { Coordinator(memory: memory) }
 
     func makeNSView(context: Context) -> NSView {
         let probe = NSView()
@@ -60,9 +73,13 @@ private struct HorizontalScrollerSuppressor: NSViewRepresentable {
     @MainActor
     final class Coordinator {
         private weak var scrollView: NSScrollView?
+        private let memory: TableScrollMemory?
         // nonisolated(unsafe): deinit is nonisolated and removeObserver is
-        // thread-safe; the token is written once from the main actor.
+        // thread-safe; the tokens are written once from the main actor.
         nonisolated(unsafe) private var observer: NSObjectProtocol?
+        nonisolated(unsafe) private var scrollObserver: NSObjectProtocol?
+
+        init(memory: TableScrollMemory?) { self.memory = memory }
 
         func attach(around probe: NSView) {
             guard scrollView == nil else { return }
@@ -75,6 +92,30 @@ private struct HorizontalScrollerSuppressor: NSViewRepresentable {
             ) { [weak self] _ in
                 MainActor.assumeIsolated { self?.apply() }
             }
+            guard let memory else { return }
+            if let origin = memory.origin { restore(origin, in: sv) }
+            // Record every scroll — the clip view's bounds origin IS the scroll position.
+            // Only while on screen: a table being torn down for a rebuild resets its clip
+            // view, and that must not overwrite the position the new table restores.
+            let clip = sv.contentView
+            clip.postsBoundsChangedNotifications = true
+            scrollObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
+            ) { [weak clip, memory] _ in
+                MainActor.assumeIsolated {
+                    guard let clip, clip.window != nil else { return }
+                    memory.origin = clip.bounds.origin
+                }
+            }
+        }
+
+        /// Scroll the rebuilt table back to where the old one was, clamped to its content.
+        private func restore(_ origin: NSPoint, in sv: NSScrollView) {
+            let clip = sv.contentView
+            guard let doc = sv.documentView else { return }
+            let maxY = max(doc.frame.height - clip.bounds.height, clip.bounds.origin.y)
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: min(origin.y, maxY)))
+            sv.reflectScrolledClipView(clip)
         }
 
         private func apply() {
@@ -87,6 +128,7 @@ private struct HorizontalScrollerSuppressor: NSViewRepresentable {
 
         deinit {
             if let observer { NotificationCenter.default.removeObserver(observer) }
+            if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         }
 
         /// Climb from the probe until an ancestor's subtree contains a table scroll
