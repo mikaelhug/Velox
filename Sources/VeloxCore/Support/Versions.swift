@@ -4,7 +4,7 @@
 /// Version numbers surfaced to the host (CLI, status, updater).
 public enum Versions {
     /// Velox release version.
-    public static let velox = "1.6.3"
+    public static let velox = "1.6.4"
     /// GitHub repo (owner/name) the updater checks for new releases.
     public static let githubRepo = "mikaelhug/Velox"
     /// Privileged-port-helper revision. The helper is (re)installed (one admin prompt) only when
@@ -12,7 +12,7 @@ public enum Versions {
     public static let porthelperRevision = "8"
 
     /// Guest kernel version (the VM "OS version") — built from kernel.org source.
-    public static let kernelVersion = "7.2.6"
+    public static let kernelVersion = "7.2.8"
     /// Docker Engine version in the guest (Docker's official static release).
     public static let dockerVersion = "29.8.1"
     /// Docker Compose plugin version bundled for the host CLI (`docker compose`).
