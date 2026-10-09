@@ -30,6 +30,18 @@ public enum GuestInstall {
         return "\(version)|\(part(kernel))|\(part(root))"
     }
 
+    /// Cheap, synchronous: does `refreshFromBundleIfNeeded()` have anything to copy? A few
+    /// `stat`s and one small file read. Lets the engine start skip the off-main hop on every
+    /// ordinary launch, so the VM can boot before the first window is built.
+    public static var refreshNeeded: Bool {
+        guard let bundledKernel = bundled("kernel"), let bundledRoot = bundled("root.img") else { return false }
+        let installedStamp = (try? String(contentsOf: stampURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fm = FileManager.default
+        let haveBoth = fm.fileExists(atPath: Paths.kernel.path) && fm.fileExists(atPath: Paths.rootDisk.path)
+        return !(haveBoth && installedStamp == stamp(version: Versions.velox, kernel: bundledKernel, root: bundledRoot))
+    }
+
     public static func refreshFromBundleIfNeeded() {
         let fm = FileManager.default
         // Only a packaged .app carries a bundled guest; a dev build has none → nothing to sync.

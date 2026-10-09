@@ -254,7 +254,16 @@ final class EngineController {
         // under SwiftUI previews so the canvas doesn't try to boot a VM.
         let isPreview = ProcessInfo.processInfo.environment["XCODE_RUNNING_FOR_PREVIEWS"] == "1"
         if !needsOnboarding && !isPreview {
-            Task { await self.start() }
+            // `Task.immediate` runs `start()` synchronously on this (main) actor up to its first
+            // real suspension, which is the VM-start continuation — so the guest begins booting
+            // during app init instead of after SwiftUI has launched and drawn the dashboard.
+            // A plain `Task` queued behind that work: launch→VM process measured 0.38–0.41 s in
+            // the GUI vs 0.10 s in the CLI, the whole startup gap to OrbStack (REPORT-2026-10-09).
+            if #available(macOS 26.0, *) {
+                Task.immediate { await self.start() }
+            } else {
+                Task { await self.start() }
+            }
         }
         if config.checkUpdatesOnStartup && !isPreview {
             scheduleStartupUpdateCheck(engineAutostarts: !needsOnboarding)
@@ -458,7 +467,12 @@ final class EngineController {
             // Off the main actor: this copies the kernel (~10 MB) and rootfs (~80 MB) after
             // an app update, and doing it inline beach-balled the whole UI — menu bar,
             // dashboard, and the Engine Logs view that should be showing boot progress.
-            await Task.detached(priority: .userInitiated) { GuestInstall.refreshFromBundleIfNeeded() }.value
+            // Only hop off the main actor when there is something to copy: on an ordinary
+            // launch this check is a few stats, and NOT suspending here is what lets the
+            // launch-time `Task.immediate` reach `manager.start` before SwiftUI builds a window.
+            if GuestInstall.refreshNeeded {
+                await Task.detached(priority: .userInitiated) { GuestInstall.refreshFromBundleIfNeeded() }.value
+            }
             let image = (try? GuestImage.resolve())?.advertising(shares: shareURLs)
                 ?? GuestImage(kernelURL: Paths.kernel, rootDiskURL: Paths.rootDisk,
                               kernelCommandLine: GuestImage.defaultCommandLine)
