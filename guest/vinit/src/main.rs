@@ -848,31 +848,47 @@ mod dhcp {
         u32::from_ne_bytes(b)
     }
 
+    /// Per-attempt OFFER/ACK wait: starts short and doubles to a 1 s cap.
+    const ATTEMPT_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+    const ATTEMPT_CAP: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Total time spent retransmitting before giving up — the same ~15 s the old flat
+    /// schedule (12 × (1 s wait + 250 ms sleep)) allowed, so a slow bridge is no likelier
+    /// to end up leaseless than before.
+    const ACQUIRE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
     pub fn acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
         // Apple's vmnet DHCP server can drop the first DISCOVER (notably right after
-        // the bridge comes up). Retransmit a few times with linear backoff before
-        // giving up, so a transient miss self-heals instead of leaving the guest with
-        // no address — and therefore no DNS — for the whole session.
-        let mut last = Error::new(ErrorKind::TimedOut, "no DHCP offer");
-        for attempt in 0..12u32 {
-            match try_acquire(ifname, mac) {
+        // the bridge comes up). Retransmit until the budget runs out, so a transient miss
+        // self-heals instead of leaving the guest with no address — and therefore no DNS —
+        // for the whole session.
+        //
+        // Exponential, starting short (100, 200, 400, 800 ms, then 1 s): the old flat 1 s
+        // wait + 250 ms sleep meant a dropped first DISCOVER cost ≥1.25 s of every boot,
+        // while vmnet answers a DISCOVER it does see in milliseconds. Each attempt's wait is
+        // its own retransmit interval — an attempt that fails faster (e.g. a send error while
+        // the link settles) sleeps out the rest of it, so the cadence never degrades to a spin.
+        let start = std::time::Instant::now();
+        let mut wait = ATTEMPT_FIRST;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let t0 = std::time::Instant::now();
+            match try_acquire(ifname, mac, wait) {
                 Ok(lease) => return Ok(lease),
                 Err(e) => {
-                    log!("DHCP attempt {} failed: {e}", attempt + 1);
-                    last = e;
-                    // Flat, short backoff: retransmit ~every 1.25s so we grab a lease
-                    // the moment the bridge is ready, instead of escalating into long gaps.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    log!("DHCP attempt {attempt} ({} ms wait) failed: {e}", wait.as_millis());
+                    if start.elapsed() >= ACQUIRE_BUDGET { return Err(e); }
+                    if let Some(rest) = wait.checked_sub(t0.elapsed()) { std::thread::sleep(rest); }
+                    wait = (wait * 2).min(ATTEMPT_CAP);
                 }
             }
         }
-        Err(last)
     }
 
-    fn try_acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
+    fn try_acquire(ifname: &str, mac: [u8; 6], wait: std::time::Duration) -> Result<Lease> {
         // Open the socket here and close it on every path (including the `?` errors
         // in the handshake) so a retried acquire doesn't leak a descriptor per miss.
-        let sock = open_socket(ifname)?;
+        let sock = open_socket(ifname, wait)?;
         let res = handshake(sock, &mac);
         unsafe { libc::close(sock); }
         res
@@ -903,7 +919,7 @@ mod dhcp {
     /// Renew the current lease in place (INIT-REBOOT style: broadcast REQUEST for
     /// the IP we already hold). Returns Ok once the server ACKs. Best-effort.
     pub fn renew(ifname: &str, mac: [u8; 6], ip: u32, server: u32) -> Result<()> {
-        let sock = open_socket(ifname)?;
+        let sock = open_socket(ifname, ATTEMPT_CAP)?;
         let xid = rand_xid();
         let server_opt = if server != 0 { Some(server) } else { None };
         let request = build(&mac, xid, REQUEST, Some(ip), server_opt);
@@ -1039,7 +1055,7 @@ mod dhcp {
         Some(Reply { xid, yiaddr, msg_type, opts })
     }
 
-    fn open_socket(ifname: &str) -> Result<i32> {
+    fn open_socket(ifname: &str, wait: std::time::Duration) -> Result<i32> {
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if s < 0 { return Err(Error::last_os_error()); }
         let on: libc::c_int = 1;
@@ -1048,10 +1064,13 @@ mod dhcp {
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on as *const _ as *const _, 4);
             // bind to the device so broadcast goes out eth0 before we have an IP
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, ifname.as_ptr() as *const _, ifname.len() as u32);
-            // Short per-try OFFER/ACK wait: the vmnet bridge often isn't ready for
-            // the very first DISCOVER, so we'd rather retransmit quickly than block
-            // 5s. Standard DHCP retransmission — costs nothing when it answers fast.
-            let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+            // Short per-try OFFER/ACK wait (`acquire` grows it 100 ms → 1 s): the vmnet
+            // bridge often isn't ready for the very first DISCOVER, so we'd rather
+            // retransmit quickly than block. Costs nothing when it answers fast.
+            let tv = libc::timeval {
+                tv_sec: wait.as_secs() as _,
+                tv_usec: wait.subsec_micros() as _,
+            };
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const _, std::mem::size_of::<libc::timeval>() as u32);
         }
         let bind = libc::sockaddr_in {
