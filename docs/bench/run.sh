@@ -768,15 +768,46 @@ matrix(){           # $1 ctx $2 label
   log "[$ENG] matrix done → $RUNDIR/matrix-$ENG.txt"
 }
 
+# The engine's Docker API unix socket, for the startup timer's direct /_ping. Taken from the
+# docker context itself (so a renamed/relocated socket follows the context), falling back to
+# each engine's well-known path.
+engine_sock(){                       # $1 ctx $2 label
+  local s
+  s=$(docker context inspect "$1" --format '{{.Endpoints.docker.Host}}' 2>/dev/null | sed -n 's#^unix://##p')
+  if [ -z "$s" ]; then
+    case "$2" in
+      velox)  s="$HOME/.velox/docker.sock" ;;
+      orb*)   s="$HOME/.orbstack/run/docker.sock" ;;
+      *)      s="$HOME/.docker/run/docker.sock" ;;
+    esac
+  fi
+  echo "$s"
+}
+# One /_ping straight at the socket: true once the daemon answers "OK". --max-time is
+# deliberately generous — Velox holds a request that arrives before dockerd is listening and
+# answers it the instant dockerd serves, so a short timeout would cut exactly the request
+# whose completion IS the ready moment (and re-quantize the measurement to the timeout).
+api_ping(){ [ "$(curl -s --max-time 30 --unix-socket "$1" http://localhost/_ping 2>/dev/null)" = "OK" ]; }
+
 startup(){          # bounces both apps; measures launch -> API-ready (warm disk cache)
   ensure_csv
-  _one(){ local CTX="$1" ENG="$2"
+  _one(){ local CTX="$1" ENG="$2" SOCK
+    SOCK=$(engine_sock "$CTX" "$ENG")
     log "[$ENG] stopping"; stop_engine "$ENG"
     local i; for i in $(seq 1 120); do api_up "$CTX" || break; sleep 0.5; done
     for i in $(seq 1 60); do [ -z "$(engine_live_pids "$ENG" | tr -d ' ')" ] && break; sleep 1; done
     sleep 3
-    log "[$ENG] starting, timing to API-ready"; local t0; t0=$(now); start_engine "$ENG"
-    for i in $(seq 1 240); do api_up "$CTX" && { rec "$ENG" lifecycle restart_to_ready time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }; sleep 0.5; done
+    # Readiness = the first "OK" from /_ping on the engine's socket, polled every ~25 ms.
+    # This used to be `docker version` every 0.5 s: the 0.5 s quantization (plus a docker CLI
+    # spawn per probe) was larger than the differences being measured — the startup gap to
+    # OrbStack is ~0.33 s — so two engines 0.3 s apart could record the same number. curl
+    # against the socket is a few ms per probe, and 120 s of wall time stays the NA cutoff.
+    log "[$ENG] starting, timing to API-ready (/_ping on $SOCK)"; local t0; t0=$(now); start_engine "$ENG"
+    local deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      api_ping "$SOCK" && { rec "$ENG" lifecycle restart_to_ready time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }
+      sleep 0.025
+    done
     rec "$ENG" lifecycle restart_to_ready time_s s NA
     warn "[$ENG] DID NOT become ready in 120s"; }
   # Order alternates with the round so neither engine always gets the warm host.
