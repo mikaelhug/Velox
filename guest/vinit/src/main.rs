@@ -107,22 +107,36 @@ fn main() {
         Ok(h) => Some(h),
         Err(e) => { log!("vinit: network thread spawn failed ({e}) — running it inline"); net_setup(); None }
     };
+    // The VirtioFS shares + binfmt registration are a third independent leg: they touch
+    // only /Users, the extra share paths, /run/rosetta and binfmt_misc (all mounted by
+    // mount_all above) — nothing the data disk or DHCP produce. They stay ordered WITHIN
+    // their thread: setup_binfmt registers Rosetta with the `F` flag, which opens the
+    // interpreter on the rosetta virtiofs share at registration time, so the share must be
+    // mounted first. Emulators must be registered before dockerd (BuildKit enumerates
+    // supported platforms at daemon start), so this thread is joined before the spawn below.
+    let fs_setup = || {
+        let rosetta_ok = setup_virtiofs();
+        setup_binfmt(rosetta_ok);
+    };
+    let fs_handle = match std::thread::Builder::new().spawn(fs_setup) {
+        Ok(h) => Some(h),
+        Err(e) => { log!("vinit: virtiofs thread spawn failed ({e}) — running it inline"); fs_setup(); None }
+    };
     let data_ok = setup_data_disk();
     // Swap is a memory-pressure safety valve, not a startup dependency, and on first
     // boot make_swapfile() fallocate()s a multi-GiB file — pure stall before dockerd.
     // Build it off the critical path. Spawned only when data_ok, so the swapfile's
     // parent (/var/lib/docker) is already mounted.
     if data_ok { spawn_worker("swap-setup", setup_swap); }
-    let rosetta_ok = setup_virtiofs();
-    // Emulators before dockerd: BuildKit enumerates supported platforms at daemon start.
-    setup_binfmt(rosetta_ok);
     // Diagnosability: one line when the host granted nested virtualization (shows
     // in Engine Logs / Copy Diagnostics). KVM self-disables without EL2 — silent.
     if std::path::Path::new("/dev/kvm").exists() {
         log!("KVM available — nested virtualization enabled");
     }
     // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
-    // place, so the network must be fully applied before it starts.
+    // place, so the network must be fully applied before it starts — and the emulators
+    // registered (above).
+    if let Some(h) = fs_handle { let _ = h.join(); }
     if let Some(h) = net_handle { let _ = h.join(); }
     enable_ip_forwarding();
     tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
