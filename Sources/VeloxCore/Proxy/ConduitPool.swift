@@ -213,6 +213,24 @@ public final class ConduitPool: @unchecked Sendable {
         }
     }
 
+    /// Docker API connections (the `docker` CLI through `~/.velox/docker.sock`) ride a warm
+    /// conduit too: `docker cp`, `docker load` and build contexts were bounded by the vsock
+    /// transport (cp in ~480 MB/s), while the same bytes over VZNAT TCP measured 1.2–1.6 GB/s.
+    /// Unlike a published port this never waits for the pool to grow and never touches the
+    /// churn breaker: no warm conduit → `fallback` (the vsock bridge) immediately, so a CLI
+    /// command can only gain latency-wise, never queue behind a burst. The guest maps the
+    /// `docker` header to dockerd's unix socket. Always takes ownership of `clientFd`.
+    public func submitDocker(clientFd: Int32, fallback: @escaping @Sendable (Int32) -> Void) {
+        queue.async {
+            guard !self.stopped, let p = self.ready.popLast() else { fallback(clientFd); return }
+            p.source.cancel()     // stop monitoring; `splice` decides who closes the fd
+            FDIO.setSocketBuffers(p.fd)   // bulk API transfers: deep buffers on this leg too
+            self.splice(conduit: p.fd, clientFd: clientFd, header: "docker", owner: p.owner) {
+                fallback($0)
+            }
+        }
+    }
+
     /// Ensure exactly one pending timeout sweep is scheduled (idempotent). Armed only while clients
     /// wait, so there's no timer at idle — and never more than one in flight regardless of load.
     private func armSweep() {
@@ -258,12 +276,21 @@ public final class ConduitPool: @unchecked Sendable {
             return
         }
         let target = endpoints?.endpoint(for: port) ?? "\(port)"
-        guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
+        splice(conduit: conduit, clientFd: clientFd, header: target, owner: owner) {
+            self.dropToFallback($0, port)
+        }
+    }
+
+    /// Write the in-band `header` and hand the pair to the relay; a stale conduit (the write
+    /// fails) sends the client to `onFail` instead. On `queue`.
+    private func splice(conduit: Int32, clientFd: Int32, header: String, owner: FdOwner?,
+                        onFail: (Int32) -> Void) {
+        guard FDIO.writeAll(conduit, Array("\(header)\n".utf8)) else {
             // Don't close inline when a source still owns it: `cancel()` is asynchronous, so
             // this would close the fd before libdispatch deregisters its kevent. Leaving
             // `owns` set makes the cancel handler do it in the order dispatch guarantees.
             if owner == nil { close(conduit) }
-            dropToFallback(clientFd, port)
+            onFail(clientFd)
             return
         }
         owner?.owns = false   // handed off; the cancel handler must not close it

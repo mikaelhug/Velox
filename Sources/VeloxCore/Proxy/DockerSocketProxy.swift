@@ -12,6 +12,15 @@ public final class DockerSocketProxy: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var throttled = false   // accepts paused for fd exhaustion (on `acceptQueue`)
     private var source: DispatchSourceRead?
+    /// Once the VZNAT conduit pool is up, connections ride it (see `ConduitPool.submitDocker`);
+    /// until then, and whenever no conduit is warm, the vsock bridge. Read/written on `acceptQueue`.
+    private var conduitPool: ConduitPool?
+    /// Kill switch for A/B measurement: VELOX_DOCKER_VIA_CONDUIT=0 keeps every connection on vsock.
+    private let conduitEnabled = ProcessInfo.processInfo.environment["VELOX_DOCKER_VIA_CONDUIT"] != "0"
+
+    public func attachConduitPool(_ pool: ConduitPool?) {
+        acceptQueue.async { self.conduitPool = pool }
+    }
 
     public init(socketPath: String, guestPort: UInt32, bridge: VsockBridge) {
         self.socketPath = socketPath
@@ -100,7 +109,12 @@ public final class DockerSocketProxy: @unchecked Sendable {
             // Bulk Docker-API transfers (`docker cp`, `load`, build contexts) were bounded by
             // the 8 KiB AF_UNIX default buffers — see `FDIO.bulkSocketBuffer`.
             FDIO.setSocketBuffers(client)
-            bridge.bridge(localFd: client, toGuestPort: guestPort)
+            if conduitEnabled, let pool = conduitPool {
+                let bridge = self.bridge, port = guestPort
+                pool.submitDocker(clientFd: client) { bridge.bridge(localFd: $0, toGuestPort: port) }
+            } else {
+                bridge.bridge(localFd: client, toGuestPort: guestPort)
+            }
         }
     }
 }

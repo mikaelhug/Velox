@@ -2533,6 +2533,17 @@ fn resolve_one(target: &str) -> std::io::Result<std::net::SocketAddr> {
 }
 
 fn bridge_to_target(fd: RawFd, header: &str) {
+    // `docker`: a Docker API connection from ~/.velox/docker.sock (ConduitPool.submitDocker).
+    // Same epoll relay as published ports — bulk API traffic (cp/load/build contexts) rides
+    // VZNAT instead of the vsock bridge. Only the host writes conduit headers, and containers
+    // are kept off the conduit listener by the conduit guard, so this adds no new exposure.
+    if header == "docker" {
+        match connect_docker_sock(fd) {
+            Some(up) => relay_submit(fd, up.into_raw_fd()),
+            None => { log!("conduit: docker.sock unavailable"); unsafe { libc::close(fd); } }
+        }
+        return;
+    }
     let mut target = header.to_string();
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
     // Bounded: `connect` with no timeout parks this thread for the full SYN timeout (~2 min)

@@ -121,6 +121,7 @@ public final class EngineRuntime: @unchecked Sendable {
                 // go on to re-arm named access below for an engine that is already gone.
                 if !self.registerPool(pool) { pool.stop(); return }
                 self.forwarder.attachConduitPool(pool)
+                self.proxy.attachConduitPool(pool)
             } catch {
                 Log.warn("conduit pool failed to start: \(error); using vsock fallback")
             }
