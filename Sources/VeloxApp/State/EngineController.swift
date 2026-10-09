@@ -257,7 +257,7 @@ final class EngineController {
             Task { await self.start() }
         }
         if config.checkUpdatesOnStartup && !isPreview {
-            Task { await self.checkForUpdates() }
+            scheduleStartupUpdateCheck(engineAutostarts: !needsOnboarding)
         }
         // Refresh the workspace list whenever the app comes to the front. While the GUI is
         // open with the engine STOPPED, the engine lock is free, so `velox workspace
@@ -273,6 +273,36 @@ final class EngineController {
     }
 
     // MARK: - Updates
+
+    /// True while the launch-time update check is still owed (see `scheduleStartupUpdateCheck`).
+    private var startupUpdateCheckPending = false
+    /// Ceiling on how long the launch-time check waits for the engine to come up.
+    private static let startupUpdateCheckFallback: Duration = .seconds(30)
+
+    /// Run the launch-time update check AFTER the engine boots, not alongside it.
+    ///
+    /// It used to fire in `init`, i.e. in the same instant as the autostart: a TLS handshake
+    /// plus a JSON fetch from api.github.com competing with the VM boot for CPU and the
+    /// network on the most latency-visible path the app has. Nothing about an update notice
+    /// is urgent, so it now runs the moment the engine reaches `.running`
+    /// (`runStartupUpdateCheckIfPending`), with a fallback after
+    /// `startupUpdateCheckFallback` in case it never does (failed boot, user stopped it) — and
+    /// right away when there is no boot to stay out of the way of (onboarding).
+    private func scheduleStartupUpdateCheck(engineAutostarts: Bool) {
+        startupUpdateCheckPending = true
+        guard engineAutostarts else { runStartupUpdateCheckIfPending(); return }
+        Task { [weak self] in
+            try? await Task.sleep(for: Self.startupUpdateCheckFallback)
+            self?.runStartupUpdateCheckIfPending()
+        }
+    }
+
+    /// Fire the owed launch-time check exactly once, whichever trigger gets here first.
+    private func runStartupUpdateCheckIfPending() {
+        guard startupUpdateCheckPending else { return }
+        startupUpdateCheckPending = false
+        Task { await self.checkForUpdates() }
+    }
 
     /// Check GitHub Releases (VELOX_GITHUB_REPO) for a newer Velox; the result lands
     /// in `availableUpdate`, which Settings → General and the menu bar observe.
@@ -532,6 +562,8 @@ final class EngineController {
             // First-run only: install terminal CLIs + the `velox` context and offer to
             // switch if needed. Backgrounded so it never delays the UI flipping to running.
             Task { await self.setUpTerminalAndContext() }
+            // The launch-time update check waited for the boot to finish (no-op after it ran).
+            runStartupUpdateCheckIfPending()
         } catch {
             // `runtime.start()` throws when the docker socket can't bind (a full or unwritable
             // ~/.velox, EMFILE) — by which point the guest is up and journaling the data disk.

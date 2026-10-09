@@ -5,7 +5,8 @@ public enum Storage {
     /// Ensure the data disk at `url` exists and is at least `sizeGiB`.
     ///
     /// The disk is a **raw** image (a sparse file on APFS). The guest formats it ext4;
-    /// VZ honours the guest's periodic `fstrim` by hole-punching the backing file, so
+    /// VZ honours the guest's `fstrim` (vinit runs it a few seconds after Docker frees
+    /// space, plus a boot and an hourly pass) by hole-punching the backing file, so
     /// blocks freed by deleted image layers return to the host (verified: a deleted
     /// 4 GiB file reclaims after a trim pass) — it doesn't grow forever.
     ///

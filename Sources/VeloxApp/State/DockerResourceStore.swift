@@ -49,8 +49,10 @@ final class DockerResourceStore {
     func start() {
         guard eventsTask == nil else { return }
         eventsTask = Task { [weak self] in
+            var backoff = ReconnectBackoff()
             while !Task.isCancelled {
                 guard let self else { return }
+                backoff.passBegan()
                 await self.refreshAll()
                 await self.refreshSystemInfo()
                 for await event in self.docker.events() {
@@ -60,7 +62,7 @@ final class DockerResourceStore {
                 // Stream ended (daemon not up yet, or restarted). Back off, reconnect —
                 // the next loop's refreshAll() re-syncs the full state.
                 if Task.isCancelled { return }
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: backoff.delayAfterPass())
             }
         }
     }

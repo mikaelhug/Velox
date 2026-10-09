@@ -97,6 +97,9 @@ public final class DockerSocketProxy: @unchecked Sendable {
                 }
                 break // EWOULDBLOCK (drained) or error
             }
+            // Bulk Docker-API transfers (`docker cp`, `load`, build contexts) were bounded by
+            // the 8 KiB AF_UNIX default buffers — see `FDIO.bulkSocketBuffer`.
+            FDIO.setSocketBuffers(client)
             bridge.bridge(localFd: client, toGuestPort: guestPort)
         }
     }

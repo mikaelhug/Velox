@@ -26,6 +26,12 @@ public final class VsockBridge: @unchecked Sendable {
                 Log.error("vsock connect to port \(port) failed: \(error.localizedDescription)")
                 close(localFd)
             case .success(let vsockFd):
+                // The Docker-API leg's other half (the unix-socket side is raised in
+                // `DockerSocketProxy`). Best-effort: VZ hands back an fd whose socket type
+                // is its own business, and a refusal just leaves its defaults in place. The
+                // published-port fallback (`reverse`) is left alone — it can carry hundreds
+                // of connections, and the guest sizes only the Docker port's window too.
+                if port == VsockPort.docker { FDIO.setSocketBuffers(vsockFd) }
                 if let header {
                     // Write the header (names the target) off the VM queue, then pump.
                     // If it can't be fully written, the guest never learns the target

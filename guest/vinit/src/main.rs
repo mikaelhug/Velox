@@ -17,8 +17,24 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 
 // ---- tiny logging to the console (fd 2 → hvc0) ----
+// Every line carries CLOCK_BOOTTIME (seconds.millis since the kernel started, the same
+// clock as the kernel's own `CONFIG_PRINTK_TIME` stamps) so boot phases — DHCP, data-disk
+// mount, dockerd spawn — can be timed straight from the Engine Logs instead of guessed.
+// One `eprintln!` (not a prefix print + a message print) so lines from concurrent boot
+// threads can't interleave mid-line.
 macro_rules! log {
-    ($($a:tt)*) => {{ eprint!("[vinit] "); eprintln!($($a)*); }};
+    ($($a:tt)*) => {{
+        let (secs, millis) = $crate::boot_time();
+        eprintln!("[{secs:4}.{millis:03}] [vinit] {}", format_args!($($a)*));
+    }};
+}
+
+/// Time since boot as (seconds, milliseconds) from CLOCK_BOOTTIME — monotonic, unaffected
+/// by `settimeofday` from `velox.epoch`/clock re-sync, so log stamps never jump.
+fn boot_time() -> (u64, u32) {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts); }
+    (ts.tv_sec.max(0) as u64, (ts.tv_nsec.max(0) / 1_000_000) as u32)
 }
 
 /// Spawn a detached worker, dropping the work if the thread can't be created.
@@ -67,6 +83,14 @@ fn main() {
     log!("starting (PID 1)");
     mount_all();
     set_clock();
+    // The vsock agent goes up FIRST, before networking, the data disk and dockerd. The host
+    // starts dialing these ports the moment the VM is running; while nothing listened, every
+    // dial failed and the host's informers fell back to their retry timers, so readiness was
+    // quantized by those timers instead of tracking dockerd. Every handler tolerates the
+    // early start: 2375 waits for dockerd's socket (handle_data), 2378 waits for the DHCP
+    // lease (handle_gateway), 2376 just dials a port that may not be published yet (the host
+    // retries), and 2374/2377 need nothing from the rest of boot.
+    start_vsock_agent();
     // Network (DHCP) and the data disk (first-boot mkfs/resize) are independent and
     // both potentially slow, so run them concurrently: the DHCP round-trip — and any
     // retries on a lossy bridge — is hidden behind the disk format instead of summed
@@ -83,25 +107,40 @@ fn main() {
         Ok(h) => Some(h),
         Err(e) => { log!("vinit: network thread spawn failed ({e}) — running it inline"); net_setup(); None }
     };
+    // The VirtioFS shares + binfmt registration are a third independent leg: they touch
+    // only /Users, the extra share paths, /run/rosetta and binfmt_misc (all mounted by
+    // mount_all above) — nothing the data disk or DHCP produce. They stay ordered WITHIN
+    // their thread: setup_binfmt registers Rosetta with the `F` flag, which opens the
+    // interpreter on the rosetta virtiofs share at registration time, so the share must be
+    // mounted first. Emulators must be registered before dockerd (BuildKit enumerates
+    // supported platforms at daemon start), so this thread is joined before the spawn below.
+    let fs_setup = || {
+        let rosetta_ok = setup_virtiofs();
+        setup_binfmt(rosetta_ok);
+    };
+    let fs_handle = match std::thread::Builder::new().spawn(fs_setup) {
+        Ok(h) => Some(h),
+        Err(e) => { log!("vinit: virtiofs thread spawn failed ({e}) — running it inline"); fs_setup(); None }
+    };
     let data_ok = setup_data_disk();
     // Swap is a memory-pressure safety valve, not a startup dependency, and on first
     // boot make_swapfile() fallocate()s a multi-GiB file — pure stall before dockerd.
     // Build it off the critical path. Spawned only when data_ok, so the swapfile's
     // parent (/var/lib/docker) is already mounted.
     if data_ok { spawn_worker("swap-setup", setup_swap); }
-    let rosetta_ok = setup_virtiofs();
-    // Emulators before dockerd: BuildKit enumerates supported platforms at daemon start.
-    setup_binfmt(rosetta_ok);
     // Diagnosability: one line when the host granted nested virtualization (shows
     // in Engine Logs / Copy Diagnostics). KVM self-disables without EL2 — silent.
     if std::path::Path::new("/dev/kvm").exists() {
         log!("KVM available — nested virtualization enabled");
     }
     // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
-    // place, so the network must be fully applied before it starts.
+    // place, so the network must be fully applied before it starts — and the emulators
+    // registered (above).
+    if let Some(h) = fs_handle { let _ = h.join(); }
     if let Some(h) = net_handle { let _ = h.join(); }
     enable_ip_forwarding();
     tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
+    tune_memory_sysctls();  // no periodic kcompactd wakeups at idle
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
@@ -120,7 +159,6 @@ fn main() {
         log!("FATAL: data disk mount failed — refusing to start dockerd (it would run on \
               non-persistent tmpfs and lose all images/volumes). Fix /dev/vdb and restart.");
     }
-    start_vsock_agent();
     start_conduit_pool();
     start_direct_access(nft_rx);
     log!("init complete — supervising");
@@ -389,6 +427,22 @@ fn tune_network_sysctls() {
         ("/proc/sys/net/ipv4/tcp_fin_timeout", "10"),               // drain FIN-WAIT-2 faster
         ("/proc/sys/net/ipv4/tcp_max_tw_buckets", "262144"),        // don't overflow TIME_WAIT under churn (default 32k stalls)
         ("/proc/sys/net/core/somaxconn", "1024"),                   // deeper accept backlog for guest listeners
+    ] {
+        if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
+    }
+}
+
+/// Memory-management sysctls for an idle-lean guest.
+///
+/// `vm.compaction_proactiveness=0` turns off *proactive* compaction only. At its default
+/// (20) kcompactd wakes every 500 ms per node to score fragmentation — a steady idle wakeup
+/// that lands in the VM process's CPU time on the host (idle CPU is where Velox trailed
+/// OrbStack). At 0 the kernel lets kcompactd sleep until it is actually asked for work.
+/// On-demand compaction is untouched: direct compaction in the allocator, kswapd waking
+/// kcompactd for high-order allocations (THP, the balloon's page migration) all still run.
+fn tune_memory_sysctls() {
+    for (path, val) in [
+        ("/proc/sys/vm/compaction_proactiveness", "0"),
     ] {
         if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
     }
@@ -825,31 +879,47 @@ mod dhcp {
         u32::from_ne_bytes(b)
     }
 
+    /// Per-attempt OFFER/ACK wait: starts short and doubles to a 1 s cap.
+    const ATTEMPT_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+    const ATTEMPT_CAP: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Total time spent retransmitting before giving up — the same ~15 s the old flat
+    /// schedule (12 × (1 s wait + 250 ms sleep)) allowed, so a slow bridge is no likelier
+    /// to end up leaseless than before.
+    const ACQUIRE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
     pub fn acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
         // Apple's vmnet DHCP server can drop the first DISCOVER (notably right after
-        // the bridge comes up). Retransmit a few times with linear backoff before
-        // giving up, so a transient miss self-heals instead of leaving the guest with
-        // no address — and therefore no DNS — for the whole session.
-        let mut last = Error::new(ErrorKind::TimedOut, "no DHCP offer");
-        for attempt in 0..12u32 {
-            match try_acquire(ifname, mac) {
+        // the bridge comes up). Retransmit until the budget runs out, so a transient miss
+        // self-heals instead of leaving the guest with no address — and therefore no DNS —
+        // for the whole session.
+        //
+        // Exponential, starting short (100, 200, 400, 800 ms, then 1 s): the old flat 1 s
+        // wait + 250 ms sleep meant a dropped first DISCOVER cost ≥1.25 s of every boot,
+        // while vmnet answers a DISCOVER it does see in milliseconds. Each attempt's wait is
+        // its own retransmit interval — an attempt that fails faster (e.g. a send error while
+        // the link settles) sleeps out the rest of it, so the cadence never degrades to a spin.
+        let start = std::time::Instant::now();
+        let mut wait = ATTEMPT_FIRST;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let t0 = std::time::Instant::now();
+            match try_acquire(ifname, mac, wait) {
                 Ok(lease) => return Ok(lease),
                 Err(e) => {
-                    log!("DHCP attempt {} failed: {e}", attempt + 1);
-                    last = e;
-                    // Flat, short backoff: retransmit ~every 1.25s so we grab a lease
-                    // the moment the bridge is ready, instead of escalating into long gaps.
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    log!("DHCP attempt {attempt} ({} ms wait) failed: {e}", wait.as_millis());
+                    if start.elapsed() >= ACQUIRE_BUDGET { return Err(e); }
+                    if let Some(rest) = wait.checked_sub(t0.elapsed()) { std::thread::sleep(rest); }
+                    wait = (wait * 2).min(ATTEMPT_CAP);
                 }
             }
         }
-        Err(last)
     }
 
-    fn try_acquire(ifname: &str, mac: [u8; 6]) -> Result<Lease> {
+    fn try_acquire(ifname: &str, mac: [u8; 6], wait: std::time::Duration) -> Result<Lease> {
         // Open the socket here and close it on every path (including the `?` errors
         // in the handshake) so a retried acquire doesn't leak a descriptor per miss.
-        let sock = open_socket(ifname)?;
+        let sock = open_socket(ifname, wait)?;
         let res = handshake(sock, &mac);
         unsafe { libc::close(sock); }
         res
@@ -880,7 +950,7 @@ mod dhcp {
     /// Renew the current lease in place (INIT-REBOOT style: broadcast REQUEST for
     /// the IP we already hold). Returns Ok once the server ACKs. Best-effort.
     pub fn renew(ifname: &str, mac: [u8; 6], ip: u32, server: u32) -> Result<()> {
-        let sock = open_socket(ifname)?;
+        let sock = open_socket(ifname, ATTEMPT_CAP)?;
         let xid = rand_xid();
         let server_opt = if server != 0 { Some(server) } else { None };
         let request = build(&mac, xid, REQUEST, Some(ip), server_opt);
@@ -1016,7 +1086,7 @@ mod dhcp {
         Some(Reply { xid, yiaddr, msg_type, opts })
     }
 
-    fn open_socket(ifname: &str) -> Result<i32> {
+    fn open_socket(ifname: &str, wait: std::time::Duration) -> Result<i32> {
         let s = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if s < 0 { return Err(Error::last_os_error()); }
         let on: libc::c_int = 1;
@@ -1025,10 +1095,13 @@ mod dhcp {
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_REUSEADDR, &on as *const _ as *const _, 4);
             // bind to the device so broadcast goes out eth0 before we have an IP
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, ifname.as_ptr() as *const _, ifname.len() as u32);
-            // Short per-try OFFER/ACK wait: the vmnet bridge often isn't ready for
-            // the very first DISCOVER, so we'd rather retransmit quickly than block
-            // 5s. Standard DHCP retransmission — costs nothing when it answers fast.
-            let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
+            // Short per-try OFFER/ACK wait (`acquire` grows it 100 ms → 1 s): the vmnet
+            // bridge often isn't ready for the very first DISCOVER, so we'd rather
+            // retransmit quickly than block. Costs nothing when it answers fast.
+            let tv = libc::timeval {
+                tv_sec: wait.as_secs() as _,
+                tv_usec: wait.subsec_micros() as _,
+            };
             libc::setsockopt(s, libc::SOL_SOCKET, libc::SO_RCVTIMEO, &tv as *const _ as *const _, std::mem::size_of::<libc::timeval>() as u32);
         }
         let bind = libc::sockaddr_in {
@@ -1214,36 +1287,103 @@ fn setup_data_disk() -> bool {
             Ok(s) if s.success() => {}, other => log!("resize2fs grow failed: {other:?}"),
         }
     }
-    start_fstrim_timer();
+    start_disk_trim();
     true
 }
 
-/// Periodically TRIM the data disk so blocks freed by deleted image layers /
-/// containers are released back to the host. VZ honours the discard by hole-punching
-/// the raw backing file (verified: a deleted 4 GiB file reclaims after a trim pass) —
-/// so the disk shrinks instead of growing forever like Docker Desktop's `Docker.raw`.
-/// Periodic (not `-o discard`) to keep delete latency off the hot path, like OrbStack/DD.
-fn start_fstrim_timer() {
+/// Return blocks freed on the data disk to the host. VZ honours a discard by hole-punching the
+/// raw backing file (verified: a deleted 4 GiB file reclaims after a trim pass), so the disk
+/// shrinks instead of growing forever like Docker Desktop's `Docker.raw`.
+///
+/// When: as soon as Docker frees space, not on a clock. OrbStack returns space continuously
+/// (its data filesystem is mounted with online discard), so an hourly-only trim left Velox
+/// holding a `docker rmi`'s worth of host disk for up to an hour. Online discard
+/// (`-o discard`) is still deliberately off: it issues a synchronous discard — a host
+/// hole-punch — inside every unlink, putting it on the hot path of layer extraction and
+/// container removal. Instead a second docker `/events` subscription (`TRIM_EVENTS_FILTER`)
+/// listens for exactly the events that free disk space and schedules ONE debounced FITRIM:
+/// `TRIM_QUIET` after the last event of a burst, but never later than `TRIM_MAX_DELAY` after
+/// the first, so a sustained stream (a CI loop) can't postpone it indefinitely.
+///
+/// Two timed passes remain, for frees that have no Docker event: one `TRIM_BOOT_DELAY` after
+/// boot (anything freed late last session, kept off the boot path) and an hourly backstop
+/// (e.g. files deleted *inside* a running container's writable layer, or log rotation).
+const TRIM_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+const TRIM_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const TRIM_BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const TRIM_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3600);
+/// filters={"event":["delete","untag","destroy","prune"]} (URL-encoded): image delete/untag,
+/// container destroy, volume destroy, and the `prune` event every `docker … prune` (images,
+/// containers, volumes, build cache) emits. Keyed on the action only — no `type` filter — so
+/// the request can't be rejected over a type name a given dockerd doesn't know; the few
+/// non-disk matches (a network destroy) just cost one cheap extra trim. ext4 skips block groups
+/// it has already trimmed, so a trim with nothing new to release is cheap.
+const TRIM_EVENTS_FILTER: &str =
+    "%7B%22event%22%3A%5B%22delete%22%2C%22untag%22%2C%22destroy%22%2C%22prune%22%5D%7D";
+
+fn start_disk_trim() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    spawn_worker("fstrim", move || trim_loop(rx));
+    // Only response BODY bytes are events (the head arrives on connect). A (re)connect itself
+    // triggers nothing: only dockerd frees space, so nothing freeable can be missed while the
+    // subscription is down that the boot pass / backstop don't already cover.
+    spawn_docker_events_stream("trim-events", TRIM_EVENTS_FILTER, || {}, move |_, body| {
+        if body { let _ = tx.send(()); }
+    });
+}
+
+fn trim_loop(events: std::sync::mpsc::Receiver<()>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+    let mut backstop = Instant::now() + TRIM_BOOT_DELAY;
+    loop {
+        match events.recv_timeout(backstop.saturating_duration_since(Instant::now())) {
+            Ok(()) => {
+                // Debounce the burst: quiet for TRIM_QUIET, capped at TRIM_MAX_DELAY overall.
+                let cap = Instant::now() + TRIM_MAX_DELAY;
+                loop {
+                    let left = cap.saturating_duration_since(Instant::now());
+                    if left.is_zero() { break }
+                    match events.recv_timeout(TRIM_QUIET.min(left)) {
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+                fstrim_data_disk("docker freed space");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                fstrim_data_disk("scheduled");
+                backstop = Instant::now() + TRIM_BACKSTOP;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // The events subscription never started (thread spawn failed): keep the timed
+                // passes rather than spin on a dead channel.
+                std::thread::sleep(backstop.saturating_duration_since(Instant::now()));
+                fstrim_data_disk("scheduled");
+                backstop = Instant::now() + TRIM_BACKSTOP;
+            }
+        }
+    }
+}
+
+/// One FITRIM pass over the whole data filesystem.
+fn fstrim_data_disk(why: &str) {
     // FITRIM: _IOWR('X', 121, struct fstrim_range) — trims the whole filesystem.
     const FITRIM: libc::c_ulong = 0xC018_5879;
     #[repr(C)]
     struct FstrimRange { start: u64, len: u64, minlen: u64 }
-    spawn_worker("fstrim", || {
-        // One pass shortly after boot (reclaims anything freed last session), then hourly.
-        let mut delay = std::time::Duration::from_secs(60);
-        loop {
-            std::thread::sleep(delay);
-            delay = std::time::Duration::from_secs(3600);
-            let path = match CString::new("/var/lib/docker") { Ok(p) => p, Err(_) => continue };
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-            if fd < 0 { continue; }
-            let mut range = FstrimRange { start: 0, len: u64::MAX, minlen: 0 };
-            if unsafe { libc::ioctl(fd, FITRIM as _, &mut range) } < 0 {
-                log!("fstrim failed: {}", std::io::Error::last_os_error());
-            }
-            unsafe { libc::close(fd); }
-        }
-    });
+    let fd = unsafe {
+        libc::open(c"/var/lib/docker".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+    };
+    if fd < 0 { return; }
+    let mut range = FstrimRange { start: 0, len: u64::MAX, minlen: 0 };
+    if unsafe { libc::ioctl(fd, FITRIM as _, &mut range) } < 0 {
+        log!("fstrim ({why}) failed: {}", std::io::Error::last_os_error());
+    } else if range.len > 0 {
+        // On return the kernel stores the number of bytes it discarded in `len`.
+        log!("fstrim ({why}): released {} MiB to the host", range.len >> 20);
+    }
+    unsafe { libc::close(fd); }
 }
 
 /// Direct (named) container access: once dockerd has built its nftables ruleset, allow the Mac
@@ -1276,30 +1416,82 @@ fn start_direct_access(triggers: std::sync::mpsc::Receiver<()>) {
 /// re-checks both chains — the informer rule). Reconnects with a short backoff: the socket
 /// vanishes across a dockerd restart, and the supervisor's respawn signal covers that gap.
 fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
+    // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly when
+    // dockerd rebuilds the drop chains. Any traffic (including the response head) is a
+    // harmless idempotent re-assert, so this informer ignores the head/body distinction.
+    let on_connect = {
+        let trigger = trigger.clone();
+        move || {
+            log!("direct-access: events informer connected");
+            // Informer rule: reconcile unconditionally on (re)connect — an event emitted
+            // before this subscription existed is lost forever (no replay), and dockerd may
+            // not flush response bytes until the next event.
+            let _ = trigger.send(());
+        }
+    };
+    spawn_docker_events_stream("events-informer",
+        "%7B%22type%22%3A%5B%22network%22%5D%7D", on_connect,
+        move |_, _| { let _ = trigger.send(()); });
+}
+
+/// THE guest's docker `/events` reader (one mechanism, CLAUDE.md §10): a dedicated thread
+/// holding one raw HTTP/1.1 subscription on the local dockerd socket, filtered by `filters`
+/// (URL-encoded JSON), reconnecting forever. `on_connect` runs on every (re)connect;
+/// `on_read(bytes, body)` on every read, with `body` true when the read carries response-body
+/// bytes — i.e. at least one event — of a 200 response (the head, which dockerd sends on
+/// subscribe, is not an event). Chunk framing isn't parsed: consumers treat the bytes as a
+/// trigger only, and every filter here is specific enough that any body is a real event.
+fn spawn_docker_events_stream<C, R>(name: &str, filters: &'static str, on_connect: C, mut on_read: R)
+where
+    C: Fn() + Send + 'static,
+    R: FnMut(&[u8], bool) + Send + 'static,
+{
     use std::io::{Read, Write};
-    spawn_worker("events-informer", move || loop {
+    let what = name.to_string();
+    spawn_worker(name, move || loop {
+        let mut rejected = false;
         if let Ok(mut s) = std::os::unix::net::UnixStream::connect(DOCKER_SOCK) {
-            // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly
-            // when dockerd rebuilds the drop chains. Headers/chunk framing aren't parsed:
-            // any traffic (including the response head) is a harmless idempotent re-assert.
-            let req = "GET /events?filters=%7B%22type%22%3A%5B%22network%22%5D%7D HTTP/1.1\r\nHost: docker\r\n\r\n";
+            let req = format!("GET /events?filters={filters} HTTP/1.1\r\nHost: docker\r\n\r\n");
             if s.write_all(req.as_bytes()).is_ok() {
-                log!("direct-access: events informer connected");
-                // Informer rule: reconcile unconditionally on (re)connect — an event
-                // emitted before this subscription existed is lost forever (no replay),
-                // and dockerd may not flush response bytes until the next event.
-                let _ = trigger.send(());
+                on_connect();
                 let mut buf = [0u8; 4096];
+                let mut head: Vec<u8> = Vec::new(); // response head, until its blank line
+                let mut in_body = false;
+                let mut ok = false;
                 while let Ok(n) = s.read(&mut buf) {
                     if n == 0 { break }
-                    let _ = trigger.send(());
+                    let mut body = in_body;
+                    if !in_body {
+                        head.extend_from_slice(&buf[..n]);
+                        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                            in_body = true;
+                            ok = head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200");
+                            body = end + 4 < head.len();
+                            if !ok {
+                                let status = String::from_utf8_lossy(&head[..end]).lines()
+                                    .next().unwrap_or("").to_string();
+                                log!("{what}: /events refused ({status}) — retrying in 30s");
+                            }
+                            head = Vec::new();
+                        } else if head.len() > 16 * 1024 {
+                            break; // not an HTTP response head we understand — reconnect
+                        }
+                    }
+                    on_read(&buf[..n], body && ok);
+                    if in_body && !ok {
+                        // dockerd refused the subscription (an error status): retrying at the
+                        // quick cadence would just spin on the same refusal.
+                        rejected = true;
+                        break;
+                    }
                 }
             }
         }
-        // Quick retry: the subscription must be live before any API client can start a
-        // container (events from before it are unrecoverable). Cheap — this only spins
-        // while dockerd's socket is down (boot / restart), then blocks in read above.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Quick retry: a subscription must be live before any API client can act (events from
+        // before it are unrecoverable). Cheap — this only spins while dockerd's socket is down
+        // (boot / restart), then blocks in read above.
+        let retry_ms = if rejected { 30_000 } else { 250 };
+        std::thread::sleep(std::time::Duration::from_millis(retry_ms));
     });
 }
 
@@ -1445,6 +1637,13 @@ fn data_disk_clean(dev: &str) -> bool {
 
 // =================== swap ===================
 
+/// swapon(2) flag (linux/swap.h; not exported by the libc crate): discard the whole area
+/// once at swapon, then every swap cluster as it is freed. On the data disk a discard is a
+/// hole-punch in the host's raw `data.img` (VZ honours it, exactly like FITRIM), so swapped-
+/// out pages that are later freed hand their host disk back instead of pinning it until the
+/// file is rebuilt. A device without discard support simply ignores the flag (no error).
+const SWAP_FLAG_DISCARD: libc::c_int = 0x10000;
+
 /// If the host requested swap (`velox.swap=<MiB>` on the cmdline), create a
 /// swapfile on the persistent data disk and enable it. No mkswap binary in the
 /// image — we write the swap v1 header ourselves and `swapon(2)` directly.
@@ -1462,24 +1661,42 @@ fn setup_swap() {
         log!("velox.swap value is out of range — skipping swap");
         return;
     };
-    match make_swapfile(path, swap_bytes) {
-        Ok(()) => {
-            let cpath = cstr(path);
-            if unsafe { libc::swapon(cpath.as_ptr(), 0) } == 0 {
-                log!("swap enabled: {mib} MiB at {path}");
-            } else {
-                log!("swapon failed: {}", std::io::Error::last_os_error());
+    let swapon = || {
+        let cpath = cstr(path);
+        if unsafe { libc::swapon(cpath.as_ptr(), SWAP_FLAG_DISCARD) } == 0 { Ok(()) }
+        else { Err(std::io::Error::last_os_error()) }
+    };
+    match make_swapfile(path, swap_bytes, true) {
+        Ok(reused) => match swapon() {
+            Ok(()) => log!("swap enabled: {mib} MiB at {path}{}", if reused { " (reused)" } else { "" }),
+            // A reused file the kernel refused (e.g. a hole the size check couldn't see):
+            // rebuild it from scratch once, exactly as a first boot would.
+            Err(e) if reused => {
+                log!("swapon of the existing swapfile failed ({e}) — recreating it");
+                match make_swapfile(path, swap_bytes, false).and_then(|_| swapon()) {
+                    Ok(()) => log!("swap enabled: {mib} MiB at {path}"),
+                    Err(e) => log!("swapon failed: {e}"),
+                }
             }
-        }
+            Err(e) => log!("swapon failed: {e}"),
+        },
         Err(e) => log!("swapfile setup failed: {e}"),
     }
 }
 
 /// Build a valid Linux v1 swapfile of (at least) `bytes`, allocated with no holes
-/// (swapon rejects sparse files) and stamped with the swap header + magic.
-fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
+/// (swapon rejects sparse files) and stamped with the swap header + magic. Returns whether
+/// an existing file was reused.
+///
+/// With `reuse`, a swapfile left by a previous boot is kept when it already has exactly the
+/// wanted size and is fully allocated (st_blocks covers st_size — a fallocate()d file always
+/// does). Rebuilding it every boot meant truncating a multi-GiB file to zero and fallocating
+/// it again: a burst of ext4 allocation + journal work for an identical result. The header is
+/// re-stamped either way, so a stale or foreign one can't survive. If the kernel still
+/// refuses the reused file, the caller rebuilds it with `reuse = false`.
+fn make_swapfile(path: &str, bytes: u64, reuse: bool) -> std::io::Result<bool> {
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
     let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
@@ -1492,12 +1709,17 @@ fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
     }
     let size = pages * page;
 
+    // symlink_metadata: a link planted at this path must not make us "reuse" another file.
+    let reusable = reuse && std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file() && m.len() == size
+             && m.blocks().saturating_mul(512) >= size)
+        .unwrap_or(false);
     let mut f = std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true).open(path)?;
+        .read(true).write(true).create(true).truncate(!reusable).open(path)?;
     // Swap must not be world/group readable.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     // Allocate real blocks — a sparse (ftruncate'd) file fails swapon with "has holes".
-    if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+    if !reusable && unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // swap_header (union, one page): info.version @1024, info.last_page @1028,
@@ -1509,7 +1731,7 @@ fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
     f.seek(SeekFrom::Start(page - 10))?;
     f.write_all(b"SWAPSPACE2")?;
     f.flush()?;
-    Ok(())
+    Ok(reusable)
 }
 
 // =================== VirtioFS + Rosetta ===================
@@ -1778,9 +2000,35 @@ fn start_vsock_agent() {
     spawn_listener(GW_PORT, handle_gateway);
 }
 
+// AF_VSOCK socket options (linux/vm_sockets.h; not exported by the libc crate). Level is
+// AF_VSOCK; the value is a u64.
+const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+/// Receive buffer for Docker-API vsock connections (default 256 KiB). For virtio-vsock this is
+/// the CREDIT the guest advertises to the host — how many bytes the host may have in flight
+/// toward us before it must wait for a credit update — so on bulk uploads (`docker cp` into a
+/// container, `docker load`, a build context) 256 KiB stalls the host every 256 KiB on a
+/// round-trip. Memory is only consumed for bytes actually queued, so idle connections cost
+/// nothing extra.
+const DOCKER_VSOCK_BUF: u64 = 4 * 1024 * 1024;
+
+/// Raise a vsock socket's buffer size. MAX first: the kernel clamps SIZE to the current
+/// max, which defaults to the same 256 KiB. Set on the LISTENING socket — accepted sockets
+/// inherit buffer_size/min/max from their listener (`__vsock_create`). Best-effort.
+fn vsock_set_buffer(fd: RawFd, bytes: u64) {
+    let sz = std::mem::size_of::<u64>() as libc::socklen_t;
+    for opt in [SO_VM_SOCKETS_BUFFER_MAX_SIZE, SO_VM_SOCKETS_BUFFER_SIZE] {
+        let r = unsafe { libc::setsockopt(fd, libc::AF_VSOCK, opt, &bytes as *const u64 as *const _, sz) };
+        if r != 0 { log!("vsock buffer option {opt} failed: {}", std::io::Error::last_os_error()); }
+    }
+}
+
 fn vsock_listen(port: u32) -> std::io::Result<RawFd> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
+    // Bulk Docker-API traffic only; the control/clock/gateway ports are a line each, and the
+    // reverse port-forward path is a fallback that can hold hundreds of connections.
+    if port == DOCKER_PORT { vsock_set_buffer(fd, DOCKER_VSOCK_BUF); }
     #[repr(C)]
     struct SockaddrVm { family: libc::sa_family_t, _r0: u16, port: u32, cid: u32, _z: [u8; 4] }
     let addr = SockaddrVm { family: libc::AF_VSOCK as _, _r0: 0, port, cid: CID_ANY, _z: [0; 4] };
@@ -1885,10 +2133,104 @@ fn handle_clock(fd: RawFd) {
 }
 
 fn handle_data(fd: RawFd) {
-    match UnixStream::connect(DOCKER_SOCK) {
-        Ok(up) => bridge(fd, up.into_raw_fd()),
-        Err(e) => { log!("dial docker.sock: {e}"); unsafe { libc::close(fd); } }
+    match connect_docker_sock(fd) {
+        Some(up) => bridge(fd, up.into_raw_fd()),
+        None => unsafe { libc::close(fd); },
     }
+}
+
+/// Upper bound on how long one Docker-API connection waits for dockerd's socket. Generous —
+/// a first boot that formats the data disk, or a dockerd crash-loop backoff (≤30 s), must not
+/// turn into dropped connections — but bounded, so a guest whose dockerd never comes up (data
+/// disk refused) doesn't park handler threads forever.
+const DOCKER_SOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connect to dockerd's API socket, waiting for it to appear if this connection arrived before
+/// dockerd bound it (the vsock agent starts first in boot, so the host's first requests land
+/// here). dockerd binds its listener early in its startup and only begins serving once it is
+/// initialized, so once connected the client's request simply blocks until dockerd answers —
+/// readiness then tracks dockerd itself, with no host-side retry quantization.
+///
+/// Event-driven (CLAUDE.md §8): an inotify watch on /run wakes us when the socket is created.
+/// The watch is armed BEFORE the next connect attempt, so a socket that appears between a
+/// failed connect and the wait is never missed. Gives up early if the host shuts its end
+/// (POLLRDHUP — its request timed out), so an abandoned connection doesn't hold a handler
+/// thread for the full wait.
+fn connect_docker_sock(client: RawFd) -> Option<UnixStream> {
+    // Steady state: dockerd is up — connect immediately, no inotify fd, no extra syscalls.
+    match UnixStream::connect(DOCKER_SOCK) {
+        Ok(s) => return Some(s),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ECONNREFUSED)) => {}
+        Err(e) => { log!("dial docker.sock: {e}"); return None; }
+    }
+    let ino = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    let watched = ino >= 0 && unsafe {
+        libc::inotify_add_watch(ino, c"/run".as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO)
+    } >= 0;
+    if !watched {
+        // No inotify (fd exhaustion): degrade to the short re-dial timer below for the wait.
+        log!("dial docker.sock: inotify unavailable ({}) — re-dialing on a short timer",
+             std::io::Error::last_os_error());
+    }
+    let deadline = std::time::Instant::now() + DOCKER_SOCK_WAIT;
+    // ECONNREFUSED means the socket FILE exists but nothing accepts on it: dockerd is between
+    // bind(2) and listen(2) (microseconds apart, and there is no event for listen), or it is a
+    // stale file left by a dockerd that died, whose successor hasn't re-created it yet (that
+    // re-creation IS an inotify event). The first has no event at all, so this case also
+    // re-dials on a short, growing timer (5 ms → 250 ms cap). ENOENT waits on the watch alone.
+    let mut redial_ms: i32 = 5;
+    let mut client_open = true; // false once the host half-closed — see the poll below
+    let result = loop {
+        let wait_ms = match UnixStream::connect(DOCKER_SOCK) {
+            Ok(s) => break Some(s),
+            Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED)
+                || (!watched && e.raw_os_error() == Some(libc::ENOENT)) => {
+                let ms = redial_ms;
+                redial_ms = (redial_ms * 2).min(250);
+                ms
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => -1, // wait for the create event
+            Err(e) => { log!("dial docker.sock: {e}"); break None; }
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            log!("dial docker.sock: dockerd did not come up within {}s — dropping connection",
+                 DOCKER_SOCK_WAIT.as_secs());
+            break None;
+        }
+        let left_ms = left.as_millis().min(i32::MAX as u128) as i32;
+        let timeout = if wait_ms < 0 { left_ms } else { wait_ms.min(left_ms) };
+        // POLLRDHUP on the client = the host shut (at least) its sending side. A negative fd is
+        // ignored by poll(2): the client stops being watched once it half-closed (see below),
+        // and the unwatched-inotify case polls the client alone.
+        let mut pfds = [
+            libc::pollfd { fd: if client_open { client } else { -1 }, events: libc::POLLRDHUP, revents: 0 },
+            libc::pollfd { fd: if watched { ino } else { -1 }, events: libc::POLLIN, revents: 0 },
+        ];
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            log!("dial docker.sock: poll failed: {}", std::io::Error::last_os_error());
+            break None;
+        }
+        if r > 0 && pfds[0].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            // Fully gone (closed/reset — its request timed out)? A zero-length send fails with
+            // EPIPE/ENOTCONN once the peer can no longer receive. If it only HALF-closed after
+            // sending a complete request, it still wants the response: keep waiting, but stop
+            // polling it — RDHUP is level-triggered and would spin this loop.
+            let sent = unsafe {
+                libc::send(client, std::ptr::null(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            };
+            if sent < 0 { break None; } // nothing left to bridge to
+            client_open = false;
+        }
+        if r > 0 && pfds[1].revents & libc::POLLIN != 0 {
+            // Drain. Which entry was created doesn't matter — the connect above is the check.
+            let mut buf = [0u8; 4096];
+            while unsafe { libc::read(ino, buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
+        }
+    };
+    if ino >= 0 { unsafe { libc::close(ino); } }
+    result
 }
 
 /// Gateway probe. The host's `GatewayProbe` connects once at boot; reply with the vmnet
@@ -2476,11 +2818,14 @@ fn bridge(a: RawFd, b: RawFd) {
 
 fn pump(from: RawFd, to: RawFd) {
     // Heap (not stack) so the larger size doesn't bloat each pump thread's stack.
-    // 128 KiB cuts read/write syscalls on bulk transfers vs 32 KiB. This pump carries
-    // the docker.sock API proxy (port 2375) and the reverse port-forward TCP datapath
-    // (port 2376) — i.e. Docker-API traffic (image push/pull, build context, logs) and
-    // published-port localhost throughput. NOT container↔internet, which is direct VZNAT.
-    let mut buf = vec![0u8; 128 * 1024];
+    // This pump carries the docker.sock API proxy (port 2375) and the reverse port-forward
+    // TCP datapath (port 2376) — i.e. Docker-API traffic (`docker cp`, image load/save,
+    // build context, logs) and published-port localhost throughput. NOT container↔internet,
+    // which is direct VZNAT. 512 KiB (was 128 KiB) so one read can take a large share of the
+    // 4 MiB vsock window (DOCKER_VSOCK_BUF) per syscall pair. It costs no RSS up front: an
+    // allocation this size is its own zero-filled mmap, and only the bytes a read actually
+    // lands in are ever touched — an idle hijacked stream still pins next to nothing.
+    let mut buf = vec![0u8; 512 * 1024];
     loop {
         let n = unsafe { libc::read(from, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n <= 0 { break; }
