@@ -17,8 +17,24 @@ use std::os::unix::net::UnixStream;
 use std::process::Command;
 
 // ---- tiny logging to the console (fd 2 → hvc0) ----
+// Every line carries CLOCK_BOOTTIME (seconds.millis since the kernel started, the same
+// clock as the kernel's own `CONFIG_PRINTK_TIME` stamps) so boot phases — DHCP, data-disk
+// mount, dockerd spawn — can be timed straight from the Engine Logs instead of guessed.
+// One `eprintln!` (not a prefix print + a message print) so lines from concurrent boot
+// threads can't interleave mid-line.
 macro_rules! log {
-    ($($a:tt)*) => {{ eprint!("[vinit] "); eprintln!($($a)*); }};
+    ($($a:tt)*) => {{
+        let (secs, millis) = $crate::boot_time();
+        eprintln!("[{secs:4}.{millis:03}] [vinit] {}", format_args!($($a)*));
+    }};
+}
+
+/// Time since boot as (seconds, milliseconds) from CLOCK_BOOTTIME — monotonic, unaffected
+/// by `settimeofday` from `velox.epoch`/clock re-sync, so log stamps never jump.
+fn boot_time() -> (u64, u32) {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts); }
+    (ts.tv_sec.max(0) as u64, (ts.tv_nsec.max(0) / 1_000_000) as u32)
 }
 
 /// Spawn a detached worker, dropping the work if the thread can't be created.

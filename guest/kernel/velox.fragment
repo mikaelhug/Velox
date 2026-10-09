@@ -141,6 +141,10 @@ CONFIG_KVM=y
 CONFIG_TTY=y
 CONFIG_UNIX98_PTYS=y
 CONFIG_PRINTK=y
+# Timestamp every kernel console line (`[    0.412345] …`) on CLOCK_BOOTTIME — the same
+# clock vinit stamps its own log lines with — so a boot can be timed end to end from the
+# Engine Logs alone (kernel init → vinit → DHCP → data disk → dockerd). A few bytes per line.
+CONFIG_PRINTK_TIME=y
 
 # --- Read-only root: erofs (compressed, demand-paged from /dev/vda) ---
 # Velox's root filesystem is a compressed read-only erofs image on a virtio-blk
