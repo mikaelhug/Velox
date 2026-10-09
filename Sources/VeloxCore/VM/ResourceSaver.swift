@@ -53,15 +53,17 @@ public final class ResourceSaver: @unchecked Sendable {
         let coalescer = Coalescer { [weak self] in await self?.evaluate() }
         self.coalescer = coalescer
         task = Task { [weak self] in
+            var backoff = ReconnectBackoff()
             while !Task.isCancelled {
                 guard let self else { return }
+                backoff.passBegan()
                 await self.evaluate()                       // current state on (re)connect
                 for await event in self.docker.events() {
                     if Task.isCancelled { return }
                     if event.type == nil || event.type == "container" { coalescer.trigger() }
                 }
                 if Task.isCancelled { return }
-                try? await Task.sleep(for: .seconds(1))      // back off, reconnect
+                try? await Task.sleep(for: backoff.delayAfterPass())   // back off, reconnect
             }
         }
     }

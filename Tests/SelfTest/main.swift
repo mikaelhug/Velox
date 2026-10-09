@@ -2192,6 +2192,27 @@ section("NamedAccessRouter.installedRoutes")
 }
 installedRoutesTest()
 
+// MARK: ReconnectBackoff (informer reconnect schedule)
+
+section("ReconnectBackoff")
+@MainActor func reconnectBackoffTest() {
+    // The three /events informers share this schedule. Readiness at boot depends on the
+    // fast start; the 1 s ceiling is what keeps a long outage from becoming a hammer.
+    var b = ReconnectBackoff()
+    var delays: [Duration] = []
+    for _ in 0..<7 { b.passBegan(); delays.append(b.delayAfterPass()) }
+    equal(delays, [.milliseconds(50), .milliseconds(100), .milliseconds(200), .milliseconds(400),
+                   .milliseconds(800), .seconds(1), .seconds(1)],
+          "failed passes back off 50 ms, doubling, to a 1 s ceiling")
+    // A pass that lasted at least the ceiling was a real connection: start over at 50 ms.
+    b.passBegan()
+    Thread.sleep(forTimeInterval: 1.05)
+    equal(b.delayAfterPass(), .milliseconds(50), "a long-lived pass resets the backoff")
+    b.passBegan()
+    equal(b.delayAfterPass(), .milliseconds(100), "…and the next fast failure grows it again")
+}
+reconnectBackoffTest()
+
 // MARK: Summary
 
 print("\n----------------------------------------")

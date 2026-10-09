@@ -64,8 +64,10 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         let coalescer = Coalescer { [weak self] in await self?.runReconcile() }
         self.coalescer = coalescer
         task = Task { [weak self] in
+            var backoff = ReconnectBackoff()
             while !Task.isCancelled {
                 guard let self else { return }
+                backoff.passBegan()
                 // Catch the current state on (re)connect (also picks up restart-policy
                 // containers that were already running) — immediate, not coalesced, so
                 // published ports come up fast and readiness fires promptly.
@@ -78,9 +80,10 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                         coalescer.trigger()
                     }
                 }
-                // Stream ended (daemon not up yet, or restarted). Back off, reconnect.
+                // Stream ended (daemon not up yet, or restarted). Back off, reconnect —
+                // 50 ms doubling to 1 s, so readiness isn't quantized to whole seconds.
                 if Task.isCancelled { return }
-                try? await Task.sleep(for: .seconds(1))
+                try? await Task.sleep(for: backoff.delayAfterPass())
             }
         }
     }
