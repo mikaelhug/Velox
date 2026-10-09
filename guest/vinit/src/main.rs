@@ -1287,36 +1287,103 @@ fn setup_data_disk() -> bool {
             Ok(s) if s.success() => {}, other => log!("resize2fs grow failed: {other:?}"),
         }
     }
-    start_fstrim_timer();
+    start_disk_trim();
     true
 }
 
-/// Periodically TRIM the data disk so blocks freed by deleted image layers /
-/// containers are released back to the host. VZ honours the discard by hole-punching
-/// the raw backing file (verified: a deleted 4 GiB file reclaims after a trim pass) —
-/// so the disk shrinks instead of growing forever like Docker Desktop's `Docker.raw`.
-/// Periodic (not `-o discard`) to keep delete latency off the hot path, like OrbStack/DD.
-fn start_fstrim_timer() {
+/// Return blocks freed on the data disk to the host. VZ honours a discard by hole-punching the
+/// raw backing file (verified: a deleted 4 GiB file reclaims after a trim pass), so the disk
+/// shrinks instead of growing forever like Docker Desktop's `Docker.raw`.
+///
+/// When: as soon as Docker frees space, not on a clock. OrbStack returns space continuously
+/// (its data filesystem is mounted with online discard), so an hourly-only trim left Velox
+/// holding a `docker rmi`'s worth of host disk for up to an hour. Online discard
+/// (`-o discard`) is still deliberately off: it issues a synchronous discard — a host
+/// hole-punch — inside every unlink, putting it on the hot path of layer extraction and
+/// container removal. Instead a second docker `/events` subscription (`TRIM_EVENTS_FILTER`)
+/// listens for exactly the events that free disk space and schedules ONE debounced FITRIM:
+/// `TRIM_QUIET` after the last event of a burst, but never later than `TRIM_MAX_DELAY` after
+/// the first, so a sustained stream (a CI loop) can't postpone it indefinitely.
+///
+/// Two timed passes remain, for frees that have no Docker event: one `TRIM_BOOT_DELAY` after
+/// boot (anything freed late last session, kept off the boot path) and an hourly backstop
+/// (e.g. files deleted *inside* a running container's writable layer, or log rotation).
+const TRIM_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+const TRIM_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+const TRIM_BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const TRIM_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3600);
+/// filters={"event":["delete","untag","destroy","prune"]} (URL-encoded): image delete/untag,
+/// container destroy, volume destroy, and the `prune` event every `docker … prune` (images,
+/// containers, volumes, build cache) emits. Keyed on the action only — no `type` filter — so
+/// the request can't be rejected over a type name a given dockerd doesn't know; the few
+/// non-disk matches (a network destroy) just cost one cheap extra trim. ext4 skips block groups
+/// it has already trimmed, so a trim with nothing new to release is cheap.
+const TRIM_EVENTS_FILTER: &str =
+    "%7B%22event%22%3A%5B%22delete%22%2C%22untag%22%2C%22destroy%22%2C%22prune%22%5D%7D";
+
+fn start_disk_trim() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    spawn_worker("fstrim", move || trim_loop(rx));
+    // Only response BODY bytes are events (the head arrives on connect). A (re)connect itself
+    // triggers nothing: only dockerd frees space, so nothing freeable can be missed while the
+    // subscription is down that the boot pass / backstop don't already cover.
+    spawn_docker_events_stream("trim-events", TRIM_EVENTS_FILTER, || {}, move |_, body| {
+        if body { let _ = tx.send(()); }
+    });
+}
+
+fn trim_loop(events: std::sync::mpsc::Receiver<()>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+    let mut backstop = Instant::now() + TRIM_BOOT_DELAY;
+    loop {
+        match events.recv_timeout(backstop.saturating_duration_since(Instant::now())) {
+            Ok(()) => {
+                // Debounce the burst: quiet for TRIM_QUIET, capped at TRIM_MAX_DELAY overall.
+                let cap = Instant::now() + TRIM_MAX_DELAY;
+                loop {
+                    let left = cap.saturating_duration_since(Instant::now());
+                    if left.is_zero() { break }
+                    match events.recv_timeout(TRIM_QUIET.min(left)) {
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+                fstrim_data_disk("docker freed space");
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                fstrim_data_disk("scheduled");
+                backstop = Instant::now() + TRIM_BACKSTOP;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                // The events subscription never started (thread spawn failed): keep the timed
+                // passes rather than spin on a dead channel.
+                std::thread::sleep(backstop.saturating_duration_since(Instant::now()));
+                fstrim_data_disk("scheduled");
+                backstop = Instant::now() + TRIM_BACKSTOP;
+            }
+        }
+    }
+}
+
+/// One FITRIM pass over the whole data filesystem.
+fn fstrim_data_disk(why: &str) {
     // FITRIM: _IOWR('X', 121, struct fstrim_range) — trims the whole filesystem.
     const FITRIM: libc::c_ulong = 0xC018_5879;
     #[repr(C)]
     struct FstrimRange { start: u64, len: u64, minlen: u64 }
-    spawn_worker("fstrim", || {
-        // One pass shortly after boot (reclaims anything freed last session), then hourly.
-        let mut delay = std::time::Duration::from_secs(60);
-        loop {
-            std::thread::sleep(delay);
-            delay = std::time::Duration::from_secs(3600);
-            let path = match CString::new("/var/lib/docker") { Ok(p) => p, Err(_) => continue };
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-            if fd < 0 { continue; }
-            let mut range = FstrimRange { start: 0, len: u64::MAX, minlen: 0 };
-            if unsafe { libc::ioctl(fd, FITRIM as _, &mut range) } < 0 {
-                log!("fstrim failed: {}", std::io::Error::last_os_error());
-            }
-            unsafe { libc::close(fd); }
-        }
-    });
+    let fd = unsafe {
+        libc::open(c"/var/lib/docker".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+    };
+    if fd < 0 { return; }
+    let mut range = FstrimRange { start: 0, len: u64::MAX, minlen: 0 };
+    if unsafe { libc::ioctl(fd, FITRIM as _, &mut range) } < 0 {
+        log!("fstrim ({why}) failed: {}", std::io::Error::last_os_error());
+    } else if range.len > 0 {
+        // On return the kernel stores the number of bytes it discarded in `len`.
+        log!("fstrim ({why}): released {} MiB to the host", range.len >> 20);
+    }
+    unsafe { libc::close(fd); }
 }
 
 /// Direct (named) container access: once dockerd has built its nftables ruleset, allow the Mac
@@ -1349,30 +1416,82 @@ fn start_direct_access(triggers: std::sync::mpsc::Receiver<()>) {
 /// re-checks both chains — the informer rule). Reconnects with a short backoff: the socket
 /// vanishes across a dockerd restart, and the supervisor's respawn signal covers that gap.
 fn start_docker_events_informer(trigger: std::sync::mpsc::Sender<()>) {
+    // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly when
+    // dockerd rebuilds the drop chains. Any traffic (including the response head) is a
+    // harmless idempotent re-assert, so this informer ignores the head/body distinction.
+    let on_connect = {
+        let trigger = trigger.clone();
+        move || {
+            log!("direct-access: events informer connected");
+            // Informer rule: reconcile unconditionally on (re)connect — an event emitted
+            // before this subscription existed is lost forever (no replay), and dockerd may
+            // not flush response bytes until the next event.
+            let _ = trigger.send(());
+        }
+    };
+    spawn_docker_events_stream("events-informer",
+        "%7B%22type%22%3A%5B%22network%22%5D%7D", on_connect,
+        move |_, _| { let _ = trigger.send(()); });
+}
+
+/// THE guest's docker `/events` reader (one mechanism, CLAUDE.md §10): a dedicated thread
+/// holding one raw HTTP/1.1 subscription on the local dockerd socket, filtered by `filters`
+/// (URL-encoded JSON), reconnecting forever. `on_connect` runs on every (re)connect;
+/// `on_read(bytes, body)` on every read, with `body` true when the read carries response-body
+/// bytes — i.e. at least one event — of a 200 response (the head, which dockerd sends on
+/// subscribe, is not an event). Chunk framing isn't parsed: consumers treat the bytes as a
+/// trigger only, and every filter here is specific enough that any body is a real event.
+fn spawn_docker_events_stream<C, R>(name: &str, filters: &'static str, on_connect: C, mut on_read: R)
+where
+    C: Fn() + Send + 'static,
+    R: FnMut(&[u8], bool) + Send + 'static,
+{
     use std::io::{Read, Write};
-    spawn_worker("events-informer", move || loop {
+    let what = name.to_string();
+    spawn_worker(name, move || loop {
+        let mut rejected = false;
         if let Ok(mut s) = std::os::unix::net::UnixStream::connect(DOCKER_SOCK) {
-            // filters={"type":["network"]} (URL-encoded) — connect/disconnect fire exactly
-            // when dockerd rebuilds the drop chains. Headers/chunk framing aren't parsed:
-            // any traffic (including the response head) is a harmless idempotent re-assert.
-            let req = "GET /events?filters=%7B%22type%22%3A%5B%22network%22%5D%7D HTTP/1.1\r\nHost: docker\r\n\r\n";
+            let req = format!("GET /events?filters={filters} HTTP/1.1\r\nHost: docker\r\n\r\n");
             if s.write_all(req.as_bytes()).is_ok() {
-                log!("direct-access: events informer connected");
-                // Informer rule: reconcile unconditionally on (re)connect — an event
-                // emitted before this subscription existed is lost forever (no replay),
-                // and dockerd may not flush response bytes until the next event.
-                let _ = trigger.send(());
+                on_connect();
                 let mut buf = [0u8; 4096];
+                let mut head: Vec<u8> = Vec::new(); // response head, until its blank line
+                let mut in_body = false;
+                let mut ok = false;
                 while let Ok(n) = s.read(&mut buf) {
                     if n == 0 { break }
-                    let _ = trigger.send(());
+                    let mut body = in_body;
+                    if !in_body {
+                        head.extend_from_slice(&buf[..n]);
+                        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                            in_body = true;
+                            ok = head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200");
+                            body = end + 4 < head.len();
+                            if !ok {
+                                let status = String::from_utf8_lossy(&head[..end]).lines()
+                                    .next().unwrap_or("").to_string();
+                                log!("{what}: /events refused ({status}) — retrying in 30s");
+                            }
+                            head = Vec::new();
+                        } else if head.len() > 16 * 1024 {
+                            break; // not an HTTP response head we understand — reconnect
+                        }
+                    }
+                    on_read(&buf[..n], body && ok);
+                    if in_body && !ok {
+                        // dockerd refused the subscription (an error status): retrying at the
+                        // quick cadence would just spin on the same refusal.
+                        rejected = true;
+                        break;
+                    }
                 }
             }
         }
-        // Quick retry: the subscription must be live before any API client can start a
-        // container (events from before it are unrecoverable). Cheap — this only spins
-        // while dockerd's socket is down (boot / restart), then blocks in read above.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Quick retry: a subscription must be live before any API client can act (events from
+        // before it are unrecoverable). Cheap — this only spins while dockerd's socket is down
+        // (boot / restart), then blocks in read above.
+        let retry_ms = if rejected { 30_000 } else { 250 };
+        std::thread::sleep(std::time::Duration::from_millis(retry_ms));
     });
 }
 
