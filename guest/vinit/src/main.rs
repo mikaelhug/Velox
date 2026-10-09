@@ -140,6 +140,7 @@ fn main() {
     if let Some(h) = net_handle { let _ = h.join(); }
     enable_ip_forwarding();
     tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
+    tune_memory_sysctls();  // no periodic kcompactd wakeups at idle
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
@@ -426,6 +427,22 @@ fn tune_network_sysctls() {
         ("/proc/sys/net/ipv4/tcp_fin_timeout", "10"),               // drain FIN-WAIT-2 faster
         ("/proc/sys/net/ipv4/tcp_max_tw_buckets", "262144"),        // don't overflow TIME_WAIT under churn (default 32k stalls)
         ("/proc/sys/net/core/somaxconn", "1024"),                   // deeper accept backlog for guest listeners
+    ] {
+        if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
+    }
+}
+
+/// Memory-management sysctls for an idle-lean guest.
+///
+/// `vm.compaction_proactiveness=0` turns off *proactive* compaction only. At its default
+/// (20) kcompactd wakes every 500 ms per node to score fragmentation — a steady idle wakeup
+/// that lands in the VM process's CPU time on the host (idle CPU is where Velox trailed
+/// OrbStack). At 0 the kernel lets kcompactd sleep until it is actually asked for work.
+/// On-demand compaction is untouched: direct compaction in the allocator, kswapd waking
+/// kcompactd for high-order allocations (THP, the balloon's page migration) all still run.
+fn tune_memory_sysctls() {
+    for (path, val) in [
+        ("/proc/sys/vm/compaction_proactiveness", "0"),
     ] {
         if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
     }
