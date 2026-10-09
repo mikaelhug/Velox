@@ -209,7 +209,7 @@ methodology, every raw value, and the cases where Docker Desktop wins are in
 | Idle RAM after the resource saver | 373 MB | 847 MB | 2.3× less |
 | Idle CPU (4 min, whole engine) | 0.76 % | 3.52 % | 4.6× less |
 | RAM with 21 containers running | 1,949 MB | 2,991 MB | 1.5× less |
-| Startup (restart → API-ready, warm) | 1.23 s | 1.99 s | 1.6× faster |
+| Startup (restart → API-ready, warm; other engine still resident¹) | 1.23 s | 1.99 s | 1.6× faster |
 | Container launch (`run --rm alpine true`) | 0.11 s | 0.13 s | 1.2× faster |
 | Published port — host → container (4 streams) | 59.8 Gbit/s | 25.3 Gbit/s | 2.4× faster |
 | `docker cp` out / in (1 GiB) | 540 / 373 MB/s | 225 / 154 MB/s | ~2.4× faster |
@@ -220,6 +220,9 @@ methodology, every raw value, and the cases where Docker Desktop wins are in
 | Postgres `pgbench` TPS (8 clients, 30 s) | 13,796 | 12,372 | on par |
 | Small-file extract (4,000 files → bind) | 3.21 s | 2.56 s | **25% slower** |
 | `compose down` (SIGTERM-ignoring services) | 10.4 s | 3.5 s | **3× slower** |
+
+¹ The harness only quit the engine being timed, which left the other one running. The fix landed
+in 2026-10; the Docker Desktop startup row has not been re-measured since.
 
 Two honest trails. `compose down` is the one users feel: for a container that
 ignores `SIGTERM` — most containers running a bare command as PID 1 — Velox waits
@@ -237,6 +240,27 @@ with attestations, and `linux/amd64`, `linux/arm/v7` and `linux/386` emulation
 which Velox does not. Docker Desktop also ships Kubernetes, Scout, Extensions and
 its AI tooling — none of which Velox has, and which account for much of the size
 difference above.
+
+**Against OrbStack** the picture is mixed. This was measured on 2026-10-09 with the same
+harness at 8 vCPU / 8 GiB each, against OrbStack 2.2.3
+([full report](docs/bench/REPORT-2026-10-09-orbstack.md)).
+
+Velox is clearly faster at container work:
+- container launch, about 2×;
+- builds, 1.4–1.9×;
+- Postgres, 2.5× the TPS;
+- container networking, 1.4–1.6×.
+
+Idle RAM is a tie.
+
+OrbStack is clearly ahead on host integration:
+- small-file bind-mount I/O, 2.3× faster;
+- startup, 0.88 s vs 1.21 s;
+- `docker cp`, 1.3–1.4× faster;
+- idle CPU;
+- giving memory and disk space back after a workload.
+
+Velox does not beat OrbStack across the board.
 
 The data disk is durable by default: a raw image attached with
 `synchronizationMode: .fsync` and guest barriers on, so every committed write

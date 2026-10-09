@@ -103,7 +103,9 @@ The following conventions are **binding** — keep them true in all future work.
 > latest `docs/bench/REPORT-*.md` as noise, and re-run the metric before calling it a
 > regression. `run.sh` has no default subcommand — name the cadence you want.
 >
-> **The full head-to-head (`docs/bench/run.sh campaign`, ~2.5 h) is ANNUAL, not per release.**
+> **The full head-to-head (`docs/bench/run.sh campaign`, ~4 h) is ANNUAL, not per release.**
+> It takes a peer — `BENCH_PEER=dd` (default) or `BENCH_PEER=orbstack` — because the North Star
+> names both; the OrbStack run writes `results-orbstack.csv` and `REPORT-<date>-orbstack.md`.
 > It bounces both applications repeatedly, needs the Mac to itself and AC power, and produces
 > a dated `docs/bench/REPORT-<date>.md`. Run it once a year, when a Docker Desktop major
 > lands, or before putting a new performance claim on the README or website — and when you

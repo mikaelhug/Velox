@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Print a Velox-vs-DD scorecard from results.csv.
+"""Print a Velox-vs-peer scorecard (peer = Docker Desktop or OrbStack) from a results CSV.
+
+    report.py [--csv PATH]     default: results.csv (Docker Desktop). OrbStack: results-orbstack.csv
 
 Aggregates ALL rows per metric (median + IQR + n) rather than showing the last one.
 The old last-write-wins behaviour published whichever single run happened to be written
@@ -11,19 +13,28 @@ flattering sample.
 import csv, os, statistics, sys, collections
 
 CSV = os.path.join(os.path.dirname(__file__), "results.csv")
+if "--csv" in sys.argv:
+    CSV = sys.argv[sys.argv.index("--csv") + 1]
+NAMES = {"dd": "Docker Desktop", "orbstack": "OrbStack"}
 
 # (suite, test, metric): (label, higher_is_better, unit)
 SPEC = [
     ("disk", "installed_footprint", "size",        ("Installed footprint (shipped)", False, "MB")),
     ("disk", "atrest_footprint", "size",           ("On-disk at rest (incl. VM data)", False, "MB")),
-    ("mem", "idle_footprint", "host_rss",          ("Idle RAM (host RSS, all procs)", False, "MB")),
     ("idle", "rss_active", "host_rss",             ("Idle RAM, pre-saver", False, "MB")),
+    ("idle", "fp_active", "host_fp",               ("Idle RAM, pre-saver (footprint)", False, "MB")),
     ("idle", "rss_saver", "host_rss",              ("Idle RAM, after resource saver", False, "MB")),
+    ("idle", "fp_saver", "host_fp",                ("Idle RAM, after saver (footprint)", False, "MB")),
     ("idle", "cpu", "pct",                          ("Idle CPU (4 min, whole engine)", False, "%")),
     ("idle", "cpu_saver", "pct",                    ("Idle CPU, after resource saver", False, "%")),
     ("mem", "loaded", "host_rss",                   ("RAM under load (21 containers)", False, "MB")),
+    ("mem", "loaded_fp", "host_fp",                 ("RAM under load (footprint)", False, "MB")),
     ("mem", "postload", "host_rss",                 ("RAM after teardown (return)", False, "MB")),
-    ("lifecycle", "restart_to_ready", "time_s",    ("Startup: restart→API-ready", False, "s")),
+    ("mem", "postload_fp", "host_fp",               ("RAM after teardown (footprint)", False, "MB")),
+    # `restart_to_ready` was measured with the OTHER engine still resident (harness defect found
+    # 2026-10-09); `restart_to_ready_solo` is the corrected measurement with both quit first.
+    ("lifecycle", "restart_to_ready", "time_s",    ("Startup (other engine resident)", False, "s")),
+    ("lifecycle", "restart_to_ready_solo", "time_s", ("Startup: restart→API-ready", False, "s")),
     ("launch", "run_true", "median_s",             ("Container launch (run true)", False, "s")),
     ("launch", "churn30_per", "per_s",             ("Sequential churn (per container)", False, "s")),
     ("launch", "parallel20_total", "total_s",      ("Parallel launch x20 (total)", False, "s")),
@@ -54,13 +65,41 @@ SPEC = [
     ("realworld", "pgbench_tps", "tps",             ("pgbench TPS (8 clients, 30s)", True, "TPS")),
 ]
 
+# Cross-checks: printed with raw values, never given a verdict.
+XCHECK = [
+    ("idle", "sysmem_active", "delta_mb",   "System memory Δ vs no engine, idle (vm_stat)"),
+    ("idle", "sysmem_saver", "delta_mb",    "System memory Δ vs no engine, after saver"),
+    ("mem", "loaded_sysmem", "delta_mb",    "System memory Δ vs no engine, under load"),
+    ("mem", "postload_sysmem", "delta_mb",  "System memory Δ vs no engine, after teardown"),
+]
+# Pairs whose verdicts must agree before a memory claim is made (RSS vs phys_footprint).
+MEMPAIRS = [("Idle RAM, pre-saver", "Idle RAM, pre-saver (footprint)"),
+            ("Idle RAM, after resource saver", "Idle RAM, after saver (footprint)"),
+            ("RAM under load (21 containers)", "RAM under load (footprint)"),
+            ("RAM after teardown (return)", "RAM after teardown (footprint)")]
+
 vals = collections.defaultdict(lambda: collections.defaultdict(list))
 nas = collections.defaultdict(lambda: collections.defaultdict(int))
 matrix = collections.defaultdict(dict)
 engines = set()
 
 with open(CSV) as f:
-    for r in csv.DictReader(f):
+    rows = list(csv.DictReader(f))
+# A suite that spanned a system sleep is flagged quality/slept=1; every timed-suite row of that
+# attempt (same engine, run, round) is dropped, not averaged in. Only the suite's own rows: the
+# startup/idle/load phases share round numbers but are separate measurements.
+SUITE_ROWS = {"launch", "net", "io", "fs", "image", "realworld", "build", "compose", "emul", "quality"}
+slept = {(r["engine"], r["run_id"], r["round"]) for r in rows
+         if r["suite"] == "quality" and r["test"] == "slept" and r["value"] == "1"}
+peers = sorted({r["engine"] for r in rows} - {"velox", "host"})
+PEER = peers[0] if peers else "dd"
+PNAME = NAMES.get(PEER, PEER)
+if True:
+    for r in rows:
+        if r["engine"] == "host":
+            continue
+        if (r["engine"], r["run_id"], r["round"]) in slept and r["suite"] in SUITE_ROWS:
+            continue
         eng, key = r["engine"], (r["suite"], r["test"], r["metric"])
         if r["suite"] == "matrix":
             matrix[r["test"]][eng] = r["value"]
@@ -93,21 +132,22 @@ def cell(med, iqr, n, unit):
     return f"{fmt(med)} {unit} [±{rel:.0f}% n={n}]"
 
 
-print(f"{'Metric':34}{'Velox':>26}{'Docker Desktop':>26}{'Δ':>9}  Verdict")
+print(f"{'Metric':34}{'Velox':>26}{PNAME:>26}{'Δ':>9}  Verdict")
 print("-" * 104)
 
 trails, unreliable, missing = [], [], []
+verdicts = {}
 
 for s, t, m, (lbl, hb, unit) in SPEC:
     d = vals.get((s, t, m), {})
     na = nas.get((s, t, m), {})
-    v_xs, d_xs = d.get("velox", []), d.get("dd", [])
+    v_xs, d_xs = d.get("velox", []), d.get(PEER, [])
     if not v_xs and not d_xs:
         print(f"{lbl:34}{'—':>26}{'—':>26}{'':>9}  not measured")
         missing.append(lbl)
         continue
     if not v_xs or not d_xs:
-        only = "velox" if v_xs else "dd"
+        only = "velox" if v_xs else PEER
         med, iqr, n = stats(v_xs or d_xs)
         left = cell(med, iqr, n, unit) if v_xs else "—"
         right = cell(med, iqr, n, unit) if d_xs else "—"
@@ -116,6 +156,11 @@ for s, t, m, (lbl, hb, unit) in SPEC:
 
     vm, vi, vn = stats(v_xs)
     dm, di, dn = stats(d_xs)
+    if vm <= 0 or dm <= 0:
+        # A ratio of non-positive values is meaningless (e.g. "retained" going negative because
+        # the baseline itself held untrimmed blocks) — show the numbers, claim nothing.
+        print(f"{lbl:34}{cell(vm, vi, vn, unit):>26}{cell(dm, di, dn, unit):>26}{'':>9}  no ratio (≤0)")
+        continue
     ratio = (vm / dm if dm else 0) if hb else (dm / vm if vm else 0)   # >1 ⇒ Velox better
 
     # Noise gate first: a metric whose own spread swamps the delta gets no verdict at all.
@@ -140,27 +185,49 @@ for s, t, m, (lbl, hb, unit) in SPEC:
         else:
             verdict = "par"
 
+    verdicts[lbl] = (verdict, ratio)
     flag = ""
-    if na.get("velox") or na.get("dd"):
-        flag = f"  (!{na.get('velox', 0)}v/{na.get('dd', 0)}d failed)"
+    if na.get("velox") or na.get(PEER):
+        flag = f"  (!{na.get('velox', 0)}v/{na.get(PEER, 0)}p failed)"
     print(f"{lbl:34}{cell(vm, vi, vn, unit):>26}{cell(dm, di, dn, unit):>26}{ratio:>8.2f}x  {verdict}{flag}")
 
 if matrix:
-    order = [e for e in ("velox", "dd") if e in engines]
+    order = [e for e in ("velox", PEER) if e in engines]
     print(f"\n{'Functional probe':34}" + "".join(f"{e:>14}" for e in order))
     print("-" * (34 + 14 * len(order)))
     for probe in sorted(matrix):
         print(f"{probe:34}" + "".join(f"{matrix[probe].get(e, '—'):>14}" for e in order))
 
 if trails:
-    print("\nTRAILS (Velox behind Docker Desktop):")
+    print(f"\nTRAILS (Velox behind {PNAME}):")
     for lbl, v, d, r in trails:
         print(f"  {lbl}: {v} vs {d}  ({r:.2f}x)")
 
 if unreliable:
     print("\nUNRELIABLE (spread too wide to call — raw values):")
     for lbl, v, d in unreliable:
-        print(f"  {lbl}\n    velox: {[round(x, 2) for x in v]}\n    dd:    {[round(x, 2) for x in d]}")
+        print(f"  {lbl}\n    velox: {[round(x, 2) for x in v]}\n    {PEER}: {[round(x, 2) for x in d]}")
+
+xc = [(lbl, vals.get((s, t, m), {})) for s, t, m, lbl in XCHECK]
+if any(d for _, d in xc):
+    print("\nCROSS-CHECK (whole-system memory, not attributed to processes; no verdict):")
+    for lbl, d in xc:
+        if d:
+            print(f"  {lbl}: velox {d.get('velox', [])}  {PEER} {d.get(PEER, [])}")
+
+# A memory claim needs RSS and phys_footprint to point the same way.
+split = []
+for a, b in MEMPAIRS:
+    if a in verdicts and b in verdicts:
+        (va, ra), (vb, rb) = verdicts[a], verdicts[b]
+        if va in ("WIN", "TRAIL", "par") and vb in ("WIN", "TRAIL", "par") and va != vb:
+            split.append(f"  {a}: RSS says {va} ({ra:.2f}x), footprint says {vb} ({rb:.2f}x)")
+if split:
+    print("\nMEMORY — depends on accounting (no claim either way):")
+    print("\n".join(split))
+
+if slept:
+    print(f"\nDISCARDED (system slept during the suite): {sorted(slept)}")
 
 if missing:
     print(f"\nNOT MEASURED: {', '.join(missing)}")

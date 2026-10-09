@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Velox vs Docker Desktop — benchmark harness.
+# Velox vs a peer engine (Docker Desktop or OrbStack) — benchmark harness.
 #
 # Selects each engine by its Docker *context* (no wrapper, no daemon swap) and runs the
-# same suite against both, ONE ENGINE RESIDENT AT A TIME. Results are appended to
-# results.csv; ./report.py prints the scorecard.
+# same suite against both, ONE ENGINE RESIDENT AT A TIME. Velox is always engine A; the peer
+# is chosen with BENCH_PEER=dd (default) or BENCH_PEER=orbstack. Results are appended to
+# results.csv (dd) or results-orbstack.csv (orbstack); ./report.py prints the scorecard.
 #
 # TWO CADENCES — pick the right one:
 #
@@ -13,21 +14,23 @@
 #                       before a human-cut release or a datapath/kernel/disk/engine
 #                       change and compare against docs/benchmarks.md. Single-shot, so
 #                       treat a delta smaller than the spreads in the report as noise.
+#                       Writes to runs/<id>/quick.csv, never to the published CSVs.
 #
-#   ./run.sh campaign   FULL (~2.5 h).  The publishable head-to-head: order-balanced
-#                       n=5 rounds, idle/CPU windows, RAM-under-load, disk reclaim and
+#   ./run.sh campaign   FULL (~4 h).  The publishable head-to-head: order-balanced
+#                       n=6 rounds, idle/CPU windows, RAM-under-load, disk reclaim and
 #                       the functional matrix. Bounces both apps repeatedly and needs
-#                       the Mac to itself. This is ANNUAL (or when a new Docker Desktop
-#                       major lands / before a claim goes on the website) — NOT per
+#                       the Mac to itself. This is ANNUAL (or when a new peer major
+#                       lands / before a claim goes on the website) — NOT per
 #                       commit and not per release. Output is a dated report next to
-#                       this script; see REPORT-2026-08-25.md for the last one and
-#                       "Running the annual comparison" in ../benchmarks.md for the
+#                       this script (REPORT-<date>.md for DD, REPORT-<date>-orbstack.md);
+#                       see "Running the annual comparison" in ../benchmarks.md for the
 #                       preconditions that make it fair.
 #
 # Usage:
-#   ./run.sh campaign             # the full order-balanced comparison (see RUN BOOK below)
-#   ./run.sh preflight            # fairness gate: AC power, thermal, host idle, disk, deps
-#   ./run.sh engine <velox|dd>    # quit the other engine, boot this one, settle
+#   BENCH_PEER=orbstack ./run.sh campaign   # the full order-balanced comparison
+#   ./run.sh preflight [ctx]      # fairness gate: AC power, quiet host, disk, deps
+#   ./run.sh parity               # configured vCPU/RAM of both apps match (aborts if not)
+#   ./run.sh engine <velox|peer>  # quit the other engine, boot this one, settle
 #   ./run.sh suite <ctx> <label>  # the timed suite against one context
 #   ./run.sh idle <ctx> <label>   # idle CPU/RAM + resource-saver reclaim depth
 #   ./run.sh loadram <ctx> <lbl>  # RAM under load, then return after teardown
@@ -37,7 +40,8 @@
 #   ./run.sh startup              # restart-to-ready timing (bounces both apps)
 #   ./run.sh report               # scorecard
 #
-# Requirements: docker CLI with both contexts, python3, jq, iperf3, hyperfine, nc, curl.
+# Requirements: Velox.app (its bundled docker/compose/buildx drive BOTH engines), python3,
+# jq, iperf3, hyperfine, nc, curl, Xcode (one 2-line Swift probe for the thermal gate).
 #   brew install jq iperf3 hyperfine
 #
 # ---- METHOD NOTES (why this harness looks the way it does) --------------------
@@ -53,15 +57,30 @@
 #     published as a catastrophic loss for whichever engine hiccuped.
 #   * NOTHING network-dependent on a timed path. The cold `docker pull` metric was
 #     deleted for this reason (same 381 MB image: 4.1 s and 20.0 s, forty minutes apart).
+#   * QUIET-HOST GATES, not long sleeps — after every engine stop/start and between heavy
+#     test groups, wait until CPU is idle, memory pressure normal and the Mac thermally
+#     nominal (host_quiet / engine_quiet). The old thermal check never fired on Apple Silicon.
+#   * ONE client toolchain — Velox's bundled docker/compose/buildx from a private
+#     DOCKER_CONFIG, so neither app's CLI or plugin re-linking can make the sides differ.
 # ------------------------------------------------------------------------------
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CSV="${BENCH_CSV:-$HERE/results.csv}"   # BENCH_CSV: write elsewhere while smoke-testing
-CSV_HEADER="engine,suite,test,metric,unit,value,ts,run_id,round,velox_ver,dd_ver"
 
-# ---- config: edit to match your two engines ----------------------------------
+# ---- config: Velox is always engine A; BENCH_PEER picks engine B -------------
+# BENCH_PEER=dd (default) or orbstack. Each peer gets its own CSV so one comparison can
+# never overwrite or mix with the other's evidence.
+BENCH_PEER="${BENCH_PEER:-dd}"
 CTX_A="velox";          LBL_A="velox";  APP_A="Velox"
-CTX_B="desktop-linux";  LBL_B="dd";     APP_B="Docker"
+case "$BENCH_PEER" in
+  dd)       CTX_B="desktop-linux"; LBL_B="dd";       APP_B="Docker";   CSV_DEFAULT="$HERE/results.csv" ;;
+  orbstack) CTX_B="orbstack";      LBL_B="orbstack"; APP_B="OrbStack"; CSV_DEFAULT="$HERE/results-orbstack.csv" ;;
+  *) echo "BENCH_PEER must be dd or orbstack (got: $BENCH_PEER)" >&2; exit 2 ;;
+esac
+CSV="${BENCH_CSV:-$CSV_DEFAULT}"         # BENCH_CSV: write elsewhere while smoke-testing
+# results.csv predates BENCH_PEER and keeps its old `dd_ver` header; the column is the peer's.
+CSV_HEADER="engine,suite,test,metric,unit,value,ts,run_id,round,velox_ver,peer_ver"
+OSG="$HOME/Library/Group Containers/HUAQ24HBR6.dev.orbstack"   # OrbStack's data (data.img.raw, swap.img)
+VELOX_BIN="/Applications/Velox.app/Contents/Resources/bin"
 IMG_ALPINE="alpine:3.20"
 IMG_IPERF="networkstatic/iperf3:latest"
 IMG_LOAD="python:3.12"      # extraction fixture: saved to a tar once, then re-loaded
@@ -82,17 +101,45 @@ log(){ echo ">>> $*" >&2; }
 warn(){ echo "!!! $*" >&2; }
 fail(){ echo "XXX $*" >&2; return 1; }
 
-VELOX_VER=""; DD_VER=""
+VELOX_VER=""; PEER_VER=""
 versions(){
   [ -n "$VELOX_VER" ] && return 0
   VELOX_VER=$(defaults read /Applications/Velox.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo unknown)
-  DD_VER=$(jq -r '.appVersion' /Applications/Docker.app/Contents/Resources/componentsVersion.json 2>/dev/null || echo unknown)
+  case "$LBL_B" in
+    dd)       PEER_VER=$(jq -r '.appVersion' /Applications/Docker.app/Contents/Resources/componentsVersion.json 2>/dev/null || echo unknown) ;;
+    orbstack) PEER_VER=$(defaults read /Applications/OrbStack.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo unknown) ;;
+  esac
 }
 
 # eng,suite,test,metric,unit,value + provenance. Provenance exists because results.csv
 # used to be an undated pile in which a June baseline and an August re-run were
 # indistinguishable, and the published scorecard silently mixed them.
-rec(){ versions; echo "$1,$2,$3,$4,$5,$6,$(now),$RUN_ID,$ROUND,$VELOX_VER,$DD_VER" >> "$CSV"; }
+# ROUND_TAG marks rows written after a resume, so a resumed round can never share a key with a
+# discarded attempt of the same round (report.py drops discarded attempts by engine+run+round).
+rec(){ versions; echo "$1,$2,$3,$4,$5,$6,$(now),$RUN_ID,$ROUND${ROUND_TAG:-},$VELOX_VER,$PEER_VER" >> "$CSV"; }
+
+# ONE client toolchain for both engines. Each app installs its own docker CLI and re-links
+# ~/.docker/cli-plugins to its own compose/buildx (OrbStack did exactly that on install), so
+# "same CLI, same compose" silently stopped being true. The harness therefore runs Velox's
+# bundled docker + compose + buildx against both sockets from a private DOCKER_CONFIG that
+# neither app touches.
+setup_client(){
+  [ -x "$VELOX_BIN/docker" ] || { echo "missing $VELOX_BIN/docker" >&2; exit 2; }
+  export PATH="$VELOX_BIN:$PATH"
+  export DOCKER_CONFIG="$HERE/runs/.docker-config"
+  mkdir -p "$DOCKER_CONFIG/cli-plugins"
+  [ -f "$DOCKER_CONFIG/config.json" ] || echo '{}' > "$DOCKER_CONFIG/config.json"
+  ln -sf "$VELOX_BIN/docker-compose" "$VELOX_BIN/docker-buildx" "$DOCKER_CONFIG/cli-plugins/"
+  local c s
+  for c in "$CTX_A" "$CTX_B"; do
+    case "$c" in
+      velox)         s="$HOME/.velox/docker.sock" ;;
+      orbstack)      s="$HOME/.orbstack/run/docker.sock" ;;
+      desktop-linux) s="$HOME/.docker/run/docker.sock" ;;
+    esac
+    docker context inspect "$c" >/dev/null 2>&1 || docker context create "$c" --docker "host=unix://$s" >/dev/null
+  done
+}
 ensure_csv(){ mkdir -p "$RUNDIR"; [ -f "$CSV" ] || echo "$CSV_HEADER" > "$CSV"; }
 
 # rate: MiB / elapsed → MB/s, or NA when the timed command failed.
@@ -107,9 +154,12 @@ print('NA' if ok!='0' or t1<t0 else round(t1-t0,3))" "$1" "$2" "$3"; }
 
 # Sleep detector. Every timed metric is wall-clock, so a system sleep inside a measurement
 # silently inflates it by the sleep duration — the 2026-08-24 run recorded a 945 s
-# `docker load` this way and the scorecard published it. `sleep_count` samples the number of
-# wake events; a suite whose count moved is discarded rather than reported.
-sleep_count(){ pmset -g log 2>/dev/null | grep -c "Wake from" 2>/dev/null || echo 0; }
+# `docker load` this way and the scorecard published it. `sleep_count` returns the timestamp
+# of the most recent Sleep/Wake/DarkWake event; a suite during which it moved is discarded.
+# It used to COUNT "Wake from" lines, but `pmset -g log` is a rolling window: when old entries
+# age out the count drops with no sleep at all, and the 2026-10-09 run discarded two complete,
+# valid Velox suites that way (the log's last real wake was the previous day).
+sleep_count(){ pmset -g log 2>/dev/null | awk '$4=="Sleep"||$4=="Wake"||$4=="DarkWake"{t=$1" "$2} END{print t}'; }
 assert_awake(){                      # $1 baseline count, $2 label — nonzero if we slept
   local n; n=$(sleep_count)
   if [ "${n:-0}" != "${1:-0}" ]; then warn "[$2] SYSTEM SLEPT during this measurement — results discarded"; return 1; fi
@@ -127,31 +177,135 @@ if len(p)>1: s+=int(p[-2])*60
 if len(p)>2: s+=int(p[-3])*3600
 print(round(float(sys.argv[2])+s,2))" "$c" "$out"); done; echo "$out"; }
 
-# Full process set, INCLUDING each engine's persistent privileged LaunchDaemon
-# (com.docker.vmnetd / dev.velox.porthelper). Those daemons are a real, permanent cost of
-# running the engine, so they belong in every RSS number.
-engine_pids(){                       # $1 label → pid list on stdout
-  if [ "$1" = "$LBL_A" ]; then
-    { engine_live_pids "$1"; pgrep -f 'dev.velox.porthelper'; } | sort -u | tr '\n' ' '
-  else
-    { engine_live_pids "$1"; pgrep -f 'com.docker.vmnetd'; } | sort -u | tr '\n' ' '
+# Tiny compiled probes (Swift, built once into runs/): see thermal_state and sum_footprint.
+probe_bin(){                         # $1 name  $2 swift source → path of the built binary
+  local b="$HERE/runs/.$1"
+  if [ ! -x "$b" ]; then
+    mkdir -p "$HERE/runs"; printf '%s\n' "$2" > "$b.swift"
+    xcrun swiftc -O "$b.swift" -o "$b" >/dev/null 2>&1 || { rm -f "$b"; return 1; }
   fi
+  echo "$b"
+}
+# phys_footprint, from the kernel's own ledger (proc_pid_rusage → ri_phys_footprint): exactly
+# what Activity Monitor's Memory column and top's MEM show, and what macOS charges against
+# memory pressure. RSS alone over- or under-states a VM process depending on how its VMM maps
+# guest RAM, so both are recorded.
+# NOT footprint(1): it sums memory *regions* and does not see OrbStack's guest RAM at all —
+# it reported 106 MB for the OrbStack Helper while the kernel ledger, top and RSS all said
+# ~1,307 MB. Publishing that would have flattered OrbStack more than tenfold.
+# Root-owned helpers can't be read unprivileged; those fall back to their RSS.
+MEMPROBE_SRC='import Darwin
+for a in CommandLine.arguments.dropFirst() {
+    guard let pid = Int32(a) else { continue }
+    var info = rusage_info_v4()
+    let r = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V4, $0) }
+    }
+    print(r == 0 ? String(info.ri_phys_footprint / 1048576) : "NA")
+}'
+sum_footprint(){ local t=0 p f mp; mp=$(probe_bin memprobe "$MEMPROBE_SRC") || { echo NA; return; }
+  for p in "$@"; do
+    f=$("$mp" "$p" 2>/dev/null)
+    case "$f" in ''|NA) f=$(ps -o rss= -p "$p" 2>/dev/null|tr -d ' '); f=$(( ${f:-0} / 1024 )) ;; esac
+    t=$((t + f)); done; echo "$t"; }
+# System-wide anonymous + wired + compressor memory, MB. Not attributed to any process, so it
+# catches memory neither process list sees (e.g. kernel-side hypervisor allocations). Used
+# only as a delta against the no-engine baseline taken at every engine switch — a cross-check.
+sysmem_mb(){ vm_stat | awk -F: '/page size of/{gsub(/[^0-9]/,"",$0); ps=$0}
+  /^Anonymous pages/||/^Pages wired down/||/^Pages occupied by compressor/{gsub(/[ .]/,"",$2); s+=$2}
+  END{printf "%d", s*ps/1048576}'; }
+sysmem_base(){ cat "$RUNDIR/sysmem-baseline" 2>/dev/null || echo NA; }
+sysmem_delta(){ local b; b=$(sysmem_base); [ "$b" = NA ] && echo NA || echo $(( $(sysmem_mb) - b )); }
+
+# Full process set, INCLUDING each engine's persistent privileged LaunchDaemon
+# (com.docker.vmnetd / dev.velox.porthelper / dev.orbstack.OrbStack.privhelper). Those daemons
+# are a real cost of running the engine, so they belong in every RSS number.
+engine_pids(){                       # $1 label → pid list on stdout
+  local helper
+  case "$1" in
+    velox)    helper='dev.velox.porthelper' ;;
+    dd)       helper='com.docker.vmnetd' ;;
+    orbstack) helper='dev.orbstack.OrbStack.privhelper' ;;
+  esac
+  { engine_live_pids "$1"; pgrep -f "$helper"; } | sort -u | tr '\n' ' '
 }
 # Process set that actually goes away when the engine stops. The privileged helpers above
 # are LaunchDaemons that outlive the app by design, so waiting for them to exit — as an
 # earlier version of this function did — could never succeed and burned 60 s per switch
 # while printing a false "still alive" warning.
+# OrbStack runs its own VMM inside "OrbStack Helper" (no Virtualization.framework XPC
+# process, verified with ps + lsof), so its whole tree lives under the app bundle.
 engine_live_pids(){                  # $1 label → pid list on stdout
-  if [ "$1" = "$LBL_A" ]; then
-    { lsof -t "$HOME/.velox/data.img" 2>/dev/null|head -1
-      pgrep -f 'Velox.app/Contents/MacOS/VeloxApp'; } | sort -u | tr '\n' ' '
-  else
-    { lsof -t "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" 2>/dev/null|head -1
-      pgrep -f 'Docker.app/Contents/MacOS|com.docker.backend|com.docker.virtualization|com.docker.build'; } | sort -u | tr '\n' ' '
-  fi
+  case "$1" in
+    velox)
+      { lsof -t "$HOME/.velox/data.img" 2>/dev/null|head -1
+        pgrep -f 'Velox.app/Contents/MacOS/VeloxApp'; } | sort -u | tr '\n' ' ' ;;
+    dd)
+      { lsof -t "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" 2>/dev/null|head -1
+        pgrep -f 'Docker.app/Contents/MacOS|com.docker.backend|com.docker.virtualization|com.docker.build'; } | sort -u | tr '\n' ' ' ;;
+    orbstack)
+      pgrep -f 'OrbStack.app/Contents/' | sort -u | tr '\n' ' ' ;;
+  esac
 }
-disk_image(){ [ "$1" = "$LBL_A" ] && echo "$HOME/.velox/data.img" \
-              || echo "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw"; }
+disk_image(){
+  case "$1" in
+    velox)    echo "$HOME/.velox/data.img" ;;
+    dd)       echo "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" ;;
+    orbstack) echo "$OSG/data/data.img.raw" ;;
+  esac
+}
+# Allocated MB of a path, or NA. A failed `du` used to become 0 via ${x:-0} — and OrbStack's
+# Group Container is TCC-protected, so its disk would have been published as 0 MB.
+dum(){ local v; v=$(du -sm "$1" 2>/dev/null | awk '{print $1}'); echo "${v:-NA}"; }
+addmb(){ python3 -c "
+import sys
+a=sys.argv[1:]; print('NA' if 'NA' in a or not a else sum(int(x) for x in a))" "$@"; }
+submb(){ python3 -c "
+import sys
+a,b=sys.argv[1],sys.argv[2]; print('NA' if 'NA' in (a,b) else int(a)-int(b))" "$1" "$2"; }
+
+# ---- quiet-host gates (conditions, not long sleeps) ---------------------------
+# `pmset -g therm` reports nothing at all on Apple Silicon, so the old CPU_Speed_Limit loop
+# exited on its first pass and never gated anything. ProcessInfo.thermalState is the real
+# signal (0 nominal, 1 fair, 2 serious, 3 critical).
+thermal_state(){ local b
+  b=$(probe_bin thermal 'import Foundation
+print(ProcessInfo.processInfo.thermalState.rawValue)') || { echo NA; return; }
+  "$b" 2>/dev/null || echo NA; }
+# Find the field labelled "idle" by name. Splitting on [ %]+ and taking NF-1 landed on the
+# literal word "idle" (the line has a trailing space), so int() made it 0 and the gate
+# reported "0% idle" on a perfectly quiet machine — a fairness check that never fired.
+host_idle(){ top -l 2 -n 0 -s 3 2>/dev/null | awk '/CPU usage/{for(j=1;j<=NF;j++) if($j=="idle"){gsub("%","",$(j-1)); v=$(j-1)}} END{print int(v)}'; }
+# Wait until the host is back to baseline: CPU idle, no memory pressure, thermally nominal.
+# The floor is a minimum, not the cost — once the conditions hold it returns. It never waits
+# forever on an unattended run: after QUIET_MAX_S it records a quality flag (so the report can
+# see which measurement started on a busy host) and carries on.
+host_quiet(){                        # $1 floor seconds  $2 what we are waiting for
+  local floor="${1:-10}" why="${2:-}" t0 idle th pr
+  sync; sleep "$floor"; t0=$(date +%s)
+  while :; do
+    idle=$(host_idle); th=$(thermal_state); pr=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+    if [ "${idle:-0}" -ge "${QUIET_IDLE:-90}" ] && { [ "$th" = 0 ] || [ "$th" = NA ]; } && [ "${pr:-1}" = 1 ]; then
+      return 0; fi
+    if [ $(( $(date +%s) - t0 )) -ge "${QUIET_MAX_S:-1200}" ]; then
+      warn "host never went quiet ($why): idle=${idle}% thermal=$th pressure=$pr — flagged, continuing"
+      rec host quality not_quiet flag n 1; return 0; fi
+    log "waiting for a quiet host ($why): idle=${idle}% thermal=$th pressure=$pr"
+    sleep 5
+  done
+}
+# After boot, wait until the engine's own process tree stops working (DHCP, image-store warmup,
+# Velox's boot fstrim at t+60 s, whatever the peer does after boot) instead of guessing a sleep.
+engine_quiet(){                      # $1 label
+  local i pids w0 w1 c0 c1 pct
+  for i in $(seq 1 60); do
+    pids="$(engine_pids "$1")"; w0=$(now); c0=$(sum_cputime $pids); sleep 10; w1=$(now); c1=$(sum_cputime $pids)
+    pct=$(python3 -c "print(int(($c1-$c0)/($w1-$w0)*100))")
+    [ "$pct" -lt "${ENGINE_QUIET_PCT:-5}" ] && { log "[$1] engine quiet (${pct}% CPU)"; return 0; }
+    log "[$1] engine still busy (${pct}% CPU over 10 s) — waiting"
+  done
+  warn "[$1] engine never went quiet after boot"; rec "$1" quality engine_not_quiet flag n 1
+}
 has_set(){ case ",$BENCH_SETS," in *",$1,"*) return 0;; esac; return 1; }
 
 # ---- fairness gate -----------------------------------------------------------
@@ -169,22 +323,13 @@ preflight(){                         # $1 optional context to assert is containe
     log "on battery — plug in to continue ($t/120)"; sleep 30
   done
   pmset -g batt 2>/dev/null | grep -q "AC Power" || { warn "still on battery after 60 min"; bad=1; }
-  # Thermal throttling silently halves throughput; wait it out rather than publish it.
-  for t in $(seq 1 60); do
-    local lim; lim=$(pmset -g therm 2>/dev/null | awk -F' *: *' '/CPU_Speed_Limit/{print $2}')
-    [ -z "$lim" ] && break
-    [ "$lim" = "100" ] && break
-    log "thermally throttled (CPU_Speed_Limit=$lim) — cooling, $t/60"; sleep 30
-  done
-  # Find the field labelled "idle" by name. Splitting on [ %]+ and taking NF-1 landed on the
-  # literal word "idle" (the line has a trailing space), so int() made it 0 and the gate
-  # reported "0% idle" on a perfectly quiet machine — a fairness check that never fired.
-  local idle; idle=$(top -l 2 -n 0 -s 3 2>/dev/null | awk '/CPU usage/{for(j=1;j<=NF;j++) if($j=="idle"){gsub("%","",$(j-1)); v=$(j-1)}} END{print int(v)}')
-  if [ -n "$idle" ] && [ "$idle" -lt 85 ] 2>/dev/null; then
-    warn "host only ${idle}% idle — close background apps"; bad=1
-  fi
+  # Thermal throttling silently halves throughput, and a busy host steals from whichever
+  # engine is measured: WAIT for both to clear (host_quiet) rather than fail once and carry on.
+  host_quiet 0 "preflight"
+  local idle; idle=$(host_idle)
   local freeg; freeg=$(df -g / | awk 'NR==2{print $4}')
-  [ "${freeg:-0}" -lt 40 ] && { warn "only ${freeg}GB free on / (need 40)"; bad=1; }
+  # The heaviest step (reclaim: 4 GiB volume + image load) needs well under 15 GB.
+  [ "${freeg:-0}" -lt "${MIN_FREE_GB:-25}" ] && { warn "only ${freeg}GB free on / (need ${MIN_FREE_GB:-25})"; bad=1; }
   tmutil status 2>/dev/null | grep -q "Running = 1" && warn "Time Machine backup running"
   if [ $# -ge 1 ] && [ -n "$1" ]; then
     local running; running=$(docker --context "$1" ps -q 2>/dev/null | wc -l | tr -d ' ')
@@ -198,11 +343,37 @@ capture_env(){                       # one snapshot per campaign, for the report
   mkdir -p "$RUNDIR"
   { sw_vers; echo; sysctl -n hw.model hw.ncpu hw.memsize; echo; uname -v; } > "$RUNDIR/host.txt" 2>&1
   cp "$HOME/.velox/config.json" "$RUNDIR/velox-config.json" 2>/dev/null
-  cp "$HOME/Library/Group Containers/group.com.docker/settings-store.json" "$RUNDIR/dd-settings-store.json" 2>/dev/null
-  cp /Applications/Docker.app/Contents/Resources/componentsVersion.json "$RUNDIR/dd-components.json" 2>/dev/null
+  cp "$HOME/.velox/workspaces.json" "$RUNDIR/velox-workspaces.json" 2>/dev/null
+  case "$LBL_B" in
+    dd)
+      cp "$HOME/Library/Group Containers/group.com.docker/settings-store.json" "$RUNDIR/dd-settings-store.json" 2>/dev/null
+      cp /Applications/Docker.app/Contents/Resources/componentsVersion.json "$RUNDIR/dd-components.json" 2>/dev/null ;;
+    orbstack)
+      cp "$HOME/.orbstack/vmconfig.json" "$RUNDIR/orbstack-vmconfig.json" 2>/dev/null
+      cp "$HOME/.orbstack/config/docker.json" "$RUNDIR/orbstack-docker.json" 2>/dev/null
+      "$HOME/.orbstack/bin/orb" config show > "$RUNDIR/orbstack-config.txt" 2>&1 ;;
+  esac
   cp "$HERE/../../versions.env" "$RUNDIR/velox-versions.env" 2>/dev/null
-  docker compose version > "$RUNDIR/compose-binary.txt" 2>&1
+  { echo "PATH docker: $(command -v docker)"; docker version --format 'client {{.Client.Version}}' 2>/dev/null
+    docker compose version; docker buildx version; echo "DOCKER_CONFIG=$DOCKER_CONFIG"
+    ls -l "$DOCKER_CONFIG/cli-plugins"; } > "$RUNDIR/compose-binary.txt" 2>&1
   log "environment captured → $RUNDIR"
+}
+
+# Host-side resource parity from each app's own settings file — the in-guest check below can
+# only see what the guest got, not what the user configured. A mismatch ABORTS.
+config_parity(){
+  local cpu="${EXPECT_CPU:-8}" mib="${EXPECT_MEM_MIB:-8192}" vc vm bc bm bad=0
+  vc=$(jq -r '.cpuCount' "$HOME/.velox/config.json" 2>/dev/null); vm=$(jq -r '.memoryGiB*1024' "$HOME/.velox/config.json" 2>/dev/null)
+  case "$LBL_B" in
+    dd)       bc=$(jq -r '.Cpus // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null)
+              bm=$(jq -r '.MemoryMiB // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null) ;;
+    orbstack) bc=$(jq -r '.cpu' "$HOME/.orbstack/vmconfig.json" 2>/dev/null); bm=$(jq -r '.memory_mib' "$HOME/.orbstack/vmconfig.json" 2>/dev/null) ;;
+  esac
+  log "configured: velox ${vc} vCPU/${vm} MiB, $LBL_B ${bc:-?} vCPU/${bm:-?} MiB (expected $cpu/$mib)"
+  [ "$vc" = "$cpu" ] && [ "$vm" = "$mib" ] || { warn "velox configuration is not ${cpu} vCPU / ${mib} MiB"; bad=1; }
+  [ "${bc:-$cpu}" = "$cpu" ] && [ "${bm:-$mib}" = "$mib" ] || { warn "$LBL_B configuration is not ${cpu} vCPU / ${mib} MiB"; bad=1; }
+  return "$bad"
 }
 
 capture_info(){                      # $1 ctx $2 label — engine identity + resource parity
@@ -216,11 +387,11 @@ capture_info(){                      # $1 ctx $2 label — engine identity + res
   rec "$2" env memory total_mb MB "${mem:-NA}"
   log "[$2] allocation: ${n:-?} vCPU, ${mem:-?} MB RAM"
   # Resource parity is the whole basis of the comparison — refuse to measure a mismatch.
-  if [ -n "$n" ] && [ -n "$mem" ]; then
-    [ "$n" != "${EXPECT_CPU:-8}" ] && warn "[$2] vCPU $n != expected ${EXPECT_CPU:-8}"
-    python3 -c "import sys; sys.exit(0 if 7000 <= float(sys.argv[1]) <= 8400 else 1)" "$mem" \
-      || warn "[$2] RAM ${mem}MB outside the 7000–8400 parity window"
-  fi
+  # (This used to only warn, while benchmarks.md promised an abort.)
+  [ -n "$n" ] && [ -n "$mem" ] || { warn "[$2] could not read in-guest allocation"; return 1; }
+  [ "$n" = "${EXPECT_CPU:-8}" ] || { warn "[$2] vCPU $n != expected ${EXPECT_CPU:-8} — refusing to measure"; return 1; }
+  python3 -c "import sys; sys.exit(0 if 7000 <= float(sys.argv[1]) <= 8400 else 1)" "$mem" \
+    || { warn "[$2] RAM ${mem}MB outside the 7000–8400 parity window — refusing to measure"; return 1; }
 }
 
 # ---- engine switching --------------------------------------------------------
@@ -234,17 +405,24 @@ api_up(){ docker --context "$1" version --format '{{.Server.Version}}' >/dev/nul
 # resident, which is background load charged to whichever engine is measured next — so the
 # UI is quit explicitly too. (Its bundle name is "Docker Desktop", not "Docker".)
 stop_engine(){                       # $1 label
-  if [ "$1" = "$LBL_A" ]; then osascript -e "quit app \"$APP_A\"" >/dev/null 2>&1
-  else
-    docker desktop stop >/dev/null 2>&1
-    osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1
-  fi
+  case "$1" in
+    velox) osascript -e "quit app \"$APP_A\"" >/dev/null 2>&1 ;;
+    dd)    # `docker desktop` is DD's own CLI plugin — reach it through the user's real config,
+           # not the harness's private one (which deliberately carries only compose/buildx).
+           DOCKER_CONFIG="$HOME/.docker" docker desktop stop >/dev/null 2>&1
+           osascript -e 'quit app "Docker Desktop"' >/dev/null 2>&1 ;;
+    orbstack)
+           # Same symmetric definition: engine down AND the GUI gone. `orb` would launch the
+           # app to talk to it, so only call it when OrbStack is actually running.
+           [ -n "$(engine_live_pids orbstack | tr -d ' ')" ] && "$HOME/.orbstack/bin/orb" stop >/dev/null 2>&1
+           osascript -e 'quit app "OrbStack"' >/dev/null 2>&1 ;;
+  esac
 }
 # Symmetric "start": launch the application and let it bring its engine up, which is what a
 # user does and what the restart_to_ready metric is supposed to represent on both sides.
 start_engine(){ if [ "$1" = "$LBL_A" ]; then open -a "$APP_A"; else open -a "$APP_B"; fi; }
 
-engine(){                            # $1 velox|dd — leave exactly this engine resident
+engine(){                            # $1 velox|<peer> — leave exactly this engine resident
   local want="$1" ctx other_lbl other_ctx
   if [ "$want" = "$LBL_A" ]; then ctx="$CTX_A"; other_lbl="$LBL_B"; other_ctx="$CTX_B"
   else ctx="$CTX_B"; other_lbl="$LBL_A"; other_ctx="$CTX_A"; fi
@@ -255,16 +433,23 @@ engine(){                            # $1 velox|dd — leave exactly this engine
   for i in $(seq 1 120); do api_up "$other_ctx" || break; sleep 1; done
   # The API can be down while the VM is still flushing; wait for the process tree too.
   for i in $(seq 1 60); do [ -z "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && break; sleep 1; done
-  [ -n "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && warn "$other_lbl processes still alive after stop"
+  # Two VMs resident at once is not a measurement — fatal, not a warning.
+  [ -n "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && { fail "$other_lbl processes still alive after stop"; return 1; }
 
   if api_up "$ctx"; then log "[$want] already up"; else
+    # The other engine just released its VM: let the host return to baseline before booting
+    # this one, then take the no-engine memory baseline for the sysmem cross-check.
+    host_quiet "${COOLDOWN_S:-30}" "after stopping $other_lbl"
+    sysmem_mb > "$RUNDIR/sysmem-baseline"
     log "[$want] starting $want"; start_engine "$want"
     for i in $(seq 1 240); do api_up "$ctx" && break; sleep 0.5; done
     api_up "$ctx" || { fail "[$want] never became ready"; return 1; }
   fi
   # Settle: DHCP, image-store warmup, and — on Velox — the boot fstrim pass at t+60s,
-  # which would otherwise land inside the first timed window.
+  # which would otherwise land inside the first timed window. Then wait for the engine's own
+  # processes to actually go quiet rather than trusting the fixed sleep.
   log "[$want] settling ${SETTLE_S:-60}s"; sleep "${SETTLE_S:-60}"
+  engine_quiet "$want"
 }
 
 # ---- readiness helpers (never a bare sleep) ----------------------------------
@@ -291,22 +476,35 @@ wait_http6(){                        # $1 url [$2 tries] — IPv6-forced
 footprint(){
   ensure_csv
   log "installed footprint (shipped bits + engine disk at rest)"
-  local va vk vr vd da dr dg
-  va=$(du -sm /Applications/Velox.app 2>/dev/null|awk '{print $1}')
-  vk=$(du -sm "$HOME/.velox/kernel" 2>/dev/null|awk '{print $1}')
-  vr=$(du -sm "$HOME/.velox/root.img" 2>/dev/null|awk '{print $1}')
-  vd=$(du -sm "$HOME/.velox/data.img" 2>/dev/null|awk '{print $1}')
-  da=$(du -sm /Applications/Docker.app 2>/dev/null|awk '{print $1}')
-  dr=$(du -sm "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw" 2>/dev/null|awk '{print $1}')
-  dg=$(du -sm "$HOME/Library/Group Containers/group.com.docker" 2>/dev/null|awk '{print $1}')
+  local va vk vr vd
+  va=$(dum /Applications/Velox.app); vk=$(dum "$HOME/.velox/kernel")
+  vr=$(dum "$HOME/.velox/root.img"); vd=$(dum "$HOME/.velox/data.img")
   # Shipped bits only — the old harness compared Velox's app+kernel+rootfs against
   # Docker.app ALONE, which flattered Velox by excluding DD's VM data entirely.
-  rec "$LBL_A" disk installed_footprint size MB "$(( ${va:-0} + ${vk:-0} + ${vr:-0} ))"
-  rec "$LBL_B" disk installed_footprint size MB "${da:-0}"
+  rec "$LBL_A" disk installed_footprint size MB "$(addmb "$va" "$vk" "$vr")"
   # And the honest total: everything the engine occupies on disk at rest.
-  rec "$LBL_A" disk atrest_footprint size MB "$(( ${va:-0} + ${vk:-0} + ${vr:-0} + ${vd:-0} ))"
-  rec "$LBL_B" disk atrest_footprint size MB "$(( ${da:-0} + ${dr:-0} + ${dg:-0} ))"
-  log "velox: app=${va} kernel=${vk} rootfs=${vr} data=${vd} | dd: app=${da} raw=${dr} group=${dg}"
+  rec "$LBL_A" disk atrest_footprint size MB "$(addmb "$va" "$vk" "$vr" "$vd")"
+  log "velox: app=${va} kernel=${vk} rootfs=${vr} data=${vd}"
+  case "$LBL_B" in
+    dd)
+      local da dr dg
+      da=$(dum /Applications/Docker.app)
+      dr=$(dum "$HOME/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw")
+      dg=$(dum "$HOME/Library/Group Containers/group.com.docker")
+      rec dd disk installed_footprint size MB "$da"
+      rec dd disk atrest_footprint size MB "$(addmb "$da" "$dr" "$dg")"
+      log "dd: app=${da} raw=${dr} group=${dg}" ;;
+    orbstack)
+      # OrbStack's kernel + rootfs ship inside the app bundle; ~/.orbstack holds its CLI links,
+      # logs and VM config. Its Group Container is TCC-protected against *listing*, so its two
+      # disk images are sized by explicit path (the same files lsof shows its VMM holding).
+      local oa oh od os
+      oa=$(dum /Applications/OrbStack.app); oh=$(dum "$HOME/.orbstack")
+      od=$(dum "$OSG/data/data.img.raw"); os=$(dum "$OSG/data/swap.img")
+      rec orbstack disk installed_footprint size MB "$(addmb "$oa" "$oh")"
+      rec orbstack disk atrest_footprint size MB "$(addmb "$oa" "$oh" "$od" "$os")"
+      log "orbstack: app=${oa} home=${oh} data=${od} swap=${os}" ;;
+  esac
 }
 
 # ---- the timed suite ---------------------------------------------------------
@@ -320,6 +518,9 @@ suite(){            # $1 context  $2 label
   local CTX="$1" ENG="$2"; local BD; BD="${BENCH_TMP:-$HOME/.velox-bench}/run.$$"
   ensure_csv; rm -rf "$BD"; mkdir -p "$BD"
   D(){ docker --context "$CTX" "$@"; }
+  # Between test groups: let writeback and heat from the previous group (iperf3 at tens of
+  # Gbit/s, pgbench, builds) clear before the next one starts, on both engines alike.
+  gate(){ host_quiet "${GATE_S:-10}" "$ENG before $1"; }
 
   # Assert the scratch dir really round-trips through the host filesystem. A guest-local
   # write here would invalidate every fs number below, so fail loudly rather than publish
@@ -361,6 +562,7 @@ suite(){            # $1 context  $2 label
   t0=$(now); for i in $(seq 1 20); do D run --rm "$IMG_ALPINE" true >/dev/null 2>&1 & done; wait; t1=$(now)
   rec "$ENG" launch parallel20_total total_s s "$(secs "$t0" "$t1" 0)"
 
+  gate net
   log "[$ENG] iperf3 published port (host->container) 1 + 4 streams"
   D rm -f ipsrv >/dev/null 2>&1
   D run -d --name ipsrv -p 5301:5201 "$IMG_IPERF" -s >/dev/null 2>&1
@@ -401,6 +603,7 @@ suite(){            # $1 context  $2 label
 
   # docker cp moves bytes over the engine's API transport (VSOCK proxy on Velox), which
   # no other metric here exercises in bulk.
+  gate cp
   log "[$ENG] docker cp ${CP_MB}MiB out + in"
   D rm -f cpbox >/dev/null 2>&1
   D run -d --name cpbox "$IMG_ALPINE" sleep 600 >/dev/null 2>&1
@@ -413,6 +616,7 @@ suite(){            # $1 context  $2 label
   D rm -f cpbox >/dev/null 2>&1; rm -f "$BD/cpout"
 
   # fs writes: wall-clock around `dd; sync` (busybox dd lacks conv=fdatasync)
+  gate fs
   log "[$ENG] fs bind-mount (VirtioFS) write+read ${DD_MB}MiB"
   rm -rf "${BD:?}/mnt"; mkdir -p "$BD/mnt"   # :? — an empty BD would make this `rm -rf /mnt`
   ok=0; t0=$(now); D run --rm -v "$BD/mnt":/m "$IMG_ALPINE" sh -c "dd if=/dev/zero of=/m/f bs=1M count=$DD_MB 2>/dev/null; sync" || ok=1; t1=$(now)
@@ -447,6 +651,7 @@ suite(){            # $1 context  $2 label
   # bandwidth to the registry, which is not a property of either engine: the same 381 MB image
   # measured 4.1 s and 20.0 s on this machine forty minutes apart. It produced a "TRAIL vs
   # Docker Desktop" row in the scorecard that was really a CDN reading.
+  gate image
   log "[$ENG] image extraction (docker load)"
   local TAR="$HERE/loadimage.tar"
   if [ ! -f "$TAR" ]; then
@@ -465,8 +670,9 @@ suite(){            # $1 context  $2 label
   rec "$ENG" image load_local total_s s "$(secs "$t0" "$t1" "$ok")"
   rec "$ENG" image load_local size_mb MB "$([ -n "$sz" ] && python3 -c "print(round($sz/1048576))" || echo NA)"
 
+  gate pgbench
   log "[$ENG] real-world: Postgres pgbench"
-  D pull -q "$IMG_PG" >/dev/null 2>&1; D rm -f pg >/dev/null 2>&1
+  D pull -q "$IMG_PG" >/dev/null 2>&1; D rm -fv pg >/dev/null 2>&1
   D run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust "$IMG_PG" >/dev/null 2>&1
   local pgready=1
   for i in $(seq 1 120); do D exec pg pg_isready -U postgres >/dev/null 2>&1 && { pgready=0; break; }; sleep 0.5; done
@@ -481,12 +687,12 @@ suite(){            # $1 context  $2 label
     rec "$ENG" realworld pgbench_init load_s s NA; rec "$ENG" realworld pgbench_tps tps tps NA
     warn "[$ENG] postgres never became ready"
   fi
-  D rm -f pg >/dev/null 2>&1
+  D rm -fv pg >/dev/null 2>&1
   fi   # core
 
-  has_set build   && suite_build   "$CTX" "$ENG" "$BD"
-  has_set compose && suite_compose "$CTX" "$ENG"
-  has_set rosetta && suite_rosetta "$CTX" "$ENG"
+  has_set build   && { gate build;   suite_build   "$CTX" "$ENG" "$BD"; }
+  has_set compose && { gate compose; suite_compose "$CTX" "$ENG"; }
+  has_set rosetta && { gate emul;    suite_rosetta "$CTX" "$ENG"; }
 
   rm -rf "$BD"
   # A sleep anywhere inside the suite invalidates every wall-clock number in it. Mark the
@@ -590,20 +796,24 @@ idle(){             # $1 ctx $2 label — engine must already be running, saver 
   log "[$ENG] idle window: 4 min active-idle sampling (pids: $pids)"
   docker --context "$CTX" ps -q >/dev/null 2>&1     # last activity, then hands off
   w0=$(now); c0=$(sum_cputime $pids)
-  local rsslist=""
-  for i in $(seq 1 24); do sleep 10; rsslist="$rsslist $(sum_rss $pids)"; done
+  local rsslist="" fplist=""
+  for i in $(seq 1 24); do sleep 10; rsslist="$rsslist $(sum_rss $pids)"; fplist="$fplist $(sum_footprint $pids)"; done
   w1=$(now); c1=$(sum_cputime $pids)
   rec "$ENG" idle cpu pct pct "$(python3 -c "print(round(($c1-$c0)/($w1-$w0)*100,2))")"
-  rec "$ENG" idle rss_active host_rss MB "$(python3 -c "
-v=sorted(float(x) for x in '''$rsslist'''.split())
-print(round(v[len(v)//2]))")"
-  # Resource Saver (both engines have one) fires at 5 min idle; sample past the timeout
-  # plus margin to capture how deep each engine actually gives memory back.
+  local MED='import sys; v=sorted(float(x) for x in sys.argv[1].split()); print(round(v[len(v)//2]))'
+  rec "$ENG" idle rss_active host_rss MB "$(python3 -c "$MED" "$rsslist")"
+  rec "$ENG" idle fp_active host_fp MB "$(python3 -c "$MED" "$fplist")"
+  rec "$ENG" idle sysmem_active delta_mb MB "$(sysmem_delta)"
+  # Velox's Resource Saver (and DD's) fires at 5 min idle; OrbStack has no timer and returns
+  # memory continuously. Sample past the timeout plus margin either way: this row is "idle
+  # RAM after 5+ minutes with nothing running", whatever mechanism each engine uses.
   log "[$ENG] waiting out the 5-min resource-saver timeout"
   sleep 240
   w0=$(now); c0=$(sum_cputime $pids); sleep 60; w1=$(now); c1=$(sum_cputime $pids)
   rss=$(sum_rss $pids)
   rec "$ENG" idle rss_saver host_rss MB "$rss"
+  rec "$ENG" idle fp_saver host_fp MB "$(sum_footprint $pids)"
+  rec "$ENG" idle sysmem_saver delta_mb MB "$(sysmem_delta)"
   rec "$ENG" idle cpu_saver pct pct "$(python3 -c "print(round(($c1-$c0)/($w1-$w0)*100,2))")"
   log "[$ENG] saver RSS ${rss}MB"
 }
@@ -615,18 +825,22 @@ loadram(){          # $1 ctx $2 label
   D(){ docker --context "$CTX" "$@"; }
   log "[$ENG] RAM under load: 20 idle containers + postgres"
   for i in $(seq 1 20); do D run -d --name "l$i" "$IMG_ALPINE" sleep 3600 >/dev/null 2>&1; done
-  D rm -f lpg >/dev/null 2>&1
+  D rm -fv lpg >/dev/null 2>&1
   D run -d --name lpg -e POSTGRES_HOST_AUTH_METHOD=trust "$IMG_PG" >/dev/null 2>&1
   for i in $(seq 1 120); do D exec lpg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 0.5; done
   sleep 60
   pids="$(engine_pids "$ENG")"
   rec "$ENG" mem loaded host_rss MB "$(sum_rss $pids)"
+  rec "$ENG" mem loaded_fp host_fp MB "$(sum_footprint $pids)"
+  rec "$ENG" mem loaded_sysmem delta_mb MB "$(sysmem_delta)"
   log "[$ENG] loaded RSS $(sum_rss $pids)MB — tearing down, then 3 min for memory to return"
   for i in $(seq 1 20); do D rm -f "l$i" >/dev/null 2>&1; done
-  D rm -f lpg >/dev/null 2>&1
+  D rm -fv lpg >/dev/null 2>&1
   sleep 180
   pids="$(engine_pids "$ENG")"
   rec "$ENG" mem postload host_rss MB "$(sum_rss $pids)"
+  rec "$ENG" mem postload_fp host_fp MB "$(sum_footprint $pids)"
+  rec "$ENG" mem postload_sysmem delta_mb MB "$(sysmem_delta)"
   log "[$ENG] post-teardown RSS $(sum_rss $pids)MB"
 }
 
@@ -636,17 +850,17 @@ reclaim(){          # $1 ctx $2 label — measure growth, then whether it comes 
   ensure_csv
   D(){ docker --context "$CTX" "$@"; }
   IMG="$(disk_image "$ENG")"
-  a0=$(du -m "$IMG" 2>/dev/null|awk '{print $1}')
+  a0=$(dum "$IMG")
   log "[$ENG] disk reclaim: baseline ${a0}MB allocated"
   D volume rm rvol >/dev/null 2>&1; D volume create rvol >/dev/null 2>&1
   D run --rm -v rvol:/m "$IMG_ALPINE" sh -c 'dd if=/dev/zero of=/m/f bs=1M count=4096 2>/dev/null; sync' >/dev/null 2>&1
   D load -i "$HERE/loadimage.tar" >/dev/null 2>&1
   sync; sleep 5
-  a1=$(du -m "$IMG" 2>/dev/null|awk '{print $1}')
+  a1=$(dum "$IMG")
   log "[$ENG] after 4GiB volume + image load: ${a1}MB"
   D volume rm rvol >/dev/null 2>&1; D rmi "$IMG_LOAD" >/dev/null 2>&1
-  # Restart is the reclaim trigger: Velox runs its fstrim pass 60 s after boot. Whether
-  # Docker Desktop returns anything is exactly what this measures — do not assume it can't.
+  # Restart is the reclaim trigger: Velox runs its fstrim pass 60 s after boot. Whether the
+  # peer returns anything is exactly what this measures — do not assume it can't.
   #
   # This MUST be a real stop+start. Calling engine() here was a silent no-op ("already up"),
   # so no boot happened, no trim pass ran, and Velox scored a fabricated "0 MB reclaimed"
@@ -658,11 +872,11 @@ reclaim(){          # $1 ctx $2 label — measure growth, then whether it comes 
   start_engine "$ENG"
   for i in $(seq 1 240); do api_up "$CTX" && break; sleep 0.5; done
   sleep 150                       # Velox trims at boot+60 s; leave margin on both engines
-  a2=$(du -m "$IMG" 2>/dev/null|awk '{print $1}')
-  rec "$ENG" disk reclaim grew_mb MB "$(( ${a1:-0} - ${a0:-0} ))"
-  rec "$ENG" disk reclaim returned_mb MB "$(( ${a1:-0} - ${a2:-0} ))"
-  rec "$ENG" disk reclaim retained_mb MB "$(( ${a2:-0} - ${a0:-0} ))"
-  log "[$ENG] grew $(( ${a1:-0} - ${a0:-0} ))MB, returned $(( ${a1:-0} - ${a2:-0} ))MB, retained $(( ${a2:-0} - ${a0:-0} ))MB"
+  a2=$(dum "$IMG")
+  rec "$ENG" disk reclaim grew_mb MB "$(submb "$a1" "$a0")"
+  rec "$ENG" disk reclaim returned_mb MB "$(submb "$a1" "$a2")"
+  rec "$ENG" disk reclaim retained_mb MB "$(submb "$a2" "$a0")"
+  log "[$ENG] grew $(submb "$a1" "$a0")MB, returned $(submb "$a1" "$a2")MB, retained $(submb "$a2" "$a0")MB"
 }
 
 # ---- functional matrix (untimed; network allowed) ----------------------------
@@ -755,12 +969,15 @@ matrix(){           # $1 ctx $2 label
   D exec mxev echo hi >/dev/null 2>&1 && p exec pass || p exec fail
   D rm -f mxev >/dev/null 2>&1
 
-  # Velox-only: <name>.velox.local reaches the container's real IP with no -p at all.
-  if [ "$ENG" = "$LBL_A" ]; then
+  # Named access: <name>.<domain> reaches the container's real IP with no -p at all. Velox
+  # (.velox.local) and OrbStack (.orb.local) both have it, so probe each one's own domain;
+  # Docker Desktop has no equivalent.
+  local dom=""; case "$ENG" in velox) dom=velox.local ;; orbstack) dom=orb.local ;; esac
+  if [ -n "$dom" ]; then
     D rm -f mxname >/dev/null 2>&1
     D run -d --name mxname "$IMG_LOAD" python -m http.server 8000 >/dev/null 2>&1
     sleep 3
-    wait_http 'http://mxname.velox.local:8000/' 30 && p named_access pass || p named_access fail
+    wait_http "http://mxname.$dom:8000/" 30 && p named_access pass || p named_access fail
     D rm -f mxname >/dev/null 2>&1
   fi
 
@@ -770,14 +987,20 @@ matrix(){           # $1 ctx $2 label
 
 startup(){          # bounces both apps; measures launch -> API-ready (warm disk cache)
   ensure_csv
-  _one(){ local CTX="$1" ENG="$2"
-    log "[$ENG] stopping"; stop_engine "$ENG"
+  _one(){ local CTX="$1" ENG="$2" OTHER
+    # Quit BOTH engines first. This used to stop only the engine being timed, so after the
+    # first round the other one was always resident during every startup measurement — the
+    # one-engine-at-a-time rule silently did not hold for this metric (2026-10-09 run). The
+    # metric is now `restart_to_ready_solo`; the old name keeps marking the contaminated data.
+    [ "$ENG" = "$LBL_A" ] && OTHER="$LBL_B" || OTHER="$LBL_A"
+    log "[$ENG] stopping (and $OTHER)"; stop_engine "$OTHER"; stop_engine "$ENG"
     local i; for i in $(seq 1 120); do api_up "$CTX" || break; sleep 0.5; done
-    for i in $(seq 1 60); do [ -z "$(engine_live_pids "$ENG" | tr -d ' ')" ] && break; sleep 1; done
-    sleep 3
+    for i in $(seq 1 60); do [ -z "$(engine_live_pids "$ENG")$(engine_live_pids "$OTHER")" ] && break; sleep 1; done
+    [ -n "$(engine_live_pids "$OTHER" | tr -d ' ')" ] && { fail "$OTHER still alive before timing $ENG"; return 1; }
+    host_quiet "${COOLDOWN_S:-30}" "before timing $ENG startup"
     log "[$ENG] starting, timing to API-ready"; local t0; t0=$(now); start_engine "$ENG"
-    for i in $(seq 1 240); do api_up "$CTX" && { rec "$ENG" lifecycle restart_to_ready time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }; sleep 0.5; done
-    rec "$ENG" lifecycle restart_to_ready time_s s NA
+    for i in $(seq 1 240); do api_up "$CTX" && { rec "$ENG" lifecycle restart_to_ready_solo time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }; sleep 0.5; done
+    rec "$ENG" lifecycle restart_to_ready_solo time_s s NA
     warn "[$ENG] DID NOT become ready in 120s"; }
   # Order alternates with the round so neither engine always gets the warm host.
   if [ $((ROUND % 2)) = 1 ]; then _one "$CTX_A" "$LBL_A"; _one "$CTX_B" "$LBL_B"
@@ -788,42 +1011,53 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
 STATE=""
 done_step(){ [ -f "$STATE" ] && grep -qxF "$1" "$STATE"; }
 mark_step(){ echo "$1" >> "$STATE"; }
+# A step that fails is retried ONCE, then the campaign STOPS (resumable with the same RUN_ID).
+# It used to ignore exit codes, so a failed preflight or a parity mismatch was marked done and
+# the run measured on regardless. A retried step runs under ROUND="<n>r", so rows from a
+# discarded attempt (e.g. a suite that spanned a system sleep) stay distinguishable in the CSV.
 step(){             # $1 key, rest: command — skip if already recorded
   local key="$1"; shift
   if done_step "$key"; then log "skip (done): $key"; return 0; fi
   log "=== $key"
-  "$@"
-  mark_step "$key"
+  if "$@"; then mark_step "$key"; return 0; fi
+  warn "step $key failed — retrying once"
+  local r0="$ROUND"; ROUND="${ROUND}r"
+  if "$@"; then ROUND="$r0"; mark_step "$key"; return 0; fi
+  ROUND="$r0"
+  echo "XXX step $key failed twice — campaign stopped. Fix the cause, then resume with RUN_ID=$RUN_ID." >&2
+  exit 1
 }
 
 campaign(){
   ensure_csv; STATE="$RUNDIR/campaign.state"; touch "$STATE"
-  log "campaign run_id=$RUN_ID (resumable; state=$STATE)"
+  log "campaign run_id=$RUN_ID peer=$LBL_B (resumable; state=$STATE; csv=$CSV)"
   step env:capture capture_env
+  step env:parity  config_parity
 
   # Phase 1 — parity verification on each engine.
-  step p1:velox:engine engine "$LBL_A"
-  step p1:velox:pre    preflight "$CTX_A"
-  step p1:velox:info   capture_info "$CTX_A" "$LBL_A"
-  step p1:velox:foot   footprint
-  step p1:dd:engine    engine "$LBL_B"
-  step p1:dd:pre       preflight "$CTX_B"
-  step p1:dd:info      capture_info "$CTX_B" "$LBL_B"
+  step p1:velox:engine    engine "$LBL_A"
+  step p1:velox:pre       preflight "$CTX_A"
+  step p1:velox:info      capture_info "$CTX_A" "$LBL_A"
+  step p1:velox:foot      footprint
+  step "p1:$LBL_B:engine" engine "$LBL_B"
+  step "p1:$LBL_B:pre"    preflight "$CTX_B"
+  step "p1:$LBL_B:info"   capture_info "$CTX_B" "$LBL_B"
 
-  # Phase 2 — idle + resource saver (needs the saver ENABLED at 5 min on both).
-  step p2:velox:engine engine "$LBL_A"
-  step p2:velox:idle   idle "$CTX_A" "$LBL_A"
-  step p2:dd:engine    engine "$LBL_B"
-  step p2:dd:idle      idle "$CTX_B" "$LBL_B"
+  # Phase 2 — idle + resource saver (Velox first; Phase 5/6 run the peer first).
+  step p2:velox:engine    engine "$LBL_A"
+  step p2:velox:idle      idle "$CTX_A" "$LBL_A"
+  step "p2:$LBL_B:engine" engine "$LBL_B"
+  step "p2:$LBL_B:idle"   idle "$CTX_B" "$LBL_B"
 
-  # Phase 3 — startup, n=5, alternating order (saver OFF from here on).
+  # Phase 3 — startup, n=6, alternating order: each engine goes first exactly 3 times
+  # (n=5 gave Velox the first slot 3 times and the peer 2).
   local r
-  for r in 1 2 3 4 5; do ROUND=$r; step "p3:startup:r$r" startup; done
+  for r in 1 2 3 4 5 6; do ROUND=$r; step "p3:startup:r$r" startup; done
 
-  # Phase 4 — the timed suite, order-balanced. Heavy sets only in rounds 1–3.
-  for r in 1 2 3 4 5; do
+  # Phase 4 — the timed suite, order-balanced, n=6. Heavy sets in rounds 1–4 (2 each way).
+  for r in 1 2 3 4 5 6; do
     ROUND=$r
-    local sets="core"; [ "$r" -le 3 ] && sets="core,build,compose,rosetta"
+    local sets="core"; [ "$r" -le 4 ] && sets="core,build,compose,rosetta"
     local first second fctx sctx
     if [ $((r % 2)) = 1 ]; then first="$LBL_A"; fctx="$CTX_A"; second="$LBL_B"; sctx="$CTX_B"
     else first="$LBL_B"; fctx="$CTX_B"; second="$LBL_A"; sctx="$CTX_A"; fi
@@ -836,34 +1070,40 @@ campaign(){
   done
   ROUND=0
 
-  # Phase 5 — one-offs (low n, labeled as such in the report).
-  step p5:velox:engine  engine "$LBL_A"
-  step p5:velox:loadram loadram "$CTX_A" "$LBL_A"
-  step p5:velox:reclaim reclaim "$CTX_A" "$LBL_A"
-  step p5:dd:engine     engine "$LBL_B"
-  step p5:dd:loadram    loadram "$CTX_B" "$LBL_B"
-  step p5:dd:reclaim    reclaim "$CTX_B" "$LBL_B"
+  # Phase 5 — one-offs (low n, labeled as such in the report). Peer first.
+  step "p5:$LBL_B:engine"  engine "$LBL_B"
+  step "p5:$LBL_B:loadram" loadram "$CTX_B" "$LBL_B"
+  step "p5:$LBL_B:reclaim" reclaim "$CTX_B" "$LBL_B"
+  step p5:velox:engine     engine "$LBL_A"
+  step p5:velox:loadram    loadram "$CTX_A" "$LBL_A"
+  step p5:velox:reclaim    reclaim "$CTX_A" "$LBL_A"
 
-  # Phase 6 — functional matrix (untimed, network allowed).
-  step p6:velox:engine engine "$LBL_A"
-  step p6:velox:matrix matrix "$CTX_A" "$LBL_A"
-  step p6:dd:engine    engine "$LBL_B"
-  step p6:dd:matrix    matrix "$CTX_B" "$LBL_B"
+  # Phase 6 — functional matrix (untimed, network allowed). Peer first.
+  step "p6:$LBL_B:engine" engine "$LBL_B"
+  step "p6:$LBL_B:matrix" matrix "$CTX_B" "$LBL_B"
+  step p6:velox:engine    engine "$LBL_A"
+  step p6:velox:matrix    matrix "$CTX_A" "$LBL_A"
 
   step p7:footprint footprint
   log "campaign complete — $CSV"
-  python3 "$HERE/report.py"
+  python3 "$HERE/report.py" --csv "$CSV"
 }
 
-# No default subcommand on purpose: the two cadences differ by 12 minutes vs 2.5 hours
+USAGE="usage: [BENCH_PEER=dd|orbstack] $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|parity|report]"
+case "${1:-help}" in report|help|-h|--help) ;; *) setup_client ;; esac
+# No default subcommand on purpose: the two cadences differ by 12 minutes vs ~4 hours
 # and the long one bounces both apps, so it must be asked for by name.
 case "${1:-help}" in
   campaign)  campaign ;;
   preflight) preflight "${2:-}" ;;
-  engine)    engine "${2:?usage: engine <velox|dd>}" ;;
-  all)       echo "$CSV_HEADER" > "$CSV"
+  parity)    config_parity ;;
+  engine)    engine "${2:?usage: engine <velox|$LBL_B>}" ;;
+  # The quick check writes to its own scratch CSV: it used to truncate results.csv — the
+  # committed evidence behind the published scorecard — on every run.
+  all)       [ -z "${BENCH_CSV:-}" ] && CSV="$RUNDIR/quick.csv"
+             mkdir -p "$RUNDIR"; echo "$CSV_HEADER" > "$CSV"
              footprint; suite "$CTX_A" "$LBL_A"; suite "$CTX_B" "$LBL_B"
-             python3 "$HERE/report.py" ;;
+             python3 "$HERE/report.py" --csv "$CSV" ;;
   footprint) footprint ;;
   suite)     suite "${2:?ctx}" "${3:?label}" ;;
   idle)      idle "${2:?ctx}" "${3:?label}" ;;
@@ -871,9 +1111,9 @@ case "${1:-help}" in
   reclaim)   reclaim "${2:?ctx}" "${3:?label}" ;;
   matrix)    matrix "${2:?ctx}" "${3:?label}" ;;
   startup)   startup ;;
-  report)    python3 "$HERE/report.py" ;;
+  report)    python3 "$HERE/report.py" --csv "$CSV" ;;
   help|-h|--help)
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' >&2
-    echo "usage: $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|report]" >&2 ;;
-  *) echo "usage: $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|report]" >&2; exit 2 ;;
+    sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//' >&2
+    echo "$USAGE" >&2 ;;
+  *) echo "$USAGE" >&2; exit 2 ;;
 esac

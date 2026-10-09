@@ -17,6 +17,16 @@ results.
 | ⚪ **Par** | VirtioFS bind read, named-volume write, overlay write, `docker load`, cold/incremental build, compose up, emulation tax, pgbench |
 | 🔴 **Trails** | `compose down` on SIGTERM-ignoring services (3× slower), small-file extract over VirtioFS (25% slower), no per-container host-IP publishing |
 
+**Against OrbStack 2.2.3** (2026-10-09, [full report](bench/REPORT-2026-10-09-orbstack.md)):
+OrbStack is the harder opponent and Velox does **not** beat it across the board.
+
+| | Velox 1.7.0 vs OrbStack 2.2.3 |
+| --- | --- |
+| 🟢 **Wins** | container launch/churn 2×, builds 1.4–1.9×, pgbench 2.5× TPS, container→host 1.6×, container↔container 1.4×, overlay write 1.9×, amd64 emulation 1.2×, install 2× smaller |
+| ⚪ **Par** | idle RAM, published port (1 stream), bind write, `docker load`, compose up/down, disk returned after a delete |
+| 🔴 **Trails** | small-file VirtioFS 2.3× slower, startup 1.21 s vs 0.88 s, `docker cp` 1.3–1.4× slower, idle CPU 2–3× higher, RAM under load 1.3× and after teardown 1.7× higher, deleted space held until the next trim, no per-container host-IP publishing |
+| ❔ **No verdict** | published port, 4 streams: Velox swings between 19 and 60 Gbit/s on the same boot (OrbStack a steady 28) |
+
 Full numbers and raw values: **[REPORT-2026-08-25.md](bench/REPORT-2026-08-25.md)**. The data
 disk is raw + durable `.fsync` ([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published
 ports ride a VZNAT conduit pool; launch is `HZ_1000` + expedited RCU
@@ -40,16 +50,20 @@ Resources** so the two match before running.
 brew install jq iperf3 hyperfine          # one-time
 cd docs/bench
 
-./run.sh                  # footprint + full suite on both engines, then prints the scorecard
+./run.sh all              # quick: footprint + one suite round per engine (scratch CSV), scorecard
+./run.sh campaign         # the full publishable comparison (~4 h, see below)
 ./run.sh report           # re-print the scorecard from results.csv
+BENCH_PEER=orbstack ./run.sh campaign   # same, against OrbStack → results-orbstack.csv
 ./run.sh startup          # restart-to-ready timing — NOTE: this quits & relaunches both apps
 ./run.sh suite velox velox            # run the active suite against one engine only
 ```
 
 The engine under test is selected purely by its **Docker context** (`velox` /
-`desktop-linux`) — no daemon swap, no `DOCKER_HOST` juggling. Edit the config block at the
-top of `run.sh` if your contexts or app names differ. Results append to
-`docs/bench/results.csv`; `report.py` renders the scorecard.
+`desktop-linux` / `orbstack`) — no daemon swap, no `DOCKER_HOST` juggling. `BENCH_PEER`
+(`dd`, the default, or `orbstack`) picks the peer. Both engines are driven by **Velox's bundled
+`docker` CLI, compose and buildx** from a private `DOCKER_CONFIG`, so neither app's own CLI or
+plugin re-linking can make the two sides differ. Results append to `docs/bench/results.csv`
+(Docker Desktop) or `results-orbstack.csv`; `report.py --csv <file>` renders the scorecard.
 
 ## Fairness controls
 
@@ -57,8 +71,8 @@ These are what make the numbers comparable rather than anecdotal:
 
 1. **Same resource caps.** Both engines pinned to 8 vCPU / 8 GB (verify with
    `docker run --rm alpine sh -c 'nproc; free -m'` on each context).
-2. **One engine under load at a time.** The suite drives a single context end-to-end; the
-   other engine sits idle. (Both VMs are resident, but only one is doing work.)
+2. **One engine resident at a time.** The other is fully quit — engine and GUI — and the run
+   aborts if any of its processes survive.
 3. **Identical, pinned images.** `alpine:3.20`, `networkstatic/iperf3`, `python:3.12`,
    `postgres:16` — pulled on both before timing.
 4. **Warm vs cold is stated per test.** Launch latency is warm (median of 12 via
@@ -126,7 +140,7 @@ host-IP publishing, which Velox does not.
 
 ### Running the annual comparison
 
-`./run.sh campaign` takes about 2.5 hours, bounces both applications repeatedly, and needs the
+`./run.sh campaign` takes about 4 hours, bounces both applications repeatedly, and needs the
 Mac to itself — so it is **an annual exercise**, not a per-commit or per-release one. Run it
 when a Docker Desktop major lands, before putting a performance claim on the website, or once
 a year to keep this page honest. The quick pre-release regression check is `./run.sh all`
@@ -139,15 +153,24 @@ Preconditions the harness enforces, each of which was bought with a wrong number
   span a sleep are fiction — `docker load` "took" 945 s instead of 7 s. A wake-event counter
   now discards any round that spans a sleep, and the campaign should be run under
   `caffeinate -dimsu`.
-- **Nothing else running**, thermals unthrottled, ≥40 GB free, no containers on the engine
+- **A quiet host, by condition rather than by sleep.** After every engine stop and start, and
+  between heavy test groups, the harness waits until the Mac is ≥90% CPU-idle, under no
+  memory pressure and thermally nominal (`ProcessInfo.thermalState` — `pmset -g therm` reports
+  nothing on Apple Silicon, so the old thermal check never fired), and until the freshly booted
+  engine's own processes are quiet. Most gates clear in seconds; the floors are 30 s after an
+  engine switch and 10 s between test groups. Also: ≥25 GB free, no containers on the engine
   under test.
-- **Both engines at matched CPU/RAM**, verified in-guest and aborted on mismatch.
+- **Both engines at matched CPU/RAM**, checked in each app's settings file *and* in-guest,
+  aborted on mismatch.
 - **One engine resident at a time**, the other fully quit including its GUI.
 - **Nothing network-dependent on a timed path** — every fixture is pre-pulled untimed. A cold
   `docker pull` metric was deliberately deleted: the same image measured 4.1 s and 20.0 s
   forty minutes apart, which is a CDN reading, not an engine property.
-- **Order-balanced rounds and n≥5.** Single-shot numbers on this workload are worthless;
-  container→host throughput alone ranges 51–94 Gbit/s across identical runs.
+- **Order-balanced rounds, n=6.** Each engine goes first exactly three times (n=5 gave one
+  side the first slot three times and the other twice). Single-shot numbers on this workload
+  are worthless; container→host throughput alone ranges 51–94 Gbit/s across identical runs.
+- **A failed step stops the campaign** (resumable with the same `RUN_ID`) after one retry; it
+  used to be marked done and the run carried on.
 
 Results land in `results.csv` with a timestamp, run id, round and both version strings;
 `./run.sh report` prints the scorecard with medians, spreads and verdicts. Per-run artifacts
@@ -178,6 +201,43 @@ Inbound `localhost:PORT → container` used to route over a single `VZVirtioSock
 the fast VZNAT path, and the host hands each published connection an idle conduit (assignment
 over VSOCK, *data* over VZNAT), so throughput jumps to **38–60 Gbit/s — 2.9–3.3× Docker
 Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty).
+
+## Velox vs OrbStack — method
+
+The North Star names OrbStack as well as Docker Desktop, so the campaign takes it as a peer:
+`BENCH_PEER=orbstack`. These rules were fixed before the first number existed. The first run
+under them (2026-10-09) is in
+[REPORT-2026-10-09-orbstack.md](bench/REPORT-2026-10-09-orbstack.md), and is summarised in the
+TL;DR above.
+
+- **Forced equal:** 8 vCPU / 8 GiB on both (OrbStack `~/.orbstack/vmconfig.json`, Velox
+  `config.json`, plus in-guest `nproc`/`free -m`); one client toolchain; identical local
+  fixtures; empty data disks; each app's privileged helper installed (porthelper / OrbStack's
+  privhelper, both counted in their engine's RAM); one engine resident at a time.
+- **Otherwise shipped defaults.** Velox keeps its 5-minute resource saver; OrbStack keeps its
+  continuous memory return and zram swap. Neither is tuned for the run.
+- **Disclosed, not "corrected":** Docker Engine version (Velox 29.8.2, OrbStack 29.4.0), guest
+  kernel (7.2 vs 7.0-orbstack), VMM (Apple `Virtualization.framework` vs OrbStack's own
+  hypervisor), swap (1 GiB vs 8 GiB zram + 1 GiB), data filesystem (ext4 vs btrfs). Both use
+  the containerd image store.
+- **Startup is timed with both engines quit.** Until 2026-10-09 the startup phase quit only
+  the engine being timed, so the other engine stayed resident — including in the August
+  Docker Desktop run, whose startup row carries that caveat.
+- **Memory is reported two ways** — summed host RSS (continuity with the Docker Desktop
+  report) and the kernel's `phys_footprint` ledger (Activity Monitor's Memory column) — and a
+  memory claim is made only when both point the same way. A whole-system `vm_stat` delta
+  against a no-engine baseline is recorded as a cross-check. `footprint(1)` is **not** used:
+  it does not see OrbStack's guest RAM at all (106 MB vs the kernel's 1,307 MB, measured).
+- **Disk** is the allocated size of each engine's images by explicit path; OrbStack's Group
+  Container refuses listing, and a failed read is NA, never 0.
+- **Named access** is probed on each engine's own domain (`.velox.local` / `.orb.local`).
+- **Same verdict rules** as the Docker Desktop report: WIN ≥1.15× / TRAIL ≤0.87× with
+  non-overlapping IQRs, UNRELIABLE above 25% spread. Every row is published, losses included;
+  any re-run covers both engines and keeps every row.
+
+Output: `results-orbstack.csv` and a hand-written `bench/REPORT-<date>-orbstack.md`. The
+OrbStack numbers are not merged into the Docker Desktop table above (different day, different
+Velox version).
 
 ## Filesystem: two harness bugs, and a read-ahead fix (2026-08-14)
 
@@ -276,8 +336,6 @@ IPIs in ~µs (~23% of launch on its own): container launch (`run --rm true`) 175
 
 ## Caveats
 
-- Both VMs were resident concurrently (only one under load at a time); a fully-quiesced
-  single-engine run would be marginally cleaner.
 - **Startup** is a *warm-disk* restart (kernel/rootfs in the host page cache), not a
   purged-cache first boot.
 - `dd`-based fs writes are wall-clock around `dd; sync` (busybox `dd` rejects
@@ -295,8 +353,4 @@ IPIs in ~µs (~23% of launch on its own): container launch (`run --rm true`) 175
 
 ## Not yet covered (planned additions)
 
-- x86 / Rosetta throughput under emulation (`--platform linux/amd64` compute)
-- `docker cp` over the VSOCK data plane (in/out)
-- Disk reclaim (sparse-image hole-punch after `rmi` + `fstrim`)
 - A multi-service `compose` stack with end-to-end HTTP latency (`wrk`/`hey`)
-- Incremental `docker build` (BuildKit cache) inner-loop timing
