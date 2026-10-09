@@ -133,14 +133,34 @@ fn main() {
     if std::path::Path::new("/dev/kvm").exists() {
         log!("KVM available — nested virtualization enabled");
     }
-    // dockerd reads GATEWAY_IP (for host.docker.internal) and expects resolv.conf in
-    // place, so the network must be fully applied before it starts — and the emulators
-    // registered (above).
+    // Emulators must be registered before dockerd starts (BuildKit enumerates platforms).
     if let Some(h) = fs_handle { let _ = h.join(); }
+    // EARLY START. dockerd needs exactly one thing from the network: the gateway for
+    // --host-gateway-ip (host.docker.internal). vmnet drops the first DISCOVER, so waiting
+    // for the lease put ~190 ms of DHCP on every boot's critical path (measured: vinit at
+    // 61 ms, dockerd spawned at 254 ms). The gateway is stable across boots, so start dockerd
+    // as soon as the data disk is mounted with the one the last lease gave; if this boot's
+    // lease disagrees, dockerd is restarted below with the real one (rare: vmnet's shared
+    // subnet does not move). Everything else that needs the network — DNS, conduits, the
+    // direct-access rules — still waits for the real lease. Containers get resolv.conf at
+    // create time, not at daemon start, so dockerd has no other dependency on the lease.
+    let early_gw = if data_ok { cached_gateway() } else { None };
+    let mut early_pid = -1;
+    if let Some(gw) = early_gw {
+        enable_ip_forwarding();
+        tune_memory_sysctls();
+        early_pid = spawn_dockerd_with_gateway(gw);
+        if early_pid >= 0 {
+            DOCKERD_PID.store(early_pid, std::sync::atomic::Ordering::SeqCst);
+            log!("dockerd started before DHCP with the cached gateway {}", ipstr(gw));
+        }
+    }
     if let Some(h) = net_handle { let _ = h.join(); }
     enable_ip_forwarding();
     tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
     tune_memory_sysctls();  // no periodic kcompactd wakeups at idle
+    let leased_gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
+    if data_ok { remember_gateway(leased_gw); }
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
     // sleeps — a crash-looping dockerd must not stop us reaping orphaned shims/zombies.
     let (deaths_tx, deaths_rx) = std::sync::mpsc::channel::<()>();
@@ -148,8 +168,15 @@ fn main() {
     // (re)spawn and on every docker network event — both signal this channel; nothing polls.
     let (nft_tx, nft_rx) = std::sync::mpsc::channel::<()>();
     if data_ok {
-        let pid = spawn_dockerd();
-        DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+        if early_pid < 0 {
+            let pid = spawn_dockerd();
+            DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
+        } else if leased_gw != 0 && Some(leased_gw) != early_gw {
+            // The lease moved the gateway: restart dockerd so host.docker.internal is right.
+            // The supervisor respawns it with GATEWAY_IP (now the leased value).
+            log!("gateway changed {} → {} — restarting dockerd", ipstr(early_gw.unwrap_or(0)), ipstr(leased_gw));
+            unsafe { libc::kill(early_pid, libc::SIGTERM); }
+        }
         start_docker_events_informer(nft_tx.clone());
         spawn_worker("dockerd-supervisor", move || dockerd_supervisor(deaths_rx, nft_tx));
     } else {
@@ -1957,6 +1984,25 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 /// The reaper (`reap_forever`) watches this PID and relaunches the daemon if it
 /// ever exits, so a dockerd crash never leaves the engine permanently dead.
 fn spawn_dockerd() -> i32 {
+    spawn_dockerd_with_gateway(GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Where the last lease's gateway is remembered across boots — see the early start in main().
+const GATEWAY_CACHE: &str = "/var/lib/docker/.velox-gateway";
+
+fn cached_gateway() -> Option<u32> {
+    std::fs::read_to_string(GATEWAY_CACHE).ok()?.trim().parse::<u32>().ok().filter(|g| *g != 0)
+}
+
+fn remember_gateway(gw: u32) {
+    if gw != 0 && cached_gateway() != Some(gw) {
+        if let Err(e) = std::fs::write(GATEWAY_CACHE, gw.to_string()) {
+            log!("gateway cache: write failed: {e}");
+        }
+    }
+}
+
+fn spawn_dockerd_with_gateway(gw: u32) -> i32 {
     // dockerd discovers containerd/runc/nft on PATH and manages its own containerd
     // (no iptables binary is shipped — see the nftables firewall backend below). Unix
     // socket (not TCP) — the vsock agent bridges to it directly.
@@ -1973,7 +2019,6 @@ fn spawn_dockerd() -> i32 {
     // host.docker.internal → the vmnet gateway (the Mac), so containers can reach
     // host services. Containers add it via `--add-host host.docker.internal:host-gateway`
     // (Docker Desktop sets the same hostname automatically too).
-    let gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
     if gw != 0 {
         args.push(format!("--host-gateway-ip={}", ipstr(gw)));
     }
