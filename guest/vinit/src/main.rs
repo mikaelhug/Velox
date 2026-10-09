@@ -1637,6 +1637,13 @@ fn data_disk_clean(dev: &str) -> bool {
 
 // =================== swap ===================
 
+/// swapon(2) flag (linux/swap.h; not exported by the libc crate): discard the whole area
+/// once at swapon, then every swap cluster as it is freed. On the data disk a discard is a
+/// hole-punch in the host's raw `data.img` (VZ honours it, exactly like FITRIM), so swapped-
+/// out pages that are later freed hand their host disk back instead of pinning it until the
+/// file is rebuilt. A device without discard support simply ignores the flag (no error).
+const SWAP_FLAG_DISCARD: libc::c_int = 0x10000;
+
 /// If the host requested swap (`velox.swap=<MiB>` on the cmdline), create a
 /// swapfile on the persistent data disk and enable it. No mkswap binary in the
 /// image — we write the swap v1 header ourselves and `swapon(2)` directly.
@@ -1654,24 +1661,42 @@ fn setup_swap() {
         log!("velox.swap value is out of range — skipping swap");
         return;
     };
-    match make_swapfile(path, swap_bytes) {
-        Ok(()) => {
-            let cpath = cstr(path);
-            if unsafe { libc::swapon(cpath.as_ptr(), 0) } == 0 {
-                log!("swap enabled: {mib} MiB at {path}");
-            } else {
-                log!("swapon failed: {}", std::io::Error::last_os_error());
+    let swapon = || {
+        let cpath = cstr(path);
+        if unsafe { libc::swapon(cpath.as_ptr(), SWAP_FLAG_DISCARD) } == 0 { Ok(()) }
+        else { Err(std::io::Error::last_os_error()) }
+    };
+    match make_swapfile(path, swap_bytes, true) {
+        Ok(reused) => match swapon() {
+            Ok(()) => log!("swap enabled: {mib} MiB at {path}{}", if reused { " (reused)" } else { "" }),
+            // A reused file the kernel refused (e.g. a hole the size check couldn't see):
+            // rebuild it from scratch once, exactly as a first boot would.
+            Err(e) if reused => {
+                log!("swapon of the existing swapfile failed ({e}) — recreating it");
+                match make_swapfile(path, swap_bytes, false).and_then(|_| swapon()) {
+                    Ok(()) => log!("swap enabled: {mib} MiB at {path}"),
+                    Err(e) => log!("swapon failed: {e}"),
+                }
             }
-        }
+            Err(e) => log!("swapon failed: {e}"),
+        },
         Err(e) => log!("swapfile setup failed: {e}"),
     }
 }
 
 /// Build a valid Linux v1 swapfile of (at least) `bytes`, allocated with no holes
-/// (swapon rejects sparse files) and stamped with the swap header + magic.
-fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
+/// (swapon rejects sparse files) and stamped with the swap header + magic. Returns whether
+/// an existing file was reused.
+///
+/// With `reuse`, a swapfile left by a previous boot is kept when it already has exactly the
+/// wanted size and is fully allocated (st_blocks covers st_size — a fallocate()d file always
+/// does). Rebuilding it every boot meant truncating a multi-GiB file to zero and fallocating
+/// it again: a burst of ext4 allocation + journal work for an identical result. The header is
+/// re-stamped either way, so a stale or foreign one can't survive. If the kernel still
+/// refuses the reused file, the caller rebuilds it with `reuse = false`.
+fn make_swapfile(path: &str, bytes: u64, reuse: bool) -> std::io::Result<bool> {
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::io::AsRawFd;
 
     let page = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
@@ -1684,12 +1709,17 @@ fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
     }
     let size = pages * page;
 
+    // symlink_metadata: a link planted at this path must not make us "reuse" another file.
+    let reusable = reuse && std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file() && m.len() == size
+             && m.blocks().saturating_mul(512) >= size)
+        .unwrap_or(false);
     let mut f = std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true).open(path)?;
+        .read(true).write(true).create(true).truncate(!reusable).open(path)?;
     // Swap must not be world/group readable.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     // Allocate real blocks — a sparse (ftruncate'd) file fails swapon with "has holes".
-    if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+    if !reusable && unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // swap_header (union, one page): info.version @1024, info.last_page @1028,
@@ -1701,7 +1731,7 @@ fn make_swapfile(path: &str, bytes: u64) -> std::io::Result<()> {
     f.seek(SeekFrom::Start(page - 10))?;
     f.write_all(b"SWAPSPACE2")?;
     f.flush()?;
-    Ok(())
+    Ok(reusable)
 }
 
 // =================== VirtioFS + Rosetta ===================
