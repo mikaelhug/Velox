@@ -81,6 +81,9 @@ struct MenuBarContentView: View {
         // the rows (230pt text cap) rather than widening the panel.
         .frame(width:270, alignment: .leading)
         .modifier(RetainStatsIfPresent(stats: engine.state.isRunning ? engine.stats : nil))
+        // Last, outside RetainStatsIfPresent's branch, so its measurement survives a stats
+        // store coming and going. The panel window would otherwise never shrink.
+        .fitsMenuBarPanelHeight()
     }
 
     private func quickRow(_ c: ContainerSummary) -> some View {
