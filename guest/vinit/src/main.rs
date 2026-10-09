@@ -83,6 +83,14 @@ fn main() {
     log!("starting (PID 1)");
     mount_all();
     set_clock();
+    // The vsock agent goes up FIRST, before networking, the data disk and dockerd. The host
+    // starts dialing these ports the moment the VM is running; while nothing listened, every
+    // dial failed and the host's informers fell back to their retry timers, so readiness was
+    // quantized by those timers instead of tracking dockerd. Every handler tolerates the
+    // early start: 2375 waits for dockerd's socket (handle_data), 2378 waits for the DHCP
+    // lease (handle_gateway), 2376 just dials a port that may not be published yet (the host
+    // retries), and 2374/2377 need nothing from the rest of boot.
+    start_vsock_agent();
     // Network (DHCP) and the data disk (first-boot mkfs/resize) are independent and
     // both potentially slow, so run them concurrently: the DHCP round-trip — and any
     // retries on a lossy bridge — is hidden behind the disk format instead of summed
@@ -136,7 +144,6 @@ fn main() {
         log!("FATAL: data disk mount failed — refusing to start dockerd (it would run on \
               non-persistent tmpfs and lose all images/volumes). Fix /dev/vdb and restart.");
     }
-    start_vsock_agent();
     start_conduit_pool();
     start_direct_access(nft_rx);
     log!("init complete — supervising");
@@ -1901,10 +1908,104 @@ fn handle_clock(fd: RawFd) {
 }
 
 fn handle_data(fd: RawFd) {
-    match UnixStream::connect(DOCKER_SOCK) {
-        Ok(up) => bridge(fd, up.into_raw_fd()),
-        Err(e) => { log!("dial docker.sock: {e}"); unsafe { libc::close(fd); } }
+    match connect_docker_sock(fd) {
+        Some(up) => bridge(fd, up.into_raw_fd()),
+        None => unsafe { libc::close(fd); },
     }
+}
+
+/// Upper bound on how long one Docker-API connection waits for dockerd's socket. Generous —
+/// a first boot that formats the data disk, or a dockerd crash-loop backoff (≤30 s), must not
+/// turn into dropped connections — but bounded, so a guest whose dockerd never comes up (data
+/// disk refused) doesn't park handler threads forever.
+const DOCKER_SOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Connect to dockerd's API socket, waiting for it to appear if this connection arrived before
+/// dockerd bound it (the vsock agent starts first in boot, so the host's first requests land
+/// here). dockerd binds its listener early in its startup and only begins serving once it is
+/// initialized, so once connected the client's request simply blocks until dockerd answers —
+/// readiness then tracks dockerd itself, with no host-side retry quantization.
+///
+/// Event-driven (CLAUDE.md §8): an inotify watch on /run wakes us when the socket is created.
+/// The watch is armed BEFORE the next connect attempt, so a socket that appears between a
+/// failed connect and the wait is never missed. Gives up early if the host shuts its end
+/// (POLLRDHUP — its request timed out), so an abandoned connection doesn't hold a handler
+/// thread for the full wait.
+fn connect_docker_sock(client: RawFd) -> Option<UnixStream> {
+    // Steady state: dockerd is up — connect immediately, no inotify fd, no extra syscalls.
+    match UnixStream::connect(DOCKER_SOCK) {
+        Ok(s) => return Some(s),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ECONNREFUSED)) => {}
+        Err(e) => { log!("dial docker.sock: {e}"); return None; }
+    }
+    let ino = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    let watched = ino >= 0 && unsafe {
+        libc::inotify_add_watch(ino, c"/run".as_ptr(), libc::IN_CREATE | libc::IN_MOVED_TO)
+    } >= 0;
+    if !watched {
+        // No inotify (fd exhaustion): degrade to the short re-dial timer below for the wait.
+        log!("dial docker.sock: inotify unavailable ({}) — re-dialing on a short timer",
+             std::io::Error::last_os_error());
+    }
+    let deadline = std::time::Instant::now() + DOCKER_SOCK_WAIT;
+    // ECONNREFUSED means the socket FILE exists but nothing accepts on it: dockerd is between
+    // bind(2) and listen(2) (microseconds apart, and there is no event for listen), or it is a
+    // stale file left by a dockerd that died, whose successor hasn't re-created it yet (that
+    // re-creation IS an inotify event). The first has no event at all, so this case also
+    // re-dials on a short, growing timer (5 ms → 250 ms cap). ENOENT waits on the watch alone.
+    let mut redial_ms: i32 = 5;
+    let mut client_open = true; // false once the host half-closed — see the poll below
+    let result = loop {
+        let wait_ms = match UnixStream::connect(DOCKER_SOCK) {
+            Ok(s) => break Some(s),
+            Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED)
+                || (!watched && e.raw_os_error() == Some(libc::ENOENT)) => {
+                let ms = redial_ms;
+                redial_ms = (redial_ms * 2).min(250);
+                ms
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => -1, // wait for the create event
+            Err(e) => { log!("dial docker.sock: {e}"); break None; }
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            log!("dial docker.sock: dockerd did not come up within {}s — dropping connection",
+                 DOCKER_SOCK_WAIT.as_secs());
+            break None;
+        }
+        let left_ms = left.as_millis().min(i32::MAX as u128) as i32;
+        let timeout = if wait_ms < 0 { left_ms } else { wait_ms.min(left_ms) };
+        // POLLRDHUP on the client = the host shut (at least) its sending side. A negative fd is
+        // ignored by poll(2): the client stops being watched once it half-closed (see below),
+        // and the unwatched-inotify case polls the client alone.
+        let mut pfds = [
+            libc::pollfd { fd: if client_open { client } else { -1 }, events: libc::POLLRDHUP, revents: 0 },
+            libc::pollfd { fd: if watched { ino } else { -1 }, events: libc::POLLIN, revents: 0 },
+        ];
+        let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            log!("dial docker.sock: poll failed: {}", std::io::Error::last_os_error());
+            break None;
+        }
+        if r > 0 && pfds[0].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+            // Fully gone (closed/reset — its request timed out)? A zero-length send fails with
+            // EPIPE/ENOTCONN once the peer can no longer receive. If it only HALF-closed after
+            // sending a complete request, it still wants the response: keep waiting, but stop
+            // polling it — RDHUP is level-triggered and would spin this loop.
+            let sent = unsafe {
+                libc::send(client, std::ptr::null(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            };
+            if sent < 0 { break None; } // nothing left to bridge to
+            client_open = false;
+        }
+        if r > 0 && pfds[1].revents & libc::POLLIN != 0 {
+            // Drain. Which entry was created doesn't matter — the connect above is the check.
+            let mut buf = [0u8; 4096];
+            while unsafe { libc::read(ino, buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
+        }
+    };
+    if ino >= 0 { unsafe { libc::close(ino); } }
+    result
 }
 
 /// Gateway probe. The host's `GatewayProbe` connects once at boot; reply with the vmnet
