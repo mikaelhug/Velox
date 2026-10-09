@@ -239,6 +239,10 @@ public enum VMConfiguration {
 
         config.directorySharingDevices = sharingDevices
 
+        // EXPERIMENTAL (perf/orbstack-gap): macOS 27 custom virtio device probes. No-op unless
+        // a VELOX_EXPERIMENT_* variable is set; see Experimental/CustomVirtioProbes.swift.
+        CustomVirtioProbes.configure(config)
+
         do {
             try config.validate()
         } catch {
