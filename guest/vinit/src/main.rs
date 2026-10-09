@@ -2000,9 +2000,35 @@ fn start_vsock_agent() {
     spawn_listener(GW_PORT, handle_gateway);
 }
 
+// AF_VSOCK socket options (linux/vm_sockets.h; not exported by the libc crate). Level is
+// AF_VSOCK; the value is a u64.
+const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+/// Receive buffer for Docker-API vsock connections (default 256 KiB). For virtio-vsock this is
+/// the CREDIT the guest advertises to the host — how many bytes the host may have in flight
+/// toward us before it must wait for a credit update — so on bulk uploads (`docker cp` into a
+/// container, `docker load`, a build context) 256 KiB stalls the host every 256 KiB on a
+/// round-trip. Memory is only consumed for bytes actually queued, so idle connections cost
+/// nothing extra.
+const DOCKER_VSOCK_BUF: u64 = 4 * 1024 * 1024;
+
+/// Raise a vsock socket's buffer size. MAX first: the kernel clamps SIZE to the current
+/// max, which defaults to the same 256 KiB. Set on the LISTENING socket — accepted sockets
+/// inherit buffer_size/min/max from their listener (`__vsock_create`). Best-effort.
+fn vsock_set_buffer(fd: RawFd, bytes: u64) {
+    let sz = std::mem::size_of::<u64>() as libc::socklen_t;
+    for opt in [SO_VM_SOCKETS_BUFFER_MAX_SIZE, SO_VM_SOCKETS_BUFFER_SIZE] {
+        let r = unsafe { libc::setsockopt(fd, libc::AF_VSOCK, opt, &bytes as *const u64 as *const _, sz) };
+        if r != 0 { log!("vsock buffer option {opt} failed: {}", std::io::Error::last_os_error()); }
+    }
+}
+
 fn vsock_listen(port: u32) -> std::io::Result<RawFd> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 { return Err(std::io::Error::last_os_error()); }
+    // Bulk Docker-API traffic only; the control/clock/gateway ports are a line each, and the
+    // reverse port-forward path is a fallback that can hold hundreds of connections.
+    if port == DOCKER_PORT { vsock_set_buffer(fd, DOCKER_VSOCK_BUF); }
     #[repr(C)]
     struct SockaddrVm { family: libc::sa_family_t, _r0: u16, port: u32, cid: u32, _z: [u8; 4] }
     let addr = SockaddrVm { family: libc::AF_VSOCK as _, _r0: 0, port, cid: CID_ANY, _z: [0; 4] };
@@ -2792,11 +2818,14 @@ fn bridge(a: RawFd, b: RawFd) {
 
 fn pump(from: RawFd, to: RawFd) {
     // Heap (not stack) so the larger size doesn't bloat each pump thread's stack.
-    // 128 KiB cuts read/write syscalls on bulk transfers vs 32 KiB. This pump carries
-    // the docker.sock API proxy (port 2375) and the reverse port-forward TCP datapath
-    // (port 2376) — i.e. Docker-API traffic (image push/pull, build context, logs) and
-    // published-port localhost throughput. NOT container↔internet, which is direct VZNAT.
-    let mut buf = vec![0u8; 128 * 1024];
+    // This pump carries the docker.sock API proxy (port 2375) and the reverse port-forward
+    // TCP datapath (port 2376) — i.e. Docker-API traffic (`docker cp`, image load/save,
+    // build context, logs) and published-port localhost throughput. NOT container↔internet,
+    // which is direct VZNAT. 512 KiB (was 128 KiB) so one read can take a large share of the
+    // 4 MiB vsock window (DOCKER_VSOCK_BUF) per syscall pair. It costs no RSS up front: an
+    // allocation this size is its own zero-filled mmap, and only the bytes a read actually
+    // lands in are ever touched — an idle hijacked stream still pins next to nothing.
+    let mut buf = vec![0u8; 512 * 1024];
     loop {
         let n = unsafe { libc::read(from, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n <= 0 { break; }
