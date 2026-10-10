@@ -73,6 +73,16 @@ final class DockerResourceStore {
         debounce.removeAll()
     }
 
+    /// The engine went idle (Resource Saver): stop, and keep the last lists on screen, read-only.
+    /// Every refresh is a no-op from here on — the Overview re-reads disk usage on appear, and
+    /// that read must not resume an engine the user only looked at. The engine replaces a frozen
+    /// store with a live one when it resumes.
+    func freeze() {
+        stop()
+        isFrozen = true
+    }
+    private(set) var isFrozen = false
+
     /// Container lifecycle actions that change a network's attached-container list.
     /// (Membership also arrives as `network` connect/disconnect events; this is the
     /// robust trigger.) Deliberately excludes frequent `health_status` / `exec_*`
@@ -149,6 +159,7 @@ final class DockerResourceStore {
     /// expected and stays silent, so the Overview never flashes it on launch. A genuine
     /// mid-session failure — after the list has loaded once — still surfaces.
     func refresh(_ resource: Resource) async {
+        guard !isFrozen else { return }
         switch resource {
         case .containers:
             do {
@@ -187,6 +198,7 @@ final class DockerResourceStore {
     private(set) var systemInfo: SystemInfo?
 
     func refreshSystemInfo() async {
+        guard !isFrozen else { return }
         systemInfo = try? await docker.systemInfo()
     }
 
@@ -202,6 +214,7 @@ final class DockerResourceStore {
     private(set) var diskUsageError: String?
 
     func refreshDiskUsage() async {
+        guard !isFrozen else { return }
         do {
             diskUsage = try await docker.systemDiskUsage()
             diskUsageError = nil

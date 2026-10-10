@@ -15,7 +15,16 @@ import VeloxCore
 @Observable
 final class EngineController {
     /// Current engine lifecycle, driven onto the main actor from the VM queue.
-    private(set) var state: EngineState = .stopped
+    private(set) var state: EngineState = .stopped {
+        didSet {
+            guard state != oldValue else { return }
+            let waiters = stateWaiters
+            stateWaiters.removeAll()
+            for w in waiters { w.resume() }
+        }
+    }
+    /// Callers of `nextStateChange()`, resumed on the next transition.
+    private var stateWaiters: [CheckedContinuation<Void, Never>] = []
     /// Monotonic lifecycle token. Bumped when a start begins and whenever the engine is
     /// torn down (stop / guest-stopped). `performStart` captures it and, after each of its
     /// `await`s, bails if it changed — so a guest that dies mid-boot can't be overwritten by
@@ -141,6 +150,10 @@ final class EngineController {
     /// The Docker API client, valid only while the engine is running. Dashboards
     /// read this; it rides an in-process VSOCK connection to the guest.
     private(set) var docker: DockerClient?
+
+    /// The dashboards' client while the engine is idle: their frozen lists stay on screen, and a
+    /// user action resumes the engine before it runs (`ResumingDockerClient`). Nil otherwise.
+    private(set) var idleDocker: ResumingDockerClient?
 
     /// Persistent, shared store of the dashboard resource lists (containers/images/
     /// volumes/networks). Owned here, above the navigation, so it survives pane
@@ -555,6 +568,7 @@ final class EngineController {
             resourceStore.start()
             self.resources = resourceStore
             self.stats = StatsStore(docker: runtime.docker, resources: resourceStore)
+            idleDocker = nil   // live lists from here on
             appliedSignature = config.bootSignature(diskGiB: workspace.diskGiB)
             bootedMemoryBytes = resources.memoryBytes
             startResourceSaver()
@@ -776,11 +790,13 @@ final class EngineController {
         startGeneration &+= 1
         let gen = startGeneration
         state = .napping
-        // The GUI's own plumbing goes now. Its informers would otherwise reconnect to a VM that
-        // isn't there, every second, for the whole idle stretch.
-        resources?.stop(); resources = nil
-        stats?.stop(); stats = nil
+        // The GUI's informers stop now — they would otherwise reconnect to a VM that isn't there,
+        // every second, for the whole idle stretch — but the lists stay on screen, frozen, and the
+        // dashboards act through a client that resumes the engine first.
+        resources?.freeze()
+        stats?.stop()
         docker = nil
+        idleDocker = ResumingDockerClient { [weak self] in await self?.resumeForAction() }
         resourceSaver?.stop(); resourceSaver = nil
         isResourceSaving = false
         portIssues.clear()
@@ -823,8 +839,23 @@ final class EngineController {
         }
     }
 
-    /// Boot a napping engine now: a Docker client connected, or the user asked (Wake button, the
-    /// dashboard window coming forward).
+    /// The live client for a dashboard action, resuming an idle engine first. Waits out a resume
+    /// already in flight (another action, a `docker` command, the Resume button). Nil if the engine
+    /// can't be resumed — it is stopping, failed, or busy with a workspace operation.
+    func resumeForAction() async -> (any DockerClientProtocol)? {
+        if state == .napping { await wake() }
+        while state == .starting || (state == .napping && wakeRequested) {
+            await nextStateChange()
+        }
+        return state == .running ? docker : nil
+    }
+
+    private func nextStateChange() async {
+        await withCheckedContinuation { stateWaiters.append($0) }
+    }
+
+    /// Boot a napping engine now: a Docker client connected, the user pressed Resume, or a
+    /// dashboard action needs it.
     func wake() async {
         wakeRequested = false
         guard state == .napping, !isEngineOwned, !isTerminating else { return }
@@ -1198,6 +1229,7 @@ final class EngineController {
         startedAt = nil
         napGateBox.withLock { $0?.close(); $0 = nil }
         wakeRequested = false
+        idleDocker = nil
         if let engineActivity {
             ProcessInfo.processInfo.endActivity(engineActivity)
             self.engineActivity = nil

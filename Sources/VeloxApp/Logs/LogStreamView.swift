@@ -43,7 +43,7 @@ struct LogWindowHost: View {
     /// A logs window outlives the pane that opened it and can be restored at launch, so it
     /// resolves its client from the target rather than from whatever is selected now.
     private var client: (any DockerClientProtocol)? {
-        guard let hostID = target.hostID else { return engine.docker }
+        guard let hostID = target.hostID else { return engine.docker ?? engine.idleDocker }
         return remotes?.session(for: hostID)?.docker
     }
 }

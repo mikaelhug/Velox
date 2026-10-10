@@ -9,8 +9,6 @@ struct RootView: View {
     @Environment(RemoteHostController.self) private var remotes
     @State private var selection: SidebarItem? = .overview
     @State private var showPalette = false
-    /// True while this window is the active one.
-    @Environment(\.appearsActive) private var appearsActive
 
     var body: some View {
         @Bindable var engine = engine
@@ -51,6 +49,12 @@ struct RootView: View {
         } detail: {
             detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if remotes.selection.isLocal, engine.state == .napping, engine.idleDocker != nil,
+                       selection != .engineLogs {
+                        IdleBanner()
+                    }
+                }
                 // Row affordances several view types deep (port links, the shell hand-off)
                 // need to know which daemon they act on. See `EnvironmentValues.dockerTarget`.
                 .environment(\.dockerTarget, dashboard?.target ?? .local)
@@ -71,16 +75,6 @@ struct RootView: View {
                 .hidden()
         )
         .sheet(isPresented: $showPalette) { palette }
-        // Bringing the dashboard forward is a request to look at the engine, so a napping one
-        // boots (~0.5 s) rather than showing an empty pane and waiting for a click. Only on the
-        // window becoming active — a window that was already active when the stop began stays
-        // as it is until the user acts (Resume, or any docker command). `initial`: a dashboard
-        // opened while idle (Menu bar → Dashboard) is born active and never sees a change.
-        .onChange(of: appearsActive, initial: true) { _, active in
-            if active, engine.state == .napping, remotes.selection.isLocal {
-                Task { await engine.wake() }
-            }
-        }
         .alert("Switch Docker context to Velox?", isPresented: $engine.showContextPrompt) {
             Button("Switch") { engine.adoptVeloxContext() }
             Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
@@ -112,8 +106,11 @@ struct RootView: View {
     private var dashboard: Dashboard? {
         switch remotes.selection {
         case .local:
-            guard engine.state.isRunning, let docker = engine.docker,
-                  let store = engine.resources, let stats = engine.stats else { return nil }
+            // Idle (or resuming from idle): the frozen lists, acting through the resuming client —
+            // looking at Velox never resumes the engine; doing something does.
+            let docker: (any DockerClientProtocol)? = engine.state.isRunning ? engine.docker
+                : (engine.state == .napping || engine.state == .starting) ? engine.idleDocker : nil
+            guard let docker, let store = engine.resources, let stats = engine.stats else { return nil }
             return Dashboard(docker: docker, store: store, stats: stats,
                              ui: engine.paneUI, issues: engine.portIssues, target: .local,
                              dataDiskURL: engine.activeWorkspace?.dataDiskURL
@@ -259,6 +256,27 @@ struct EngineStatusBar: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(.separator, lineWidth: 0.5)
         )
+    }
+}
+
+/// Over the dashboards while the engine is idle: they show the last known state, read-only
+/// until something resumes the engine.
+struct IdleBanner: View {
+    @Environment(EngineController.self) private var engine
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "moon.zzz").foregroundStyle(.indigo)
+            Text("Engine idle. Showing the last known state; any action resumes it.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Resume") { Task { await engine.wake() } }
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
     }
 }
 
