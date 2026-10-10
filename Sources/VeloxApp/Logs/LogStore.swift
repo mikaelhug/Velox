@@ -93,24 +93,44 @@ final class LogStore {
     /// is the trigger, the reconcile is the truth), so a `start` firing in the gap isn't
     /// missed. Returns false when we should give up: task cancelled, container removed,
     /// or the engine (events stream) went away.
+    ///
+    /// An events stream that simply ENDS is not the container going away: the local engine's
+    /// stream ends when Resource Saver stops it, and a remote host's when its tunnel redials.
+    /// So this re-subscribes and reconciles again rather than giving up — through the local
+    /// engine's client that waits out an idle stop instead of resuming it — and gives up only when
+    /// the container is gone or the daemon can't answer an inspect at all.
     private func waitUntilRunning() async -> Bool {
-        let events = docker.events()
-        if await isRunning() { return true }
-        for await event in events {
-            if Task.isCancelled { return false }
-            guard event.containerID == containerID else { continue }
-            switch event.action {
-            case "start", "restart", "unpause": return true
-            case "destroy":                     return false
-            default:                            continue
+        var backoff = ReconnectBackoff()
+        while !Task.isCancelled {
+            backoff.passBegan()
+            let events = docker.events()
+            switch await runningState() {
+            case .running?: return true
+            case nil:       return false        // no container, or no daemon to ask
+            case .stopped?: break
             }
+            for await event in events {
+                if Task.isCancelled { return false }
+                guard event.containerID == containerID else { continue }
+                switch event.action {
+                case "start", "restart", "unpause": return true
+                case "destroy":                     return false
+                default:                            continue
+                }
+            }
+            if Task.isCancelled { return false }
+            try? await Task.sleep(for: backoff.delayAfterPass())
         }
         return false
     }
 
-    private func isRunning() async -> Bool {
-        guard let info = try? await docker.inspectContainer(containerID) else { return false }
-        return info.state?.status == "running"
+    private enum RunState { case running, stopped }
+
+    /// The container's state from one inspect; nil when it can't be inspected (removed, or the
+    /// daemon is gone).
+    private func runningState() async -> RunState? {
+        guard let info = try? await docker.inspectContainer(containerID) else { return nil }
+        return info.state?.status == "running" ? .running : .stopped
     }
 
     /// All buffered lines as plain text — for the "Copy" button.

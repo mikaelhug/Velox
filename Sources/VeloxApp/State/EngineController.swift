@@ -16,15 +16,17 @@ import VeloxCore
 final class EngineController {
     /// Current engine lifecycle, driven onto the main actor from the VM queue.
     private(set) var state: EngineState = .stopped {
-        didSet {
-            guard state != oldValue else { return }
-            let waiters = stateWaiters
-            stateWaiters.removeAll()
-            for w in waiters { w.resume() }
-        }
+        didSet { if state != oldValue { signalWaiters() } }
     }
-    /// Callers of `nextStateChange()`, resumed on the next transition.
+    /// Callers of `nextStateChange()`, resumed on the next change of `state` or `wakeRequested`
+    /// — everything `resumeForAction` and `liveClientWaiting` wait on.
     private var stateWaiters: [CheckedContinuation<Void, Never>] = []
+
+    private func signalWaiters() {
+        let waiters = stateWaiters
+        stateWaiters.removeAll()
+        for w in waiters { w.resume() }
+    }
     /// Monotonic lifecycle token. Bumped when a start begins and whenever the engine is
     /// torn down (stop / guest-stopped). `performStart` captures it and, after each of its
     /// `await`s, bails if it changed — so a guest that dies mid-boot can't be overwritten by
@@ -122,7 +124,11 @@ final class EngineController {
     /// app termination can close it without the main actor.
     private nonisolated let napGateBox = Locked<NapGate?>(nil)
     /// A Wake asked for while the nap was still powering the VM off; honored once it is down.
-    private var wakeRequested = false
+    private var wakeRequested = false {
+        // A deferred resume can be dropped without any state change (an operation took the
+        // engine first); a `resumeForAction` waiting on it must see that, not wait forever.
+        didSet { if wakeRequested != oldValue { signalWaiters() } }
+    }
     /// The idle stop in flight. `performStop` waits for it instead of racing it: it is the one
     /// thing that can turn an "Idle" engine back into "Running" or leave a gate behind.
     private var napTask: Task<Void, Never>?
@@ -153,7 +159,13 @@ final class EngineController {
 
     /// The dashboards' client while the engine is idle: their frozen lists stay on screen, and a
     /// user action resumes the engine before it runs (`ResumingDockerClient`). Nil otherwise.
-    private(set) var idleDocker: ResumingDockerClient?
+    private(set) var idleDocker: EngineDockerClient?
+
+    /// A client for windows that outlive the pane that opened them (container logs): it follows
+    /// the engine across idle stops and resumes — waiting while it is idle, never resuming it.
+    var followingDocker: EngineDockerClient {
+        EngineDockerClient { [weak self] in await self?.liveClientWaiting() }
+    }
 
     /// Persistent, shared store of the dashboard resource lists (containers/images/
     /// volumes/networks). Owned here, above the navigation, so it survives pane
@@ -796,7 +808,7 @@ final class EngineController {
         resources?.freeze()
         stats?.stop()
         docker = nil
-        idleDocker = ResumingDockerClient { [weak self] in await self?.resumeForAction() }
+        idleDocker = EngineDockerClient { [weak self] in await self?.resumeForAction() }
         resourceSaver?.stop(); resourceSaver = nil
         isResourceSaving = false
         portIssues.clear()
@@ -847,6 +859,13 @@ final class EngineController {
         while state == .starting || (state == .napping && wakeRequested) {
             await nextStateChange()
         }
+        return state == .running ? docker : nil
+    }
+
+    /// The live client once the engine is running — waiting, without resuming it, while it is idle
+    /// or starting. Nil when it is stopped or failed.
+    func liveClientWaiting() async -> (any DockerClientProtocol)? {
+        while state == .napping || state == .starting { await nextStateChange() }
         return state == .running ? docker : nil
     }
 

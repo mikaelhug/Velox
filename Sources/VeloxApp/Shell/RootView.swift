@@ -58,6 +58,7 @@ struct RootView: View {
                 // Row affordances several view types deep (port links, the shell hand-off)
                 // need to know which daemon they act on. See `EnvironmentValues.dockerTarget`.
                 .environment(\.dockerTarget, dashboard?.target ?? .local)
+                .environment(\.engineIdle, remotes.selection.isLocal && engine.state == .napping)
                 // Rebuild the detail pane when the workspace OR the host changes.
                 // `OverviewModel` captures the data-disk URL at init, so a pane that
                 // survived a switch would keep gauging the OLD workspace's disk — and a
@@ -143,7 +144,12 @@ struct RootView: View {
     /// engine, so it is deliberately not part of a remote host's identity.
     private var paneIdentity: String {
         switch remotes.selection {
-        case .local:            return "local:\(engine.workspaces?.activeID ?? "")"
+        // The store is part of the identity: every pane captures its store and client once, into
+        // `@State`, so when a resume swaps the frozen store for a live one the panes must be rebuilt
+        // — or they keep showing (and refreshing) the frozen copy.
+        case .local:
+            let store = engine.resources.map { "\(ObjectIdentifier($0).hashValue)" } ?? "-"
+            return "local:\(engine.workspaces?.activeID ?? ""):\(store)"
         case .remote(let id):   return "remote:\(id)"
         }
     }

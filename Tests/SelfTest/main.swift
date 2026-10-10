@@ -2492,6 +2492,23 @@ section("Engine nap")
     try? await Task.sleep(for: .milliseconds(1600))
     equal(naps3b.value, 2, "a stopped saver can't be revived by rearm()")
 
+    // EngineDockerClient: resolves the engine's live client per call and forwards to it; with no
+    // engine every call throws and every stream just finishes (never hangs).
+    let liveAPI = FakeDaemonAPI(); liveAPI.list.value = [stopped("x1"), stopped("x2")]
+    let resolves = Locked(0)
+    let following = EngineDockerClient { resolves.withLock { $0 += 1 }; return liveAPI }
+    equal((try? await following.containers())?.count, 2, "calls run on the resolved live client")
+    equal(resolves.value, 1, "one resolve per call")
+    let inspected = try? await following.inspectContainer("x1")
+    equal(inspected?.name, "x1", "inspect is forwarded too")
+    let gone = EngineDockerClient { nil }
+    var threw = false
+    do { _ = try await gone.containers() } catch is EngineDockerClient.Unavailable { threw = true } catch {}
+    check(threw, "no engine: calls throw Unavailable")
+    var streamed = 0
+    for await _ in gone.events() { streamed += 1 }
+    equal(streamed, 0, "no engine: streams finish instead of hanging")
+
     // 4. A paused container is not idle; events restart the countdown.
     let api4 = FakeDaemonAPI()
     api4.list.value = [ContainerSummary(id: "p", names: ["p"], image: "x", state: "paused", status: "Paused")]

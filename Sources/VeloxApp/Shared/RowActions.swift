@@ -293,4 +293,16 @@ extension EnvironmentValues {
         get { self[DockerTargetKey.self] }
         set { self[DockerTargetKey.self] = newValue }
     }
+
+    /// True while the pane shows the local engine's frozen lists because Resource Saver stopped it.
+    /// Views that fetch on their own (not on a user action) skip the fetch then: through the idle
+    /// client it would resume the engine just because something came into view.
+    var engineIdle: Bool {
+        get { self[EngineIdleKey.self] }
+        set { self[EngineIdleKey.self] = newValue }
+    }
+}
+
+private struct EngineIdleKey: EnvironmentKey {
+    static let defaultValue = false
 }

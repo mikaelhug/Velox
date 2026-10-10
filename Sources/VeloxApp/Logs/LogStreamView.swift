@@ -38,12 +38,22 @@ struct LogWindowHost: View {
             }
         }
         .navigationTitle("\(target.name) — Logs")
+        // Opening a logs window is a request to see them: an idle engine resumes. (A window that
+        // is already open when the engine goes idle just waits — see `client`.)
+        .task(id: target) {
+            if target.hostID == nil, engine.state == .napping { _ = await engine.resumeForAction() }
+        }
     }
 
     /// A logs window outlives the pane that opened it and can be restored at launch, so it
     /// resolves its client from the target rather than from whatever is selected now.
     private var client: (any DockerClientProtocol)? {
-        guard let hostID = target.hostID else { return engine.docker ?? engine.idleDocker }
+        // The local engine through a client that follows it across idle stops and resumes: the
+        // window stays open while the engine is idle and picks up again once it runs, without
+        // resuming it itself.
+        guard let hostID = target.hostID else {
+            return engine.state.isStopped || engine.state.failureMessage != nil ? nil : engine.followingDocker
+        }
         return remotes?.session(for: hostID)?.docker
     }
 }

@@ -629,6 +629,7 @@ private struct ContainerInspector: View {
     @Environment(\.dockerTarget) private var dockerTarget
     let container: ContainerSummary?
     let docker: any DockerClientProtocol
+    @Environment(\.engineIdle) private var engineIdle
 
     /// What the panel renders: a summary plus its enrichment, swapped in together.
     /// Rendering `container` directly while its inspect loads mixes generations —
@@ -656,6 +657,12 @@ private struct ContainerInspector: View {
         }
         .task(id: container) {
             guard let c = container else { shown = nil; return }
+            // Idle: show the list's summary, don't inspect — selecting a row (or reopening a pane
+            // with a remembered selection) must not resume the engine.
+            if engineIdle {
+                if shown?.c.id != c.id { shown = Snapshot(c: c, inspect: nil) }
+                return
+            }
             let info = try? await docker.inspectContainer(c.id)
             // The selection may have moved on mid-fetch; that id's run updates.
             guard container?.id == c.id else { return }
