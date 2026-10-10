@@ -119,11 +119,14 @@ public enum VMConfiguration {
             // rcu_expedited does not shorten those. Each grace period ends when the RCU kthread's
             // force-quiescent-state scan finds every idle vCPU quiescent, and that scan runs every
             // 3 jiffies by default at HZ=1000 — ~3 ms of pure waiting per scan round, several
-            // rounds per `docker run --rm`. Scanning every jiffy finishes them sooner; the scan
-            // only runs while a grace period is in flight, so an idle guest pays nothing.
-            // Measured (interleaved boots, hyperfine n=25): `run --rm alpine true` 84–92 → 76 ms,
-            // the start→die span 35.5 → 27 ms; the same A/B live on one boot gave 101–104 → 93–95.
-            + " rcutree.jiffies_till_first_fqs=1 rcutree.jiffies_till_next_fqs=1"
+            // rounds per `docker run --rm`. Here the first scan runs as soon as a grace period
+            // starts (0; idle vCPUs are found quiescent right there) and later ones every jiffy
+            // (1, the minimum). Scans only run while a grace period is in flight, so an idle guest
+            // pays nothing (idle CPU measured equal: 0.425–0.433 % either way).
+            // Measured, hyperfine n=25: `run --rm alpine true` 84–92 → 76 ms going 3/3 → 1/1
+            // (interleaved boots; the start→die span 35.5 → 27 ms), then 79 → 73–74 ms going
+            // first 1 → 0 (live, same boot, alternated twice).
+            + " rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1"
         // Optional host-supplied extra kernel parameters, appended LAST so a
         // duplicated key overrides the defaults (kernel takes the last value).
         // Used for scheduler A/B tuning, e.g. VELOX_KCMDLINE_EXTRA="preempt=full".
