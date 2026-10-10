@@ -114,6 +114,16 @@ public enum VMConfiguration {
             // Standard container-host tuning; the cost is a few extra IPIs, negligible for
             // an interactive dev engine where launch latency is the metric that matters.
             + " rcupdate.rcu_expedited=1"
+            // Normal (non-expedited) grace periods still gate container teardown: deleting a
+            // veth runs netdev_run_todo → rcu_barrier(), which waits for call_rcu callbacks, and
+            // rcu_expedited does not shorten those. Each grace period ends when the RCU kthread's
+            // force-quiescent-state scan finds every idle vCPU quiescent, and that scan runs every
+            // 3 jiffies by default at HZ=1000 — ~3 ms of pure waiting per scan round, several
+            // rounds per `docker run --rm`. Scanning every jiffy finishes them sooner; the scan
+            // only runs while a grace period is in flight, so an idle guest pays nothing.
+            // Measured (interleaved boots, hyperfine n=25): `run --rm alpine true` 84–92 → 76 ms,
+            // the start→die span 35.5 → 27 ms; the same A/B live on one boot gave 101–104 → 93–95.
+            + " rcutree.jiffies_till_first_fqs=1 rcutree.jiffies_till_next_fqs=1"
         // Optional host-supplied extra kernel parameters, appended LAST so a
         // duplicated key overrides the defaults (kernel takes the last value).
         // Used for scheduler A/B tuning, e.g. VELOX_KCMDLINE_EXTRA="preempt=full".
