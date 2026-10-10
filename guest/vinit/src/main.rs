@@ -461,6 +461,7 @@ fn enable_ip_forwarding() {
 /// in seconds, `connect()` starts returning EADDRNOTAVAIL, the conduit pool can't redial, and the
 /// whole published-port path stalls. Widening the port range and enabling TIME_WAIT reuse (safe —
 /// it relies on TCP timestamps to reject stale segments) keeps source ports available.
+/// Also restores stock-moby bridge filtering (bridge-nf-call-* off until dockerd asks) — below.
 fn tune_network_sysctls() {
     for (path, val) in [
         ("/proc/sys/net/ipv4/ip_local_port_range", "10240\t65535"), // ~55k ephemeral ports (was ~28k)
@@ -468,6 +469,19 @@ fn tune_network_sysctls() {
         ("/proc/sys/net/ipv4/tcp_fin_timeout", "10"),               // drain FIN-WAIT-2 faster
         ("/proc/sys/net/ipv4/tcp_max_tw_buckets", "262144"),        // don't overflow TIME_WAIT under churn (default 32k stalls)
         ("/proc/sys/net/core/somaxconn", "1024"),                   // deeper accept backlog for guest listeners
+        // Bridged frames skip the IP netfilter hooks, as on a stock moby host. br_netfilter is
+        // BUILT IN here (no modules), and the kernel's default for a loaded br_netfilter is 1 —
+        // so every container↔container frame on a bridge was walking nftables + conntrack twice
+        // (bridge hook → ip hooks). On a distro host br_netfilter is a module that dockerd 28+
+        // only loads when a network needs it, and dockerd still turns these back on itself the
+        // moment one does: creating a network with `enable_icc=false` flips them to 1 (measured).
+        // Default (icc=true) networks need nothing from them: published-port hairpin is served
+        // by docker-proxy, and dockerd's direct-access drops and Velox's named-access allows
+        // match routed traffic at the IP layer. Measured live, same boot, 3×8 s iperf3 each:
+        // container↔container 103–128 → 153–156 Gbit/s (and steady), container→host 93–101
+        // → 103–112 Gbit/s.
+        ("/proc/sys/net/bridge/bridge-nf-call-iptables", "0"),
+        ("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0"),
     ] {
         if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
     }
