@@ -87,6 +87,7 @@ fn main() {
     log!("starting (PID 1)");
     mount_all();
     set_clock();
+    tune_block_readahead();
     // The vsock agent goes up FIRST, before networking, the data disk and dockerd. The host
     // starts dialing these ports the moment the VM is running; while nothing listened, every
     // dial failed and the host's informers fell back to their retry timers, so readiness was
@@ -211,6 +212,29 @@ fn main() {
 /// CString from a KNOWN-CONSTANT (or fully vinit-computed) path — never call this on
 /// host-supplied input. With `panic = "abort"` a panic in PID 1 is a kernel panic, so
 /// anything that can carry outside bytes must handle the NUL error instead (do_mount).
+/// Block read-ahead for the virtio disks: Linux's usual 128 KiB, set before anything demand-pages
+/// dockerd.
+///
+/// VZ's virtio-blk reports a 4 MiB max transfer and the kernel derives an 8 MiB read-ahead window
+/// from it, so a page fault on the erofs root pulled up to 8 MiB around it into the guest page
+/// cache (decompressing it on the way), and a small metadata read on the data disk did the same.
+/// Guest pages touched once stay resident in the VM process on the host (macOS 27's balloon
+/// returns nothing), so boot-time over-read is idle RAM for the life of the engine. Measured
+/// (60 s after boot, 2 boots each, isolated data disk):
+///   8 MiB both (old)          VM RSS 889-890 MB, phys_footprint 598 MB
+///   128 KiB root only               832-836 MB                   572-576 MB
+///   128 KiB root + data             773-776 MB                   515-519 MB
+/// Container start (python import-heavy, cold guest cache) and `docker run` latency unchanged.
+/// The cost: cold-guest-cache sequential reads of a 1 GiB volume file (dd bs=1M, host cache warm)
+/// drop from 8.5-17 to 7.9-11.4 GB/s on the first two passes (the third is equal) — still above
+/// what the host SSD sustains. A 1 MiB data-disk window measured no better on that read and kept
+/// 18 MB more RAM, so both disks get the kernel default.
+fn tune_block_readahead() {
+    for dev in ["vda", "vdb"] {
+        let _ = std::fs::write(format!("/sys/block/{dev}/queue/read_ahead_kb"), "128");
+    }
+}
+
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("BUG: NUL in constant path")
 }
