@@ -917,11 +917,10 @@ matrix(){           # $1 ctx $2 label
   wait_http 'http://127.0.0.1:80/' 40 && p privileged_port pass || p privileged_port fail
   D rm -f mxpriv >/dev/null 2>&1
 
-  # Per-container host-IP publish. Two separate cases, because they have different answers:
+  # Per-container host-IP publish. Two separate cases, because they once had different answers:
   #   loopback (-p 127.0.0.1:…) — Velox honours this explicitly (PublishBind.swift).
-  #   a real LAN address        — DOCUMENTED Velox limitation: the guest dockerd cannot bind
-  #                               a macOS address, so only the global publishHostIP knob works.
-  # Recorded as a plain fail on Velox. A design rationale is not a pass.
+  #   a real LAN address        — failed on Velox until 2026-10 (the guest dockerd couldn't bind
+  #                               a macOS address); now ip_nonlocal_bind + exact host binding.
   D rm -f mxbind >/dev/null 2>&1
   D run -d --name mxbind -p 127.0.0.1:18002:8000 "$IMG_LOAD" python -m http.server 8000 >/dev/null 2>&1
   wait_http 'http://127.0.0.1:18002/' 40 && p publish_loopback_pin pass || p publish_loopback_pin fail

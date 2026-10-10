@@ -236,8 +236,8 @@ Functionally the two engines came out level on every probe that was run — bind
 mounts, `host.docker.internal`, TCP/UDP/IPv6 publishing, privileged ports, BuildKit
 with attestations, and `linux/amd64`, `linux/arm/v7` and `linux/386` emulation
 (where the emulation tax is the same on both, 4.9× vs 4.8× over native). Velox adds
-`<name>.velox.local`; Docker Desktop supports per-container host-IP publishing,
-which Velox does not. Docker Desktop also ships Kubernetes, Scout, Extensions and
+`<name>.velox.local`. Per-container host-IP publishing (`-p <LAN-IP>:…`), which Docker
+Desktop had and Velox lacked in that run, is now supported too. Docker Desktop also ships Kubernetes, Scout, Extensions and
 its AI tooling — none of which Velox has, and which account for much of the size
 difference above.
 

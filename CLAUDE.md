@@ -16,11 +16,13 @@ pillars that deliver it:
    userspace netstack:** a host-side `PortForwarder` maps published ports to the
    host address in `VeloxConfig.publishHostIP` — **`0.0.0.0` by default, matching
    Docker's own default**, so a published port is reachable from other machines
-   (`"127.0.0.1"` restores host-only; see `PublishBind`). The guest always publishes
-   guest-locally on `0.0.0.0`, so a macOS host address is never sent to the guest —
-   per-container `-p <hostIP>:…` is unsupported (the guest dockerd can't bind a Mac
-   address) and the global setting is the knob. dockerd `--host-gateway-ip` wires
-   `host.docker.internal`.
+   (`"127.0.0.1"` restores host-only; see `PublishBind`). Per-container
+   `-p <hostIP>:…` works too: vinit sets `ip_nonlocal_bind` in the guest's root netns so
+   dockerd accepts the Mac address and reports it back, the host binds exactly that address
+   (`PublishedPort.resolveHostIP`; conflicting addresses on one port fail closed to loopback),
+   and every relay path dials the container endpoint directly (`PublishedEndpoints`), since
+   docker-proxy then listens on that non-local address, not 127.0.0.1. dockerd
+   `--host-gateway-ip` wires `host.docker.internal`.
    (Truly *beating* VZNAT on raw throughput would need a custom hypervisor —
    OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)
    **Direct named access** (`<name>.velox.local` → the container's *real* IP, any
