@@ -92,13 +92,44 @@ public struct PublishBind: Sendable, Equatable {
 /// silently widen every deliberately-private service (a database, an admin port) onto the LAN.
 public struct PublishedPort: Hashable, Sendable {
     public let port: UInt16
-    /// Every binding dockerd reported for this port was a loopback address.
-    public let loopbackOnly: Bool
+    /// The host address the container asked for (`-p <hostIP>:…`), or nil for a plain `-p`,
+    /// which follows the global `publishHostIP` default. `"127.0.0.1"` is the loopback pin.
+    public let hostIP: String?
 
-    public init(port: UInt16, loopbackOnly: Bool) {
-        self.port = port; self.loopbackOnly = loopbackOnly
+    public init(port: UInt16, hostIP: String?) {
+        self.port = port; self.hostIP = hostIP
     }
 
-    /// The address this port's host listener binds, given the configured default.
-    public func bind(default def: PublishBind) -> PublishBind { loopbackOnly ? .loopback : def }
+    public init(port: UInt16, loopbackOnly: Bool) {
+        self.init(port: port, hostIP: loopbackOnly ? PublishBind.loopback.label : nil)
+    }
+
+    /// Every binding dockerd reported for this port was a loopback address.
+    public var loopbackOnly: Bool { hostIP.map(PublishBind.isLoopbackLiteral) ?? false }
+
+    /// The address this port's host listener binds, given the configured default. An explicit
+    /// per-container address always wins over the global default, in both directions: a
+    /// loopback pin is never widened, and a specific LAN address is bound exactly (an
+    /// unparseable one fails closed to loopback, as `PublishBind.parse` does).
+    public func bind(default def: PublishBind) -> PublishBind {
+        guard let hostIP else { return def }
+        return PublishBind.isLoopbackLiteral(hostIP) ? .loopback : PublishBind.parse(hostIP)
+    }
+
+    /// Resolve the host address for one port from every binding dockerd reported for it
+    /// (v4 and v6 entries, possibly several containers). Any wildcard binding means the
+    /// global default. Otherwise all-loopback pins loopback; one specific address binds
+    /// exactly that; anything mixed (two different addresses) narrows to loopback — the
+    /// fail-closed direction, since one listener per port can carry only one address.
+    public static func resolveHostIP(_ reported: [String?]) -> String? {
+        var specific = Set<String>()
+        var sawLoopback = false
+        for ip in reported {
+            guard let ip, !ip.isEmpty, ip != "0.0.0.0", ip != "::" else { return nil }
+            if PublishBind.isLoopbackLiteral(ip) { sawLoopback = true } else { specific.insert(ip) }
+        }
+        if specific.isEmpty { return sawLoopback ? PublishBind.loopback.label : nil }
+        if specific.count == 1, !sawLoopback { return specific.first }
+        return PublishBind.loopback.label
+    }
 }

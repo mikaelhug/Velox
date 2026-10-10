@@ -2091,6 +2091,25 @@ do {
     // keep the stale listener (right port, wrong address) instead of rebinding.
     check(PublishedPort(port: 80, loopbackOnly: true) != PublishedPort(port: 80, loopbackOnly: false),
           "same port, different bind → distinct specs (forces a rebind)")
+
+    // Per-container host-IP publish (`-p <LAN-IP>:…`): bind exactly the requested address,
+    // never the wider global default — and never widen when bindings disagree.
+    let lan = PublishedPort(port: 18003, hostIP: "192.168.5.243")
+    equal(lan.bind(default: .wildcard).label, "192.168.5.243", "-p <LAN-IP> binds exactly that address")
+    check(!lan.bind(default: .wildcard).isWildcard, "…not the wildcard default")
+    check(!lan.loopbackOnly, "a LAN address is not a loopback pin")
+    equal(PublishedPort.resolveHostIP(["0.0.0.0", "::"]), nil, "plain -p (v4+v6 wildcard) → default")
+    equal(PublishedPort.resolveHostIP(["127.0.0.1"]), "127.0.0.1", "loopback pin → loopback")
+    equal(PublishedPort.resolveHostIP(["192.168.5.243"]), "192.168.5.243", "one LAN address → that address")
+    equal(PublishedPort.resolveHostIP(["192.168.5.243", "0.0.0.0"]), nil,
+          "a wildcard binding on the same port wins (it already covers the address)")
+    equal(PublishedPort.resolveHostIP(["192.168.5.243", "10.0.0.2"]), "127.0.0.1",
+          "two different addresses on one port fail CLOSED to loopback")
+    equal(PublishedPort.resolveHostIP(["192.168.5.243", "127.0.0.1"]), "127.0.0.1",
+          "LAN + loopback on one port fail CLOSED to loopback")
+    check(PublishedPort(port: 18003, hostIP: "garbage").bind(default: .wildcard).isLoopback,
+          "an unparseable HostIp fails closed to loopback")
+    check(PublishedPort(port: 5432, hostIP: "::1").loopbackOnly, "::1 is a loopback pin too")
 }
 
 

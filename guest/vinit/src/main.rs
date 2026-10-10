@@ -506,6 +506,15 @@ fn tune_network_sysctls() {
         // → 103–112 Gbit/s.
         ("/proc/sys/net/bridge/bridge-nf-call-iptables", "0"),
         ("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0"),
+        // Per-container host-IP publish (`-p <Mac-LAN-IP>:8080:80`). dockerd binds the HostIp
+        // it is given, and a macOS address is not local here, so the container failed with
+        // EADDRNOTAVAIL. Non-local bind lets dockerd (root netns only — the sysctl is per
+        // netns, containers keep the default) accept it and report the HostIp back; the host
+        // PortForwarder then binds exactly that address on the Mac. Guest routing is
+        // unchanged: the address is NOT assigned here, so container → Mac traffic to it still
+        // leaves via VZNAT.
+        ("/proc/sys/net/ipv4/ip_nonlocal_bind", "1"),
+        ("/proc/sys/net/ipv6/ip_nonlocal_bind", "1"),
     ] {
         if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
     }

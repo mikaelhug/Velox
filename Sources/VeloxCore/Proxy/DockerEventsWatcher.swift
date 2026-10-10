@@ -176,11 +176,11 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         // A successful list means dockerd is up and answering — release any
         // startup waiter (the source of truth for readiness, not a `/_ping` poll).
         signalReady()
-        // port → "every binding dockerd reported for it was loopback". Accumulated with AND
-        // across containers and across a port's v4/v6 entries, so a port is narrowed to
-        // host-only only when nothing published it on a wider address.
-        var tcpBinds: [UInt16: Bool] = [:]
-        var udpBinds: [UInt16: Bool] = [:]
+        // port → every HostIp dockerd reported for it (across containers and a port's v4/v6
+        // entries), resolved below by `PublishedPort.resolveHostIP`: any wildcard → the global
+        // default; all loopback → host-only; one specific address → exactly that address.
+        var tcpBinds: [UInt16: [String?]] = [:]
+        var udpBinds: [UInt16: [String?]] = [:]
         var endpointMap: [UInt16: String] = [:]
         var nameMap: [String: in_addr_t] = [:]
         // Bare compose service aliases, merged after the loop: two projects each with a `db`
@@ -216,15 +216,14 @@ public final class DockerEventsWatcher: @unchecked Sendable {
             for p in c.ports {
                 guard let pub = p.publicPort, pub > 0, pub <= 65_535 else { continue }
                 let port = UInt16(pub)
-                let loopback = PublishBind.isLoopbackLiteral(p.ip)
                 switch p.type {
                 case "tcp":
-                    tcpBinds[port] = (tcpBinds[port] ?? true) && loopback
+                    tcpBinds[port, default: []].append(p.ip)
                     // Direct-dial endpoint — only when the container's IP is unambiguous;
                     // otherwise omit and the conduit falls back to docker-proxy.
                     if let ip = c.directIP { endpointMap[port] = "\(ip):\(p.privatePort)" }
                 case "udp":
-                    udpBinds[port] = (udpBinds[port] ?? true) && loopback
+                    udpBinds[port, default: []].append(p.ip)
                 default: break
                 }
             }
@@ -253,8 +252,8 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                      + "are used by more than one project — use <service>.<project>.\(NamedAccess.domain) instead")
         }
         names?.update(nameMap)
-        let tcp = Set(tcpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
-        let udp = Set(udpBinds.map { PublishedPort(port: $0.key, loopbackOnly: $0.value) })
+        let tcp = Set(tcpBinds.map { PublishedPort(port: $0.key, hostIP: PublishedPort.resolveHostIP($0.value)) })
+        let udp = Set(udpBinds.map { PublishedPort(port: $0.key, hostIP: PublishedPort.resolveHostIP($0.value)) })
         if commit(tcp, udp) { onPorts(tcp, udp) } // idempotent reconcile; safe outside the lock
     }
 
