@@ -15,7 +15,7 @@ results.
 | --- | --- |
 | 🟢 **Wins** | install 6× smaller, idle RAM 2.4× less, idle CPU 4.6× less, startup 1.6× faster, container launch 1.2×, published ports 2.4–3.4×, `docker cp` ~2.4×, container→container net 1.4×, 1.5× more disk handed back after a delete |
 | ⚪ **Par** | VirtioFS bind read, named-volume write, overlay write, `docker load`, cold/incremental build, compose up, emulation tax, pgbench |
-| 🔴 **Trails** | `compose down` on SIGTERM-ignoring services (3× slower), small-file extract over VirtioFS (25% slower), no per-container host-IP publishing |
+| 🔴 **Trails** | `compose down` on SIGTERM-ignoring services (3× slower), small-file extract over VirtioFS (25% slower), no per-container host-IP publishing (supported since) |
 
 **Against OrbStack 2.2.3** (2026-10-09, [full report](bench/REPORT-2026-10-09-orbstack.md)):
 OrbStack is the harder opponent and Velox does **not** beat it across the board.
@@ -24,7 +24,7 @@ OrbStack is the harder opponent and Velox does **not** beat it across the board.
 | --- | --- |
 | 🟢 **Wins** | container launch/churn 2×, builds 1.4–1.9×, pgbench 2.5× TPS, container→host 1.6×, container↔container 1.4×, overlay write 1.9×, amd64 emulation 1.2×, install 2× smaller |
 | ⚪ **Par** | idle RAM, published port (1 stream), bind write, `docker load`, compose up/down, disk returned after a delete |
-| 🔴 **Trails** | small-file VirtioFS 2.3× slower, startup 1.21 s vs 0.88 s, `docker cp` 1.3–1.4× slower, idle CPU 2–3× higher, RAM under load 1.3× and after teardown 1.7× higher, deleted space held until the next trim, no per-container host-IP publishing |
+| 🔴 **Trails** | small-file VirtioFS 2.3× slower, startup 1.21 s vs 0.88 s, `docker cp` 1.3–1.4× slower, idle CPU 2–3× higher, RAM under load 1.3× and after teardown 1.7× higher, deleted space held until the next trim, no per-container host-IP publishing (supported since) |
 | ❔ **No verdict** | published port, 4 streams: Velox swings between 19 and 60 Gbit/s on the same boot (OrbStack a steady 28) |
 
 Full numbers and raw values: **[REPORT-2026-08-25.md](bench/REPORT-2026-08-25.md)**. The data
@@ -135,8 +135,8 @@ Compose down -v                           10.36 s            3.49 s    0.34x  TR
 Both engines also passed every functional probe that was run — bind mounts,
 `host.docker.internal`, TCP/UDP/IPv6 publishing, privileged ports, BuildKit with
 attestations, `linux/amd64` + `linux/arm/v7` + `linux/386` emulation, `exec`, `stats`,
-`logs -f`, `events`. Velox adds `<name>.velox.local`; Docker Desktop supports per-container
-host-IP publishing, which Velox does not.
+`logs -f`, `events`. Velox adds `<name>.velox.local`. Per-container host-IP publishing, which Docker Desktop
+had and Velox lacked in that run, is supported since (IPv4).
 
 ### Running the annual comparison
 
