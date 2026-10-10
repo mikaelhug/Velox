@@ -48,6 +48,14 @@ RUN wget -qO docker.tgz "https://download.docker.com/linux/static/stable/aarch64
  && mkdir -p /out/bin \
  && cp docker/dockerd docker/containerd docker/containerd-shim-runc-v2 docker/runc \
        docker/docker-proxy docker/docker-init /out/bin/
+# Strip symbol tables + DWARF AFTER the tarball's SHA-256 is verified above: Docker's static
+# release ships dockerd/containerd/runc/shim/proxy with full symbols: 151 -> 135 MB uncompressed,
+# root.img 95.1 -> 89.6 MB (lz4hc,12).
+# Go keeps pclntab separately, so panics still symbolize. The stripped sections are never loaded
+# at runtime, so this is pure install footprint: root.img ships twice (app bundle + ~/.velox).
+RUN apk add --no-cache binutils >/dev/null \
+ && strip --strip-all /out/bin/dockerd /out/bin/containerd /out/bin/containerd-shim-runc-v2 \
+      /out/bin/runc /out/bin/docker-proxy /out/bin/docker-init
 
 # --- QEMU user-mode emulators: linux/arm + linux/386 (+ a linux/amd64 fallback) ---
 # Rosetta covers linux/amd64; these cover the rest of the matrix Docker Desktop and OrbStack
