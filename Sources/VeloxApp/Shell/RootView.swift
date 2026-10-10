@@ -73,9 +73,10 @@ struct RootView: View {
         .sheet(isPresented: $showPalette) { palette }
         // Bringing the dashboard forward is a request to look at the engine, so a napping one
         // boots (~0.5 s) rather than showing an empty pane and waiting for a click. Only on the
-        // window becoming active — a window that was already active when the nap began stays
-        // as it is until the user acts (the Wake button, or any docker command).
-        .onChange(of: appearsActive) { _, active in
+        // window becoming active — a window that was already active when the stop began stays
+        // as it is until the user acts (Resume, or any docker command). `initial`: a dashboard
+        // opened while idle (Menu bar → Dashboard) is born active and never sees a change.
+        .onChange(of: appearsActive, initial: true) { _, active in
             if active, engine.state == .napping, remotes.selection.isLocal {
                 Task { await engine.wake() }
             }

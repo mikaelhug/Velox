@@ -13,14 +13,15 @@ import CoreServices
 ///   sources of *running* containers only (the set arrives from `DockerEventsWatcher`'s
 ///   reconcile, so it follows `docker run`/`rm` with no scan), and one persistent vsock stream
 ///   to vinit (`VsockPort.fileEvents`). Nothing polls.
-/// - **The guest re-creates the event with a no-op `chmod(path, <host mode>)`** — the mode the
-///   host just read, so nothing changes on the Mac but ctime. Linux turns that into IN_ATTRIB
-///   on the file and on its parent's watch, which libuv (`fs.watch`), chokidar, watchdog,
-///   rb-inotify and watchman all treat as a change. Deletes and renames poke the parent
-///   directory the same way, which makes watchers rescan it. Mode — not mtime — is the carrier
-///   because re-stamping mtime races a second save (it could roll mtime back).
-/// - **The echo is filtered at the source** (`EchoFilter`): our chmod comes back as an FSEvent,
-///   and with FileEvents the flags are sticky, so only a moved mtime or size counts as a change.
+/// - **The guest re-creates the event with a setattr that changes nothing** — normally a chown to
+///   the file's current owner, which the guest kernel's virtiofs fast mode answers without
+///   reaching the Mac at all; a chmod to the mode sent here is only the fallback (fast mode off,
+///   setuid/setgid files). Linux turns either into IN_ATTRIB on the file and on its parent's
+///   watch, which libuv (`fs.watch`), chokidar, watchdog, rb-inotify and watchman all treat as a
+///   change. Deletes and renames poke the parent directory the same way, which makes watchers
+///   rescan it. Never mtime: re-stamping it races a second save (it could roll mtime back).
+/// - **The echo is filtered at the source** (`EchoFilter`): the fallback chmod comes back as an
+///   FSEvent, and with FileEvents the flags are sticky, so only a moved mtime or size counts.
 ///
 /// - **Bounded.** A bind mount of `/` or `/Users` would put every file write on the Mac on
 ///   this path, so roots that shallow are not watched (`isTooBroad`). A bind of `$HOME` itself

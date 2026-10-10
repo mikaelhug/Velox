@@ -23,8 +23,19 @@ public final class VsockBridge: @unchecked Sendable {
     /// `header` is set, it is written to the guest connection before piping
     /// (used by reverse port-forwarding to name the target port).
     public func bridge(localFd: Int32, toGuestPort port: UInt32, header: String? = nil) {
-        connect(localFd: localFd, port: port, header: header,
+        connect(localFd: localFd, port: port, header: header, done: activityToken(port: port),
                 deadline: .now() + Self.bootGrace, delay: .milliseconds(20))
+    }
+
+    /// A Docker-API client counts as activity from the moment it is accepted — not only once its
+    /// relay is up — so the idle stop, which releases the socket and then checks for activity
+    /// (`EngineRuntime.releaseDockerSocketIfIdle`), sees a client still mid-connect. The returned
+    /// closure ends it exactly once, on whichever path the connection finishes.
+    private func activityToken(port: UInt32) -> @Sendable () -> Void {
+        guard port == VsockPort.docker, let activity else { return {} }
+        activity.begin()
+        let ended = Locked(false)
+        return { if !ended.withLock({ done in defer { done = true }; return done }) { activity.end() } }
     }
 
     /// How long a Docker-API connect may keep being refused before the client is dropped.
@@ -36,10 +47,10 @@ public final class VsockBridge: @unchecked Sendable {
     /// connection exists only once the engine has been up for a while.
     static let bootGrace: DispatchTimeInterval = .seconds(10)
 
-    private func connect(localFd: Int32, port: UInt32, header: String?,
+    private func connect(localFd: Int32, port: UInt32, header: String?, done: @escaping @Sendable () -> Void,
                          deadline: DispatchTime, delay: DispatchTimeInterval) {
         manager.connectToGuestPort(port) { [weak self] result in
-            guard let self else { close(localFd); return }
+            guard let self else { close(localFd); done(); return }
             switch result {
             case .failure(let error):
                 if port == VsockPort.docker, DispatchTime.now() < deadline, !self.isStopped {
@@ -47,13 +58,16 @@ public final class VsockBridge: @unchecked Sendable {
                     if case .milliseconds(let ms) = delay { next = .milliseconds(min(ms * 2, 500)) }
                     else { next = delay }
                     DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
-                        self.connect(localFd: localFd, port: port, header: header,
+                        self.connect(localFd: localFd, port: port, header: header, done: done,
                                      deadline: deadline, delay: next)
                     }
                     return
                 }
-                Log.error("vsock connect to port \(port) failed: \(error.localizedDescription)")
+                if !self.isStopped {
+                    Log.error("vsock connect to port \(port) failed: \(error.localizedDescription)")
+                }
                 close(localFd)
+                done()
             case .success(let vsockFd):
                 // The Docker-API leg's other half (the unix-socket side is raised in
                 // `DockerSocketProxy`). Best-effort: VZ hands back an fd whose socket type
@@ -71,18 +85,20 @@ public final class VsockBridge: @unchecked Sendable {
                             Log.error("vsock header write to port \(port) failed; dropping connection")
                             close(vsockFd)
                             close(localFd)
+                            done()
                             return
                         }
-                        self.startPump(localFd, vsockFd, port: port)
+                        self.startPump(localFd, vsockFd, port: port, done: done)
                     }
                 } else {
-                    self.startPump(localFd, vsockFd, port: port)
+                    self.startPump(localFd, vsockFd, port: port, done: done)
                 }
             }
         }
     }
 
-    private func startPump(_ localFd: Int32, _ vsockFd: Int32, port: UInt32) {
+    private func startPump(_ localFd: Int32, _ vsockFd: Int32, port: UInt32,
+                           done: @escaping @Sendable () -> Void) {
         // One relay for the whole process (CLAUDE.md: one mechanism per job). This path used
         // to run its own `SocketPump` — a second, independent implementation of exactly the
         // same job (bidirectional splice with backpressure and half-close). Both had to get
@@ -97,11 +113,8 @@ public final class VsockBridge: @unchecked Sendable {
         // drain" the same instant — `bridge.stopAll()` runs before `EventRelay.stopAll()`, so
         // anything that got past this guard is in the relay's set by the time it drains.
         lock.lock()
-        guard !stopped else { lock.unlock(); close(localFd); close(vsockFd); return }
-        let isDocker = port == VsockPort.docker
-        let activity = isDocker ? self.activity : nil
-        activity?.begin()
-        EventRelay.shared.relay(localFd, vsockFd, spinReads: isDocker) { activity?.end() }
+        guard !stopped else { lock.unlock(); close(localFd); close(vsockFd); done(); return }
+        EventRelay.shared.relay(localFd, vsockFd, spinReads: port == VsockPort.docker) { done() }
         lock.unlock()
     }
 

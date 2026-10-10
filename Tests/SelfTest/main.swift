@@ -2280,14 +2280,61 @@ fileEventBridgeTest()
 
 section("Engine nap")
 @MainActor func engineNapTests() async {
-    // ActivityCounter reports only the busy/idle EDGES.
+    // ActivityCounter signals only the busy/idle EDGES, and carries no value with them: a handler
+    // reads `isBusy`, because two edges racing across zero can be delivered in either order.
     let counter = ActivityCounter()
     let edges = Locked<[Bool]>([])
-    counter.setOnChange { busy in edges.withLock { $0.append(busy) } }
+    counter.setOnChange { edges.withLock { $0.append(counter.isBusy) } }
     counter.begin(); counter.begin(); counter.end(); counter.end()
     counter.end()   // unmatched: must not go negative or fire
     equal(edges.value, [true, false], "two overlapping requests are one busy stretch")
     check(!counter.isBusy, "an unmatched end leaves the counter at zero")
+
+    // The guest MAC is minted once and then stable: every boot is the same DHCP client.
+    let macURL = FileManager.default.temporaryDirectory.appendingPathComponent("vx-mac-\(getpid())")
+    try? FileManager.default.removeItem(at: macURL)
+    let mac1 = VMConfiguration.stableMACAddress(at: macURL)
+    let mac2 = VMConfiguration.stableMACAddress(at: macURL)
+    equal(mac1.string, mac2.string, "the guest MAC survives a reboot")
+    check(mac1.isLocallyAdministeredAddress && mac1.isUnicastAddress, "…and is a locally administered unicast MAC")
+    try? "not a mac".write(to: macURL, atomically: true, encoding: .utf8)
+    check(VMConfiguration.stableMACAddress(at: macURL).isLocallyAdministeredAddress,
+          "a damaged file is replaced, not trusted")
+    try? FileManager.default.removeItem(at: macURL)
+
+    // DockerSocketProxy hands its listener over and takes one back without the path ever
+    // disappearing: a client that connects in between waits in the backlog and is served by the
+    // adopter. (Guest port 9999 on a VM-less manager: each bridge fails at once and closes the
+    // client — EOF is the proof it was accepted, rather than left hanging.)
+    let proxyPath = FileManager.default.temporaryDirectory.path + "/vx-proxy-\(getpid()).sock"
+    unlink(proxyPath)
+    func dialProxy() -> Int32 {
+        let c = socket(AF_UNIX, SOCK_STREAM, 0)
+        var tv = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let r = UnixSocketAddress.withSockaddr(path: proxyPath) { connect(c, $0, $1) }
+        return r == 0 ? c : -1
+    }
+    func servedEOF(_ c: Int32) -> Bool {
+        var b: UInt8 = 0
+        return c >= 0 && read(c, &b, 1) == 0
+    }
+    let bridge = VsockBridge(manager: VMManager())
+    let proxyA = DockerSocketProxy(socketPath: proxyPath, guestPort: 9999, bridge: bridge)
+    do { try proxyA.start() } catch { check(false, "proxy starts: \(error)") }
+    let first = dialProxy()
+    check(servedEOF(first), "the proxy accepts and bridges a client")
+    let kept = proxyA.stop(keepListener: true)
+    check(kept != nil && FileManager.default.fileExists(atPath: proxyPath),
+          "a kept listener is returned and its path stays")
+    let waiting = dialProxy()
+    check(waiting >= 0, "a client connecting during the handoff is not refused")
+    let proxyB = DockerSocketProxy(socketPath: proxyPath, guestPort: 9999, bridge: bridge)
+    if let kept { do { try proxyB.start(adopting: kept) } catch { check(false, "adopt: \(error)") } }
+    check(servedEOF(waiting), "the adopting proxy serves the client that waited in the backlog")
+    proxyB.stop()
+    check(!FileManager.default.fileExists(atPath: proxyPath), "a full stop removes the path")
+    for fd in [first, waiting] where fd >= 0 { close(fd) }
 
     // What a fresh dockerd would restart — moby's RestartManager.ShouldRestart.
     check(ResourceSaver.dockerdWouldRestart(policy: "always", exitCode: 0),
@@ -2423,6 +2470,20 @@ section("Engine nap")
     try? await Task.sleep(for: .milliseconds(1600))
     equal(naps3.value, 1, "the countdown starts when the last client leaves")
     s3.stop()
+
+    // 3b. A declined nap is retried: rearm() counts down again instead of the saver going quiet.
+    let api3b = FakeDaemonAPI(); api3b.list.value = []
+    let (s3b, naps3b) = napSaver(api3b, ActivityCounter())
+    s3b.start()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps3b.value, 1, "the first countdown asks for a nap")
+    s3b.rearm()   // the front end declined it
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps3b.value, 2, "after rearm() the saver asks again")
+    s3b.stop()
+    s3b.rearm()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps3b.value, 2, "a stopped saver can't be revived by rearm()")
 
     // 4. A paused container is not idle; events restart the countdown.
     let api4 = FakeDaemonAPI()

@@ -31,6 +31,8 @@ public enum Paths {
     public static var engineLock: URL { root.appendingPathComponent("engine.lock") }
     /// User preferences persisted by the GUI (resources, file shares, etc.).
     public static var config: URL { root.appendingPathComponent("config.json") }
+    /// The guest NIC's MAC address, kept across boots (`VMConfiguration.stableMACAddress`).
+    public static var macAddress: URL { root.appendingPathComponent("mac-address") }
 
     /// Parent of every non-default workspace's disk: `~/.velox/workspaces/<id>/data.img`.
     /// The **Default** workspace deliberately keeps the legacy `dataDisk` slot above

@@ -2141,14 +2141,33 @@ fn start_vsock_agent() {
     spawn_listener(FSEV_PORT, handle_file_events);
 }
 
-/// Host file changes → guest inotify, for bind mounts. The host's
-/// `FileEventBridge` streams `A <mode-octal> <path>\n` for every bind-mounted path the Mac
-/// changed; we re-create the event with a no-op `chmod(path, mode)` — the mode the host just
-/// read, so the Mac file is untouched but for ctime — which the kernel reports as IN_ATTRIB to
-/// any watch on the file and on its directory. Only paths on a FUSE/virtiofs mount are touched
-/// (statfs magic), never symlinks, never anything guest-local.
+/// Host file changes → guest inotify, for bind mounts. The host's `FileEventBridge` streams
+/// `A <mode-octal> <path>\n` for every bind-mounted path the Mac changed, and we raise IN_ATTRIB
+/// on it (and on its directory's watch) with a setattr that changes nothing:
+///
+/// - **Fast mode on** (`virtiofs.velox_fast=1`, the default — guest/kernel/patches/10-virtiofs-fast.sh):
+///   chown to the file's CURRENT owner. The patched FUSE answers an owner-only setattr locally, so
+///   nothing reaches the Mac at all — no ctime bump, no echo FSEvent, and nothing to race.
+/// - **Otherwise** (fast mode off, or a setuid/setgid file, where chown would drop the bit):
+///   chmod to the mode the host just read. That one does reach the Mac, so a host chmod landing
+///   between the host's read and this call is reverted — the reason it is only the fallback.
+///
+/// The path is opened `O_PATH|O_NOFOLLOW` first and everything after acts on that handle (via
+/// `/proc/self/fd`): the FUSE check, the symlink check and the setattr all see the same inode, so
+/// swapping a path component for a symlink after the check can't steer it onto a guest-local
+/// file. Only paths on a FUSE/virtiofs mount are touched, never symlinks.
 const FSEV_PORT: u32 = 2380;
 const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+/// Whether the guest kernel's virtiofs fast mode is on (the module parameter the patch adds).
+fn virtiofs_fast_mode() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        std::fs::read_to_string("/sys/module/virtiofs/parameters/velox_fast")
+            .map(|v| v.trim() == "Y" || v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
 
 fn handle_file_events(fd: RawFd) {
     use std::io::BufRead;
@@ -2160,11 +2179,28 @@ fn handle_file_events(fd: RawFd) {
         let (Some("A"), Some(mode), Some(path)) = (it.next(), it.next(), it.next()) else { continue };
         let Ok(mode) = u32::from_str_radix(mode, 8) else { continue };
         let Ok(c) = CString::new(path) else { continue };
-        let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statfs(c.as_ptr(), &mut sfs) } != 0 || sfs.f_type as i64 != FUSE_SUPER_MAGIC { continue; }
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 || (st.st_mode & libc::S_IFMT) == libc::S_IFLNK { continue; }
-        unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t); }
+        let h = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if h < 0 { continue; }
+        poke_inode(h, mode);
+        unsafe { libc::close(h); }
+    }
+}
+
+/// The setattr for one opened path (`O_PATH` handle `h`); see `handle_file_events`.
+fn poke_inode(h: RawFd, host_mode: u32) {
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(h, &mut sfs) } != 0 || sfs.f_type as i64 != FUSE_SUPER_MAGIC { return; }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(h, &mut st) } != 0 || (st.st_mode & libc::S_IFMT) == libc::S_IFLNK { return; }
+    // The magic link resolves to the opened inode itself, not by re-walking the path.
+    let Ok(proc_path) = CString::new(format!("/proc/self/fd/{h}")) else { return };
+    let setid = st.st_mode & (libc::S_ISUID | libc::S_ISGID) != 0;
+    unsafe {
+        if virtiofs_fast_mode() && !setid {
+            libc::chown(proc_path.as_ptr(), st.st_uid, st.st_gid);
+        } else {
+            libc::chmod(proc_path.as_ptr(), (host_mode & 0o7777) as libc::mode_t);
+        }
     }
 }
 

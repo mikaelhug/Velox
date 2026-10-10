@@ -43,6 +43,12 @@ public final class EngineRuntime: @unchecked Sendable {
     /// past a stop and its tail re-armed named access on a dead engine. Guarded by `lock`.
     private var probeTask: Task<Void, Never>?
     private var stopped = false
+    /// Idle stop: the Docker socket has left the proxy (`releaseDockerSocketIfIdle`); `stop()`
+    /// must not stop or unlink it. Guarded by `lock`.
+    private var dockerSocketReleased = false
+    /// The released listener until `EngineNap.stop` claims it. A `stop()` that finds it still
+    /// here closes it and removes the path — it is the only owner left. Guarded by `lock`.
+    private var releasedListener: Int32?
     private let lock = NSLock()
 
     public init(manager: VMManager, publish: PublishBind = .wildcard) {
@@ -181,6 +187,41 @@ public final class EngineRuntime: @unchecked Sendable {
         return text.contains("port \(port)") && text.contains("nameserver 127.0.0.1")
     }
 
+    /// Idle stop, step 1: stop accepting on the Docker socket, and give it up — still bound and
+    /// listening, so new clients wait in its backlog — unless Docker-API work is in flight.
+    ///
+    /// The check comes AFTER the proxy stopped accepting, and the proxy's stop is a barrier: every
+    /// client it ever accepted has been counted by then (`VsockBridge` counts from accept). So a
+    /// `docker ps` that lands as the idle timer fires either holds the stop off — the proxy accepts
+    /// again and this returns false — or arrives after the release and waits for the gate. Before,
+    /// such a client was accepted, then dropped by the stop with EOF.
+    ///
+    /// Returns false when busy (nothing changed) or already stopped. Blocking: call it off the main
+    /// thread.
+    public func releaseDockerSocketIfIdle() -> Bool {
+        // Held throughout (bounded by the proxy's 5 s settle): a concurrent `stop()` must see the
+        // socket either still the proxy's or already released — never mid-way, or both would stop
+        // the proxy and the second would unlink a path the gate is about to serve.
+        lock.lock(); defer { lock.unlock() }
+        guard !stopped, !dockerSocketReleased, let fd = proxy.stop(keepListener: true) else { return false }
+        if activity.isBusy {
+            do { try proxy.start(adopting: fd) } catch {}   // adopting never binds, so never throws
+            Log.info("resource saver: Docker request in flight — engine kept running")
+            return false
+        }
+        dockerSocketReleased = true
+        releasedListener = fd
+        return true
+    }
+
+    /// Claim the listener `releaseDockerSocketIfIdle` released (once). Nil if a `stop()` got there
+    /// first.
+    func takeReleasedDockerSocket() -> Int32? {
+        lock.lock(); defer { lock.unlock() }
+        defer { releasedListener = nil }
+        return releasedListener
+    }
+
     /// Whether `stop()` has run. Synchronous, so the lock is never held across an `await`.
     private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
 
@@ -211,12 +252,7 @@ public final class EngineRuntime: @unchecked Sendable {
     /// the kernel reclaims at exit anyway, but the named-access **host routes** are
     /// installed out-of-process by the porthelper and would survive — so that removal
     /// has to actually complete. Blocking, so call it off the main thread.
-    ///
-    /// `keepingDockerSocket` is the nap: the Docker socket's listener is left open and its path
-    /// in place, and returned for a `NapGate` to hold (nil if this stop had already run, or the
-    /// proxy couldn't release it). Everything else is torn down exactly as for a stop.
-    @discardableResult
-    public func stop(waitForTeardown: Bool = false, keepingDockerSocket: Bool = false) -> Int32? {
+    public func stop(waitForTeardown: Bool = false) {
         lock.lock()
         if stopped {
             lock.unlock()
@@ -224,9 +260,12 @@ public final class EngineRuntime: @unchecked Sendable {
             // route removal asynchronously. A caller that is about to exit still needs it to
             // have landed, and the router's serial queue makes this wait for that removal.
             if waitForTeardown { namedRouter.stop(wait: true) }
-            return nil
+            return
         }
         stopped = true
+        let socketReleased = dockerSocketReleased
+        let unclaimed = releasedListener
+        releasedListener = nil
         let pool = conduitPool
         conduitPool = nil
         let probe = probeTask
@@ -251,7 +290,15 @@ public final class EngineRuntime: @unchecked Sendable {
         // queue, `DockerSocketProxy` cancels on its accept queue, and `VsockBridge` registers
         // under the same lock its stop takes — so by the time we reach `EventRelay.stopAll()`
         // nothing can still be producing.
-        let keptListener = proxy.stop(keepListener: keepingDockerSocket)   // stop accepting…
+        // Stop accepting on the docker socket… unless an idle stop already took it from the
+        // proxy; then it is the gate's, or — unclaimed, because this stop overtook the idle one —
+        // ours to close.
+        if !socketReleased {
+            proxy.stop()
+        } else if let unclaimed {
+            close(unclaimed)
+            unlink(Paths.dockerSocket.path)
+        }
         bridge.stopAll()      // …and stop admitting new bridged streams
         // The resolver entry is deliberately NOT withdrawn here. Removing and recreating it
         // churns the domain's config in mDNSResponder exactly like a port change does, and a
@@ -264,7 +311,6 @@ public final class EngineRuntime: @unchecked Sendable {
         // live connections.
         EventRelay.shared.stopAll()
         // The installed helper daemon stays resident (it's idle); just drop our handle.
-        return keptListener
     }
 
     /// Wait for dockerd to answer before declaring the engine ready. The events

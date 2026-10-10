@@ -5,6 +5,26 @@ import Virtualization
 /// boot loader, serial console, entropy source, memory balloon, root + data block
 /// devices, VirtioFS shares, VZNAT networking, and the VSOCK device.
 public enum VMConfiguration {
+    /// The guest NIC's MAC: created once, then the same on every boot.
+    ///
+    /// VZ otherwise invents a random MAC per configuration, so every boot was a brand-new DHCP
+    /// client to macOS's bootpd — a new lease (they last a day) and a new guest IP each time.
+    /// Resource Saver's idle stop multiplies boots, and the vmnet pool is 253 addresses: this
+    /// Mac's `/var/db/dhcpd_leases` already held a different MAC for every one of them. One MAC
+    /// keeps one lease and one guest IP. A missing or unreadable file just mints a new one.
+    public static func stableMACAddress(at url: URL = Paths.macAddress) -> VZMACAddress {
+        if let text = try? String(contentsOf: url, encoding: .utf8),
+           let mac = VZMACAddress(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+           mac.isLocallyAdministeredAddress, mac.isUnicastAddress {
+            return mac
+        }
+        let mac = VZMACAddress.randomLocallyAdministered()
+        do { try (mac.string + "\n").write(to: url, atomically: true, encoding: .utf8) }
+        catch { Log.warn("could not save the guest MAC address (\(error.localizedDescription)) — "
+                         + "the next boot will lease a new IP") }
+        return mac
+    }
+
     public struct Resources: Sendable, Codable, Equatable {
         public var cpuCount: Int
         public var memoryBytes: UInt64
@@ -160,6 +180,7 @@ public enum VMConfiguration {
         // file-handle device) was prototyped but is ~6x slower on this datapath.
         let network = VZVirtioNetworkDeviceConfiguration()
         network.attachment = VZNATNetworkDeviceAttachment()
+        network.macAddress = stableMACAddress()
         config.networkDevices = [network]
 
         // Block devices, in order: /dev/vda = the read-only erofs root (the OS),

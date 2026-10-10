@@ -23,9 +23,6 @@ final class CLISession: @unchecked Sendable {
     private var runtime: EngineRuntime?
     private var saver: ResourceSaver?
     private var unbind: () -> Void = {}
-    /// The Docker socket between `runtime.stop(keepingDockerSocket:)` and the gate taking it,
-    /// i.e. while the VM is being flushed and powered off for a nap.
-    private var napListener: Int32?
     private var gate: NapGate?
 
     init(prefs: VeloxConfig, workspace: Workspace, resources: VMConfiguration.Resources, dataDisk: URL,
@@ -124,32 +121,37 @@ final class CLISession: @unchecked Sendable {
         self.saver = saver
     }
 
-    /// Stop the VM the ordinary way — plumbing down, guest flushed, powered off — but keep the
-    /// Docker socket for a `NapGate`, whose first client calls `wake()`.
+    /// Idle stop (Resource Saver's `onNap`): release the Docker socket unless a request is in
+    /// flight, then the shared `EngineNap.stop` sequence; the gate's first client calls `wake()`.
     private func nap() {
         queue.async { [self] in
-            guard phase == .running, let runtime else { return }
+            guard phase == .running, let runtime, runtime.releaseDockerSocketIfIdle() else {
+                saver?.rearm()   // declined: count down again rather than never napping
+                return
+            }
             phase = .napping
             saver?.stop()
             saver = nil
-            napListener = runtime.stop(waitForTeardown: true, keepingDockerSocket: true)
-            self.runtime = nil
-            manager.stopGracefully { [self] in
+            // `runtime` stays set until the outcome: a Ctrl-C meanwhile stops it, which closes the
+            // released socket if the stop below hasn't claimed it yet.
+            EngineNap.stop(runtime: runtime, manager: manager, deadline: 120,
+                           onDemand: { [weak self] in self?.wake() }) { [self] outcome in
                 queue.async { [self] in
-                    guard phase == .napping else { return }   // Ctrl-C took over; it cleaned up
-                    guard let listener = napListener else {
-                        Log.warn("resource saver: could not keep the Docker socket — stopping the engine")
-                        stopPlumbing()
-                        exit(0)
+                    switch outcome {
+                    case .stopped(let gate):
+                        guard phase == .napping else { gate.close(); return }   // Ctrl-C took over
+                        self.runtime = nil
+                        self.gate = gate
+                        phase = .napped
+                        gate.start()
+                        Log.info("resource saver: engine stopped — resumes on the next Docker request")
+                    case .cancelled:
+                        return   // a stop overtook this one and owns the rest
+                    case .stuck:
+                        Log.error("resource saver: the engine did not stop — exiting")
+                        _ = stopPlumbingLocked()
+                        exit(1)
                     }
-                    napListener = nil
-                    let gate = NapGate(listener: listener, socketPath: Paths.dockerSocket.path) {
-                        [weak self] in self?.wake()
-                    }
-                    self.gate = gate
-                    phase = .napped
-                    gate.start()
-                    Log.info("resource saver: engine stopped — resumes on the next Docker request")
                 }
             }
         }
@@ -168,28 +170,30 @@ final class CLISession: @unchecked Sendable {
     /// accepting docker CLI connections and remove the host routes BEFORE flushing the guest.
     /// `waitForTeardown: true` is not optional: the named-access routes are installed
     /// out-of-process by the porthelper, and this process exits moments later, so an async
-    /// removal would never run. Safe from any thread except `queue`.
+    /// removal would never run. From any thread except `queue`.
     ///
-    /// Returns false when there is no VM to flush — the engine is fully napped, and its guest
-    /// was flushed and powered off when the nap began.
+    /// Returns false when there is no VM to flush — the engine is stopped for idleness, and its
+    /// guest was flushed and powered off then.
     @discardableResult
     func stopPlumbing() -> Bool {
-        queue.sync {
-            let vmMayRun = phase != .napped
-            phase = .stopping
-            gate?.close()
-            gate = nil
-            if let napListener {
-                close(napListener)
-                unlink(Paths.dockerSocket.path)
-                self.napListener = nil
-            }
-            unbind()
-            unbind = {}
-            runtime?.stop(waitForTeardown: true)
-            saver?.stop()
-            return vmMayRun
-        }
+        queue.sync { stopPlumbingLocked() }
+    }
+
+    /// `stopPlumbing` for code already on `queue`.
+    private func stopPlumbingLocked() -> Bool {
+        let vmMayRun = phase != .napped
+        // Mid idle-stop, the socket is in flight inside `EngineNap.stop`, which would close it only
+        // after the VM is down — and this process exits the moment that happens. Remove the path
+        // now so `docker` isn't left facing a dead socket file.
+        if phase == .napping { unlink(Paths.dockerSocket.path) }
+        phase = .stopping
+        gate?.close()
+        gate = nil
+        unbind()
+        unbind = {}
+        runtime?.stop(waitForTeardown: true)
+        saver?.stop()
+        return vmMayRun
     }
 
     private static func discard(_ handoff: NapGate.Handoff?) {

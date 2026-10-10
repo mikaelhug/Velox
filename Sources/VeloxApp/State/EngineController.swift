@@ -114,6 +114,13 @@ final class EngineController {
     private nonisolated let napGateBox = Locked<NapGate?>(nil)
     /// A Wake asked for while the nap was still powering the VM off; honored once it is down.
     private var wakeRequested = false
+    /// The idle stop in flight. `performStop` waits for it instead of racing it: it is the one
+    /// thing that can turn an "Idle" engine back into "Running" or leave a gate behind.
+    private var napTask: Task<Void, Never>?
+    /// True from the socket's release until the idle stop's outcome is handled — the window in
+    /// which only `EngineNap.stop` holds the Docker socket. A quit there exits before that stop
+    /// can close it, so `teardown` removes the path itself. Boxed: `teardown` is nonisolated.
+    private nonisolated let napInFlight = Locked(false)
     /// Single-instance guard: acquired before boot, released on stop. Prevents a
     /// concurrent `velox start` (or second app) from attaching the same data.img.
     private var instanceLock: InstanceLock?
@@ -416,18 +423,17 @@ final class EngineController {
     /// - Parameter handoff: waking from a nap — the engine keeps its instance lock and disk, and
     ///   the new runtime adopts the Docker socket and the clients the nap parked.
     private func performStart(handoff: NapGate.Handoff? = nil) async {
-        guard state.isStopped || state.failureMessage != nil
-                || (handoff != nil && state == .napping) else {
-            NapGate.discard(handoff, socketPath: Paths.dockerSocket.path)
-            return
-        }
-        // Until the runtime adopts it, a failure must close what the nap was holding.
+        // Until the runtime adopts it, every way out must close what the idle stop was holding —
+        // the clients that asked for the resume would otherwise hang until Velox quits.
         var pendingHandoff = handoff
+        defer { NapGate.discard(pendingHandoff, socketPath: Paths.dockerSocket.path) }
+        guard state.isStopped || state.failureMessage != nil
+                || (handoff != nil && state == .napping) else { return }
         // Refuse while an orphan VM may still hold the disk. `flock` is per-open-file-
         // description, so re-acquiring throws even inside this same process — and the catch
         // below calls `cleanup()`, which would release the lock the LIVE VM depends on and
         // let a second engine attach the same ext4 image.
-        guard !isTerminating else { NapGate.discard(handoff, socketPath: Paths.dockerSocket.path); return }
+        guard !isTerminating else { return }
         // A wake keeps the lock it napped with: releasing it for the nap would let a
         // `velox start` attach this disk in between.
         guard !vmUnreachable, handoff != nil || instanceLock == nil else {
@@ -604,7 +610,6 @@ final class EngineController {
             // The launch-time update check waited for the boot to finish (no-op after it ran).
             runStartupUpdateCheckIfPending()
         } catch {
-            NapGate.discard(pendingHandoff, socketPath: Paths.dockerSocket.path)
             // `runtime.start()` throws when the docker socket can't bind (a full or unwritable
             // ~/.velox, EMFILE) — by which point the guest is up and journaling the data disk.
             // `cleanup()` alone would release the instance lock under a live VM, letting a
@@ -642,7 +647,7 @@ final class EngineController {
     /// blocking route removal stays off the main thread. `completion` fires on a
     /// background queue.
     private nonisolated func teardown(completion: @escaping @Sendable () -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [manager, runtimeBox, napGateBox] in
+        DispatchQueue.global(qos: .userInitiated).async { [manager, runtimeBox, napGateBox, napInFlight] in
             // A fully napped engine has no VM to flush — just the socket to give back. (Mid-nap
             // there is no gate yet, and the stop below waits for the VM the nap is powering off.)
             let napped = napGateBox.withLock { gate -> Bool in
@@ -661,6 +666,7 @@ final class EngineController {
                     // Stopping again is idempotent for the runtime we already stopped, and
                     // catches that one — so nothing outlives a teardown.
                     runtimeBox.value?.stop(waitForTeardown: true)
+                    if napInFlight.value { unlink(Paths.dockerSocket.path) }
                     completion()
                 }
             }
@@ -671,6 +677,10 @@ final class EngineController {
     /// callers must not treat that as stopped.
     @discardableResult
     private func performStop() async -> Bool {
+        // An idle stop in flight finishes first — into a gate, a resume, or a failure — and this
+        // then stops whatever it left. Racing it let both tear down the same runtime and leave a
+        // socket file nobody served.
+        if let napTask { await napTask.value }
         guard state.isOn || state.isBusy else { return true }
         // Fully napped: the VM is already down and flushed — release the socket and the lock.
         // (Mid-nap, with the VM still powering off, the ordinary path below waits for it.)
@@ -732,16 +742,42 @@ final class EngineController {
 
     // MARK: - Nap (Resource Saver on macOS 27 — see `EngineNap.swift`)
 
+    /// Resource Saver's `onNap`. One idle stop at a time; `performStop` awaits it.
+    private func beginNap() {
+        guard napTask == nil else { return }
+        napTask = Task { [weak self] in
+            await self?.performNap()
+            self?.napTask = nil
+        }
+    }
+
     /// Power the VM off while idle but keep serving the Docker socket; the first client — or a
-    /// Wake — boots it again. The instance lock and `attachedDiskURL` stay: the engine is still
-    /// this process's, and a wake may land at any moment.
+    /// Resume — boots it again. The instance lock and `attachedDiskURL` stay: the engine is still
+    /// this process's, and a resume may land at any moment.
     private func performNap() async {
-        guard state == .running, !isEngineOwned, !isTerminating else { return }
+        guard state == .running, !isEngineOwned, !isTerminating, let runtime else {
+            resourceSaver?.rearm()   // declined: count down again rather than never napping
+            return
+        }
+        // Step 1, off the main actor (it settles the proxy's accept queue): give up the socket
+        // unless a Docker request is in flight — a client that got in first keeps it running.
+        let released = await Task.detached(priority: .userInitiated) {
+            runtime.releaseDockerSocketIfIdle()
+        }.value
+        guard released else {
+            resourceSaver?.rearm()
+            return
+        }
+        napInFlight.value = true
+        defer { napInFlight.value = false }
+        // Only `performStop` (which waits for this task) or a quit can intervene, and a quit
+        // stops the runtime — which closes the released socket itself.
+        guard state == .running, !isTerminating, runtime === self.runtime else { return }
         startGeneration &+= 1
         let gen = startGeneration
         state = .napping
         // The GUI's own plumbing goes now. Its informers would otherwise reconnect to a VM that
-        // isn't there, every second, for the whole nap.
+        // isn't there, every second, for the whole idle stretch.
         resources?.stop(); resources = nil
         stats?.stop(); stats = nil
         docker = nil
@@ -753,53 +789,37 @@ final class EngineController {
             ProcessInfo.processInfo.endActivity(engineActivity)
             self.engineActivity = nil
         }
-        let listener: Int32?? = await withCheckedContinuation { cont in
-            let once = OnceResume(cont)
-            napTeardown { fd in once.fire(.some(fd)) }
-            // Same bound as a stop: a VM that never confirms it is down must not leave the
-            // engine "napping" with clients queued on a socket nobody will ever accept.
-            DispatchQueue.global().asyncAfter(deadline: .now() + Self.stopDeadline) {
-                if once.fire(.none) {
-                    Log.warn("resource saver: VM stop did not complete in \(Int(Self.stopDeadline))s")
-                }
+        let outcome = await withCheckedContinuation { (cont: CheckedContinuation<EngineNap.Outcome, Never>) in
+            EngineNap.stop(runtime: runtime, manager: manager, deadline: Self.stopDeadline,
+                           onDemand: { [weak self] in Task { @MainActor in await self?.wake() } }) {
+                cont.resume(returning: $0)
             }
         }
-        runtime = nil
+        // A quit took over while the VM was powering off: it owns everything else, and nothing
+        // can have started since, so closing (and unlinking) the gate is safe.
+        guard gen == startGeneration, state == .napping else {
+            if case .stopped(let gate) = outcome { gate.close() }
+            return
+        }
+        if runtime === self.runtime { self.runtime = nil }
         engineLog.detach()
         consolePipe = nil
-        guard case .some(let kept) = listener else {
+        switch outcome {
+        case .stopped(let gate):
+            napGateBox.value = gate
+            gate.start()
+            engineLog.mark("idle — engine stopped by Resource Saver")
+            Log.info("resource saver: engine stopped — resumes on the next Docker request")
+            // In its own task, not this one: a resume whose dockerd never answers calls
+            // `performStop`, which waits for `napTask` — i.e. for this task.
+            if wakeRequested { Task { await self.wake() } }
+        case .cancelled:
+            cleanup()
+            state = .stopped
+        case .stuck:
             vmUnreachable = true
             state = .failed("The engine did not stop and may still be running. Quit and reopen "
                             + "Velox before starting it again.")
-            return
-        }
-        // A Stop or a quit took over while the VM was powering off: it owns the rest.
-        guard gen == startGeneration, state == .napping else {
-            if let kept { close(kept) }
-            return
-        }
-        guard let kept else {
-            Log.warn("resource saver: could not keep the Docker socket — stopping the engine")
-            cleanup()
-            state = .stopped
-            return
-        }
-        let gate = NapGate(listener: kept, socketPath: Paths.dockerSocket.path) { [weak self] in
-            Task { @MainActor in await self?.wake() }
-        }
-        napGateBox.value = gate
-        gate.start()
-        engineLog.mark("idle — engine stopped by Resource Saver")
-        Log.info("resource saver: engine stopped — resumes on the next Docker request")
-        if wakeRequested { await wake() }
-    }
-
-    /// The nap's half of `teardown()`: plumbing down with the Docker socket kept, guest flushed,
-    /// VM off. `completion` gets the kept listener (nil if it couldn't be kept).
-    private nonisolated func napTeardown(completion: @escaping @Sendable (Int32?) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [manager, runtimeBox] in
-            let kept = runtimeBox.value?.stop(waitForTeardown: true, keepingDockerSocket: true)
-            manager.stopGracefully { completion(kept) }
         }
     }
 
@@ -1227,7 +1247,7 @@ final class EngineController {
             idleMinutes: config.resourceSaverMinutes,
             mode: mode, activity: runtime?.activity)
         if mode == .nap {
-            saver.onNap = { [weak self] in Task { @MainActor in await self?.performNap() } }
+            saver.onNap = { [weak self] in Task { @MainActor in self?.beginNap() } }
         }
         // Reflect saver mode in the menu-bar icon (moon badge). The callback fires
         // on the saver's internal queue; hop to the main actor for the @Observable.

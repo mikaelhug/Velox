@@ -75,12 +75,15 @@ public final class ResourceSaver: @unchecked Sendable {
     private var coalescer: Coalescer?
     private var idleTimer: DispatchSourceTimer?
     private var saving = false
-    // Nap mode only (all on `queue`): the last container verdict, whether Docker-API work is in
-    // flight, and whether the nap already fired (it fires once — the front end then stops us).
+    // Nap mode only (all on `queue`): the last container verdict and whether the nap already
+    // fired (it fires once; the front end then stops us, or calls `rearm()` if it declines).
     private var lastRunning = -1
-    private var apiBusy = false
     private var napFired = false
+    private var stopped = false
     private var napCheck: Task<Void, Never>?
+    /// The nap countdown: one timer, re-scheduled on every event — not one allocated per event.
+    /// Parked at `.distantFuture` while the engine isn't idle.
+    private var napTimer: DispatchSourceTimer?
     /// Bumped by everything that breaks the quiet; a confirmation commits only if it is unchanged.
     private var napGen: UInt64 = 0
     /// True while `confirmNap` runs. Its own requests flip the activity counter too, and must
@@ -127,16 +130,18 @@ public final class ResourceSaver: @unchecked Sendable {
         // read instead of a full `containers()` fetch per event (CLAUDE.md §8).
         let coalescer = Coalescer { [weak self] in await self?.evaluate() }
         self.coalescer = coalescer
-        if mode == .nap, let activity {
-            activity.setOnChange { [weak self] busy in
+        if mode == .nap {
+            let t = DispatchSource.makeTimerSource(queue: queue)
+            t.schedule(deadline: .distantFuture)
+            t.setEventHandler { [weak self] in self?.napCountdownElapsed() }
+            t.resume()
+            queue.async { self.napTimer = t }
+            // Each edge just re-evaluates, reading the counter live (`apiBusy`): edges can arrive
+            // out of order, so their direction is never trusted.
+            activity?.setOnChange { [weak self] in
                 guard let saver = self else { return }
-                saver.queue.async {
-                    saver.apiBusy = busy
-                    if !saver.confirming { saver.rearmNapCountdown() }
-                }
+                saver.queue.async { if !saver.confirming { saver.rearmNapCountdown() } }
             }
-            let busy = activity.isBusy
-            queue.async { self.apiBusy = busy }
         }
         task = Task { [weak self] in
             var backoff = ReconnectBackoff()
@@ -168,12 +173,28 @@ public final class ResourceSaver: @unchecked Sendable {
         queue.async {
             self.idleTimer?.cancel()
             self.idleTimer = nil
+            self.napTimer?.cancel()
+            self.napTimer = nil
             self.napCheck?.cancel()
             self.napCheck = nil
-            self.napFired = true   // a stopped saver never naps
+            self.stopped = true   // a stopped saver never naps, and `rearm()` can't revive it
             if self.saving { self.exitSaver() }
         }
     }
+
+    /// Nap mode: the front end declined the nap `onNap` asked for (a Docker request got in at the
+    /// last moment, or the engine was busy with something else). Count down again from zero —
+    /// without this the saver had fired its one nap and never tried again.
+    public func rearm() {
+        queue.async {
+            guard self.mode == .nap, !self.stopped else { return }
+            self.napFired = false
+            self.rearmNapCountdown()
+        }
+    }
+
+    /// Docker-API work in flight right now. Read live, never cached — see `ActivityCounter`.
+    private var apiBusy: Bool { activity?.isBusy ?? false }
 
     /// Read the running-container count, then apply on `queue`.
     ///
@@ -243,21 +264,18 @@ public final class ResourceSaver: @unchecked Sendable {
     /// not. Every activity edge and every Docker event comes through here, so the countdown
     /// measures an unbroken quiet stretch.
     private func rearmNapCountdown() {
-        guard mode == .nap, !napFired else { return }
+        guard mode == .nap, !napFired, !stopped else { return }
         napGen &+= 1
-        idleTimer?.cancel(); idleTimer = nil
-        guard lastRunning == 0, !apiBusy else { return }
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + max(idleThreshold, 1))
-        t.setEventHandler { [weak self] in
-            guard let self, !self.napFired, !self.confirming else { return }
-            self.idleTimer = nil
-            self.confirming = true
-            let gen = self.napGen
-            self.napCheck = Task { await self.confirmNap(gen) }
-        }
-        t.resume()
-        idleTimer = t
+        let idle = lastRunning == 0 && !apiBusy
+        napTimer?.schedule(deadline: idle ? .now() + max(idleThreshold, 1) : .distantFuture)
+    }
+
+    private func napCountdownElapsed() {
+        guard !napFired, !stopped, !confirming else { return }
+        napTimer?.schedule(deadline: .distantFuture)
+        confirming = true
+        let gen = napGen
+        napCheck = Task { await self.confirmNap(gen) }
     }
 
     /// The countdown ran out: confirm from a fresh list (never a cached verdict) that nothing
@@ -269,7 +287,7 @@ public final class ResourceSaver: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.confirming = false
-            guard verdict, gen == self.napGen, !self.napFired,
+            guard verdict, gen == self.napGen, !self.napFired, !self.stopped,
                   self.lastRunning == 0, !self.apiBusy else { return }
             self.napFired = true
             Log.info("resource saver: idle for \(Int(self.idleThreshold / 60)) min — stopping the engine")
