@@ -294,6 +294,17 @@ connections stall and serialize on the VM queue.
   `DockerClient` (one persistent VSOCK connection over `HTTPCodec`, straight to
   dockerd — *not* the unix-socket proxy), reconciling the instant a container
   changes. Result: a published port is reachable in ~0.4s vs 2–28s when polled.
+- **Resource Saver naps on macOS 27** (`ResourceSaver.Mode.nap`; the balloon returns nothing
+  there): after the idle countdown — nothing active (paused/restarting count), no Docker-API
+  connection or in-process request in flight (`ActivityCounter`), no Docker event — the front
+  end stops the VM the ordinary way but **keeps `docker.sock`**: the proxy's listening fd goes
+  to a `NapGate` and back to the next runtime (`EngineRuntime.stop(keepingDockerSocket:)` /
+  `start(adopting:)`), never closed or re-bound, so a client mid-transition waits in the listen
+  backlog. The first accept is the wake event (§8) — a cold boot, ~0.45 s; VZ save/restore was
+  built and deleted (slower than boot, see the Engine Sleep history). The instance lock is
+  kept across the nap, the GUI's informers are torn down (they would reconnect to nothing every
+  second), and a stopped container dockerd would restart on boot (`always`, `on-failure` with a
+  non-zero exit) vetoes the nap rather than being resurrected by it.
 - The **informer rule:** the event is only the *trigger*; a full reconcile (the
   `containers()` list) is the source of truth, re-run on every (re)connect — so a
   missed event or a daemon restart self-heals. Never trust event deltas alone.

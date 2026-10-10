@@ -10,19 +10,48 @@ public final class VsockBridge: @unchecked Sendable {
     /// with a live pump on a VM being powered off — and since the next start builds a fresh
     /// `VsockBridge`, that pump and its two fds would leak for the life of the process.
     private var stopped = false
+    /// Counts live Docker-API connections (port 2375 only) for Resource Saver's nap: a
+    /// connected client — `docker events`, a build session, a `compose` run — is activity.
+    private let activity: ActivityCounter?
 
-    public init(manager: VMManager) {
+    public init(manager: VMManager, activity: ActivityCounter? = nil) {
         self.manager = manager
+        self.activity = activity
     }
 
     /// Takes ownership of `localFd` and connects it to `port` in the guest. If
     /// `header` is set, it is written to the guest connection before piping
     /// (used by reverse port-forwarding to name the target port).
     public func bridge(localFd: Int32, toGuestPort port: UInt32, header: String? = nil) {
+        connect(localFd: localFd, port: port, header: header,
+                deadline: .now() + Self.bootGrace, delay: .milliseconds(20))
+    }
+
+    /// How long a Docker-API connect may keep being refused before the client is dropped.
+    ///
+    /// The VM is "running" to Virtualization.framework ~0.1 s before vinit's vsock agent is
+    /// listening, and a connect in that window is refused. Nothing used to land there by
+    /// accident; a wake from a nap lands there by design — the client that woke the engine is
+    /// bridged the moment the VM starts. Bounded and only for the Docker port: a published-port
+    /// connection exists only once the engine has been up for a while.
+    static let bootGrace: DispatchTimeInterval = .seconds(10)
+
+    private func connect(localFd: Int32, port: UInt32, header: String?,
+                         deadline: DispatchTime, delay: DispatchTimeInterval) {
         manager.connectToGuestPort(port) { [weak self] result in
             guard let self else { close(localFd); return }
             switch result {
             case .failure(let error):
+                if port == VsockPort.docker, DispatchTime.now() < deadline, !self.isStopped {
+                    let next: DispatchTimeInterval
+                    if case .milliseconds(let ms) = delay { next = .milliseconds(min(ms * 2, 500)) }
+                    else { next = delay }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        self.connect(localFd: localFd, port: port, header: header,
+                                     deadline: deadline, delay: next)
+                    }
+                    return
+                }
                 Log.error("vsock connect to port \(port) failed: \(error.localizedDescription)")
                 close(localFd)
             case .success(let vsockFd):
@@ -69,7 +98,10 @@ public final class VsockBridge: @unchecked Sendable {
         // anything that got past this guard is in the relay's set by the time it drains.
         lock.lock()
         guard !stopped else { lock.unlock(); close(localFd); close(vsockFd); return }
-        EventRelay.shared.relay(localFd, vsockFd, spinReads: port == VsockPort.docker) {}
+        let isDocker = port == VsockPort.docker
+        let activity = isDocker ? self.activity : nil
+        activity?.begin()
+        EventRelay.shared.relay(localFd, vsockFd, spinReads: isDocker) { activity?.end() }
         lock.unlock()
     }
 
@@ -80,4 +112,6 @@ public final class VsockBridge: @unchecked Sendable {
     public func stopAll() {
         lock.lock(); stopped = true; lock.unlock()
     }
+
+    private var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
 }

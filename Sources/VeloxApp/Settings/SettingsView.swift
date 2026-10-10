@@ -348,8 +348,7 @@ private struct ResourceSaverSection: View {
     var body: some View {
         Section {
             Toggle("Enable Resource Saver", isOn: $config.resourceSaverEnabled)
-                .disabled(!ResourceSaver.isEffectiveOnThisOS)
-            if config.resourceSaverEnabled && ResourceSaver.isEffectiveOnThisOS {
+            if config.resourceSaverEnabled {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Idle timeout").font(.callout)
                     IntSlider(value: $config.resourceSaverMinutes, range: 1...60,
@@ -359,8 +358,11 @@ private struct ResourceSaverSection: View {
         } header: {
             Text("Resource Saver")
         } footer: {
-            if !ResourceSaver.isEffectiveOnThisOS {
-                Text("Unavailable on this version of macOS: its virtualization framework does not hand reclaimed memory back to the Mac, so the saver would only cost CPU. Your setting is kept for when that changes.")
+            if ResourceSaver.modeForThisOS == .nap {
+                // macOS 27: the balloon returns nothing, so the saver shuts the VM down instead.
+                Text(config.resourceSaverEnabled
+                     ? "Stops the engine after \(config.resourceSaverMinutes) idle \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") to free memory. Resumes on the next docker command."
+                     : "Stops the engine while idle to free memory. Resumes on the next docker command.")
             } else {
                 Text(config.resourceSaverEnabled
                      ? "Reclaims CPU and memory \(config.resourceSaverMinutes) \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") after the last container stops. Exits automatically the moment a container starts."

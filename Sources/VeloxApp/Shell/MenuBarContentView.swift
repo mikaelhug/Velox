@@ -121,6 +121,8 @@ struct MenuBarContentView: View {
             ProgressView().controlSize(.small)
         } else if engine.needsOnboarding {
             Button("Finish Setup…") { openDashboard() }.controlSize(.small)
+        } else if engine.state == .napping {
+            Button("Resume") { Task { await engine.wake() } }.controlSize(.small)
         } else if engine.state.isRunning {
             Button("Stop") { Task { await engine.stop() } }.controlSize(.small)
         } else if engine.state.isBusy {
@@ -166,6 +168,7 @@ struct MenuBarContentView: View {
     private var statusColor: NSColor {
         switch engine.state {
         case .running: return .systemGreen
+        case .napping: return .systemIndigo
         case .starting, .stopping: return .systemYellow
         case .failed: return .systemRed
         case .stopped: return .systemRed

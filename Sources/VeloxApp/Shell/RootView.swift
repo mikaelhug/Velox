@@ -9,6 +9,8 @@ struct RootView: View {
     @Environment(RemoteHostController.self) private var remotes
     @State private var selection: SidebarItem? = .overview
     @State private var showPalette = false
+    /// True while this window is the active one.
+    @Environment(\.appearsActive) private var appearsActive
 
     var body: some View {
         @Bindable var engine = engine
@@ -69,6 +71,15 @@ struct RootView: View {
                 .hidden()
         )
         .sheet(isPresented: $showPalette) { palette }
+        // Bringing the dashboard forward is a request to look at the engine, so a napping one
+        // boots (~0.5 s) rather than showing an empty pane and waiting for a click. Only on the
+        // window becoming active — a window that was already active when the nap began stays
+        // as it is until the user acts (the Wake button, or any docker command).
+        .onChange(of: appearsActive) { _, active in
+            if active, engine.state == .napping, remotes.selection.isLocal {
+                Task { await engine.wake() }
+            }
+        }
         .alert("Switch Docker context to Velox?", isPresented: $engine.showContextPrompt) {
             Button("Switch") { engine.adoptVeloxContext() }
             Button("Not Now", role: .cancel) { engine.declineVeloxContext() }
@@ -228,6 +239,9 @@ struct EngineStatusBar: View {
                     .frame(width: 54)
             } else if engine.isEngineOwned || engine.state.isBusy {
                 ProgressView().controlSize(.small)
+            } else if engine.state == .napping {
+                Button("Resume") { Task { await engine.wake() } }
+                    .controlSize(.small)
             } else if engine.state.isRunning {
                 Button("Stop") { Task { await engine.stop() } }
                     .controlSize(.small)
@@ -268,11 +282,15 @@ struct EngineDownView: View {
                 Text(failure)
             } else if engine.needsOnboarding {
                 Text("Finish setup to boot the Velox engine.")
+            } else if engine.state == .napping {
+                Text("Stopped by Resource Saver. Resumes on the next docker command.")
             } else {
                 Text("The Velox engine is \(engine.state.label.lowercased()). Start it to see \(item.title.lowercased()).")
             }
         } actions: {
-            if !engine.needsOnboarding && !engine.isEngineOwned && engine.workspaceError == nil {
+            if engine.state == .napping && !engine.isEngineOwned {
+                Button("Resume") { Task { await engine.wake() } }
+            } else if !engine.needsOnboarding && !engine.isEngineOwned && engine.workspaceError == nil {
                 Button(engine.state.isBusy ? "Starting…" : "Start Engine") {
                     Task { await engine.start() }
                 }

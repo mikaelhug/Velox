@@ -292,7 +292,7 @@ private struct WorkspacePrompts: ViewModifier {
                 // time is a wall of text the user stops reading by the third switch. The only
                 // non-obvious fact is the restart, so that is all it says. Still branched:
                 // promising a restart when the engine is stopped would just be wrong.
-                if engine.state.isRunning || engine.state.isBusy {
+                if engine.state.isOn || engine.state.isBusy {
                     Text("The engine will restart.")
                 } else {
                     Text("Takes effect on the next start.")

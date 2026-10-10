@@ -2276,6 +2276,177 @@ section("FileEventBridge")
 }
 fileEventBridgeTest()
 
+// MARK: Engine nap (Resource Saver on macOS 27)
+
+section("Engine nap")
+@MainActor func engineNapTests() async {
+    // ActivityCounter reports only the busy/idle EDGES.
+    let counter = ActivityCounter()
+    let edges = Locked<[Bool]>([])
+    counter.setOnChange { busy in edges.withLock { $0.append(busy) } }
+    counter.begin(); counter.begin(); counter.end(); counter.end()
+    counter.end()   // unmatched: must not go negative or fire
+    equal(edges.value, [true, false], "two overlapping requests are one busy stretch")
+    check(!counter.isBusy, "an unmatched end leaves the counter at zero")
+
+    // What a fresh dockerd would restart — moby's RestartManager.ShouldRestart.
+    check(ResourceSaver.dockerdWouldRestart(policy: "always", exitCode: 0),
+          "`always` restarts even a container stopped by hand")
+    check(ResourceSaver.dockerdWouldRestart(policy: "on-failure", exitCode: 137),
+          "`on-failure` restarts a non-zero exit (retry count resets with the daemon)")
+    check(!ResourceSaver.dockerdWouldRestart(policy: "on-failure", exitCode: 0), "…not a clean exit")
+    check(!ResourceSaver.dockerdWouldRestart(policy: "unless-stopped", exitCode: 0),
+          "a stopped `unless-stopped` container stays stopped")
+    check(!ResourceSaver.dockerdWouldRestart(policy: "no", exitCode: 1), "`no` never restarts")
+    check(!ResourceSaver.dockerdWouldRestart(policy: nil, exitCode: nil), "no policy never restarts")
+    check(ResourceSaver.isActive(state: "paused"), "a paused container lives in guest RAM")
+    check(ResourceSaver.isActive(state: "restarting"), "a restarting container is active")
+    check(!ResourceSaver.isActive(state: "exited") && !ResourceSaver.isActive(state: "created"),
+          "exited and created containers hold nothing in the VM")
+
+    // NapGate: the first client wakes the engine; the handoff carries the listener and the
+    // parked client with its request bytes untouched.
+    let path = FileManager.default.temporaryDirectory.path + "/vx-nap-\(getpid()).sock"
+    unlink(path)
+    let listener = socket(AF_UNIX, SOCK_STREAM, 0)
+    let bound = UnixSocketAddress.withSockaddr(path: path) { bind(listener, $0, $1) }
+    check(bound == 0 && listen(listener, 8) == 0, "test listener is up")
+    _ = fcntl(listener, F_SETFL, fcntl(listener, F_GETFL, 0) | O_NONBLOCK)
+    let woke = Locked(0)
+    let gate = NapGate(listener: listener, socketPath: path) { woke.withLock { $0 += 1 } }
+    gate.start()
+    func dial() -> Int32 {
+        let c = socket(AF_UNIX, SOCK_STREAM, 0)
+        _ = UnixSocketAddress.withSockaddr(path: path) { connect(c, $0, $1) }
+        return c
+    }
+    let client1 = dial()
+    _ = "GET /_ping HTTP/1.1\r\n\r\n".withCString { write(client1, $0, strlen($0)) }
+    let client2 = dial()
+    try? await Task.sleep(for: .milliseconds(200))
+    equal(woke.value, 1, "two clients wake the engine once")
+    let handoff = gate.handOff()
+    equal(handoff.listener, listener, "the listener handed on is the one the proxy served")
+    equal(handoff.clients.count, 2, "every parked client is handed on")
+    var buf = [UInt8](repeating: 0, count: 64)
+    let n = handoff.clients.first.map { read($0, &buf, buf.count) } ?? -1
+    check(n > 0 && String(decoding: buf[0..<max(n, 0)], as: UTF8.self).hasPrefix("GET /_ping"),
+          "a parked client's request bytes wait, unread, for the new engine")
+    // A client arriving after the handoff waits in the backlog of the SAME socket — no gap.
+    let client3 = dial()
+    let late = accept(listener, nil, nil)
+    check(late >= 0, "a connect during the handoff lands in the kept listener's backlog")
+    check(FileManager.default.fileExists(atPath: path), "the socket path never disappears")
+    for fd in [client1, client2, client3, late] + handoff.clients { close(fd) }
+    NapGate.discard(handoff, socketPath: path)
+    check(!FileManager.default.fileExists(atPath: path), "discard removes the socket file")
+
+    let closing = NapGate(listener: socket(AF_UNIX, SOCK_STREAM, 0), socketPath: path) {}
+    closing.close()
+    closing.close()   // idempotent
+
+    // ResourceSaver in nap mode, against a scripted daemon (idle threshold 0 → 1 s countdown).
+    final class FakeDaemonAPI: DockerClientProtocol, @unchecked Sendable {
+        let list = Locked<[ContainerSummary]>([])
+        let policies = Locked<[String: (String, Int)]>([:])
+        let stream: AsyncStream<DockerEvent>
+        let feed: AsyncStream<DockerEvent>.Continuation
+        init() { (stream, feed) = AsyncStream<DockerEvent>.makeStream() }
+        func containers() async throws -> [ContainerSummary] { list.value }
+        func inspectContainer(_ id: String) async throws -> ContainerInspect {
+            let (policy, code) = policies.value[id] ?? ("no", 0)
+            return ContainerInspect(name: id, config: .init(image: "x"),
+                                    hostConfig: .init(restartPolicy: .init(name: policy)),
+                                    state: .init(status: "exited", exitCode: code))
+        }
+        func events() -> AsyncStream<DockerEvent> { stream }
+        func images() async throws -> [ImageSummary] { [] }
+        func volumes() async throws -> [Volume] { [] }
+        func networks() async throws -> [NetworkSummary] { [] }
+        func startContainer(_ id: String) async throws {}
+        func stopContainer(_ id: String) async throws {}
+        func restartContainer(_ id: String) async throws {}
+        func pauseContainer(_ id: String) async throws {}
+        func unpauseContainer(_ id: String) async throws {}
+        func removeContainer(_ id: String, force: Bool) async throws {}
+        func pruneContainers() async throws -> UInt64 { 0 }
+        func pruneBuildCache() async throws -> UInt64 { 0 }
+        func systemDiskUsage() async throws -> DiskUsage { throw DockerError.decoding("unused") }
+        func systemInfo() async throws -> SystemInfo { throw DockerError.decoding("unused") }
+        func pullImage(_ reference: String) -> AsyncThrowingStream<String, Error> { .init { $0.finish() } }
+        func removeImage(_ id: String, force: Bool) async throws {}
+        func pruneImages(all: Bool) async throws -> UInt64 { 0 }
+        func removeVolume(_ name: String, force: Bool) async throws {}
+        func pruneVolumes() async throws -> UInt64 { 0 }
+        func stats(container id: String) -> AsyncStream<ContainerStatsSample> { .init { $0.finish() } }
+        func logs(container id: String, tail: Int, since: Double?) -> AsyncStream<LogFrame> { .init { $0.finish() } }
+    }
+    func stopped(_ id: String) -> ContainerSummary {
+        ContainerSummary(id: id, names: [id], image: "x", state: "exited", status: "Exited (0)")
+    }
+    func napSaver(_ api: FakeDaemonAPI, _ activity: ActivityCounter) -> (ResourceSaver, Locked<Int>) {
+        let naps = Locked(0)
+        let saver = ResourceSaver(manager: VMManager(), docker: api, fullMemoryBytes: 1 << 30,
+                                  floorBytes: 1 << 29, idleMinutes: 0, mode: .nap, activity: activity)
+        saver.onNap = { naps.withLock { $0 += 1 } }
+        return (saver, naps)
+    }
+
+    // 1. Idle, a plain stopped container: naps once.
+    let api1 = FakeDaemonAPI(); api1.list.value = [stopped("a")]
+    let (s1, naps1) = napSaver(api1, ActivityCounter())
+    s1.start()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps1.value, 1, "an idle engine naps after the countdown")
+    try? await Task.sleep(for: .milliseconds(1200))
+    equal(naps1.value, 1, "…exactly once")
+    s1.stop()
+
+    // 2. A stopped `always` container vetoes the nap.
+    let api2 = FakeDaemonAPI(); api2.list.value = [stopped("db")]
+    api2.policies.value = ["db": ("always", 0)]
+    let (s2, naps2) = napSaver(api2, ActivityCounter())
+    s2.start()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps2.value, 0, "a container dockerd would restart on boot vetoes the nap")
+    s2.stop()
+
+    // 3. An in-flight Docker-API request holds the nap off; it counts down once the work ends.
+    let api3 = FakeDaemonAPI(); api3.list.value = []
+    let busy = ActivityCounter()
+    busy.begin()
+    let (s3, naps3) = napSaver(api3, busy)
+    s3.start()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps3.value, 0, "no nap while a client is connected")
+    busy.end()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps3.value, 1, "the countdown starts when the last client leaves")
+    s3.stop()
+
+    // 4. A paused container is not idle; events restart the countdown.
+    let api4 = FakeDaemonAPI()
+    api4.list.value = [ContainerSummary(id: "p", names: ["p"], image: "x", state: "paused", status: "Paused")]
+    let (s4, naps4) = napSaver(api4, ActivityCounter())
+    s4.start()
+    try? await Task.sleep(for: .milliseconds(1600))
+    equal(naps4.value, 0, "a paused container keeps the engine awake")
+    api4.list.value = [stopped("p")]
+    let event = try? JSONDecoder().decode(DockerEvent.self,
+                                          from: Data(#"{"Type":"container","Action":"die"}"#.utf8))
+    if let event { api4.feed.yield(event) }
+    try? await Task.sleep(for: .milliseconds(700))
+    if let event = try? JSONDecoder().decode(DockerEvent.self, from: Data(#"{"Type":"image","Action":"pull"}"#.utf8)) {
+        api4.feed.yield(event)   // activity half-way through the countdown restarts it
+    }
+    try? await Task.sleep(for: .milliseconds(700))
+    equal(naps4.value, 0, "an image event restarts the countdown")
+    try? await Task.sleep(for: .milliseconds(1000))
+    equal(naps4.value, 1, "…and it naps a full quiet stretch later")
+    s4.stop()
+}
+await engineNapTests()
+
 // MARK: Summary
 
 print("\n----------------------------------------")

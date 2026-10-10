@@ -12,13 +12,25 @@ public final class DockerSocketProxy: @unchecked Sendable {
     private var listenFd: Int32 = -1
     private var throttled = false   // accepts paused for fd exhaustion (on `acceptQueue`)
     private var source: DispatchSourceRead?
+    /// Set on `acceptQueue` by `stop(keepListener: true)`: the cancel handler then leaves the
+    /// listening fd open, because an engine nap is handing it to a `NapGate`.
+    private var keepListenerOnCancel = false
     public init(socketPath: String, guestPort: UInt32, bridge: VsockBridge) {
         self.socketPath = socketPath
         self.guestPort = guestPort
         self.bridge = bridge
     }
 
-    public func start() throws {
+    /// - Parameter adopting: a listener handed over from a `NapGate` — already bound to
+    ///   `socketPath`, listening and non-blocking. Taking it over instead of re-binding is what
+    ///   makes a wake seamless: the path never disappears, so no client sees a refused connect.
+    public func start(adopting adopted: Int32? = nil) throws {
+        if let adopted {
+            listenFd = adopted
+            startAccepting(adopted)
+            Log.info("docker socket proxy: \(socketPath) → guest vsock port \(guestPort) (resumed)")
+            return
+        }
         unlink(socketPath) // clear any stale socket file
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -44,29 +56,48 @@ public final class DockerSocketProxy: @unchecked Sendable {
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
         listenFd = fd
+        startAccepting(fd)
+        Log.info("docker socket proxy: \(socketPath) → guest vsock port \(guestPort)")
+    }
+
+    private func startAccepting(_ fd: Int32) {
         let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
         // Strong `src` capture: dispatch releases the handlers on cancel, breaking the cycle.
         src.setEventHandler { [weak self] in self?.acceptConnections(source: src) }
         // Clear the field in the cancel handler — it runs on `acceptQueue`, the same queue
         // as `acceptConnections`, so a queued accept event that lands after `stop()` sees
         // -1 and bails instead of calling `accept()` on a closed (possibly reused) fd.
-        src.setCancelHandler { [weak self] in self?.listenFd = -1; close(fd) }
+        src.setCancelHandler { [weak self] in
+            let keep = self?.keepListenerOnCancel ?? false
+            self?.listenFd = -1
+            if !keep { close(fd) }
+        }
         src.resume()
         source = src
-
-        Log.info("docker socket proxy: \(socketPath) → guest vsock port \(guestPort)")
     }
 
-    public func stop() {
+    /// Stop accepting. With `keepListener`, the listening socket stays open and its path stays
+    /// in place, and the fd is returned for a `NapGate` to hold; otherwise it is closed and the
+    /// path removed.
+    @discardableResult
+    public func stop(keepListener: Bool = false) -> Int32? {
         let src = source
         source = nil
+        let kept = Locked<Int32>(-1)
         // Cancel ON `acceptQueue`, synchronously. Two things depend on it: an accept handler
         // already running finishes before this returns (so `EngineRuntime.stop()`'s documented
         // "stop admitting, then drain" ordering is actually enforced, not merely intended), and
         // the cancel is ordered behind any pending fd-exhaustion resume on the same queue.
-        acceptQueue.async { src?.cancel() }
+        acceptQueue.async { [self] in
+            keepListenerOnCancel = keepListener
+            kept.value = listenFd
+            src?.cancel()
+        }
         acceptQueue.settle("docker-proxy")
+        // nil only if the accept queue never quiesced — the caller then has no socket to hold.
+        guard !keepListener else { let fd = kept.value; return fd >= 0 ? fd : nil }
         unlink(socketPath)
+        return nil
     }
 
     private func acceptConnections(source: DispatchSourceRead) {

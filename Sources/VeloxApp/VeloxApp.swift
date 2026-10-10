@@ -156,7 +156,8 @@ struct VeloxApp: App {
         // reliably observe @Observable reads that happen lazily inside its label
         // closure, so the Resource Saver moon never appeared without this.
         let menuSymbol = engine.state.menuBarSymbol
-        let saverActive = engine.isResourceSaving && engine.state.isRunning
+        let saverActive = (engine.isResourceSaving && engine.state.isRunning)
+            || engine.state == .napping
         let runningCount = engine.state.isRunning
             ? (engine.resources?.containers.filter(\.isRunning).count ?? 0) : 0
         let updateAvailable = engine.availableUpdate?.isUpdateAvailable == true

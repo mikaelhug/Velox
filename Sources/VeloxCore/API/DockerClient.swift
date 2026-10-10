@@ -27,15 +27,19 @@ public actor DockerClient: DockerClientProtocol {
     /// resource saver, dashboards) — so they don't each open their own VSOCK stream
     /// (CLAUDE.md §8's "one persistent VSOCK connection"). See `DockerEventHub`.
     private nonisolated let eventHub: DockerEventHub
+    /// In-flight requests and pulls (not the event/stats/log streams, which informers hold
+    /// open forever) — Resource Saver must not nap the engine under a GUI-driven pull or prune.
+    private nonisolated let activity: ActivityCounter?
 
-    public init(connector: any DockerConnector) {
+    public init(connector: any DockerConnector, activity: ActivityCounter? = nil) {
         self.connector = connector
+        self.activity = activity
         self.eventHub = DockerEventHub { DockerClient.rawEventsStream(connector: connector) }
     }
 
     /// The embedded engine — the overwhelmingly common case.
-    public init(manager: VMManager) {
-        self.init(connector: VsockConnector(manager: manager))
+    public init(manager: VMManager, activity: ActivityCounter? = nil) {
+        self.init(connector: VsockConnector(manager: manager), activity: activity)
     }
 
     private static func path(_ suffix: String) -> String { "/\(apiVersion)\(suffix)" }
@@ -51,6 +55,8 @@ public actor DockerClient: DockerClientProtocol {
     }
 
     private func send(_ method: String, _ path: String, body: Data? = nil, readTimeout: Int32? = 300) async throws -> Data {
+        activity?.begin()
+        defer { activity?.end() }
         let fd = try await openConnection()
         if let readTimeout {
             // Bound the wait so a wedged dockerd (accepts the VSOCK connection but never
@@ -247,9 +253,11 @@ public actor DockerClient: DockerClientProtocol {
         let (image, tag) = Self.splitReference(reference)
         let path = Self.path("/images/create?fromImage=\(image.urlEncoded)&tag=\(tag.urlEncoded)")
         let connector = self.connector
+        let activity = self.activity
         return AsyncThrowingStream { continuation in
             let conn = StreamConnection()
-            continuation.onTermination = { _ in conn.cancel() }
+            activity?.begin()
+            continuation.onTermination = { _ in conn.cancel(); activity?.end() }
             connector.connect { result in
                 switch result {
                 case .failure(let error):

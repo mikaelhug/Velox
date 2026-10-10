@@ -4,14 +4,6 @@ import VeloxCore
 
 // Velox CLI entry point.
 
-/// Holds the CLI-binding teardown closure and the engine runtime so they can be
-/// shared across the VM's @Sendable stop/signal handlers (the runtime is created
-/// only once the VM has started).
-private final class Teardown: @unchecked Sendable {
-    var run: () -> Void = {}
-    var runtime: EngineRuntime?
-    var saver: ResourceSaver?
-}
 
 private func hostArch() -> String {
     #if arch(arm64)
@@ -126,31 +118,12 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
         // never boot a stale ~/.velox kernel/rootfs against a new host.
         GuestInstall.refreshFromBundleIfNeeded()
 
-        let image = try GuestImage.resolve().advertising(shares: prefs.shareURLs)
-        let config = try VMConfiguration.build(
-            image: image, dataDisk: dataDisk,
-            resources: resources, extraShares: prefs.shareURLs,
-            nestedVirtualization: prefs.nestedVirtualization)
-        Log.info("booting guest: kernel=\(image.kernelURL.lastPathComponent) "
-                 + "root=\(image.rootDiskURL.lastPathComponent) "
-                 + "cmdline=\"\(image.kernelCommandLine)\"")
+        let session = CLISession(prefs: prefs, workspace: workspace, resources: resources,
+                                 dataDisk: dataDisk, bind: bind)
+        let manager = session.manager
 
-        let manager = VMManager()
-        let teardown = Teardown()
-
-        // Drop the host plumbing — same order as the GUI's `EngineController.teardown()`:
-        // stop accepting docker CLI connections and remove the host routes BEFORE flushing
-        // the guest. `waitForTeardown: true` is not optional here: the named-access routes
-        // are installed out-of-process by the porthelper, and this process calls `exit`
-        // moments later, so an async removal would simply never run and the routes would be
-        // left pointing at a dead VM. Bounded (3 s per porthelper round-trip).
-        let stopPlumbing: @Sendable () -> Void = {
-            teardown.run()
-            teardown.runtime?.stop(waitForTeardown: true)
-            teardown.saver?.stop()
-        }
         manager.onStop { error in
-            stopPlumbing()
+            session.stopPlumbing()
             exit(error == nil ? 0 : 1)
         }
 
@@ -175,7 +148,7 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
                 }
                 interrupted.value = true
                 Log.info("signal \(sig) — flushing and stopping guest…")
-                stopPlumbing()
+                guard session.stopPlumbing() else { exit(0) }   // napped: nothing left to flush
                 manager.stopGracefully { exit(0) }
             }
             source.resume()
@@ -183,55 +156,7 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
         }
         _ = signalSources // keep alive
 
-        manager.start(configuration: config) { result in
-            switch result {
-            case .success:
-                // Stamp the first successful boot only now that there IS one — the flag is
-                // what turns a later missing disk into a loud failure instead of a silent
-                // blank re-create, so stamping before the VM starts would also protect
-                // workspaces whose first boot never happened. (The GUI stamps at the same
-                // point: when the engine reaches running.)
-                WorkspaceStore.recordBoot(id: workspace.id)
-                // All the engine plumbing (Docker socket proxy, port forwarders, events
-                // watcher, named access, clock sync, conduit pool) is shared with the
-                // GUI via EngineRuntime — one wiring, no CLI/GUI drift.
-                let runtime = EngineRuntime(manager: manager, publish: prefs.publishBind)
-                do {
-                    try runtime.start()
-                    teardown.runtime = runtime
-                    teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
-                    // Resource Saver stays outside EngineRuntime (the GUI re-arms its
-                    // own on settings changes) but rides the runtime's Docker client.
-                    if prefs.resourceSaverEnabled && !ResourceSaver.isEffectiveOnThisOS {
-                        Log.info("resource saver: not started — ballooning returns no memory on this macOS release")
-                    }
-                    if prefs.resourceSaverEnabled && ResourceSaver.isEffectiveOnThisOS {
-                        let saver = ResourceSaver(
-                            manager: manager, docker: runtime.docker,
-                            fullMemoryBytes: prefs.resources.memoryBytes,
-                            floorBytes: prefs.resourceSaverFloorBytes,
-                            idleMinutes: prefs.resourceSaverMinutes)
-                        saver.start() // reclaim RAM while idle
-                        teardown.saver = saver
-                    }
-                } catch {
-                    Log.error("docker socket proxy failed to start: \(error)")
-                }
-                Log.info("guest started — console follows (Ctrl-C to stop).")
-            case .failure(let error):
-                let ns = error as NSError
-                Log.error("failed to start guest: \(error.localizedDescription)")
-                Log.error("  domain=\(ns.domain) code=\(ns.code)")
-                if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-                    Log.error("  underlying: \(underlying.domain) code=\(underlying.code) — "
-                              + "\(underlying.localizedDescription)")
-                }
-                for (k, v) in ns.userInfo where k != NSUnderlyingErrorKey {
-                    Log.error("  userInfo[\(k)] = \(v)")
-                }
-                exit(1)
-            }
-        }
+        session.boot(handoff: nil)
 
         dispatchMain() // park main thread; exits via onStop handler
     } catch {

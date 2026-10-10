@@ -18,6 +18,9 @@ public final class EngineRuntime: @unchecked Sendable {
     /// The in-process Docker API client (persistent VSOCK connections, straight to
     /// dockerd). Front ends use it for dashboards, resource savers, readiness.
     public let docker: DockerClient
+    /// Docker-API work in flight — external clients on the socket plus in-process requests.
+    /// Resource Saver's nap waits for it to go quiet (see `EngineNap.swift`).
+    public let activity = ActivityCounter()
 
     private let manager: VMManager
     private let bridge: VsockBridge
@@ -44,13 +47,13 @@ public final class EngineRuntime: @unchecked Sendable {
 
     public init(manager: VMManager, publish: PublishBind = .wildcard) {
         self.manager = manager
-        let bridge = VsockBridge(manager: manager)
+        let bridge = VsockBridge(manager: manager, activity: activity)
         self.bridge = bridge
         proxy = DockerSocketProxy(
             socketPath: Paths.dockerSocket.path,
             guestPort: VsockPort.docker,
             bridge: bridge)
-        docker = DockerClient(manager: manager)
+        docker = DockerClient(manager: manager, activity: activity)
         // Published ports: one listener per `-p` port on the configured host address
         // (all interfaces by default, like Docker), reverse-forwarded to the guest.
         // Privileged ports (<1024) come pre-bound from the root helper.
@@ -96,8 +99,17 @@ public final class EngineRuntime: @unchecked Sendable {
 
     /// Wire everything up. Throws only if the Docker unix-socket proxy can't bind
     /// (everything else is best-effort and degrades gracefully).
-    public func start() throws {
-        try proxy.start()
+    ///
+    /// - Parameter handoff: waking from a nap — serve the socket the `NapGate` held instead of
+    ///   binding a new one, and relay the clients it parked. Their bytes reach dockerd as soon
+    ///   as it answers (vinit holds early Docker-API connections), so they are bridged right
+    ///   away rather than after readiness.
+    public func start(adopting handoff: NapGate.Handoff? = nil) throws {
+        try proxy.start(adopting: handoff?.listener)
+        for client in handoff?.clients ?? [] {
+            FDIO.setSocketBuffers(client)
+            bridge.bridge(localFd: client, toGuestPort: VsockPort.docker)
+        }
         // Loopback-only; named access is off without it. Don't swallow the error: a fast
         // restart can still find the previous responder's UDP port bound (its `stop()` is
         // async), and silently losing `<name>.velox.local` for the whole session with no log
@@ -199,7 +211,12 @@ public final class EngineRuntime: @unchecked Sendable {
     /// the kernel reclaims at exit anyway, but the named-access **host routes** are
     /// installed out-of-process by the porthelper and would survive — so that removal
     /// has to actually complete. Blocking, so call it off the main thread.
-    public func stop(waitForTeardown: Bool = false) {
+    ///
+    /// `keepingDockerSocket` is the nap: the Docker socket's listener is left open and its path
+    /// in place, and returned for a `NapGate` to hold (nil if this stop had already run, or the
+    /// proxy couldn't release it). Everything else is torn down exactly as for a stop.
+    @discardableResult
+    public func stop(waitForTeardown: Bool = false, keepingDockerSocket: Bool = false) -> Int32? {
         lock.lock()
         if stopped {
             lock.unlock()
@@ -207,7 +224,7 @@ public final class EngineRuntime: @unchecked Sendable {
             // route removal asynchronously. A caller that is about to exit still needs it to
             // have landed, and the router's serial queue makes this wait for that removal.
             if waitForTeardown { namedRouter.stop(wait: true) }
-            return
+            return nil
         }
         stopped = true
         let pool = conduitPool
@@ -234,7 +251,7 @@ public final class EngineRuntime: @unchecked Sendable {
         // queue, `DockerSocketProxy` cancels on its accept queue, and `VsockBridge` registers
         // under the same lock its stop takes — so by the time we reach `EventRelay.stopAll()`
         // nothing can still be producing.
-        proxy.stop()          // stop accepting on the docker socket…
+        let keptListener = proxy.stop(keepListener: keepingDockerSocket)   // stop accepting…
         bridge.stopAll()      // …and stop admitting new bridged streams
         // The resolver entry is deliberately NOT withdrawn here. Removing and recreating it
         // churns the domain's config in mDNSResponder exactly like a port change does, and a
@@ -247,6 +264,7 @@ public final class EngineRuntime: @unchecked Sendable {
         // live connections.
         EventRelay.shared.stopAll()
         // The installed helper daemon stays resident (it's idle); just drop our handle.
+        return keptListener
     }
 
     /// Wait for dockerd to answer before declaring the engine ready. The events

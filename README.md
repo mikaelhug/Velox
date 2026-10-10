@@ -53,7 +53,8 @@ below, with the methodology, the raw values and a runnable harness in
   images, attestations, Wasm).
 - **Event-driven, never polling.** Published ports come up the instant a
   container starts; a Resource Saver balloons an idle engine down to a
-  **sub-100 MB** host footprint; the guest clock survives Mac sleep.
+  **sub-100 MB** host footprint (on macOS 27 it stops the idle engine and resumes it on the
+  next `docker` command); the guest clock survives Mac sleep.
 - **Self-updating** — `velox update` or the in-app Update button.
 
 <div align="center">

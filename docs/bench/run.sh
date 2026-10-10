@@ -797,7 +797,11 @@ idle(){             # $1 ctx $2 label — engine must already be running, saver 
   docker --context "$CTX" ps -q >/dev/null 2>&1     # last activity, then hands off
   w0=$(now); c0=$(sum_cputime $pids)
   local rsslist="" fplist=""
-  for i in $(seq 1 24); do sleep 10; rsslist="$rsslist $(sum_rss $pids)"; fplist="$fplist $(sum_footprint $pids)"; done
+  # Re-resolve the process set per sample: on macOS 27 Velox's Resource Saver stops the VM and a
+  # resume starts a NEW VM process, so a set captured once can miss the engine entirely.
+  local now_pids
+  for i in $(seq 1 24); do sleep 10; now_pids="$(engine_pids "$ENG")"
+    rsslist="$rsslist $(sum_rss $now_pids)"; fplist="$fplist $(sum_footprint $now_pids)"; done
   w1=$(now); c1=$(sum_cputime $pids)
   rec "$ENG" idle cpu pct pct "$(python3 -c "print(round(($c1-$c0)/($w1-$w0)*100,2))")"
   local MED='import sys; v=sorted(float(x) for x in sys.argv[1].split()); print(round(v[len(v)//2]))'
@@ -809,7 +813,13 @@ idle(){             # $1 ctx $2 label — engine must already be running, saver 
   # RAM after 5+ minutes with nothing running", whatever mechanism each engine uses.
   log "[$ENG] waiting out the 5-min resource-saver timeout"
   sleep 240
+  pids="$(engine_pids "$ENG")"
   w0=$(now); c0=$(sum_cputime $pids); sleep 60; w1=$(now); c1=$(sum_cputime $pids)
+  # A resume inside the window means a VM the CPU delta above never saw, and a VM process the
+  # memory rows below must include — say so rather than record a silently partial number.
+  local after; after="$(engine_pids "$ENG")"
+  [ "$after" = "$pids" ] || warn "[$ENG] engine processes changed during the saver window ($pids → $after): resumed?"
+  pids="$after"
   rss=$(sum_rss $pids)
   rec "$ENG" idle rss_saver host_rss MB "$rss"
   rec "$ENG" idle fp_saver host_fp MB "$(sum_footprint $pids)"
