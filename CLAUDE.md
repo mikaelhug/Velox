@@ -182,6 +182,14 @@ all cgroup/netfilter container prereqs, etc. built-in (monolithic, no modules).
   container, on a Docker **named volume** — never the host APFS (case-insensitive
   collisions + slow bind mounts). Only the final `Image` is copied back to
   `Assets/velox-vmlinux` (and `~/.velox/kernel`).
+- **Source patches are the exception, not the norm.** `guest/kernel/patches/*.sh` are applied
+  in the tree before config (`build-kernel.sh`). Each checks its anchors and **fails the build**
+  if upstream moved the code, so a version-watch kernel bump can never ship a patch silently
+  dropped. Today there is exactly one — `10-virtiofs-fast.sh`, enabled by
+  `virtiofs.velox_fast=1` on the cmdline — which stops the guest sending FLUSH,
+  `security.capability` GETXATTR and chown round trips that Apple's VirtioFS server answers but
+  ignores (small-file bind-mount untar 2.45 → 1.67 s). Prefer a fragment option or a cmdline
+  knob; add a patch only for a measured win nothing else can deliver, and keep it tiny.
 - The kernel version + SHA-256 are pinned in `versions.env`
   (`KERNEL_ORG_VERSION`/`KERNEL_ORG_SHA256`; the kernel.org `v<MAJOR>.x` dir is
   derived from the version). No LinuxKit.

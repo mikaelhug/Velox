@@ -127,6 +127,12 @@ public enum VMConfiguration {
             // (interleaved boots; the start→die span 35.5 → 27 ms), then 79 → 73–74 ms going
             // first 1 → 0 (live, same boot, alternated twice).
             + " rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1"
+            // virtiofs fast mode (guest/kernel/patches/10-virtiofs-fast.sh): skip the FLUSH,
+            // security.capability and chown round trips that Apple's VirtioFS server answers but
+            // ignores — 11 → 6 synchronous requests per extracted file, small-file untar into a
+            // bind mount 2.45 → 1.67 s. An older kernel without the patch ignores the unknown
+            // parameter; `virtiofs.velox_fast=0` in VELOX_KCMDLINE_EXTRA turns it off.
+            + " virtiofs.velox_fast=1"
         // Optional host-supplied extra kernel parameters, appended LAST so a
         // duplicated key overrides the defaults (kernel takes the last value).
         // Used for scheduler A/B tuning, e.g. VELOX_KCMDLINE_EXTRA="preempt=full".

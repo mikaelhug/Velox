@@ -127,6 +127,15 @@ if [ ! -d "$SRC" ]; then
 fi
 cd "$SRC"
 
+# --- Phase 2b: Velox source patches (guest/kernel/patches/*.sh, name order) ---
+# Each script checks its own anchors and exits non-zero if upstream moved the code, which
+# fails this build — a kernel bump can never ship with a patch silently missing.
+for p in /tmp/patches/*.sh; do
+    [ -f "$p" ] || continue
+    echo "==> [container] applying $(basename "$p")"
+    sh "$p"
+done
+
 # --- Phase 3: tinyconfig + curated fragment + olddefconfig ---
 echo "==> [container] make tinyconfig"
 make ARCH=arm64 tinyconfig >/dev/null
@@ -208,6 +217,7 @@ docker run --rm --platform "$PLATFORM" \
     -e REQUIRED_SYMBOLS="${REQUIRED_SYMBOLS[*]}" \
     -v "$VOLUME":/build \
     -v "$PWD/$FRAGMENT":/tmp/velox.fragment:ro \
+    -v "$PWD/guest/kernel/patches":/tmp/patches:ro \
     -v "$OUT_ABS":/out \
     "$BUILDER_TAG" bash -c "$IN_CONTAINER"
 
