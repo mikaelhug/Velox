@@ -209,20 +209,19 @@ public enum VMConfiguration {
         case .installed:
             do {
                 let rosetta = try VZLinuxRosettaDirectoryShare()
-                // Persist Rosetta's ahead-of-time translation cache across runs via a
-                // host-side cache daemon on a unix socket, so x86-64 binaries aren't
-                // re-translated every launch (Docker-Desktop parity). The caching
-                // classes/property are NS_REFINED_FOR_SWIFT with no overlay in the
-                // Command-Line-Tools SDK, so they import under their __-prefixed
-                // names — functionally identical, and the spelling is guaranteed by
-                // the refinement contract.
-                let cacheSock = Paths.root.appendingPathComponent("rosetta.sock")
-                do {
-                    rosetta.__options = try __VZLinuxRosettaUnixSocketCachingOptions(path: cacheSock.path)
-                    Log.info("Rosetta translation cache: \(cacheSock.path)")
-                } catch {
-                    Log.warn("Rosetta cache off (translations won't persist): \(error.localizedDescription)")
-                }
+                // No translation-cache options, deliberately. VZLinuxRosettaCachingOptions does
+                // not run a cache on the host: it only tells the guest's Rosetta runtime where a
+                // GUEST `rosettad daemon` listens (a unix path or an abstract socket name). The
+                // runtime runs inside each container, so it resolves that path in the container's
+                // mount namespace and that abstract name in the container's network namespace —
+                // a daemon in the guest's init namespaces is unreachable from any bridge-networked
+                // container or BuildKit step. Measured (2026-10-10): with `rosettad daemon` running
+                // in the init netns, `--network host` amd64 containers start python 18% faster
+                // (0.138 → 0.113 s; steady-state compute unchanged), bridge containers not at all;
+                // the old host-path option (`~/.velox/rosetta.sock`, a path no guest ever had) was
+                // inert: identical timings to no option. Reaching every container would need a
+                // per-netns relay that loses the race with the container's first exec, or an
+                // OCI-runtime wrapper injecting a bind mount — not worth a new component.
                 let fsRosetta = VZVirtioFileSystemDeviceConfiguration(tag: "rosetta")
                 fsRosetta.share = rosetta
                 sharingDevices.append(fsRosetta)
