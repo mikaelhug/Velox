@@ -49,12 +49,6 @@ struct RootView: View {
         } detail: {
             detail(for: selection ?? .overview)
                 .frame(minWidth: 560, minHeight: 360)
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if remotes.selection.isLocal, engine.state == .napping, engine.idleDocker != nil,
-                       selection != .engineLogs {
-                        IdleBanner()
-                    }
-                }
                 // Row affordances several view types deep (port links, the shell hand-off)
                 // need to know which daemon they act on. See `EnvironmentValues.dockerTarget`.
                 .environment(\.dockerTarget, dashboard?.target ?? .local)
@@ -262,27 +256,6 @@ struct EngineStatusBar: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(.separator, lineWidth: 0.5)
         )
-    }
-}
-
-/// Over the dashboards while the engine is idle: they show the last known state, read-only
-/// until something resumes the engine.
-struct IdleBanner: View {
-    @Environment(EngineController.self) private var engine
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "moon.zzz").foregroundStyle(.indigo)
-            Text("Engine idle. Showing the last known state; any action resumes it.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("Resume") { Task { await engine.wake() } }
-                .controlSize(.small)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(.bar)
     }
 }
 
