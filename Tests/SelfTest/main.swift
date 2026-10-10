@@ -2232,6 +2232,30 @@ section("ReconnectBackoff")
 }
 reconnectBackoffTest()
 
+// MARK: FileEventBridge (host file changes → guest inotify)
+
+section("FileEventBridge")
+@MainActor func fileEventBridgeTest() {
+    equal(FileEventBridge.line(mode: 0o100644, path: "/Users/a/src/app.js"), "A 644 /Users/a/src/app.js\n",
+          "a change is one line carrying the permission bits only (no file-type bits)")
+    equal(FileEventBridge.line(mode: 0o40755, path: "/Users/a/src"), "A 755 /Users/a/src\n",
+          "directories are poked with their own mode")
+    equal(FileEventBridge.line(mode: 0o4755, path: "/Users/a/bin/x"), "A 4755 /Users/a/bin/x\n",
+          "setuid/sticky bits survive, so the guest's chmod is a true no-op")
+    check(FileEventBridge.line(mode: 0o644, path: "/Users/a/evil\nA 777 /etc") == nil,
+          "a path with a newline can't inject a second line")
+    check(FileEventBridge.line(mode: 0o644, path: "relative/path") == nil, "relative paths are refused")
+
+    var f = FileEventBridge.EchoFilter()
+    check(f.admit("/p", mtimeSec: 10, mtimeNsec: 5, size: 100), "the first change is forwarded")
+    check(!f.admit("/p", mtimeSec: 10, mtimeNsec: 5, size: 100),
+          "our own chmod echo (same mtime + size) is dropped — no feedback storm")
+    check(f.admit("/p", mtimeSec: 10, mtimeNsec: 6, size: 100), "a new save (mtime moved) is forwarded")
+    check(f.admit("/p", mtimeSec: 10, mtimeNsec: 6, size: 101), "a same-mtime size change is forwarded")
+    check(f.admit("/q", mtimeSec: 10, mtimeNsec: 6, size: 101), "paths are tracked independently")
+}
+fileEventBridgeTest()
+
 // MARK: Summary
 
 print("\n----------------------------------------")

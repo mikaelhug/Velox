@@ -2138,6 +2138,34 @@ fn start_vsock_agent() {
     spawn_listener(CLOCK_PORT, handle_clock);
     spawn_listener(DOCKER_PORT, handle_data);
     spawn_listener(GW_PORT, handle_gateway);
+    spawn_listener(FSEV_PORT, handle_file_events);
+}
+
+/// Host file changes → guest inotify, for bind mounts. The host's
+/// `FileEventBridge` streams `A <mode-octal> <path>\n` for every bind-mounted path the Mac
+/// changed; we re-create the event with a no-op `chmod(path, mode)` — the mode the host just
+/// read, so the Mac file is untouched but for ctime — which the kernel reports as IN_ATTRIB to
+/// any watch on the file and on its directory. Only paths on a FUSE/virtiofs mount are touched
+/// (statfs magic), never symlinks, never anything guest-local.
+const FSEV_PORT: u32 = 2380;
+const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+
+fn handle_file_events(fd: RawFd) {
+    use std::io::BufRead;
+    use std::os::unix::io::FromRawFd;
+    let stream = unsafe { std::fs::File::from_raw_fd(fd) };
+    for line in std::io::BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        let mut it = line.splitn(3, ' ');
+        let (Some("A"), Some(mode), Some(path)) = (it.next(), it.next(), it.next()) else { continue };
+        let Ok(mode) = u32::from_str_radix(mode, 8) else { continue };
+        let Ok(c) = CString::new(path) else { continue };
+        let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c.as_ptr(), &mut sfs) } != 0 || sfs.f_type as i64 != FUSE_SUPER_MAGIC { continue; }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 || (st.st_mode & libc::S_IFMT) == libc::S_IFLNK { continue; }
+        unsafe { libc::chmod(c.as_ptr(), (mode & 0o7777) as libc::mode_t); }
+    }
 }
 
 // AF_VSOCK socket options (linux/vm_sockets.h; not exported by the libc crate). Level is

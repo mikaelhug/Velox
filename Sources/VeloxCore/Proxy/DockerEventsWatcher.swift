@@ -23,6 +23,9 @@ public final class DockerEventsWatcher: @unchecked Sendable {
     /// Fired with the set of bridge-network subnets (CIDRs) whenever it changes — the host routes
     /// each to the guest so container IPs are reachable. Nil → named-access routing disabled.
     private let onSubnets: (@Sendable (Set<String>) -> Void)?
+    /// Fired each reconcile with the bind-mount sources of running containers
+    /// (`FileEventBridge` watches exactly these).
+    public var onBindSources: (@Sendable (Set<String>) -> Void)?
     private var task: Task<Void, Never>?
     private var lastTCP: Set<PublishedPort> = []
     private var lastUDP: Set<PublishedPort> = []
@@ -233,6 +236,10 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         // Refresh the direct-dial map every reconcile (a restart can change a container's IP
         // without changing the published-port *set*), independent of the onPorts diff below.
         endpoints?.update(endpointMap, udp: udpEndpointMap)
+        if let onBindSources {
+            onBindSources(Set(containers.lazy.filter { $0.state == "running" }
+                                .flatMap { $0.mounts }.filter { $0.type == "bind" }.map(\.source)))
+        }
         // Bridge-network subnets → the host routes each to the guest so container IPs are
         // reachable. Install these BEFORE publishing names, so a freshly-resolvable
         // <name>.velox.local is routable the moment DNS answers it (rather than briefly

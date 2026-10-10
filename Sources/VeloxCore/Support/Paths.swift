@@ -88,6 +88,9 @@ public enum VsockPort {
     /// VZNATNetworkDeviceAttachment is opaque to Swift, so the host learns the vmnet
     /// gateway IP (and guest IP/mask) this way — needed to bind the conduit pool.
     public static let gateway: UInt32 = 2378
+    /// Host file events → guest: the host streams `A <mode-octal> <path>\n` lines and the
+    /// guest re-creates each as an inotify event (see `FileEventBridge`).
+    public static let fileEvents: UInt32 = 2380
 }
 
 /// The VZNAT reverse-dial conduit pool's **TCP** port (NOT a vsock port). The guest dials

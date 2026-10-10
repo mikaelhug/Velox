@@ -242,7 +242,7 @@ The binding architecture:
   binfmt (`setup_binfmt`) — then forks+supervises `dockerd` (on a unix socket, with
   `--host-gateway-ip` for host.docker.internal), runs the vsock agent (ports 2375
   docker / 2374 control+sync / 2376 reverse-port-forward / 2377 clock / 2378
-  gateway-probe), and reaps
+  gateway-probe / 2380 host file events → inotify for bind mounts), and reaps
   zombies. All custom guest code is Rust (pillar #3) — keep it lean.
 - The engine ships as Docker's **official static binaries** (`DOCKER_VERSION` in
   `versions.env`). A tiny musl userland (`nftables`, `e2fsprogs`, `ca-certificates`

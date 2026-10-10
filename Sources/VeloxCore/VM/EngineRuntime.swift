@@ -31,6 +31,8 @@ public final class EngineRuntime: @unchecked Sendable {
     private let watcher: DockerEventsWatcher
     private let clockSync: ClockSync
     private let forwardingGuard: ForwardingGuard
+    /// Host file changes → guest inotify for bind mounts (`VELOX_FILE_EVENTS=0` disables).
+    private let fileEvents: FileEventBridge?
     /// Set by the async gateway-probe task once the fast path is up; guarded by `lock`
     /// because `stop()` can race the probe.
     private var conduitPool: ConduitPool?
@@ -83,6 +85,13 @@ public final class EngineRuntime: @unchecked Sendable {
         // Some VPN clients zero net.inet.ip.forwarding on connect, which kills the
         // entire vmnet NAT datapath; the guard restores it through the helper.
         forwardingGuard = ForwardingGuard(helper: helper)
+        if ProcessInfo.processInfo.environment["VELOX_FILE_EVENTS"] != "0" {
+            let bridge = FileEventBridge(manager: manager)
+            fileEvents = bridge
+            watcher.onBindSources = { bridge.update(sources: $0) }
+        } else {
+            fileEvents = nil
+        }
     }
 
     /// Wire everything up. Throws only if the Docker unix-socket proxy can't bind
@@ -209,6 +218,7 @@ public final class EngineRuntime: @unchecked Sendable {
         probe?.cancel()
         forwardingGuard.stop()
         watcher.stop()
+        fileEvents?.stop()
         nameDNS.stop()
         namedRouter.stop(wait: waitForTeardown)  // remove host routes so none dangle once the VM is gone
         forwarder.stopAll()
