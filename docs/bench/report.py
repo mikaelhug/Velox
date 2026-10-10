@@ -36,6 +36,9 @@ SPEC = [
     ("lifecycle", "restart_to_ready", "time_s",    ("Startup (other engine resident)", False, "s")),
     ("lifecycle", "restart_to_ready_solo", "time_s", ("Startup: restart→API-ready", False, "s")),
     ("lifecycle", "restart_to_ready_ping", "time_s", ("Startup (25 ms /_ping poll)", False, "s")),
+    # The 25 ms poll perturbs OrbStack (each early, slow-failing connection delays it ~0.5 s);
+    # `_sparse` waits for the socket file, then one blocking request (2026-10-10).
+    ("lifecycle", "restart_to_ready_sparse", "time_s", ("Startup: restart→API-ready (sparse probe)", False, "s")),
     ("launch", "run_true", "median_s",             ("Container launch (run true)", False, "s")),
     ("launch", "churn30_per", "per_s",             ("Sequential churn (per container)", False, "s")),
     ("launch", "parallel20_total", "total_s",      ("Parallel launch x20 (total)", False, "s")),

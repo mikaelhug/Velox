@@ -1024,13 +1024,22 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
     # spawn per probe) was larger than the differences being measured — the startup gap to
     # OrbStack is ~0.33 s. Recorded as `restart_to_ready_ping` so it never mixes with the
     # 0.5 s-polled `restart_to_ready_solo` rows of the 2026-10-09 run.
+    #
+    # The probe must not perturb what it measures. Hammering the socket every 25 ms cost OrbStack
+    # ~0.5 s (2026-10-10): its early connections fail slowly (~0.1–0.3 s each) and each one
+    # pushes its first answer out — measured 1.26–1.35 s at 10–100 ms probe intervals vs
+    # 0.75–0.79 s at 250–500 ms, same Mac, same hour. Velox holds an early connection open until
+    # dockerd answers, so it reads the same either way (0.42–0.45 s). So: wait for the socket
+    # FILE with stat (no connections at all), then one blocking request; only an outright
+    # failure retries, 250 ms apart. Recorded as `restart_to_ready_sparse`.
     log "[$ENG] starting, timing to API-ready (/_ping on $SOCK)"; local t0; t0=$(now); start_engine "$ENG"
     local deadline=$((SECONDS + 120))
+    while [ "$SECONDS" -lt "$deadline" ] && [ ! -S "$SOCK" ]; do sleep 0.005; done
     while [ "$SECONDS" -lt "$deadline" ]; do
-      api_ping "$SOCK" && { rec "$ENG" lifecycle restart_to_ready_ping time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }
-      sleep 0.025
+      api_ping "$SOCK" && { rec "$ENG" lifecycle restart_to_ready_sparse time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }
+      sleep 0.25
     done
-    rec "$ENG" lifecycle restart_to_ready_ping time_s s NA
+    rec "$ENG" lifecycle restart_to_ready_sparse time_s s NA
     warn "[$ENG] DID NOT become ready in 120s"; }
   # Order alternates with the round so neither engine always gets the warm host. ROUND may
   # carry a non-numeric tag (step's retry appends "r"), so use its leading digits only.

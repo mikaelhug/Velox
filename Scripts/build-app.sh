@@ -126,6 +126,13 @@ cp "$DIST/plugins/docker-buildx"  "$APP/Contents/Resources/bin/docker-buildx"
 cp "$KERNEL_SRC"                "$APP/Contents/Resources/kernel"
 cp "$ROOT_SRC"                  "$APP/Contents/Resources/root.img"
 [ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# Strip local symbols from the bundled Docker CLIs (already SHA-256 verified above; signed
+# below, so stripping's invalidated signature is replaced). Measured: docker 40 → 36 MiB,
+# compose 29 → 26 MiB, buildx already stripped upstream. No runtime effect.
+for b in docker docker-compose docker-buildx; do
+    strip -x "$APP/Contents/Resources/bin/$b" 2>/dev/null \
+        || { echo "error: strip failed on bin/$b" >&2; exit 1; }
+done
 chmod +x "$APP/Contents/Resources/bin/velox" "$APP/Contents/Resources/bin/docker" \
          "$APP/Contents/Resources/bin/docker-compose" "$APP/Contents/Resources/bin/docker-buildx" \
          "$APP/Contents/Resources/bin/velox-porthelper"
