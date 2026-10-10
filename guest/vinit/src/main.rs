@@ -2736,8 +2736,23 @@ impl Dir {
 }
 struct Conn { a: RawFd, b: RawFd, ab: Dir, ba: Dir }
 
+/// Keep a bulk-relay thread off CPU 0. Under VZ every virtio interrupt (net, vsock, blk, fs)
+/// is a GICv3 SPI routed to CPU 0, so CPU 0 runs all of eth0's RX softirq — ~90% of it during
+/// a published-port transfer. A relay worker the scheduler happens to place there competes
+/// with the softirq feeding it: measured single-stream published port 31–37 Gbit/s with the
+/// worker on CPU 0 vs 48–49 Gbit/s elsewhere, on the same boot (the source of the ±25%
+/// single-stream spread; now ±1%). Best-effort; a 1–2 vCPU guest keeps every CPU.
+fn pin_off_irq_cpu() {
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if n <= 2 { return; }
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for c in 1..(n as usize).min(libc::CPU_SETSIZE as usize) { unsafe { libc::CPU_SET(c, &mut set) }; }
+    unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set); }
+}
+
 fn relay_worker_loop(w: std::sync::Arc<RelayWorker>) {
     use std::collections::HashMap; use std::rc::Rc; use std::cell::RefCell;
+    pin_off_irq_cpu();
     let mut conns: HashMap<RawFd, Rc<RefCell<Conn>>> = HashMap::new();
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 512];
     loop {
@@ -2881,13 +2896,19 @@ fn handle_reverse(fd: RawFd) {
 }
 
 /// UDP reverse relay. The host tunnels each datagram length-prefixed
-/// (`[u16 BE len][payload]`) over the vsock stream; we dial the published UDP
-/// port inside the guest (docker-proxy on 127.0.0.1:port, same as the TCP path)
-/// and shuttle datagrams both ways until the host closes the flow (idle) or errors.
+/// (`[u16 BE len][payload]`) over the vsock stream; we dial the target — the container's
+/// own `ip:port` when the host knows it (direct dial, like the TCP path; required for a port
+/// published on a specific host address, whose docker-proxy listens on that non-local
+/// address rather than 127.0.0.1), else docker-proxy on 127.0.0.1:port — and shuttle
+/// datagrams both ways until the host closes the flow (idle) or errors.
 fn handle_reverse_udp(vsock: RawFd, port: &str) {
     use std::os::unix::io::AsRawFd;
-    let target = format!("127.0.0.1:{port}");
-    let sock = match std::net::UdpSocket::bind("127.0.0.1:0") {
+    let (target, local) = if port.contains(':') {
+        (port.to_string(), "0.0.0.0:0")       // container IP: must leave via a routable source
+    } else {
+        (format!("127.0.0.1:{port}"), "127.0.0.1:0")
+    };
+    let sock = match std::net::UdpSocket::bind(local) {
         Ok(s) => s, Err(e) => { log!("udp reverse bind: {e}"); unsafe { libc::close(vsock); } return; }
     };
     if let Err(e) = sock.connect(&target) {
