@@ -1031,9 +1031,23 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
     # dockerd answers, so it reads the same either way (0.42–0.45 s). So: wait for the socket
     # FILE with stat (no connections at all), then one blocking request; only an outright
     # failure retries, 250 ms apart. Recorded as `restart_to_ready_sparse`.
+    #
+    # "The socket file exists" must mean the NEW engine's socket: an engine that leaves its
+    # socket file behind on quit would otherwise pass the wait at once and fall through to the
+    # 250 ms retry loop — the dense probing this avoids, applied to one engine only. So wait for
+    # an inode different from the one there before the start (a fresh bind is a new inode).
+    local before; before=$(stat -L -f %i "$SOCK" 2>/dev/null || echo none)
     log "[$ENG] starting, timing to API-ready (/_ping on $SOCK)"; local t0; t0=$(now); start_engine "$ENG"
     local deadline=$((SECONDS + 120))
-    while [ "$SECONDS" -lt "$deadline" ] && [ ! -S "$SOCK" ]; do sleep 0.005; done
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if [ -S "$SOCK" ]; then
+        [ "$before" = none ] && break
+        [ "$(stat -L -f %i "$SOCK" 2>/dev/null)" != "$before" ] && break
+        sleep 0.01
+      else
+        sleep 0.005
+      fi
+    done
     while [ "$SECONDS" -lt "$deadline" ]; do
       api_ping "$SOCK" && { rec "$ENG" lifecycle restart_to_ready_sparse time_s s "$(secs "$t0" "$(now)" 0)"; log "[$ENG] ready"; return 0; }
       sleep 0.25

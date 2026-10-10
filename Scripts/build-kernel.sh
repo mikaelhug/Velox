@@ -129,11 +129,37 @@ cd "$SRC"
 
 # --- Phase 2b: Velox source patches (guest/kernel/patches/*.sh, name order) ---
 # Each script checks its own anchors and exits non-zero if upstream moved the code, which
-# fails this build — a kernel bump can never ship with a patch silently missing.
+# fails this build — a kernel bump can never ship with a patch silently missing. A patch
+# saves the pristine copy of each file as `<file>.velox-orig` the first time it edits it.
+#
+# The tree lives on a persistent volume, so this phase owns two things no single script can:
+#  - EVERY saved original is restored before any patch runs. Restoring per script left a
+#    deleted (or renamed) patch with its edits compiled in forever.
+#  - A file whose patched result is byte-identical to last build keeps the previous copy
+#    and mtime (`<file>.velox-prev`), so an unchanged patch costs no recompile. An original
+#    no patch edits any more is dropped once its file is back to pristine.
+origs=$(find . -name "*.velox-orig" -not -path "./.git/*")
+for o in $origs; do
+    f="${o%.velox-orig}"
+    cp -p "$f" "$f.velox-prev"
+    cp "$o" "$f"
+done
 for p in /tmp/patches/*.sh; do
     [ -f "$p" ] || continue
     echo "==> [container] applying $(basename "$p")"
     sh "$p"
+done
+for o in $(find . -name "*.velox-orig" -not -path "./.git/*"); do
+    f="${o%.velox-orig}"
+    if [ -f "$f.velox-prev" ] && cmp -s "$f" "$f.velox-prev"; then
+        mv "$f.velox-prev" "$f"
+    else
+        rm -f "$f.velox-prev"
+    fi
+    if cmp -s "$f" "$o"; then
+        echo "==> [container] $f: no patch edits it any more — pristine"
+        rm -f "$o"
+    fi
 done
 
 # --- Phase 3: tinyconfig + curated fragment + olddefconfig ---

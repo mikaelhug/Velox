@@ -21,7 +21,11 @@ pillars that deliver it:
    dockerd accepts the Mac address and reports it back, the host binds exactly that address
    (`PublishedPort.resolveHostIP`; conflicting addresses on one port fail closed to loopback),
    and every relay path dials the container endpoint directly (`PublishedEndpoints`), since
-   docker-proxy then listens on that non-local address, not 127.0.0.1. dockerd
+   docker-proxy then listens on that non-local address, not 127.0.0.1. The cost of
+   `ip_nonlocal_bind`: an address the Mac doesn't have is accepted by `docker run` (Docker
+   would refuse it), so the failure surfaces at the host bind — a named warning
+   (`PublishBind.bindFailure`) plus the port's bind-issue badge — never silently. IPv4 only;
+   an IPv6 host address fails closed to loopback. dockerd
    `--host-gateway-ip` wires `host.docker.internal`.
    (Truly *beating* VZNAT on raw throughput would need a custom hypervisor —
    OrbStack's moat, out of scope; VZNAT keeps us on-par-or-better within VZ.)

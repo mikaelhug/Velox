@@ -40,6 +40,10 @@ public final class PortForwarder: @unchecked Sendable {
     /// Privileged ports already warned about a specific `publishHostIP` the helper can't
     /// bind (warn-once; all access is on `queue`).
     private var warnedSpecificPrivileged: Set<UInt16> = []
+    /// The address each port's failed bind was last logged for. A failed bind is retried on
+    /// every reconcile (the address may appear later — a VPN, a new interface), so without
+    /// this the same warning repeated on each container event (warn-once; on `queue`).
+    private var warnedBindFailure: [UInt16: String] = [:]
     /// Fired when a published port can't get its localhost listener (true) or the
     /// condition clears (false) — the GUI badges the port instead of burying the
     /// only signal in a log line. Set before `reconcile` is first called.
@@ -232,7 +236,10 @@ public final class PortForwarder: @unchecked Sendable {
                 }
             }
             guard bound == 0, listen(s, 128) == 0 else {
-                Log.warn("port-forward: could not bind \(publish.label):\(port) (errno \(errno))")
+                let err = errno
+                if warnedBindFailure.updateValue(publish.label, forKey: port) != publish.label {
+                    Log.warn(publish.bindFailure(port: port, proto: "port", errno: err))
+                }
                 Darwin.close(s)
                 onBindIssue?(port, true)
                 return
@@ -261,7 +268,7 @@ public final class PortForwarder: @unchecked Sendable {
             }
         }
         listeners[port] = Listener(sources: sources, spec: spec)
-        warnedPrivileged.remove(port)
+        warnedPrivileged.remove(port); warnedBindFailure.removeValue(forKey: port)
         if shadowed {
             Log.warn("port-forward: \(publish.label):\(port) is bound, but another process already holds "
                      + "127.0.0.1:\(port) — it keeps winning `localhost` traffic; this port serves "
@@ -369,6 +376,7 @@ public final class PortForwarder: @unchecked Sendable {
 
     private func closeListener(_ port: UInt16) {
         warnedPrivileged.remove(port)
+        warnedBindFailure.removeValue(forKey: port)
         onBindIssue?(port, false) // unpublished → whatever issue it had is moot
         guard let listener = listeners.removeValue(forKey: port) else { return }
         for source in listener.sources { source.cancel() }

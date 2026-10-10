@@ -113,6 +113,10 @@ public final class UDPForwarder: @unchecked Sendable {
     private var warnedPrivileged: Set<UInt16> = []
     /// Privileged ports already warned about a specific `publishHostIP` (warn-once; on `queue`).
     private var warnedSpecificPrivileged: Set<UInt16> = []
+    /// The address each port's failed bind was last logged for. A failed bind is retried on
+    /// every reconcile (the address may appear later — a VPN, a new interface), so without
+    /// this the same warning repeated on each container event (warn-once; on `queue`).
+    private var warnedBindFailure: [UInt16: String] = [:]
     private let idleSeconds: TimeInterval
     private var reaper: DispatchSourceTimer?
     private let maxPending = 32
@@ -222,7 +226,10 @@ public final class UDPForwarder: @unchecked Sendable {
             fd = pfd
         } else {
             guard let s = Self.bindUDP(port: port, v4: publish.v4) else {
-                Log.warn("udp-forward: could not bind \(publish.label):\(port)/udp (errno \(errno))")
+                let err = errno
+                if warnedBindFailure.updateValue(publish.label, forKey: port) != publish.label {
+                    Log.warn(publish.bindFailure(port: port, proto: "udp", errno: err))
+                }
                 onBindIssue?(port, true)
                 return
             }
@@ -253,7 +260,7 @@ public final class UDPForwarder: @unchecked Sendable {
 
         let listener = Listener(sockets: sockets, spec: spec)
         listeners[port] = listener
-        warnedPrivileged.remove(port)
+        warnedPrivileged.remove(port); warnedBindFailure.removeValue(forKey: port)
         for s in sockets { s.source.resume() }
         onBindIssue?(port, false)   // serving now — clear any earlier badge
         Log.info("udp-forward: \(publish.label):\(port)/udp → guest:\(port)/udp"
@@ -314,6 +321,7 @@ public final class UDPForwarder: @unchecked Sendable {
 
     private func closeListener(_ port: UInt16) {
         warnedPrivileged.remove(port)
+        warnedBindFailure.removeValue(forKey: port)
         onBindIssue?(port, false) // unpublished → whatever issue it had is moot
         guard let listener = listeners.removeValue(forKey: port) else { return }
         // Every flow must be deregistered from the relay loop BEFORE the shared UDP fd

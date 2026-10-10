@@ -34,7 +34,13 @@ public final class EventRelay: @unchecked Sendable {
 
     /// Take ownership of `a` and `b` and relay between them until both sides close; `onClose`
     /// fires once when both fds are closed. The fds are made non-blocking.
-    public func relay(_ a: Int32, _ b: Int32, onClose: @escaping @Sendable () -> Void) {
+    ///
+    /// `spinReads` arms the short post-read spin (see `RelayWorker.readSpinNs`). It is for the
+    /// Docker-API leg only — the one path whose writer (the docker CLI) is stuck with an 8 KiB
+    /// send buffer. Published-port conduits carry many concurrent bulk streams over a small
+    /// worker pool, where a spinning read would hold a worker while its other pairs wait.
+    public func relay(_ a: Int32, _ b: Int32, spinReads: Bool = false,
+                      onClose: @escaping @Sendable () -> Void) {
         // Round-robin over the workers whose loop is still alive. A retired worker would
         // accept the pair and never register it — the connection would hang open forever.
         rrLock.lock()
@@ -49,7 +55,7 @@ public final class EventRelay: @unchecked Sendable {
             Log.error("event relay: no live worker — dropping the connection")
             close(a); close(b); onClose(); return
         }
-        w.add(a, b, onClose)
+        w.add(a, b, spinReads, onClose)
     }
 
     /// Close every relayed pair (engine stop). Without this, an established published-port
@@ -121,8 +127,9 @@ private final class RelayConn {
     let ab: RelayDir   // a → b
     let ba: RelayDir   // b → a
     let onClose: @Sendable () -> Void
-    init(a: Int32, b: Int32, onClose: @escaping @Sendable () -> Void) {
-        self.a = a; self.b = b
+    let spinReads: Bool
+    init(a: Int32, b: Int32, spinReads: Bool, onClose: @escaping @Sendable () -> Void) {
+        self.a = a; self.b = b; self.spinReads = spinReads
         ab = RelayDir(src: a, dst: b)
         ba = RelayDir(src: b, dst: a)
         self.onClose = onClose
@@ -174,8 +181,8 @@ private final class RelayWorker: @unchecked Sendable {
         return true
     }
 
-    func add(_ a: Int32, _ b: Int32, _ onClose: @escaping @Sendable () -> Void) {
-        let conn = RelayConn(a: a, b: b, onClose: onClose)
+    func add(_ a: Int32, _ b: Int32, _ spinReads: Bool, _ onClose: @escaping @Sendable () -> Void) {
+        let conn = RelayConn(a: a, b: b, spinReads: spinReads, onClose: onClose)
         addLock.lock(); incoming.append(conn); addLock.unlock()
         var byte: UInt8 = 1
         _ = write(pipeW, &byte, 1) // wake the loop
@@ -256,7 +263,8 @@ private final class RelayWorker: @unchecked Sendable {
     /// within microseconds; catching that refill here saves a sleep/wake per 8 KiB chunk.
     /// Measured: `docker cp` in 488 → 847 MB/s, out 640 → 740 MB/s, `docker run` and
     /// `docker ps` latency unchanged. Bounded and only armed by data actually flowing, so an
-    /// idle connection never spins.
+    /// idle connection never spins — and only on pairs registered with `spinReads` (the
+    /// Docker-API leg), so a busy published-port conduit never holds its worker.
     private static let readSpinNs: UInt64 = 20_000
 
     private func handleRead(_ conn: RelayConn, _ dir: RelayDir) {
@@ -283,7 +291,7 @@ private final class RelayWorker: @unchecked Sendable {
                 if conn.ab.finished && conn.ba.finished { teardown(conn) }
                 return
             } else {
-                if errno == EAGAIN, readAny {
+                if errno == EAGAIN, readAny, conn.spinReads {
                     let now = DispatchTime.now().uptimeNanoseconds
                     if spinUntil == 0 { spinUntil = now + Self.readSpinNs }
                     if now < spinUntil { continue }

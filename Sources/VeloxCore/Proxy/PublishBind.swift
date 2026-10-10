@@ -10,10 +10,12 @@ import Foundation
 /// drives this; the default is the Docker-compatible wildcard, and `"127.0.0.1"` restores
 /// the old host-only behaviour for anyone who wants it.
 ///
-/// This is a **host-side** bind address only. The guest always publishes on `0.0.0.0`
-/// guest-locally, and a macOS host address means nothing inside the VM — asking the guest
-/// dockerd for one fails with `cannot assign requested address` — so a per-container
-/// `-p <hostIP>:8080:80` is not supported. This global setting is the supported knob.
+/// A per-container `-p <hostIP>:8080:80` overrides this for its port (`PublishedPort`). The
+/// guest dockerd accepts the Mac address only because vinit sets `ip_nonlocal_bind` — which
+/// also means it accepts an address the Mac doesn't have, where Docker would fail the
+/// `docker run`. That error surfaces here instead: the host bind fails, `bindFailure` names
+/// the address, and the port gets its bind-issue badge. IPv4 only; an IPv6 host address
+/// fails closed to loopback.
 public struct PublishBind: Sendable, Equatable {
     /// IPv4 address to bind, in network byte order.
     public let v4: in_addr_t
@@ -52,22 +54,39 @@ public struct PublishBind: Sendable, Equatable {
     /// only reason to set this key at all is to restrict (the default is already
     /// all-interfaces), so a typo means someone was trying to lock down — resolving that
     /// to "exposed on the LAN" would be exactly the wrong direction. Warns either way.
-    public static func parse(_ raw: String) -> PublishBind {
+    ///
+    /// `origin` names where the value came from in that warning — the `publishHostIP` setting
+    /// by default, or a container's `-p <hostIP>:<port>`.
+    public static func parse(_ raw: String, origin: String? = nil) -> PublishBind {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         switch s {
-        case "", "0.0.0.0", "*": return .wildcard
-        case "127.0.0.1", "localhost": return .loopback
+        case "", "0.0.0.0", "*", "::": return .wildcard
+        case "127.0.0.1", "localhost", "::1": return .loopback
         default: break
         }
         var a = in_addr()
         guard s.withCString({ inet_pton(AF_INET, $0, &a) }) == 1 else {
-            Log.warn("publishHostIP \"\(raw)\" is not a valid IPv4 address — "
-                     + "binding published ports to 127.0.0.1 (host-only)")
+            let what = origin ?? "publishHostIP \"\(raw)\""
+            let why = s.contains(":") ? "IPv6 host addresses aren't supported for published ports"
+                                      : "not a valid IPv4 address"
+            Log.warn("\(what): \(why) — binding 127.0.0.1 instead (host-only)")
             return .loopback
         }
         // A specific host address: bind exactly it. If it isn't assigned to any interface
         // the bind fails with EADDRNOTAVAIL and the forwarder logs the address by name.
         return PublishBind(v4: a.s_addr, v6: nil, isWildcard: false, label: s)
+    }
+
+    /// The log line for a failed host bind. `EADDRNOTAVAIL` on a specific address is the one
+    /// worth spelling out: it means the Mac has no such address, and because the guest accepted
+    /// it (`ip_nonlocal_bind`) the container is running while its port silently isn't.
+    public func bindFailure(port: UInt16, proto: String, errno err: Int32) -> String {
+        if err == EADDRNOTAVAIL, !isWildcard, !isLoopback {
+            return "\(proto)-forward: \(label) is not an address of this Mac — port \(port) is NOT "
+                + "published (the container is running). Use an address `ifconfig` lists, or "
+                + "publish without a host IP."
+        }
+        return "\(proto)-forward: could not bind \(label):\(port) (errno \(err))"
     }
 
     /// True when a `HostIp` reported by dockerd is a loopback literal.
@@ -113,7 +132,9 @@ public struct PublishedPort: Hashable, Sendable {
     /// unparseable one fails closed to loopback, as `PublishBind.parse` does).
     public func bind(default def: PublishBind) -> PublishBind {
         guard let hostIP else { return def }
-        return PublishBind.isLoopbackLiteral(hostIP) ? .loopback : PublishBind.parse(hostIP)
+        return PublishBind.isLoopbackLiteral(hostIP)
+            ? .loopback
+            : PublishBind.parse(hostIP, origin: "-p \(hostIP.contains(":") ? "[\(hostIP)]" : hostIP):\(port)")
     }
 
     /// Resolve the host address for one port from every binding dockerd reported for it

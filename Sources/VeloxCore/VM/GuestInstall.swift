@@ -49,7 +49,6 @@ public enum GuestInstall {
     }
 
     public static func refreshFromBundleIfNeeded() {
-        let fm = FileManager.default
         // Only a packaged .app carries a bundled guest; a dev build has none → nothing to sync.
         // `refreshNeeded` is the one definition of "already current" (shared with the engine's
         // off-main decision, so the two can't drift apart).

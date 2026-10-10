@@ -209,9 +209,6 @@ fn main() {
 
 // =================== filesystems ===================
 
-/// CString from a KNOWN-CONSTANT (or fully vinit-computed) path — never call this on
-/// host-supplied input. With `panic = "abort"` a panic in PID 1 is a kernel panic, so
-/// anything that can carry outside bytes must handle the NUL error instead (do_mount).
 /// Block read-ahead for the virtio disks: Linux's usual 128 KiB, set before anything demand-pages
 /// dockerd.
 ///
@@ -235,6 +232,9 @@ fn tune_block_readahead() {
     }
 }
 
+/// CString from a KNOWN-CONSTANT (or fully vinit-computed) path — never call this on
+/// host-supplied input. With `panic = "abort"` a panic in PID 1 is a kernel panic, so
+/// anything that can carry outside bytes must handle the NUL error instead (do_mount).
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("BUG: NUL in constant path")
 }

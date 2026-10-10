@@ -44,16 +44,16 @@ public final class VsockBridge: @unchecked Sendable {
                             close(localFd)
                             return
                         }
-                        self.startPump(localFd, vsockFd)
+                        self.startPump(localFd, vsockFd, port: port)
                     }
                 } else {
-                    self.startPump(localFd, vsockFd)
+                    self.startPump(localFd, vsockFd, port: port)
                 }
             }
         }
     }
 
-    private func startPump(_ localFd: Int32, _ vsockFd: Int32) {
+    private func startPump(_ localFd: Int32, _ vsockFd: Int32, port: UInt32) {
         // One relay for the whole process (CLAUDE.md: one mechanism per job). This path used
         // to run its own `SocketPump` — a second, independent implementation of exactly the
         // same job (bidirectional splice with backpressure and half-close). Both had to get
@@ -69,7 +69,7 @@ public final class VsockBridge: @unchecked Sendable {
         // anything that got past this guard is in the relay's set by the time it drains.
         lock.lock()
         guard !stopped else { lock.unlock(); close(localFd); close(vsockFd); return }
-        EventRelay.shared.relay(localFd, vsockFd) {}
+        EventRelay.shared.relay(localFd, vsockFd, spinReads: port == VsockPort.docker) {}
         lock.unlock()
     }
 

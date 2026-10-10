@@ -2110,6 +2110,15 @@ do {
     check(PublishedPort(port: 18003, hostIP: "garbage").bind(default: .wildcard).isLoopback,
           "an unparseable HostIp fails closed to loopback")
     check(PublishedPort(port: 5432, hostIP: "::1").loopbackOnly, "::1 is a loopback pin too")
+    check(PublishBind.parse("::").isWildcard, ":: is the v6 spelling of all interfaces")
+    check(PublishBind.parse("::1").isLoopback, "::1 is the v6 spelling of loopback")
+    check(PublishedPort(port: 8080, hostIP: "fd00::5").bind(default: .wildcard).isLoopback,
+          "an IPv6 host address fails closed to loopback (v4-only listeners)")
+    let lanBind = PublishBind.parse("192.0.2.77")
+    check(lanBind.bindFailure(port: 8080, proto: "port", errno: EADDRNOTAVAIL).contains("not an address of this Mac"),
+          "EADDRNOTAVAIL on a specific address names the missing address")
+    check(PublishBind.wildcard.bindFailure(port: 8080, proto: "port", errno: EADDRINUSE).contains("errno"),
+          "other bind failures keep the generic errno message")
 }
 
 
@@ -2253,6 +2262,17 @@ section("FileEventBridge")
     check(f.admit("/p", mtimeSec: 10, mtimeNsec: 6, size: 100), "a new save (mtime moved) is forwarded")
     check(f.admit("/p", mtimeSec: 10, mtimeNsec: 6, size: 101), "a same-mtime size change is forwarded")
     check(f.admit("/q", mtimeSec: 10, mtimeNsec: 6, size: 101), "paths are tracked independently")
+
+    check(FileEventBridge.isTooBroad("/"), "/ is never watched")
+    check(FileEventBridge.isTooBroad("/Users"), "/Users is never watched")
+    check(!FileEventBridge.isTooBroad("/Users/a"), "a home directory is watched (with exclusions)")
+    check(!FileEventBridge.isTooBroad("/tmp/.X11-unix"), "two components is a real bind")
+    equal(FileEventBridge.exclusions(roots: ["/Users/a"], home: "/Users/a"),
+          ["/Users/a/Library", "/Users/a/.velox"], "a $HOME bind drops ~/Library and ~/.velox")
+    equal(FileEventBridge.exclusions(roots: ["/Users/a/src"], home: "/Users/a"), [],
+          "a project bind needs no exclusions")
+    equal(FileEventBridge.exclusions(roots: ["/Users/a", "/Users/a/Library/App"], home: "/Users/a"),
+          ["/Users/a/.velox"], "never exclude a subtree the user bound explicitly")
 }
 fileEventBridgeTest()
 

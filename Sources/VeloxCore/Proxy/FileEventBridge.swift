@@ -22,6 +22,12 @@ import CoreServices
 /// - **The echo is filtered at the source** (`EchoFilter`): our chmod comes back as an FSEvent,
 ///   and with FileEvents the flags are sticky, so only a moved mtime or size counts as a change.
 ///
+/// - **Bounded.** A bind mount of `/` or `/Users` would put every file write on the Mac on
+///   this path, so roots that shallow are not watched (`isTooBroad`). A bind of `$HOME` itself
+///   is watched minus `~/Library` and `~/.velox` — app caches, and Velox's own `data.img`,
+///   which the VM rewrites constantly (`exclusions`). A burst bigger than `maxLinesPerBatch`
+///   (a host-side `git checkout`, an `npm install`) collapses to its parent directories.
+///
 /// `VELOX_FILE_EVENTS=0` turns it off (EngineRuntime).
 public final class FileEventBridge: @unchecked Sendable {
     private let manager: VMManager
@@ -33,6 +39,9 @@ public final class FileEventBridge: @unchecked Sendable {
     private var pending: [UInt8] = []
     private var stopped = false
     private var echo = EchoFilter()
+    private var warnedBroad = Set<String>()
+    private var warnedBurst = false
+    private let home = NSHomeDirectory()
 
     public init(manager: VMManager) { self.manager = manager }
 
@@ -45,7 +54,16 @@ public final class FileEventBridge: @unchecked Sendable {
             for s in sources where s.hasPrefix("/") {
                 var isDir: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: s, isDirectory: &isDir) else { continue }
-                dirs.insert(isDir.boolValue ? s : (s as NSString).deletingLastPathComponent)
+                let dir = isDir.boolValue ? s : (s as NSString).deletingLastPathComponent
+                if Self.isTooBroad(dir) {
+                    if warnedBroad.insert(dir).inserted {
+                        Log.warn("file events: not watching bind source \(dir) — too broad (every file "
+                                 + "change on the Mac would reach the guest); bind a project directory "
+                                 + "for change notifications")
+                    }
+                    continue
+                }
+                dirs.insert(dir)
             }
             guard dirs != roots else { return }
             roots = dirs
@@ -67,8 +85,21 @@ public final class FileEventBridge: @unchecked Sendable {
     private func restartStream() {
         stopStream()
         guard !roots.isEmpty else { return }
-        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
-                                       retain: nil, release: nil, copyDescription: nil)
+        // The stream holds a reference to us for as long as it lives (released by
+        // FSEventStreamRelease), so a callback already queued when the bridge's last other
+        // owner lets go can never reach a freed object.
+        var ctx = FSEventStreamContext(
+            version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<FileEventBridge>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<FileEventBridge>.fromOpaque(info).release()
+            },
+            copyDescription: nil)
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents
                                              | kFSEventStreamCreateFlagNoDefer
                                              | kFSEventStreamCreateFlagUseCFTypes)
@@ -88,6 +119,8 @@ public final class FileEventBridge: @unchecked Sendable {
             Log.warn("file events: FSEventStreamCreate failed for \(roots.count) path(s)")
             return
         }
+        let excluded = Self.exclusions(roots: roots, home: home)
+        if !excluded.isEmpty { FSEventStreamSetExclusionPaths(s, excluded as CFArray) }
         FSEventStreamSetDispatchQueue(s, queue)
         FSEventStreamStart(s)
         stream = s
@@ -100,6 +133,29 @@ public final class FileEventBridge: @unchecked Sendable {
         stream = nil
     }
 
+    /// A root this shallow (`/`, `/Users`, `/Volumes`, `/private`) covers far more than any
+    /// project: watching it would turn every write on the Mac into guest work.
+    public static func isTooBroad(_ dir: String) -> Bool {
+        dir.split(separator: "/").count < 2
+    }
+
+    /// Subtrees to drop from a stream over `roots`: `~/Library` (app caches and state churn
+    /// constantly) and `~/.velox` (the VM's own `data.img`), when a root contains them — never
+    /// when a root sits inside them, which would silence a bind the user asked for.
+    public static func exclusions(roots: Set<String>, home: String) -> [String] {
+        [home + "/Library", home + "/.velox"].filter { ex in
+            roots.contains { ex.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }
+                && !roots.contains { $0 == ex || $0.hasPrefix(ex + "/") }
+        }
+    }
+
+    /// Paths forwarded per FSEvents batch. Each line costs the guest one FUSE setattr round
+    /// trip, so a host-side `git checkout` or `npm install` touching tens of thousands of files
+    /// would otherwise queue seconds of guest work. Past the cap a batch pokes only parent
+    /// directories (a watcher rescans a poked directory, so the change still arrives); what is
+    /// left beyond that is dropped.
+    static let maxLinesPerBatch = 2048
+
     private static let contentMask = FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated
         | kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemRenamed
         | kFSEventStreamEventFlagItemModified)
@@ -108,17 +164,29 @@ public final class FileEventBridge: @unchecked Sendable {
     private func handle(_ batch: [(String, FSEventStreamEventFlags)]) {
         var lines: [String] = []
         var seen = Set<String>()
-        func poke(_ path: String) {
-            guard seen.insert(path).inserted else { return }
+        // `force` sends even when mtime and size are unchanged — a collapsed burst pokes the
+        // parent of an in-place edit, whose own mtime didn't move. It still records the stat,
+        // so the echo of that chmod is filtered like any other.
+        func poke(_ path: String, force: Bool = false) {
+            guard lines.count < Self.maxLinesPerBatch, seen.insert(path).inserted else { return }
             var st = stat()
             guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK else { return }
-            guard echo.admit(path, mtimeSec: st.st_mtimespec.tv_sec, mtimeNsec: st.st_mtimespec.tv_nsec,
-                             size: Int64(st.st_size)) else { return }
+            let changed = echo.admit(path, mtimeSec: st.st_mtimespec.tv_sec,
+                                     mtimeNsec: st.st_mtimespec.tv_nsec, size: Int64(st.st_size))
+            guard changed || force else { return }
             if let line = Self.line(mode: st.st_mode, path: path) { lines.append(line) }
+        }
+        let burst = batch.count > Self.maxLinesPerBatch
+        if burst, !warnedBurst {
+            warnedBurst = true
+            Log.info("file events: \(batch.count) host changes in one batch — forwarding their "
+                     + "directories instead of each file (logged once)")
         }
         for (path, flags) in batch where flags & Self.contentMask != 0 {
             let parent = (path as NSString).deletingLastPathComponent
-            if FileManager.default.fileExists(atPath: path) {
+            if burst {
+                poke(parent, force: true)
+            } else if FileManager.default.fileExists(atPath: path) {
                 poke(path)
                 // A new entry: the parent's listing changed too.
                 if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated
