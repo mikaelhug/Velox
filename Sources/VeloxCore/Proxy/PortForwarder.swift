@@ -22,6 +22,8 @@ public final class PortForwarder: @unchecked Sendable {
     }
 
     private let bridge: VsockBridge
+    /// Container endpoints for direct dial (see `PublishedEndpoints.tcpTarget`).
+    private let endpoints: PublishedEndpoints?
     /// Source of listeners for privileged (<1024) ports, which an unprivileged
     /// process can't bind itself (nil ⇒ such ports are skipped).
     private let privilegedBinder: PrivilegedPortBinder?
@@ -46,8 +48,10 @@ public final class PortForwarder: @unchecked Sendable {
     public init(bridge: VsockBridge,
                 privilegedBinder: PrivilegedPortBinder? = nil,
                 conduitPool: ConduitPool? = nil,
-                publish: PublishBind = .wildcard) {
+                publish: PublishBind = .wildcard,
+                endpoints: PublishedEndpoints? = nil) {
         self.bridge = bridge
+        self.endpoints = endpoints
         self.privilegedBinder = privilegedBinder
         self.conduitPool = conduitPool
         self.publish = publish
@@ -58,8 +62,9 @@ public final class PortForwarder: @unchecked Sendable {
     /// the fast path; in-flight ones are unaffected. The pool gets the vsock relay as its
     /// last-resort fallback (used only when no conduit is available in time).
     public func attachConduitPool(_ pool: ConduitPool) {
-        pool.setFallback { [bridge] clientFd, port in
-            bridge.bridge(localFd: clientFd, toGuestPort: VsockPort.reverse, header: "\(port)\n")
+        pool.setFallback { [bridge, endpoints] clientFd, port in
+            let target = endpoints?.tcpTarget(port) ?? "\(port)"
+            bridge.bridge(localFd: clientFd, toGuestPort: VsockPort.reverse, header: "\(target)\n")
         }
         queue.async { self.conduitPool = pool }
     }
@@ -389,7 +394,8 @@ public final class PortForwarder: @unchecked Sendable {
             if let pool = conduitPool {
                 pool.submit(clientFd: client, port: port)
             } else {
-                bridge.bridge(localFd: client, toGuestPort: VsockPort.reverse, header: "\(port)\n")
+                let target = endpoints?.tcpTarget(port) ?? "\(port)"
+                bridge.bridge(localFd: client, toGuestPort: VsockPort.reverse, header: "\(target)\n")
             }
         }
     }

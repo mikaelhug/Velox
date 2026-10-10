@@ -54,12 +54,16 @@ public final class EngineRuntime: @unchecked Sendable {
         // Privileged ports (<1024) come pre-bound from the root helper.
         let helper = PortHelperManager()
         portHelper = helper
-        let fwd = PortForwarder(bridge: bridge, privilegedBinder: helper, publish: publish)
+        // Direct-dial endpoint map: the watcher fills it; the conduit pool and both forwarders'
+        // vsock relays read it.
+        let endpoints = PublishedEndpoints()
+        self.endpoints = endpoints
+        let fwd = PortForwarder(bridge: bridge, privilegedBinder: helper, publish: publish,
+                                endpoints: endpoints)
         forwarder = fwd
-        let udp = UDPForwarder(manager: manager, privilegedBinder: helper, publish: publish)
+        let udp = UDPForwarder(manager: manager, privilegedBinder: helper, publish: publish,
+                               endpoints: endpoints)
         udpForwarder = udp
-        // Direct-dial endpoint map: the watcher fills it, the conduit pool reads it.
-        endpoints = PublishedEndpoints()
         // Direct (named) container access: the watcher fills name→IP for the loopback
         // DNS responder and surfaces bridge subnets, which the router routes to the
         // guest via the porthelper. Gated on the one-time grant; inert if declined.

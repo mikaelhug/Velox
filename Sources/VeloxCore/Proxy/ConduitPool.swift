@@ -8,16 +8,31 @@ import Foundation
 public final class PublishedEndpoints: @unchecked Sendable {
     private let lock = NSLock()
     private var map: [UInt16: String] = [:]
+    private var udpMap: [UInt16: String] = [:]
 
     public init() {}
 
-    public func update(_ m: [UInt16: String]) {
-        lock.lock(); map = m; lock.unlock()
+    public func update(_ m: [UInt16: String], udp: [UInt16: String] = [:]) {
+        lock.lock(); map = m; udpMap = udp; lock.unlock()
     }
 
     public func endpoint(for port: UInt16) -> String? {
         lock.lock(); defer { lock.unlock() }; return map[port]
     }
+
+    public func udpEndpoint(for port: UInt16) -> String? {
+        lock.lock(); defer { lock.unlock() }; return udpMap[port]
+    }
+
+    /// The in-band target for a TCP relay to the guest: the container endpoint when known,
+    /// else the bare port (the guest then dials docker-proxy on 127.0.0.1). Every relay path —
+    /// conduit and vsock fallback alike — uses this, because a port published on a specific
+    /// host address (`-p <Mac-IP>:…`) has docker-proxy listening on that non-local address in
+    /// the guest, not on 127.0.0.1, so only the direct dial reaches it.
+    public func tcpTarget(_ port: UInt16) -> String { endpoint(for: port) ?? "\(port)" }
+
+    /// Same for UDP (`"<ip>:<port>"` or the bare port).
+    public func udpTarget(_ port: UInt16) -> String { udpEndpoint(for: port) ?? "\(port)" }
 }
 
 /// Host end of the VZNAT reverse-dial conduit pool. The guest dials a pool of TCP conduits
@@ -288,7 +303,7 @@ public final class ConduitPool: @unchecked Sendable {
             close(clientFd)
             return
         }
-        let target = endpoints?.endpoint(for: port) ?? "\(port)"
+        let target = endpoints?.tcpTarget(port) ?? "\(port)"
         guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
             // Don't close inline when a source still owns it: `cancel()` is asynchronous, so
             // this would close the fd before libdispatch deregisters its kevent. Leaving

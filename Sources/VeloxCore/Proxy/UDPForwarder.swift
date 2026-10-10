@@ -104,6 +104,8 @@ public final class UDPForwarder: @unchecked Sendable {
     private let privilegedBinder: PrivilegedPortBinder?
     /// Host address the listeners bind (default: all interfaces).
     private let publish: PublishBind
+    /// Container endpoints for direct dial (see `PublishedEndpoints.udpTarget`).
+    private let endpoints: PublishedEndpoints?
     private let queue = DispatchQueue(label: "dev.velox.udpfwd")
     private let relay = RelayLoop()
     private var listeners: [UInt16: Listener] = [:]
@@ -122,8 +124,10 @@ public final class UDPForwarder: @unchecked Sendable {
 
     public init(manager: VMManager, idleSeconds: TimeInterval = 60,
                 privilegedBinder: PrivilegedPortBinder? = nil,
-                publish: PublishBind = .wildcard) {
+                publish: PublishBind = .wildcard,
+                endpoints: PublishedEndpoints? = nil) {
         self.manager = manager
+        self.endpoints = endpoints
         self.idleSeconds = idleSeconds
         self.privilegedBinder = privilegedBinder
         self.publish = publish
@@ -397,7 +401,7 @@ public final class UDPForwarder: @unchecked Sendable {
                     Log.error("udp-forward: vsock connect failed: \(error.localizedDescription)")
                     listener.flows[key] = nil
                 case .success(let vsockFd):
-                    let header = Array("udp \(port)\n".utf8)
+                    let header = Array("udp \(self.endpoints?.udpTarget(port) ?? "\(port)")\n".utf8)
                     guard FDIO.writeAll(vsockFd, header) else { Darwin.close(vsockFd); listener.flows[key] = nil; return }
                     // Non-blocking from here on: reads run on the relay loop, and writes
                     // must never block the shared queue (writeFrame drops when full).

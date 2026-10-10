@@ -182,6 +182,7 @@ public final class DockerEventsWatcher: @unchecked Sendable {
         var tcpBinds: [UInt16: [String?]] = [:]
         var udpBinds: [UInt16: [String?]] = [:]
         var endpointMap: [UInt16: String] = [:]
+        var udpEndpointMap: [UInt16: String] = [:]
         var nameMap: [String: in_addr_t] = [:]
         // Bare compose service aliases, merged after the loop: two projects each with a `db`
         // both claimed `db.velox.local` and resolution went to whichever dockerd happened to
@@ -224,13 +225,14 @@ public final class DockerEventsWatcher: @unchecked Sendable {
                     if let ip = c.directIP { endpointMap[port] = "\(ip):\(p.privatePort)" }
                 case "udp":
                     udpBinds[port, default: []].append(p.ip)
+                    if let ip = c.directIP { udpEndpointMap[port] = "\(ip):\(p.privatePort)" }
                 default: break
                 }
             }
         }
         // Refresh the direct-dial map every reconcile (a restart can change a container's IP
         // without changing the published-port *set*), independent of the onPorts diff below.
-        endpoints?.update(endpointMap)
+        endpoints?.update(endpointMap, udp: udpEndpointMap)
         // Bridge-network subnets → the host routes each to the guest so container IPs are
         // reachable. Install these BEFORE publishing names, so a freshly-resolvable
         // <name>.velox.local is routable the moment DNS answers it (rather than briefly
