@@ -2289,6 +2289,13 @@ section("Engine nap")
     counter.end()   // unmatched: must not go negative or fire
     equal(edges.value, [true, false], "two overlapping requests are one busy stretch")
     check(!counter.isBusy, "an unmatched end leaves the counter at zero")
+    // Regression: the handler used to grow by a pair of thunks per request and overflowed the
+    // stack after ~4,000 requests. 100k requests must leave it callable at constant depth.
+    let fired = Locked(0)
+    let busyCounter = ActivityCounter()
+    busyCounter.setOnChange { fired.withLock { $0 += 1 } }
+    for _ in 0..<100_000 { busyCounter.begin(); busyCounter.end() }
+    equal(fired.value, 200_000, "100k requests fire 200k edges without the handler growing")
 
     // The guest MAC is minted once and then stable: every boot is the same DHCP client.
     let macURL = FileManager.default.temporaryDirectory.appendingPathComponent("vx-mac-\(getpid())")

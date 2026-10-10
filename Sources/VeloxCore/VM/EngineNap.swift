@@ -32,32 +32,40 @@ import Foundation
 /// "busy: false" argument could record idle while a `docker build` is connected. A handler reads
 /// `isBusy` when it runs instead — the last one to run always sees the current state.
 public final class ActivityCounter: @unchecked Sendable {
-    private let state = Locked<(count: Int, onChange: (@Sendable () -> Void)?)>((0, nil))
+    // Plain stored properties behind a plain lock — deliberately NOT a `Locked<(count, onChange)>`.
+    // Mutating a tuple that holds a closure through the generic `Locked.withLock(inout T)`
+    // re-abstracts the closure on every pass (into the generic representation and back), and the
+    // stored value grows by a pair of thunks each time: after ~4,000 requests, firing the handler
+    // recursed through 16,000 thunk frames and overflowed the stack (crashed v1.7.1-dev after
+    // 50 minutes of dashboard use, 2026-10-10).
+    private let lock = NSLock()
+    private var count = 0
+    private var onChange: (@Sendable () -> Void)?
 
     public init() {}
 
     /// Called when work begins after an idle stretch and when the last piece of work ends. Runs on
     /// whatever thread ended or began the work — hop to your own queue, then read `isBusy`.
     public func setOnChange(_ handler: (@Sendable () -> Void)?) {
-        state.withLock { $0.onChange = handler }
+        lock.lock(); onChange = handler; lock.unlock()
     }
 
-    public var isBusy: Bool { state.value.count > 0 }
+    public var isBusy: Bool { lock.lock(); defer { lock.unlock() }; return count > 0 }
 
     public func begin() {
-        let edge = state.withLock { s -> (@Sendable () -> Void)? in
-            s.count += 1
-            return s.count == 1 ? s.onChange : nil
-        }
+        lock.lock()
+        count += 1
+        let edge = count == 1 ? onChange : nil
+        lock.unlock()
         edge?()
     }
 
     public func end() {
-        let edge = state.withLock { s -> (@Sendable () -> Void)? in
-            guard s.count > 0 else { return nil }   // an unmatched end must not go negative
-            s.count -= 1
-            return s.count == 0 ? s.onChange : nil
-        }
+        lock.lock()
+        guard count > 0 else { lock.unlock(); return }   // an unmatched end must not go negative
+        count -= 1
+        let edge = count == 0 ? onChange : nil
+        lock.unlock()
         edge?()
     }
 }
