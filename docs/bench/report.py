@@ -95,21 +95,20 @@ slept = {(r["engine"], r["run_id"], r["round"]) for r in rows
 peers = sorted({r["engine"] for r in rows} - {"velox", "host"})
 PEER = peers[0] if peers else "dd"
 PNAME = NAMES.get(PEER, PEER)
-if True:
-    for r in rows:
-        if r["engine"] == "host":
-            continue
-        if (r["engine"], r["run_id"], r["round"]) in slept and r["suite"] in SUITE_ROWS:
-            continue
-        eng, key = r["engine"], (r["suite"], r["test"], r["metric"])
-        if r["suite"] == "matrix":
-            matrix[r["test"]][eng] = r["value"]
-            engines.add(eng)
-            continue
-        try:
-            vals[key][eng].append(float(r["value"]))
-        except (ValueError, TypeError):
-            nas[key][eng] += 1          # "NA" — a failed measurement, never a zero
+for r in rows:
+    if r["engine"] == "host":
+        continue
+    if (r["engine"], r["run_id"], r["round"]) in slept and r["suite"] in SUITE_ROWS:
+        continue
+    eng, key = r["engine"], (r["suite"], r["test"], r["metric"])
+    if r["suite"] == "matrix":
+        matrix[r["test"]][eng] = r["value"]
+        engines.add(eng)
+        continue
+    try:
+        vals[key][eng].append(float(r["value"]))
+    except (ValueError, TypeError):
+        nas[key][eng] += 1          # "NA" — a failed measurement, never a zero
 
 
 def stats(xs):

@@ -1032,8 +1032,10 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
     done
     rec "$ENG" lifecycle restart_to_ready_ping time_s s NA
     warn "[$ENG] DID NOT become ready in 120s"; }
-  # Order alternates with the round so neither engine always gets the warm host.
-  if [ $((ROUND % 2)) = 1 ]; then _one "$CTX_A" "$LBL_A"; _one "$CTX_B" "$LBL_B"
+  # Order alternates with the round so neither engine always gets the warm host. ROUND may
+  # carry a non-numeric tag (step's retry appends "r"), so use its leading digits only.
+  local rnum="${ROUND%%[!0-9]*}"
+  if [ $(( ${rnum:-0} % 2 )) = 1 ]; then _one "$CTX_A" "$LBL_A"; _one "$CTX_B" "$LBL_B"
   else _one "$CTX_B" "$LBL_B"; _one "$CTX_A" "$LBL_A"; fi
 }
 

@@ -2205,11 +2205,11 @@ section("ReconnectBackoff")
                    .milliseconds(800), .seconds(1), .seconds(1)],
           "failed passes back off 50 ms, doubling, to a 1 s ceiling")
     // A pass that lasted at least the ceiling was a real connection: start over at 50 ms.
-    b.passBegan()
-    Thread.sleep(forTimeInterval: 1.05)
-    equal(b.delayAfterPass(), .milliseconds(50), "a long-lived pass resets the backoff")
-    b.passBegan()
-    equal(b.delayAfterPass(), .milliseconds(100), "…and the next fast failure grows it again")
+    let t0 = ContinuousClock.now
+    b.passBegan(at: t0)
+    equal(b.delayAfterPass(at: t0 + .milliseconds(1_050)), .milliseconds(50), "a long-lived pass resets the backoff")
+    b.passBegan(at: t0)
+    equal(b.delayAfterPass(at: t0 + .milliseconds(10)), .milliseconds(100), "…and the next fast failure grows it again")
 }
 reconnectBackoffTest()
 

@@ -71,6 +71,10 @@ const DOCKER_SOCK: &str = "/run/docker.sock";
 /// against this (atomic) value and signals the supervisor thread to respawn when it
 /// dies; -1 means "no dockerd" (e.g. a data-disk failure refused startup).
 static DOCKERD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+/// Set once boot knows dockerd will never be started (the data disk failed to mount), so
+/// Docker-API connections fail at once instead of waiting `DOCKER_SOCK_WAIT` for a socket that
+/// cannot appear.
+static DOCKERD_NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() {
     // vinit IS the init — it must be PID 1. If it's ever exec'd otherwise (e.g.
@@ -144,11 +148,20 @@ fn main() {
     // subnet does not move). Everything else that needs the network — DNS, conduits, the
     // direct-access rules — still waits for the real lease. Containers get resolv.conf at
     // create time, not at daemon start, so dockerd has no other dependency on the lease.
-    let early_gw = if data_ok { cached_gateway() } else { None };
+    //
+    // One exception: a container dockerd itself starts at boot (a restart policy) gets its
+    // resolv.conf when it starts — and before the lease /etc/resolv.conf is the empty rootfs
+    // file, so it would be handed Docker's 8.8.8.8 fallback (no *.docker.internal responder, no
+    // corporate/VPN DNS) until its next restart. So the early start only happens when no
+    // container would be restarted by dockerd (`any_restart_policy_container`).
+    if !data_ok { DOCKERD_NEVER.store(true, std::sync::atomic::Ordering::SeqCst); }
+    // Sysctls dockerd needs (ip_forward) and the guest-wide tuning: none depend on the lease.
+    enable_ip_forwarding();
+    tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
+    tune_memory_sysctls();  // no periodic kcompactd wakeups at idle
+    let early_gw = if data_ok && !any_restart_policy_container() { cached_gateway() } else { None };
     let mut early_pid = -1;
     if let Some(gw) = early_gw {
-        enable_ip_forwarding();
-        tune_memory_sysctls();
         early_pid = spawn_dockerd_with_gateway(gw);
         if early_pid >= 0 {
             DOCKERD_PID.store(early_pid, std::sync::atomic::Ordering::SeqCst);
@@ -156,9 +169,6 @@ fn main() {
         }
     }
     if let Some(h) = net_handle { let _ = h.join(); }
-    enable_ip_forwarding();
-    tune_network_sysctls(); // survive published-port connection churn (TIME_WAIT/port exhaustion)
-    tune_memory_sysctls();  // no periodic kcompactd wakeups at idle
     let leased_gw = GATEWAY_IP.load(std::sync::atomic::Ordering::Relaxed);
     if data_ok { remember_gateway(leased_gw); }
     // dockerd lifecycle is supervised on a *separate* thread so the PID-1 reaper never
@@ -173,9 +183,13 @@ fn main() {
             DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
         } else if leased_gw != 0 && Some(leased_gw) != early_gw {
             // The lease moved the gateway: restart dockerd so host.docker.internal is right.
-            // The supervisor respawns it with GATEWAY_IP (now the leased value).
+            // Done here, synchronously, before the reaper and the supervisor exist — handing it
+            // to the supervisor would count a deliberate restart as crash loop #1 (2 s backoff
+            // and a misleading log line).
             log!("gateway changed {} → {} — restarting dockerd", ipstr(early_gw.unwrap_or(0)), ipstr(leased_gw));
-            unsafe { libc::kill(early_pid, libc::SIGTERM); }
+            stop_and_reap(early_pid, std::time::Duration::from_secs(10));
+            let pid = spawn_dockerd();
+            DOCKERD_PID.store(pid, std::sync::atomic::Ordering::SeqCst);
         }
         start_docker_events_informer(nft_tx.clone());
         spawn_worker("dockerd-supervisor", move || dockerd_supervisor(deaths_rx, nft_tx));
@@ -2002,6 +2016,40 @@ fn remember_gateway(gw: u32) {
     }
 }
 
+/// Whether any container on the data disk has a restart policy dockerd would act on at start
+/// (always / unless-stopped / on-failure). Read straight from dockerd's per-container
+/// `hostconfig.json` — a few small files, no daemon needed. Conservative: anything unreadable
+/// or unrecognised counts as "would restart", which only costs the early-start speed-up.
+fn any_restart_policy_container() -> bool {
+    let Ok(dir) = std::fs::read_dir("/var/lib/docker/containers") else { return false };
+    for entry in dir.flatten() {
+        let Ok(cfg) = std::fs::read_to_string(entry.path().join("hostconfig.json")) else { return true };
+        let policy = cfg.split("\"RestartPolicy\":{\"Name\":\"").nth(1)
+            .and_then(|rest| rest.split('"').next());
+        match policy {
+            Some("") | Some("no") => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// SIGTERM `pid` and reap it, escalating to SIGKILL after `grace`. Only for use before the
+/// reaper runs (the early-start restart in main), so nobody else can collect the status.
+fn stop_and_reap(pid: i32, grace: std::time::Duration) {
+    unsafe { libc::kill(pid, libc::SIGTERM); }
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        let r = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if r == pid || r < 0 { return; }
+        if std::time::Instant::now() >= deadline {
+            unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, std::ptr::null_mut(), 0); }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn spawn_dockerd_with_gateway(gw: u32) -> i32 {
     // dockerd discovers containerd/runc/nft on PATH and manages its own containerd
     // (no iptables binary is shipped — see the nftables firewall backend below). Unix
@@ -2205,6 +2253,7 @@ fn connect_docker_sock(client: RawFd) -> Option<UnixStream> {
     // Steady state: dockerd is up — connect immediately, no inotify fd, no extra syscalls.
     match UnixStream::connect(DOCKER_SOCK) {
         Ok(s) => return Some(s),
+        Err(_) if DOCKERD_NEVER.load(std::sync::atomic::Ordering::SeqCst) => return None,
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT) | Some(libc::ECONNREFUSED)) => {}
         Err(e) => { log!("dial docker.sock: {e}"); return None; }
     }
@@ -2226,6 +2275,10 @@ fn connect_docker_sock(client: RawFd) -> Option<UnixStream> {
     let mut redial_ms: i32 = 5;
     let mut client_open = true; // false once the host half-closed — see the poll below
     let result = loop {
+        if DOCKERD_NEVER.load(std::sync::atomic::Ordering::SeqCst) {
+            log!("dial docker.sock: dockerd is not running (data disk failed) — dropping connection");
+            break None;
+        }
         let wait_ms = match UnixStream::connect(DOCKER_SOCK) {
             Ok(s) => break Some(s),
             Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED)
@@ -2292,7 +2345,9 @@ fn handle_gateway(fd: RawFd) {
     };
     let ip = GUEST_IP.load(std::sync::atomic::Ordering::Relaxed);
     let mask = GUEST_MASK.load(std::sync::atomic::Ordering::Relaxed);
-    let line = format!("{} {} {}\n", ipstr(gw), ipstr(ip), ipstr(mask));
+    // The 4th field is this boot's conduit token (see `conduit_token`). It travels only over
+    // vsock — private to this VM — so nothing else on the vmnet bridge can learn it.
+    let line = format!("{} {} {} {}\n", ipstr(gw), ipstr(ip), ipstr(mask), conduit_token());
     let _ = nix_write(fd, line.as_bytes());
     unsafe { libc::close(fd); }
 }
@@ -2463,6 +2518,23 @@ fn conduit_slot() {
     }
 }
 
+/// Per-boot secret every conduit presents before the host will park it. The pool listens on
+/// the vmnet bridge, which every VZ NAT VM on the Mac shares, and checking the source IP
+/// alone let any of them spoof the guest's address and be handed published-port client
+/// connections. The token reaches the host only over vsock (the gateway probe), so a spoofer
+/// can't know it. 128 random bits, hex.
+fn conduit_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut b = [0u8; 16];
+        let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, b.len(), 0) };
+        if n != b.len() as isize {
+            let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+        }
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    })
+}
+
 /// Dial one conduit to the host's pool listener over VZNAT, with keepalive so a silently
 /// evicted idle conduit is detected + redialled within ~40s. None on failure (caller backs off).
 fn dial_conduit() -> Option<RawFd> {
@@ -2470,8 +2542,12 @@ fn dial_conduit() -> Option<RawFd> {
     if gw == 0 { return None; }
     let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::from(gw), POOL_PORT));
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5)) {
-        Ok(stream) => {
+        Ok(mut stream) => {
             let _ = stream.set_nodelay(true); // assignment + data flow without Nagle delay
+            // Authenticate first: the host parks a conduit only after this boot's token.
+            if std::io::Write::write_all(&mut stream, format!("{}\n", conduit_token()).as_bytes()).is_err() {
+                return None;
+            }
             let fd = stream.into_raw_fd();
             set_conduit_keepalive(fd);
             Some(fd)
@@ -2533,17 +2609,6 @@ fn resolve_one(target: &str) -> std::io::Result<std::net::SocketAddr> {
 }
 
 fn bridge_to_target(fd: RawFd, header: &str) {
-    // `docker`: a Docker API connection from ~/.velox/docker.sock (ConduitPool.submitDocker).
-    // Same epoll relay as published ports — bulk API traffic (cp/load/build contexts) rides
-    // VZNAT instead of the vsock bridge. Only the host writes conduit headers, and containers
-    // are kept off the conduit listener by the conduit guard, so this adds no new exposure.
-    if header == "docker" {
-        match connect_docker_sock(fd) {
-            Some(up) => relay_submit(fd, up.into_raw_fd()),
-            None => { log!("conduit: docker.sock unavailable"); unsafe { libc::close(fd); } }
-        }
-        return;
-    }
     let mut target = header.to_string();
     if !target.contains(':') { target = format!("127.0.0.1:{target}"); }
     // Bounded: `connect` with no timeout parks this thread for the full SYN timeout (~2 min)

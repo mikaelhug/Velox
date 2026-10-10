@@ -23,14 +23,15 @@ public struct ReconnectBackoff: Sendable {
 
     public init() {}
 
-    /// Call at the top of each connect + reconcile + stream pass.
-    public mutating func passBegan() {
-        passStarted = .now
+    /// Call at the top of each connect + reconcile + stream pass. `now` is injectable so the
+    /// schedule can be tested without sleeping.
+    public mutating func passBegan(at now: ContinuousClock.Instant = .now) {
+        passStarted = now
     }
 
     /// The delay to sleep before the next pass, now that the current one has ended.
-    public mutating func delayAfterPass() -> Duration {
-        if ContinuousClock.now - passStarted >= Self.ceiling { next = Self.initial }
+    public mutating func delayAfterPass(at now: ContinuousClock.Instant = .now) -> Duration {
+        if now - passStarted >= Self.ceiling { next = Self.initial }
         let delay = next
         next = min(next * 2, Self.ceiling)
         return delay

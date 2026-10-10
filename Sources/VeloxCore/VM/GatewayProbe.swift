@@ -10,6 +10,9 @@ public struct GatewayInfo: Sendable {
     public let gatewayIP: in_addr_t
     /// The guest's own VZNAT IP, network byte order (used to validate conduit peers).
     public let guestIP: in_addr_t
+    /// This boot's conduit token: every conduit must send it (`<token>\n`) before it is parked.
+    /// nil only for a guest that predates conduit authentication.
+    public let conduitToken: String?
 }
 
 public enum GatewayProbe {
@@ -44,7 +47,7 @@ public enum GatewayProbe {
                                socklen_t(MemoryLayout<timeval>.size))
                     var buf = [UInt8]()
                     var byte: UInt8 = 0
-                    while buf.count < 64 {
+                    while buf.count < 128 {
                         let n = read(fd, &byte, 1)
                         if n <= 0 { break }
                         if byte == UInt8(ascii: "\n") { break }
@@ -59,7 +62,8 @@ public enum GatewayProbe {
 
     private static func parse(_ line: String) -> GatewayInfo? {
         let parts = line.split(separator: " ").map(String.init)
-        guard parts.count == 3,
+        // `<gw> <ip> <mask> [<conduit token>]` — the token field is absent from an older guest.
+        guard parts.count == 3 || parts.count == 4,
               let gw = ipToBE(parts[0]), gw != 0,
               let ip = ipToBE(parts[1]),
               let mask = ipToBE(parts[2]) else { return nil }
@@ -68,7 +72,9 @@ public enum GatewayProbe {
             return nil
         }
         Log.info("gateway probe: gw=\(parts[0]) guest=\(parts[1]) mask=\(parts[2]) iface=\(iface)")
-        return GatewayInfo(gatewayIP: gw, guestIP: ip)
+        let token = parts.count == 4 && !parts[3].isEmpty ? parts[3] : nil
+        if token == nil { Log.warn("gateway probe: guest sent no conduit token; conduits are authenticated by source IP only") }
+        return GatewayInfo(gatewayIP: gw, guestIP: ip, conduitToken: token)
     }
 
     /// Parse dotted-decimal → `in_addr_t` (network byte order), or nil.

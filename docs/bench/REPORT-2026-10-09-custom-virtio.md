@@ -20,11 +20,22 @@ reporting OrbStack's biggest resource gain. Its data disk is btrfs mounted `disc
 |---|---|---|---|---|
 | Startup, GUI launch → API ready (10 ms `/_ping` poll) | 0.95–0.98 s | **0.47 s** | 1.24–1.27 s | `Task.immediate` boots the VM during app init; dockerd starts before DHCP with the cached gateway |
 | Idle CPU, VM process (quiet 90 s windows) | 0.37–0.40 % | **0.18–0.19 %** | 0.27 % | `vm.compaction_proactiveness=0`, 15-min ClockSync backstop, fewer guest wakers |
-| `docker cp` out, 1 GiB | 643–649 MB/s | **609–1,001 MB/s** (median ~780) | 691 MB/s | Docker API over the VZNAT conduit pool |
-| `docker cp` in, 1 GiB | ~480 MB/s | ~500 MB/s | 542 MB/s | capped by the docker CLI's 8 KiB AF_UNIX send buffer; same ceiling as OrbStack |
+| `docker cp` out, 1 GiB | 532 MB/s | ~620–650 MB/s | 691 MB/s | 4 MiB socket buffers + 4 MiB guest vsock window (still a small trail) |
+| `docker cp` in, 1 GiB | ~370 MB/s | ~480 MB/s | 542 MB/s | same; capped by the docker CLI's own 8 KiB AF_UNIX send buffer — OrbStack sits at the same ceiling |
 | Disk returned after a 2 GiB delete | next boot / hourly | **2.6 GB within 45 s** | continuous | debounced FITRIM on Docker delete/destroy/prune events |
 | Small-file extract (busybox, 8,000 entries) | ~2.4 s | ~2.4 s | 0.88 s | no viable fix inside VZ (see below) |
 | RAM returned after teardown | none | none | continuous | macOS 27 VZ balloon releases nothing (see below) |
+
+**The Docker-API-over-conduit route was tried and removed.** A first A/B showed `cp` out at
+609–1,001 MB/s over a VZNAT conduit, but back-to-back reruns with the route on and off were
+indistinguishable (616–656 vs 627–687 MB/s), so the earlier spread was noise. Without a
+measurable gain it wasn't worth moving the root-equivalent Docker API off the VM-private vsock
+channel onto the shared vmnet bridge.
+
+**Conduit authentication, kept.** Every conduit now presents a per-boot 128-bit token before
+the host parks it. The guest hands the token over vsock in the gateway probe. Before this, the
+pool trusted the source IP alone, which any VZ NAT VM on the same bridge could spoof to receive
+published-port client connections.
 
 Unchanged:
 - Container launch: 98 ms median, before and after.
@@ -38,9 +49,10 @@ until then neither is published.
 
 ## The macOS 27 custom-device experiments
 
-`VZCustomVirtioDevice` (new in the macOS 27 SDK) was tried through env-gated probes in
-`Sources/VeloxCore/VM/Experimental/CustomVirtioProbes.swift`. Stock Linux binds custom
-device IDs 26 (virtio-fs) and 5 (virtio-balloon).
+`VZCustomVirtioDevice` (new in the macOS 27 SDK) was tried through env-gated probes, kept in
+git history at commit `7ebaa39` (`Sources/VeloxCore/VM/Experimental/CustomVirtioProbes.swift`)
+and removed from the tree once the verdicts were in. Stock Linux binds custom device IDs 26
+(virtio-fs) and 5 (virtio-balloon).
 
 ### Velox-owned virtio-fs server: works, but cannot reach OrbStack
 

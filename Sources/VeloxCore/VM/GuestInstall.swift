@@ -33,6 +33,12 @@ public enum GuestInstall {
     /// Cheap, synchronous: does `refreshFromBundleIfNeeded()` have anything to copy? A few
     /// `stat`s and one small file read. Lets the engine start skip the off-main hop on every
     /// ordinary launch, so the VM can boot before the first window is built.
+    ///
+    /// Stamped on the bundle's CONTENT, not just the version string. Stamping on version
+    /// alone meant a guest rebuilt under the same VELOX_VERSION was never installed:
+    /// ~/.velox kept the older kernel/rootfs and the VM silently booted it, while the app
+    /// bundle carried the new one — invisible (the versions match), and it would strand users
+    /// on a stale guest if a release ever re-cut the same version.
     public static var refreshNeeded: Bool {
         guard let bundledKernel = bundled("kernel"), let bundledRoot = bundled("root.img") else { return false }
         let installedStamp = (try? String(contentsOf: stampURL, encoding: .utf8))?
@@ -45,19 +51,10 @@ public enum GuestInstall {
     public static func refreshFromBundleIfNeeded() {
         let fm = FileManager.default
         // Only a packaged .app carries a bundled guest; a dev build has none → nothing to sync.
-        guard let bundledKernel = bundled("kernel"), let bundledRoot = bundled("root.img") else { return }
-
-        // Stamp on the bundle's CONTENT, not just the version string. Stamping on version
-        // alone meant a guest rebuilt under the same VELOX_VERSION was never installed:
-        // ~/.velox kept the older kernel/rootfs and the VM silently booted it, while the
-        // app bundle carried the new one. That is invisible (the versions match) and costs
-        // a debugging cycle every time — and it would strand users on a stale guest if a
-        // release ever re-cut the same version.
-        let installedStamp = (try? String(contentsOf: stampURL, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `refreshNeeded` is the one definition of "already current" (shared with the engine's
+        // off-main decision, so the two can't drift apart).
+        guard refreshNeeded, let bundledKernel = bundled("kernel"), let bundledRoot = bundled("root.img") else { return }
         let bundleStamp = stamp(version: Versions.velox, kernel: bundledKernel, root: bundledRoot)
-        let haveBoth = fm.fileExists(atPath: Paths.kernel.path) && fm.fileExists(atPath: Paths.rootDisk.path)
-        if haveBoth, installedStamp == bundleStamp { return } // already current
 
         do {
             try Paths.ensureRoot()

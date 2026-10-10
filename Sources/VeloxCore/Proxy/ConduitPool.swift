@@ -52,6 +52,8 @@ public final class ConduitPool: @unchecked Sendable {
 
     private let bindIP: in_addr_t      // network byte order; the vmnet bridge (gateway) address
     private let guestIP: in_addr_t     // the only allowed conduit peer (network byte order)
+    /// `<token>\n` every conduit must send before it is parked (nil: source-IP check only).
+    private let tokenLine: [UInt8]?
     private let queue = DispatchQueue(label: "dev.velox.conduitpool")
     /// Set by `stop()`. Checked in `assign` so a late assignment can't splice a pair onto a
     /// VM being powered off, after `EngineRuntime.stop()` has already drained the relay. On `queue`.
@@ -76,6 +78,7 @@ public final class ConduitPool: @unchecked Sendable {
     public init(gateway: GatewayInfo, endpoints: PublishedEndpoints? = nil) {
         self.bindIP = gateway.gatewayIP
         self.guestIP = gateway.guestIP
+        self.tokenLine = gateway.conduitToken.map { Array("\($0)\n".utf8) }
         self.endpoints = endpoints
     }
 
@@ -145,31 +148,59 @@ public final class ConduitPool: @unchecked Sendable {
                 close(cfd); continue
             }
             Self.setKeepalive(cfd)
-            // A client is already waiting (a burst drained the pool) → assign this conduit to it
-            // immediately instead of parking it.
-            if !waiting.isEmpty {
-                let w = waiting.removeFirst()
-                // This IS a served client — count it, or the breaker only ever sees the
-                // empty-on-submit signal and trips (then doubles its bypass to the 16 s cap)
-                // in exactly the sustained-load regime the fast path exists for.
-                breaker.served()
-                assign(conduit: cfd, clientFd: w.fd, port: w.port, owner: nil)
-                continue
-            }
-            // Otherwise park it. Watch for a readable event before assignment — that's EOF/error
-            // (conntrack eviction / guest gone) → prune it so the pool can't accrue dead fds.
-            let src = DispatchSource.makeReadSource(fileDescriptor: cfd, queue: queue)
-            let owner = FdOwner()
-            src.setEventHandler { [weak self] in self?.discardDead(cfd) }
-            // The source owns the fd until it's popped for assignment. `cancel()` is
-            // asynchronous, so closing the fd inline (as this used to) can beat libdispatch's
+            // Watch the conduit with a read source that owns the fd until assignment. `cancel()`
+            // is asynchronous, so closing the fd inline (as this used to) can beat libdispatch's
             // kevent deregistration — the same fd-closed-under-a-live-source violation that
             // produces EV_VANISHED aborts and fd-reuse cross-talk. Closing from the cancel
             // handler is the only ordering dispatch guarantees.
+            let src = DispatchSource.makeReadSource(fileDescriptor: cfd, queue: queue)
+            let owner = FdOwner()
             src.setCancelHandler { if owner.owns { close(cfd) } }
-            src.resume()
-            ready.append(Parked(fd: cfd, source: src, owner: owner))
+            if tokenLine != nil {
+                // Not trusted yet: the first bytes must be this boot's token. The source IP alone
+                // proves nothing on the shared vmnet bridge (any VZ NAT VM can spoof it).
+                src.setEventHandler { [weak self] in self?.authenticate(cfd, src, owner) }
+                src.resume()
+            } else {
+                src.resume()
+                admit(cfd, src, owner)
+            }
         }
+    }
+
+    /// First readable event on an unauthenticated conduit: it must carry exactly the token line.
+    /// Anything else (wrong token, EOF, a partial line) closes it — a real guest sends the token
+    /// in its first write, and simply redials if its conduit is dropped.
+    private func authenticate(_ fd: Int32, _ src: DispatchSourceRead, _ owner: FdOwner) {
+        guard let want = tokenLine else { return }
+        var buf = [UInt8](repeating: 0, count: 128)
+        let n = recv(fd, &buf, buf.count, MSG_DONTWAIT)
+        guard n == want.count, Array(buf[0..<n]) == want else {
+            if n > 0 { Log.warn("conduit pool: rejecting a conduit with a bad token") }
+            src.cancel()          // cancel handler closes the fd
+            return
+        }
+        admit(fd, src, owner)
+    }
+
+    /// A trusted conduit: hand it to a waiting client, or park it.
+    private func admit(_ fd: Int32, _ src: DispatchSourceRead, _ owner: FdOwner) {
+        // A client is already waiting (a burst drained the pool) → assign this conduit to it
+        // immediately instead of parking it.
+        if !waiting.isEmpty {
+            let w = waiting.removeFirst()
+            // This IS a served client — count it, or the breaker only ever sees the
+            // empty-on-submit signal and trips (then doubles its bypass to the 16 s cap)
+            // in exactly the sustained-load regime the fast path exists for.
+            breaker.served()
+            src.cancel()          // stop monitoring; `assign` decides who closes the fd
+            assign(conduit: fd, clientFd: w.fd, port: w.port, owner: owner)
+            return
+        }
+        // Otherwise park it. From now on a readable event before assignment is EOF/error
+        // (conntrack eviction / guest gone) → prune it so the pool can't accrue dead fds.
+        src.setEventHandler { [weak self] in self?.discardDead(fd) }
+        ready.append(Parked(fd: fd, source: src, owner: owner))
     }
 
     /// A parked conduit became readable before assignment → it's dead. Remove + close it.
@@ -209,24 +240,6 @@ public final class ConduitPool: @unchecked Sendable {
                     self.waiting.append((fd: clientFd, port: port, deadline: now + self.waitTimeout))
                     self.armSweep()
                 }
-            }
-        }
-    }
-
-    /// Docker API connections (the `docker` CLI through `~/.velox/docker.sock`) ride a warm
-    /// conduit too: `docker cp`, `docker load` and build contexts were bounded by the vsock
-    /// transport (cp in ~480 MB/s), while the same bytes over VZNAT TCP measured 1.2–1.6 GB/s.
-    /// Unlike a published port this never waits for the pool to grow and never touches the
-    /// churn breaker: no warm conduit → `fallback` (the vsock bridge) immediately, so a CLI
-    /// command can only gain latency-wise, never queue behind a burst. The guest maps the
-    /// `docker` header to dockerd's unix socket. Always takes ownership of `clientFd`.
-    public func submitDocker(clientFd: Int32, fallback: @escaping @Sendable (Int32) -> Void) {
-        queue.async {
-            guard !self.stopped, let p = self.ready.popLast() else { fallback(clientFd); return }
-            p.source.cancel()     // stop monitoring; `splice` decides who closes the fd
-            FDIO.setSocketBuffers(p.fd)   // bulk API transfers: deep buffers on this leg too
-            self.splice(conduit: p.fd, clientFd: clientFd, header: "docker", owner: p.owner) {
-                fallback($0)
             }
         }
     }
@@ -276,21 +289,12 @@ public final class ConduitPool: @unchecked Sendable {
             return
         }
         let target = endpoints?.endpoint(for: port) ?? "\(port)"
-        splice(conduit: conduit, clientFd: clientFd, header: target, owner: owner) {
-            self.dropToFallback($0, port)
-        }
-    }
-
-    /// Write the in-band `header` and hand the pair to the relay; a stale conduit (the write
-    /// fails) sends the client to `onFail` instead. On `queue`.
-    private func splice(conduit: Int32, clientFd: Int32, header: String, owner: FdOwner?,
-                        onFail: (Int32) -> Void) {
-        guard FDIO.writeAll(conduit, Array("\(header)\n".utf8)) else {
+        guard FDIO.writeAll(conduit, Array("\(target)\n".utf8)) else {
             // Don't close inline when a source still owns it: `cancel()` is asynchronous, so
             // this would close the fd before libdispatch deregisters its kevent. Leaving
             // `owns` set makes the cancel handler do it in the order dispatch guarantees.
             if owner == nil { close(conduit) }
-            onFail(clientFd)
+            dropToFallback(clientFd, port)
             return
         }
         owner?.owns = false   // handed off; the cancel handler must not close it
