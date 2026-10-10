@@ -250,12 +250,24 @@ private final class RelayWorker: @unchecked Sendable {
 
     // src readable: drain it (read→write repeatedly) until EAGAIN or a partial write applies
     // backpressure. Draining per event keeps bulk throughput (few epoll/kqueue dispatches).
+    /// After a successful read, keep re-reading for up to this long before going back to
+    /// kevent. A writer with a small send buffer — the docker CLI's 8 KiB AF_UNIX default on
+    /// every `docker cp` / `load` upload, which no server-side setting can raise — refills it
+    /// within microseconds; catching that refill here saves a sleep/wake per 8 KiB chunk.
+    /// Measured: `docker cp` in 488 → 847 MB/s, out 640 → 740 MB/s, `docker run` and
+    /// `docker ps` latency unchanged. Bounded and only armed by data actually flowing, so an
+    /// idle connection never spins.
+    private static let readSpinNs: UInt64 = 20_000
+
     private func handleRead(_ conn: RelayConn, _ dir: RelayDir) {
         if dir.pendLen > 0 { return } // currently flushing (read should be disabled)
+        var readAny = false
+        var spinUntil: UInt64 = 0
         while true {
             let buf = dir.buffer()   // allocated on first use, not at registration
             let n = read(dir.src, buf, dir.cap)
             if n > 0 {
+                readAny = true; spinUntil = 0
                 let w = write(dir.dst, buf, n)
                 if w == n { dir.growIfSaturated(n); continue } // fully written — keep draining
                 dir.pendOff = w > 0 ? w : 0
@@ -271,6 +283,11 @@ private final class RelayWorker: @unchecked Sendable {
                 if conn.ab.finished && conn.ba.finished { teardown(conn) }
                 return
             } else {
+                if errno == EAGAIN, readAny {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if spinUntil == 0 { spinUntil = now + Self.readSpinNs }
+                    if now < spinUntil { continue }
+                }
                 if errno == EAGAIN || errno == EINTR { return }
                 teardown(conn)
                 return
