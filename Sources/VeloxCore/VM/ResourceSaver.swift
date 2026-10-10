@@ -12,6 +12,23 @@ import Foundation
 /// (you must wait the threshold), armed when the count hits zero and cancelled the
 /// instant a container starts — not a status poll.
 public final class ResourceSaver: @unchecked Sendable {
+    /// Whether ballooning returns memory to macOS on this OS release — i.e. whether running the
+    /// saver does anything at all.
+    ///
+    /// **macOS 27: it doesn't.** Virtualization.framework backs guest RAM with shared-memory
+    /// regions (64 × 128 MiB, `SM=SHM` in vmmap), and an inflated
+    /// `VZVirtioTraditionalMemoryBalloonDevice` frees none of it on the host: measured 7 GiB
+    /// ballooned (`nr_balloon_pages` 1,835,008) with the VM process unchanged at 3.7 GB RSS and
+    /// 0 reclaimable, across deflate/re-inflate cycles, compaction, minutes of hold and a
+    /// simulated memory-pressure notification. On macOS 26.6 the same code took idle RSS
+    /// 734 → 373 MB. On 27 the saver therefore only costs CPU (the inflate) and is not started.
+    /// The user's setting is kept, so it comes back by itself on a release that isn't 27;
+    /// `VELOX_RESOURCE_SAVER_FORCE=1` runs it anyway, to re-test a newer 27.x.
+    public static var isEffectiveOnThisOS: Bool {
+        if ProcessInfo.processInfo.environment["VELOX_RESOURCE_SAVER_FORCE"] == "1" { return true }
+        return ProcessInfo.processInfo.operatingSystemVersion.majorVersion != 27
+    }
+
     private let manager: VMManager
     private let docker: any DockerClientProtocol
     private let fullMemoryBytes: UInt64

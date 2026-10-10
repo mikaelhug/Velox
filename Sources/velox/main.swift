@@ -202,7 +202,10 @@ func runStart(bind: BindMode, workspaceName: String?) -> Never {
                     teardown.run = CLIBinding.apply(bind, socketPath: Paths.dockerSocket.path)
                     // Resource Saver stays outside EngineRuntime (the GUI re-arms its
                     // own on settings changes) but rides the runtime's Docker client.
-                    if prefs.resourceSaverEnabled {
+                    if prefs.resourceSaverEnabled && !ResourceSaver.isEffectiveOnThisOS {
+                        Log.info("resource saver: not started — ballooning returns no memory on this macOS release")
+                    }
+                    if prefs.resourceSaverEnabled && ResourceSaver.isEffectiveOnThisOS {
                         let saver = ResourceSaver(
                             manager: manager, docker: runtime.docker,
                             fullMemoryBytes: prefs.resources.memoryBytes,

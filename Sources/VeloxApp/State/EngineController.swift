@@ -1086,6 +1086,11 @@ final class EngineController {
         resourceSaver = nil
         isResourceSaving = false
         guard config.resourceSaverEnabled, bootedMemoryBytes > 0, let docker else { return }
+        // macOS 27's balloon returns nothing to the host — see ResourceSaver.isEffectiveOnThisOS.
+        guard ResourceSaver.isEffectiveOnThisOS else {
+            Log.info("resource saver: not started — ballooning returns no memory on this macOS release")
+            return
+        }
         // Floor at ¼ of the booted RAM, clamped to [512 MiB, 1 GiB], so dockerd
         // stays responsive enough to notice the next container start.
         let floor = min(max(bootedMemoryBytes / 4, 512 * 1024 * 1024), 1024 * 1024 * 1024)

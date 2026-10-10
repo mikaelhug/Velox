@@ -348,7 +348,8 @@ private struct ResourceSaverSection: View {
     var body: some View {
         Section {
             Toggle("Enable Resource Saver", isOn: $config.resourceSaverEnabled)
-            if config.resourceSaverEnabled {
+                .disabled(!ResourceSaver.isEffectiveOnThisOS)
+            if config.resourceSaverEnabled && ResourceSaver.isEffectiveOnThisOS {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Idle timeout").font(.callout)
                     IntSlider(value: $config.resourceSaverMinutes, range: 1...60,
@@ -358,9 +359,13 @@ private struct ResourceSaverSection: View {
         } header: {
             Text("Resource Saver")
         } footer: {
-            Text(config.resourceSaverEnabled
-                 ? "Reclaims CPU and memory \(config.resourceSaverMinutes) \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") after the last container stops. Exits automatically the moment a container starts."
-                 : "Reduces CPU and memory usage when no containers are running. Exits automatically when a container starts.")
+            if !ResourceSaver.isEffectiveOnThisOS {
+                Text("Unavailable on this version of macOS: its virtualization framework does not hand reclaimed memory back to the Mac, so the saver would only cost CPU. Your setting is kept for when that changes.")
+            } else {
+                Text(config.resourceSaverEnabled
+                     ? "Reclaims CPU and memory \(config.resourceSaverMinutes) \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") after the last container stops. Exits automatically the moment a container starts."
+                     : "Reduces CPU and memory usage when no containers are running. Exits automatically when a container starts.")
+            }
         }
     }
 }
