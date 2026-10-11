@@ -544,6 +544,10 @@ server's hostname, and "Open in Terminal" deliberately spawns its **own** `ssh -
 shell outlives Velox. `.velox.local` named access and the VS Code Dev Containers attach are
 local-engine features and are hidden for remote hosts.
 
+## 13. GUI text
+
+- Keep UI text (labels, hints, messages) very short and professional. No long sentences in the GUI.
+
 ## Build / run quick reference
 
 ```bash

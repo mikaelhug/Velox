@@ -98,7 +98,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Startup")
             } footer: {
-                Text("Velox lives in the menu bar and keeps the engine available without opening the dashboard.")
+                Text("Keeps the engine available from the menu bar.")
             }
 
             Section {
@@ -106,7 +106,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Notifications")
             } footer: {
-                Text("Posts a macOS notification when a container exits with a non-zero code (clean stops are ignored). Event-driven — nothing polls.")
+                Text("Alerts when a container exits with an error.")
             }
 
             Section {
@@ -120,7 +120,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Software Updates")
             } footer: {
-                Text("Updates are pulled from GitHub Releases and installed in place.")
+                Text("Installed from GitHub Releases.")
             }
 
             Section {
@@ -133,7 +133,7 @@ private struct GeneralPane: View {
             } header: {
                 Text("Docker CLI")
             } footer: {
-                Text("Points the `docker` CLI at the Velox engine, so `docker` commands target Velox from any terminal.")
+                Text("Points `docker` at Velox in every terminal.")
             }
 
             Section("About") {
@@ -212,14 +212,14 @@ private struct ResourcesPane: View {
             } header: {
                 Text("CPU")
             } footer: {
-                Text("Number of virtual CPUs available to the engine.")
+                Text("Virtual CPUs for the engine.")
             }
             Section {
                 IntSlider(value: $config.memoryGiB, range: 1...maxMemory, unit: "GB")
             } header: {
                 Text("Memory")
             } footer: {
-                Text("Maximum RAM the guest may use. Resource Saver reclaims unused memory back to macOS while idle.")
+                Text("Maximum memory for the engine.")
             }
             Section {
                 IntSlider(value: $config.swapGiB, range: 0...8,
@@ -227,7 +227,7 @@ private struct ResourcesPane: View {
             } header: {
                 Text("Swap")
             } footer: {
-                Text("Disk-backed swap inside the guest, on the data disk. Lets memory-hungry builds spill over instead of being OOM-killed.")
+                Text("Disk-backed swap for memory-heavy builds.")
             }
             Section {
                 IntSlider(value: activeDiskGiB, range: Workspace.diskGiBRange, step: 8, unit: "GB")
@@ -241,10 +241,7 @@ private struct ResourcesPane: View {
                 // Size and location are per-workspace, so this section describes the active
                 // one. Location lives on the workspace itself (right-click it in the
                 // sidebar) rather than here, where it would read as a global setting.
-                Text("Maximum size of \(activeName)'s data disk, backing /var/lib/docker. "
-                    + "The image is sparse — only the space actually used is allocated on "
-                    + "your Mac, and reclaimed when you remove images. To move it to another "
-                    + "folder or disk, right-click the workspace in the sidebar.")
+                Text("Maximum size of \(activeName)'s data. Right-click the workspace to move it.")
             }
             ResourceSaverSection(config: $config)
             NestedVirtualizationSection(config: $config)
@@ -335,8 +332,8 @@ private struct NestedVirtualizationSection: View {
             Text("Nested Virtualization")
         } footer: {
             Text(supported
-                 ? "Exposes /dev/kvm inside the engine, so containers you grant it to (--device /dev/kvm) can run their own hardware-accelerated VMs — QEMU, Firecracker, Android emulators. Off by default; takes effect on restart."
-                 : "Requires an Apple M3 or later. This Mac's chip doesn't support nested virtualization.")
+                 ? "Exposes /dev/kvm to containers. Applies after restart."
+                 : "Requires Apple M3 or later.")
         }
     }
 }
@@ -358,16 +355,10 @@ private struct ResourceSaverSection: View {
         } header: {
             Text("Resource Saver")
         } footer: {
-            if ResourceSaver.modeForThisOS == .nap {
-                // macOS 27: the balloon returns nothing, so the saver shuts the VM down instead.
-                Text(config.resourceSaverEnabled
-                     ? "Stops the engine after \(config.resourceSaverMinutes) idle \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") to free memory. Resumes on the next docker command."
-                     : "Stops the engine while idle to free memory. Resumes on the next docker command.")
-            } else {
-                Text(config.resourceSaverEnabled
-                     ? "Reclaims CPU and memory \(config.resourceSaverMinutes) \(config.resourceSaverMinutes == 1 ? "minute" : "minutes") after the last container stops. Exits automatically the moment a container starts."
-                     : "Reduces CPU and memory usage when no containers are running. Exits automatically when a container starts.")
-            }
+            // macOS 27: the balloon returns nothing, so the saver stops the VM instead.
+            Text(ResourceSaver.modeForThisOS == .nap
+                 ? "Stops the idle engine. Resumes on demand."
+                 : "Frees memory while no containers run.")
         }
     }
 }
@@ -450,7 +441,7 @@ private struct FileSharingPane: View {
                 } header: {
                     Text("Additional Directories")
                 } footer: {
-                    Text("Containers can mount these read-write with `docker run -v`.")
+                    Text("Mountable with `docker run -v`.")
                 }
             }
 
