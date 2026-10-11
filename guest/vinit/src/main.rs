@@ -529,11 +529,8 @@ fn tune_network_sysctls() {
 /// On-demand compaction is untouched: direct compaction in the allocator, kswapd waking
 /// kcompactd for high-order allocations (THP, the balloon's page migration) all still run.
 fn tune_memory_sysctls() {
-    for (path, val) in [
-        ("/proc/sys/vm/compaction_proactiveness", "0"),
-    ] {
-        if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
-    }
+    let (path, val) = ("/proc/sys/vm/compaction_proactiveness", "0");
+    if let Err(e) = std::fs::write(path, val) { log!("sysctl {path}={val} failed: {e}"); }
 }
 
 fn iface_up(s: RawFd, name: &str) {
