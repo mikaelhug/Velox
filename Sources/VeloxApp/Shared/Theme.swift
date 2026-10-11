@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import VeloxCore
 
 /// Shared visual tokens so the dashboards read as one app rather than a pile of
 /// default tables. Spacing, radii, and the card surfaces all come from here.
@@ -178,6 +179,18 @@ extension View {
     func persistTableLayout<R: Identifiable>(_ layout: TableColumnCustomization<R>,
                                              _ name: String) -> some View {
         onChange(of: layout) { _, newValue in TableLayout.save(name, newValue) }
+    }
+
+    /// Keeps a dashboard table's highlight equal to what its actions act on: every selection
+    /// change is narrowed to `TableSelection.effective` (visible rows; a header un-highlights
+    /// once its members are only partly picked). Every multi-select pane uses this together
+    /// with `TableSelection.resolve` — one selection rule, never a per-pane variant.
+    func honestSelection(_ selection: Binding<Set<String>>,
+                         _ scope: @escaping () -> TableSelection) -> some View {
+        onChange(of: selection.wrappedValue) { _, ids in
+            let effective = scope().effective(ids)
+            if effective != ids { selection.wrappedValue = effective }
+        }
     }
 }
 

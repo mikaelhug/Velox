@@ -365,6 +365,37 @@ do {
 
 // MARK: DockerRunCommand reconstruction
 
+section("TableSelection")
+do {
+    // A standalone row "solo" and one Compose project "p" with three members.
+    let open = TableSelection(rows: ["solo"],
+                              groups: [.init(header: "project:p", members: ["a", "b", "c"], expanded: true)])
+    let all: Set<String> = ["solo", "project:p", "a", "b", "c"]
+    equal(open.resolve(["project:p"]), ["a", "b", "c"], "header alone → the whole project")
+    equal(open.resolve(all), ["solo", "a", "b", "c"], "⌘A → everything")
+    equal(open.resolve(all.subtracting(["b"])), ["solo", "a", "c"],
+          "⌘A then ⌘-click a member out → that member is spared")
+    equal(open.resolve(["project:p", "a"]), ["a"], "header + one member → just that member")
+    equal(open.resolve(["solo", "project:p", "a"]), ["solo", "a"],
+          "range ending mid-group → only the rows in range")
+    equal(open.effective(all.subtracting(["b"])), ["solo", "a", "c"],
+          "partial pick un-highlights the header")
+    equal(open.effective(all), all, "full pick keeps the header")
+    equal(open.effective(["project:p"]), ["project:p"], "header alone keeps the header")
+
+    // Rows nobody can see never count: filtered out, or under a collapsed header.
+    equal(open.resolve(["solo", "gone"]), ["solo"], "a row the table doesn't show is ignored")
+    let shut = TableSelection(rows: ["solo"],
+                              groups: [.init(header: "project:p", members: ["a", "b", "c"], expanded: false)])
+    equal(shut.resolve(["a", "c"]), [], "hidden members of a collapsed group are ignored")
+    equal(shut.resolve(["project:p", "a", "c"]), ["a", "b", "c"],
+          "collapsed header + stale hidden members → the whole project it shows")
+    let filtered = TableSelection(rows: ["x"])
+    equal(filtered.resolve(["x", "y"]), ["x"], "flat table: rows the filter hides are dropped")
+    equal(TableSelection(rows: [], groups: [.init(header: "project:e", members: [], expanded: true)])
+            .resolve(["project:e"]), [], "an empty group resolves to nothing")
+}
+
 section("DockerRunCommand")
 do {
     let inspect = ContainerInspect(

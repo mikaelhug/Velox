@@ -241,6 +241,7 @@ struct VolumesView: View {
         .contextMenu(forSelectionType: VolumeRow.ID.self) { ids in
             contextMenu(for: ids)
         }
+        .honestSelection($ui.volumeSelection) { selectionScope }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button(role: .destructive) { pruneConfirm = true } label: {
@@ -418,20 +419,27 @@ extension VolumesView {
 // MARK: - Selection & context menus
 
 extension VolumesView {
-    /// Selected rows resolved to concrete volumes — a selected project header expands
-    /// to all its members.
+    /// Selected rows resolved to concrete volumes through the shared rule (`TableSelection`):
+    /// a project header means all its members only when none were picked one by one.
     fileprivate var selectedVolumes: [Volume] { volumes(for: ui.volumeSelection) }
 
-    private func volumes(for ids: Set<VolumeRow.ID>) -> [Volume] {
-        var byID: [String: Volume] = [:]
-        for id in ids {
-            if let v = model.volumes.first(where: { $0.id == id }) {
-                byID[v.id] = v
-            } else if let g = group(forRowID: id) {
-                for v in g.volumes { byID[v.id] = v }
+    /// The rows the table shows, for `TableSelection`.
+    fileprivate var selectionScope: TableSelection {
+        var rows: [String] = [], groups: [TableSelection.Group] = []
+        for entry in layout.entries {
+            switch entry {
+            case .standalone(let v): rows.append(v.id)
+            case .group(let g):
+                groups.append(.init(header: VolumeRow.project(g).id, members: g.volumes.map(\.id),
+                                    expanded: !ui.volumeCollapsed.contains(g.name)))
             }
         }
-        return Array(byID.values)
+        return TableSelection(rows: rows, groups: groups)
+    }
+
+    private func volumes(for ids: Set<VolumeRow.ID>) -> [Volume] {
+        let picked = selectionScope.resolve(ids)
+        return model.volumes.filter { picked.contains($0.id) }
     }
 
     private func group(forRowID id: String) -> VolumeGroup? {

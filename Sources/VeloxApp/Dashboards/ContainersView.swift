@@ -252,6 +252,7 @@ struct ContainersView: View {
         .contextMenu(forSelectionType: ContainerRow.ID.self) { ids in
             contextMenu(for: ids)
         }
+        .honestSelection($ui.containerSelection) { selectionScope }
         // Rebuild the table when its row heights change shape — see `heightPattern`.
         .id(heightPattern)
         .searchable(text: $ui.containerSearch, placement: .toolbar, prompt: "Filter containers")
@@ -473,18 +474,26 @@ struct ContainersView: View {
 
     // MARK: Bulk actions
 
-    /// Resolve selected row IDs to the underlying containers — a selected project
-    /// row expands to all its members — de-duplicated by container id.
-    private func containers(for ids: Set<ContainerRow.ID>) -> [ContainerSummary] {
-        var byID: [String: ContainerSummary] = [:]
-        for id in ids {
-            if let c = model.containers.first(where: { $0.id == id }) {
-                byID[c.id] = c
-            } else if let g = group(forRowID: id) {
-                for c in g.containers { byID[c.id] = c }
+    /// The rows the table shows, for the shared selection rule (`TableSelection`).
+    private var selectionScope: TableSelection {
+        var rows: [String] = [], groups: [TableSelection.Group] = []
+        for entry in topLevel {
+            switch entry {
+            case .standalone(let c): rows.append(c.id)
+            case .group(let g):
+                groups.append(.init(header: ContainerRow.project(g).id, members: g.containers.map(\.id),
+                                    expanded: !ui.containerCollapsed.contains(g.name)))
             }
         }
-        return Array(byID.values)
+        return TableSelection(rows: rows, groups: groups)
+    }
+
+    /// Resolve selected row IDs to the underlying containers (see `TableSelection`): a
+    /// project row means all its members only when none were picked one by one, and rows
+    /// hidden by the filter or a collapsed group never count.
+    private func containers(for ids: Set<ContainerRow.ID>) -> [ContainerSummary] {
+        let picked = selectionScope.resolve(ids)
+        return model.containers.filter { picked.contains($0.id) }
     }
 
     private var selectedContainers: [ContainerSummary] { containers(for: ui.containerSelection) }

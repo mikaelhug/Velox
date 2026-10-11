@@ -80,13 +80,13 @@ struct ImagesView: View {
         _tableLayout = State(initialValue: TableLayout.load("images"))
     }
 
-    /// Selection resolved against what actually exists. `ui.imageSelection` holds raw row ids
-    /// in `PaneUIState`, which survives pane switches and engine restarts and is never pruned —
-    /// so after a `docker image prune` elsewhere the toolbar stayed armed and the dialog
-    /// offered to remove images that were already gone. Containers and Volumes both resolve;
-    /// this pane didn't.
+    /// Selection resolved against the rows the table actually shows (`TableSelection`, the
+    /// rule every pane shares). `ui.imageSelection` holds raw row ids in `PaneUIState`, which
+    /// survives pane switches and engine restarts and is never pruned — so after a `docker
+    /// image prune` elsewhere the dialog offered images already gone, and images hidden by
+    /// the filter stayed selected and were removed off-screen.
     private var selectedImageIDs: Set<String> {
-        ui.imageSelection.intersection(model.images.map(\.id))
+        TableSelection(rows: filtered.map(\.id)).resolve(ui.imageSelection)
     }
 
     private var filtered: [ImageSummary] {
@@ -138,6 +138,7 @@ struct ImagesView: View {
                                        description: Text(model.loadError ?? "Pull one to get started."))
             }
         }
+        .honestSelection($ui.imageSelection) { TableSelection(rows: filtered.map(\.id)) }
         .contextMenu(forSelectionType: ImageSummary.ID.self) { ids in
             if ids.count == 1, let img = model.images.first(where: { ids.contains($0.id) }) {
                 Button("Run…") { runTarget = img }
