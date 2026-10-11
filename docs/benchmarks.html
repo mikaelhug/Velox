@@ -3,17 +3,17 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Velox benchmarks - Docker Desktop comparison</title>
+    <title>Velox vs alternatives - benchmarks</title>
     <meta
       name="description"
-      content="Reproducible Velox benchmark results against Docker Desktop on Apple Silicon, including startup, memory, networking, filesystem, and cold pull measurements."
+      content="Reproducible benchmarks of Velox against Docker Desktop and OrbStack on Apple Silicon: startup, memory, CPU, networking, filesystem, builds and disk."
     >
     <meta name="theme-color" content="#090a0d">
     <link rel="canonical" href="https://mikaelhug.github.io/Velox/benchmarks.html">
-    <meta property="og:title" content="Velox benchmarks">
+    <meta property="og:title" content="Velox vs alternatives">
     <meta
       property="og:description"
-      content="A reproducible head-to-head benchmark suite comparing Velox and Docker Desktop on Apple Silicon Macs."
+      content="A reproducible three-way benchmark of Velox, Docker Desktop and OrbStack on Apple Silicon Macs."
     >
     <meta property="og:type" content="article">
     <meta property="og:url" content="https://mikaelhug.github.io/Velox/benchmarks.html">
@@ -48,7 +48,7 @@
     <header class="page-header">
       <div class="page-title">
         <p class="eyebrow">Reproducible benchmark suite</p>
-        <h1>Velox vs Docker Desktop</h1>
+        <h1>Velox vs alternatives</h1>
         <p>
           Same Mac, same resource caps, same pinned images, one engine under
           load at a time. The harness and full methodology live in the repo.
@@ -59,17 +59,18 @@
     <main>
       <section class="section">
         <div class="section-heading" style="text-align: left; max-width: none; margin-bottom: 28px;">
-          <p class="eyebrow">Recorded run &middot; 25 August 2026</p>
-          <h2>Apple M4 Pro, macOS 26.6.2, 8 vCPU / 8 GB each</h2>
+          <p class="eyebrow">Recorded run &middot; 11 October 2026</p>
+          <h2>Apple M4 Pro, macOS 27.0.1, 8 vCPU / 8 GB each</h2>
           <p class="note" style="text-align: left; margin: 12px 0 0;">
-            Velox 1.2.0 against Docker Desktop 4.88.0, measured on the same Mac on
-            the same day. Both engines ran the identical Docker Engine 29.7.2, the
-            same containerd image store, the same <code>docker</code> CLI and the
-            same compose plugin, with only one engine resident at a time &mdash; so
-            what these numbers compare is the host around the engine, not the engine.
-            Medians over five order-balanced rounds (three for build and compose).
-            Rows whose run-to-run spread was too wide to call are omitted here and
-            published in full, with their raw values, in the report.
+            Velox 1.7.1 against Docker Desktop 4.94.0 and OrbStack 2.2.3, in one
+            campaign: the same Mac, the same night, one engine resident at a time,
+            each at a verified 8 vCPU / 8 GB, all three emptied first and driven by the
+            same <code>docker</code> CLI and compose plugin. Six rounds ran the engines
+            in all six orders, so each went first, middle and last twice. Medians, n=6
+            (n=3 for builds and compose, n=1 for the memory phases). A verdict needs at
+            least 15% and non-overlapping spreads; anything closer is on par. Rows marked
+            &dagger; were re-measured the same morning in the same rotation, after Velox
+            adopted a 3 s stop default and the disk-reclaim test was fixed.
           </p>
         </div>
 
@@ -79,166 +80,219 @@
               <th>Metric</th>
               <th>Velox</th>
               <th>Docker Desktop</th>
+              <th>OrbStack</th>
               <th>vs Docker Desktop</th>
+              <th>vs OrbStack</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>Install footprint</td>
-              <td>357 MB</td>
-              <td>2,193 MB</td>
-              <td class="status-win">6.1x smaller</td>
+              <td>327 MB</td>
+              <td>2,198 MB</td>
+              <td>696 MB</td>
+              <td class="status-win">6.7x smaller</td>
+              <td class="status-win">2.1x smaller</td>
+            </tr>
+            <tr>
+              <td>Startup, quit to API-ready</td>
+              <td>0.59 s</td>
+              <td>1.79 s</td>
+              <td>1.35 s</td>
+              <td class="status-win">3.1x faster</td>
+              <td class="status-win">2.3x faster</td>
             </tr>
             <tr>
               <td>Idle RAM, whole engine</td>
-              <td>734 MB</td>
-              <td>1,771 MB</td>
-              <td class="status-win">2.4x less</td>
+              <td>667 MB</td>
+              <td>2,306 MB</td>
+              <td>767 MB</td>
+              <td class="status-win">3.5x less</td>
+              <td>on par</td>
             </tr>
             <tr>
               <td>Idle RAM, after resource saver</td>
-              <td>373 MB</td>
-              <td>847 MB</td>
-              <td class="status-win">2.3x less</td>
+              <td>133 MB</td>
+              <td>989 MB</td>
+              <td>753 MB</td>
+              <td class="status-win">7.4x less</td>
+              <td class="status-win">5.7x less</td>
             </tr>
             <tr>
-              <td>Idle CPU, 4 min</td>
-              <td>0.76%</td>
-              <td>3.52%</td>
-              <td class="status-win">4.6x less</td>
+              <td>Idle CPU, idle state (after saver)</td>
+              <td>0.00 %</td>
+              <td>0.51 %</td>
+              <td>0.15 %</td>
+              <td class="status-win">0% vs 0.51%</td>
+              <td class="status-win">0% vs 0.15%</td>
             </tr>
             <tr>
               <td>RAM with 21 containers running</td>
-              <td>1,949 MB</td>
-              <td>2,991 MB</td>
-              <td class="status-win">1.5x less</td>
+              <td>1,543 MB</td>
+              <td>3,098 MB</td>
+              <td>1,563 MB</td>
+              <td class="status-win">2.0x less</td>
+              <td>on par</td>
             </tr>
             <tr>
-              <td>Startup, restart to API-ready</td>
-              <td>1.23 s</td>
-              <td>1.99 s</td>
-              <td class="status-win">1.6x faster</td>
+              <td>RAM 3 min after removing them</td>
+              <td>1,566 MB</td>
+              <td>3,052 MB</td>
+              <td>1,149 MB</td>
+              <td class="status-win">1.9x less</td>
+              <td class="status-trail">1.4x behind</td>
             </tr>
             <tr>
               <td>Container launch</td>
-              <td>0.11 s</td>
+              <td>0.09 s</td>
               <td>0.13 s</td>
-              <td class="status-win">1.2x faster</td>
+              <td>0.21 s</td>
+              <td class="status-win">1.4x faster</td>
+              <td class="status-win">2.3x faster</td>
             </tr>
             <tr>
               <td>Parallel launch, 20 containers</td>
-              <td>0.86 s</td>
-              <td>1.01 s</td>
-              <td class="status-win">1.2x faster</td>
+              <td>0.76 s</td>
+              <td>0.98 s</td>
+              <td>1.66 s</td>
+              <td class="status-win">1.3x faster</td>
+              <td class="status-win">2.2x faster</td>
+            </tr>
+            <tr>
+              <td>Network, container to host</td>
+              <td>97.3 Gbit/s</td>
+              <td>24.4 Gbit/s</td>
+              <td>58.4 Gbit/s</td>
+              <td class="status-win">4.0x faster</td>
+              <td class="status-win">1.7x faster</td>
             </tr>
             <tr>
               <td>Network, container to container</td>
-              <td>130 Gbit/s</td>
-              <td>96.4 Gbit/s</td>
-              <td class="status-win">1.4x faster</td>
+              <td>165 Gbit/s</td>
+              <td>92.2 Gbit/s</td>
+              <td>91.4 Gbit/s</td>
+              <td class="status-win">1.8x faster</td>
+              <td class="status-win">1.8x faster</td>
             </tr>
             <tr>
               <td>Published port, 1 stream</td>
-              <td>43.4 Gbit/s</td>
-              <td>12.7 Gbit/s</td>
-              <td class="status-win">3.4x faster</td>
+              <td>47.9 Gbit/s</td>
+              <td>12.4 Gbit/s</td>
+              <td>49.3 Gbit/s</td>
+              <td class="status-win">3.9x faster</td>
+              <td>on par</td>
             </tr>
             <tr>
               <td>Published port, 4 streams</td>
-              <td>59.8 Gbit/s</td>
-              <td>25.3 Gbit/s</td>
-              <td class="status-win">2.4x faster</td>
+              <td>20.2 Gbit/s</td>
+              <td>25.6 Gbit/s</td>
+              <td>30.3 Gbit/s</td>
+              <td class="status-trail">1.3x behind</td>
+              <td class="status-trail">1.5x behind</td>
             </tr>
             <tr>
               <td>docker cp out, 1 GiB</td>
-              <td>540 MB/s</td>
-              <td>225 MB/s</td>
-              <td class="status-win">2.4x faster</td>
+              <td>715 MB/s</td>
+              <td>220 MB/s</td>
+              <td>694 MB/s</td>
+              <td class="status-win">3.2x faster</td>
+              <td>on par</td>
             </tr>
             <tr>
               <td>docker cp in, 1 GiB</td>
-              <td>373 MB/s</td>
-              <td>154 MB/s</td>
-              <td class="status-win">2.4x faster</td>
-            </tr>
-            <tr>
-              <td>Disk returned after deleting ~5 GB</td>
-              <td>5,295 MB</td>
-              <td>3,594 MB</td>
-              <td class="status-win">1.5x more</td>
+              <td>932 MB/s</td>
+              <td>148 MB/s</td>
+              <td>546 MB/s</td>
+              <td class="status-win">6.3x faster</td>
+              <td class="status-win">1.7x faster</td>
             </tr>
             <tr>
               <td>VirtioFS bind-mount read, cached</td>
-              <td>2,452 MB/s</td>
-              <td>2,180 MB/s</td>
+              <td>2,753 MB/s</td>
+              <td>2,327 MB/s</td>
+              <td>2,048 MB/s</td>
+              <td class="status-win">1.2x faster</td>
+              <td class="status-win">1.3x faster</td>
+            </tr>
+            <tr>
+              <td>Small-file extract, 4,000 files</td>
+              <td>2.06 s</td>
+              <td>2.35 s</td>
+              <td>1.15 s</td>
               <td>on par</td>
+              <td class="status-trail">1.8x behind</td>
             </tr>
             <tr>
               <td>Named-volume write</td>
-              <td>2,115 MB/s</td>
-              <td>1,840 MB/s</td>
-              <td>on par</td>
+              <td>2,303 MB/s</td>
+              <td>1,771 MB/s</td>
+              <td>1,050 MB/s</td>
+              <td class="status-win">1.3x faster</td>
+              <td class="status-win">2.2x faster</td>
             </tr>
             <tr>
               <td>Image extraction, docker load</td>
-              <td>6.70 s</td>
+              <td>5.87 s</td>
               <td>6.38 s</td>
+              <td>5.65 s</td>
               <td>on par</td>
-            </tr>
-            <tr>
-              <td>Cold build, --no-cache</td>
-              <td>1.60 s</td>
-              <td>1.77 s</td>
               <td>on par</td>
             </tr>
             <tr>
               <td>Incremental build</td>
-              <td>1.52 s</td>
-              <td>1.56 s</td>
+              <td>1.35 s</td>
+              <td>1.48 s</td>
+              <td>2.06 s</td>
               <td>on par</td>
-            </tr>
-            <tr>
-              <td>amd64 emulation tax vs native</td>
-              <td>4.89x</td>
-              <td>4.82x</td>
-              <td>on par</td>
+              <td class="status-win">1.5x faster</td>
             </tr>
             <tr>
               <td>Postgres pgbench TPS</td>
-              <td>13,796</td>
-              <td>12,372</td>
+              <td>15,750</td>
+              <td>14,693</td>
+              <td>6,550</td>
               <td>on par</td>
+              <td class="status-win">2.4x more</td>
             </tr>
             <tr>
-              <td>Small-file extract to bind mount</td>
-              <td>3.21 s</td>
-              <td>2.56 s</td>
-              <td class="status-trail">25% slower</td>
+              <td>compose down, SIGTERM-ignoring &dagger;</td>
+              <td>3.31 s</td>
+              <td>3.50 s</td>
+              <td>10.6 s</td>
+              <td>on par</td>
+              <td class="status-win">3.2x faster</td>
             </tr>
             <tr>
-              <td>compose down, SIGTERM-ignoring services</td>
-              <td>10.4 s</td>
-              <td>3.5 s</td>
-              <td class="status-trail">3x slower</td>
+              <td>Disk still held 150 s after deleting ~5 GB &dagger;</td>
+              <td>0 MB</td>
+              <td>1,120 MB</td>
+              <td>0 MB</td>
+              <td class="status-win">all returned</td>
+              <td>on par</td>
             </tr>
           </tbody>
         </table>
 
         <p class="note" style="text-align: left;">
-          Both engines were also checked functionally and came out level on every
-          probe run: bind mounts, <code>host.docker.internal</code>, TCP, UDP and
-          IPv6 publishing, privileged ports, BuildKit with attestations, and
+          All three passed every functional probe: bind mounts,
+          <code>host.docker.internal</code>, TCP, UDP and IPv6 publishing,
+          per-container host IPs, privileged ports, BuildKit with attestations, and
           <code>linux/amd64</code>, <code>linux/arm/v7</code> and
-          <code>linux/386</code> emulation. Velox adds
-          <code>&lt;name&gt;.velox.local</code>. Per-container host-IP publishing,
-          which Velox lacked in that run, is supported since. Docker Desktop ships
-          Kubernetes, Scout, Extensions and its AI tooling, which Velox has no
-          equivalent for.
+          <code>linux/386</code> emulation. Velox and OrbStack add direct
+          <code>&lt;name&gt;.local</code> container access. Velox returns memory by
+          stopping the idle engine after 5 minutes, because macOS 27's memory balloon
+          frees nothing, so the 3-minute post-teardown row catches it before that. The
+          4-stream published-port result swings between 20 and 60 Gbit/s on macOS 27 for
+          every Velox build tested, 1.7.0 included. The Mac-to-VM direction of Apple's NAT
+          measures about 14 Gbit/s with no Velox code in the path; on macOS 26.6 it was a
+          steady 60. <code>compose down</code> measures the stop grace period for
+          containers that ignore SIGTERM: Velox and Docker Desktop ship 3 s, OrbStack keeps
+          Docker's 10 s. Disk reclaim is a single sample per engine, taken 150 s after a
+          restart.
           <br /><br />
           Read the
-          <a href="https://github.com/mikaelhug/Velox/blob/main/docs/bench/REPORT-2026-08-25.md">full report</a>,
-          including the four measurement defects found and corrected while producing
-          it, or inspect the runnable harness in
+          <a href="https://github.com/mikaelhug/Velox/blob/main/docs/bench/REPORT-2026-10-11-3way.md">full report</a>,
+          with every raw value and its caveats, or inspect the runnable harness in
           <a href="https://github.com/mikaelhug/Velox/tree/main/docs/bench">docs/bench</a>.
         </p>
       </section>

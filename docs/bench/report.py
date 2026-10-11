@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Print a Velox-vs-peer scorecard (peer = Docker Desktop or OrbStack) from a results CSV.
+"""Print a Velox scorecard against one or more peers (Docker Desktop, OrbStack) from a results CSV.
 
-    report.py [--csv PATH]     default: results.csv (Docker Desktop). OrbStack: results-orbstack.csv
+    report.py [--csv PATH] [--peer dd|orbstack] [--supersede RUN_ID] [--md]
+        default CSV: results.csv (Docker Desktop). A BENCH_PEER=orbstack run writes
+        results-orbstack.csv.
+        Three-way campaign: results-3way.csv — one column per engine, a verdict against each
+        peer. --peer narrows any CSV to the classic two-column Velox-vs-peer table.
 
 Aggregates ALL rows per metric (median + IQR + n) rather than showing the last one.
 The old last-write-wins behaviour published whichever single run happened to be written
@@ -25,8 +29,11 @@ SPEC = [
     ("idle", "fp_active", "host_fp",               ("Idle RAM, pre-saver (footprint)", False, "MB")),
     ("idle", "rss_saver", "host_rss",              ("Idle RAM, after resource saver", False, "MB")),
     ("idle", "fp_saver", "host_fp",                ("Idle RAM, after saver (footprint)", False, "MB")),
-    ("idle", "cpu", "pct",                          ("Idle CPU (4 min, whole engine)", False, "%")),
-    ("idle", "cpu_saver", "pct",                    ("Idle CPU, after resource saver", False, "%")),
+    # Idle is compared in each product's idle state: after the 5-minute resource-saver timeout
+    # (a product without a saver is measured as it is — that is its trade-off). The first 4
+    # minutes, with every VM still running, are kept as context, not the idle comparison.
+    ("idle", "cpu_saver", "pct",                    ("Idle CPU (idle state, after saver)", False, "%")),
+    ("idle", "cpu", "pct",                          ("Idle CPU, first 4 min (before saver)", False, "%")),
     ("mem", "loaded", "host_rss",                   ("RAM under load (21 containers)", False, "MB")),
     ("mem", "loaded_fp", "host_fp",                 ("RAM under load (footprint)", False, "MB")),
     ("mem", "postload", "host_rss",                 ("RAM after teardown (return)", False, "MB")),
@@ -89,6 +96,19 @@ engines = set()
 
 with open(CSV) as f:
     rows = list(csv.DictReader(f))
+# --supersede RUN_ID: a same-day re-measurement kept in the same CSV under its own run id. For
+# every (suite, test, metric, engine) that run contains, its rows REPLACE the other runs' rows
+# rather than mixing with them — a fixed test or a changed default must not be averaged with the
+# build/test it corrects. Superseded metrics are marked † so the table says which numbers came
+# from the re-measurement. Without the flag those rows are ignored, so the campaign renders as run.
+superseded = set()
+SUP = sys.argv[sys.argv.index("--supersede") + 1] if "--supersede" in sys.argv else None
+extra = [r for r in rows if r["run_id"] == SUP]
+rows = [r for r in rows if not r["run_id"].endswith("-followup")]
+if SUP:
+    keys = {(r["suite"], r["test"], r["metric"], r["engine"]) for r in extra}
+    superseded = {k[:3] for k in keys}
+    rows = [r for r in rows if (r["suite"], r["test"], r["metric"], r["engine"]) not in keys] + extra
 # A suite that spanned a system sleep is flagged quality/slept=1; every timed-suite row of that
 # attempt (same engine, run, round) is dropped, not averaged in. Only the suite's own rows: the
 # startup/idle/load phases share round numbers but are separate measurements.
@@ -96,6 +116,8 @@ SUITE_ROWS = {"launch", "net", "io", "fs", "image", "realworld", "build", "compo
 slept = {(r["engine"], r["run_id"], r["round"]) for r in rows
          if r["suite"] == "quality" and r["test"] == "slept" and r["value"] == "1"}
 peers = sorted({r["engine"] for r in rows} - {"velox", "host"})
+if "--peer" in sys.argv:
+    peers = [sys.argv[sys.argv.index("--peer") + 1]]
 PEER = peers[0] if peers else "dd"
 PNAME = NAMES.get(PEER, PEER)
 for r in rows:
@@ -135,6 +157,117 @@ def cell(med, iqr, n, unit):
     return f"{fmt(med)} {unit} [±{rel:.0f}% n={n}]"
 
 
+def zero_verdict(vm, dm, hb):
+    """A lower-is-better metric where one side measured exactly zero (idle CPU once Velox's
+    resource saver has stopped the VM) is the best possible result, not an undefined ratio.
+    This used to print "no ratio" and so never credited the win. Negative values (a baseline
+    artefact) and higher-is-better zeros still get no verdict."""
+    if hb or vm < 0 or dm < 0 or (vm == 0) == (dm == 0):
+        return None
+    return ("WIN", float("inf")) if vm == 0 else ("TRAIL", 0.0)
+
+
+def judge(v_xs, p_xs, hb):
+    """(verdict, ratio) for Velox against one peer; ratio > 1 means Velox is better."""
+    vm, vi, _ = stats(v_xs)
+    dm, di, _ = stats(p_xs)
+    zero = zero_verdict(vm, dm, hb)
+    if zero:
+        return zero
+    if vm <= 0 or dm <= 0:
+        return "no ratio (≤0)", None
+    ratio = vm / dm if hb else dm / vm
+    if vi / vm > 0.25 or di / dm > 0.25:
+        return "UNRELIABLE", ratio
+    if not (vm + vi / 2 < dm - di / 2 or dm + di / 2 < vm - vi / 2):
+        return "par", ratio            # overlapping IQRs: not separated, whatever the medians say
+    return ("WIN" if ratio >= 1.15 else "TRAIL" if ratio <= 0.87 else "par"), ratio
+
+
+MD = "--md" in sys.argv      # Markdown table rows (for the dated REPORT), not fixed-width
+
+
+def mdcell(med, iqr, n, unit):
+    rel = (iqr / med * 100) if med else 0
+    return f"{fmt(med)} {unit} <sub>±{rel:.0f}% n={n}</sub>"
+
+
+if len(peers) > 1 and MD:
+    cols = ["velox"] + peers
+    print("| Metric | " + " | ".join(NAMES.get(e, e.capitalize()) for e in cols) + " | "
+          + " | ".join("vs " + NAMES.get(p, p) for p in peers) + " |")
+    print("|" + " --- |" * (1 + len(cols) + len(peers)))
+    for s_, t, m, (lbl, hb, unit) in SPEC:
+        d = vals.get((s_, t, m), {})
+        if not any(d.get(e) for e in cols):
+            continue
+        row = [lbl + (" †" if (s_, t, m) in superseded else "")] + [mdcell(*stats(d[e]), unit) if d.get(e) else "—" for e in cols]
+        for p in peers:
+            if d.get("velox") and d.get(p):
+                verdict, ratio = judge(d["velox"], d[p], hb)
+                bold = verdict in ("WIN", "TRAIL")
+                txt = ("∞× " if ratio == float("inf") else f"{ratio:.2f}× " if ratio else "") + verdict
+                row.append(f"**{txt}**" if bold else txt)
+            else:
+                row.append("—")
+        print("| " + " | ".join(row) + " |")
+    sys.exit(0)
+
+if len(peers) > 1:
+    # Three-way: one column per engine, then Velox's verdict against each peer. Same rules as
+    # the two-way table (noise gate, IQR overlap, 15% threshold) — just applied per pair.
+    cols = ["velox"] + peers
+    head = f"{'Metric':34}" + "".join(f"{NAMES.get(e, e.capitalize()):>26}" for e in cols)
+    head += "".join(f"{'vs ' + NAMES.get(p, p):>24}" for p in peers)
+    print(head)
+    print("-" * len(head))
+    pair_trails = collections.defaultdict(list)
+    pair_unrel = collections.defaultdict(list)
+    for s_, t, m, (lbl, hb, unit) in SPEC:
+        d = vals.get((s_, t, m), {})
+        if not any(d.get(e) for e in cols):
+            print(f"{lbl:34}" + "".join(f"{'—':>26}" for _ in cols) + "  not measured")
+            continue
+        cells = "".join(f"{(cell(*stats(d[e]), unit) if d.get(e) else '—'):>26}" for e in cols)
+        vs = ""
+        for p in peers:
+            if d.get("velox") and d.get(p):
+                verdict, ratio = judge(d["velox"], d[p], hb)
+                rtxt = "∞x " if ratio == float("inf") else (f"{ratio:.2f}x " if ratio else "")
+                vs += f"{rtxt + verdict:>24}"
+                if verdict == "TRAIL":
+                    pair_trails[p].append(f"  {lbl}: {cell(*stats(d['velox']), unit)} vs "
+                                          f"{cell(*stats(d[p]), unit)}  ({ratio:.2f}x)")
+                if verdict == "UNRELIABLE":
+                    pair_unrel[p].append(f"  {lbl}: velox {[round(x, 2) for x in sorted(d['velox'])]}"
+                                         f"  {p} {[round(x, 2) for x in sorted(d[p])]}")
+            else:
+                vs += f"{'—':>24}"
+        print(f"{lbl + (' †' if (s_, t, m) in superseded else ''):34}{cells}{vs}")
+    if matrix:
+        order = [e for e in cols if e in engines]
+        print(f"\n{'Functional probe':34}" + "".join(f"{e:>14}" for e in order))
+        print("-" * (34 + 14 * len(order)))
+        for probe in sorted(matrix):
+            print(f"{probe:34}" + "".join(f"{matrix[probe].get(e, '—'):>14}" for e in order))
+    for p in peers:
+        if pair_trails[p]:
+            print(f"\nTRAILS (Velox behind {NAMES.get(p, p)}):\n" + "\n".join(pair_trails[p]))
+        if pair_unrel[p]:
+            print(f"\nUNRELIABLE vs {NAMES.get(p, p)} (spread too wide to call — raw values):\n"
+                  + "\n".join(pair_unrel[p]))
+    xc = [(lbl, vals.get((s_, t, m), {})) for s_, t, m, lbl in XCHECK]
+    if any(d for _, d in xc):
+        print("\nCROSS-CHECK (whole-system memory, not attributed to processes; no verdict):")
+        for lbl, d in xc:
+            if d:
+                print(f"  {lbl}: " + "  ".join(f"{e} {d.get(e, [])}" for e in cols))
+    if slept:
+        print(f"\nDISCARDED (system slept during the suite): {sorted(slept)}")
+    if superseded:
+        print("\n† re-measured after the campaign (--supersede); replaces the campaign's rows")
+    sys.exit(0)
+
 print(f"{'Metric':34}{'Velox':>26}{PNAME:>26}{'Δ':>9}  Verdict")
 print("-" * 104)
 
@@ -159,6 +292,11 @@ for s, t, m, (lbl, hb, unit) in SPEC:
 
     vm, vi, vn = stats(v_xs)
     dm, di, dn = stats(d_xs)
+    zero = zero_verdict(vm, dm, hb)
+    if zero:
+        verdicts[lbl] = zero
+        print(f"{lbl:34}{cell(vm, vi, vn, unit):>26}{cell(dm, di, dn, unit):>26}{'∞' if zero[0] == 'WIN' else '0':>8}x  {zero[0]}")
+        continue
     if vm <= 0 or dm <= 0:
         # A ratio of non-positive values is meaningless (e.g. "retained" going negative because
         # the baseline itself held untrimmed blocks) — show the numbers, claim nothing.

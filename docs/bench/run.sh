@@ -4,8 +4,9 @@
 #
 # Selects each engine by its Docker *context* (no wrapper, no daemon swap) and runs the
 # same suite against both, ONE ENGINE RESIDENT AT A TIME. Velox is always engine A; the peer
-# is chosen with BENCH_PEER=dd (default) or BENCH_PEER=orbstack. Results are appended to
-# results.csv (dd) or results-orbstack.csv (orbstack); ./report.py prints the scorecard.
+# is chosen with BENCH_PEER=dd (default) or BENCH_PEER=orbstack, or BENCH_PEER=all for all
+# three in one campaign. Results are appended to results.csv (dd), results-orbstack.csv
+# (orbstack) or results-3way.csv (all); ./report.py prints the scorecard.
 #
 # TWO CADENCES — pick the right one:
 #
@@ -28,6 +29,7 @@
 #
 # Usage:
 #   BENCH_PEER=orbstack ./run.sh campaign   # the full order-balanced comparison
+#   BENCH_PEER=all ./run.sh campaign        # Velox + Docker Desktop + OrbStack, one campaign
 #   ./run.sh preflight [ctx]      # fairness gate: AC power, quiet host, disk, deps
 #   ./run.sh parity               # configured vCPU/RAM of both apps match (aborts if not)
 #   ./run.sh engine <velox|peer>  # quit the other engine, boot this one, settle
@@ -71,11 +73,35 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # never overwrite or mix with the other's evidence.
 BENCH_PEER="${BENCH_PEER:-dd}"
 CTX_A="velox";          LBL_A="velox";  APP_A="Velox"
+ctx_of(){ case "$1" in velox) echo velox ;; dd) echo desktop-linux ;; orbstack) echo orbstack ;; esac; }
+app_of(){ case "$1" in velox) echo Velox ;; dd) echo Docker ;; orbstack) echo OrbStack ;; esac; }
+# BENCH_PEER=all measures all three in ONE campaign — same day, same host state, every phase
+# order-rotated — rather than two separate head-to-heads that each re-measure Velox at a
+# different time. Its rows go to their own CSV.
 case "$BENCH_PEER" in
-  dd)       CTX_B="desktop-linux"; LBL_B="dd";       APP_B="Docker";   CSV_DEFAULT="$HERE/results.csv" ;;
-  orbstack) CTX_B="orbstack";      LBL_B="orbstack"; APP_B="OrbStack"; CSV_DEFAULT="$HERE/results-orbstack.csv" ;;
-  *) echo "BENCH_PEER must be dd or orbstack (got: $BENCH_PEER)" >&2; exit 2 ;;
+  dd)       PEERS="dd";          CSV_DEFAULT="$HERE/results.csv" ;;
+  orbstack) PEERS="orbstack";    CSV_DEFAULT="$HERE/results-orbstack.csv" ;;
+  all)      PEERS="dd orbstack"; CSV_DEFAULT="$HERE/results-3way.csv" ;;
+  *) echo "BENCH_PEER must be dd, orbstack or all (got: $BENCH_PEER)" >&2; exit 2 ;;
 esac
+ENGINES="velox $PEERS"
+# The first peer keeps the two-engine helpers (`all`, single-peer phases) working unchanged.
+LBL_B="${PEERS%% *}"; CTX_B="$(ctx_of "$LBL_B")"; APP_B="$(app_of "$LBL_B")"
+
+# The engines in the order round $1 runs them. Two engines alternate. Three cycle through all
+# 3! = 6 orders over rounds 1–6 — each engine goes first, second and last exactly twice, and
+# rounds 1–3 alone are a Latin square (each engine once in each slot), which is why the heavy
+# sets run in rounds 1–3 of a three-way campaign.
+order_for(){
+  local r=$(( ${1:-1} ))
+  set -- $ENGINES
+  if [ "$#" -eq 2 ]; then [ $((r % 2)) = 1 ] && echo "$1 $2" || echo "$2 $1"; return; fi
+  local a=$1 b=$2 c=$3
+  case $(( (r - 1) % 6 )) in
+    0) echo "$a $b $c" ;; 1) echo "$b $c $a" ;; 2) echo "$c $a $b" ;;
+    3) echo "$a $c $b" ;; 4) echo "$c $b $a" ;; 5) echo "$b $a $c" ;;
+  esac
+}
 CSV="${BENCH_CSV:-$CSV_DEFAULT}"         # BENCH_CSV: write elsewhere while smoke-testing
 # results.csv predates BENCH_PEER and keeps its old `dd_ver` header; the column is the peer's.
 CSV_HEADER="engine,suite,test,metric,unit,value,ts,run_id,round,velox_ver,peer_ver"
@@ -101,22 +127,26 @@ log(){ echo ">>> $*" >&2; }
 warn(){ echo "!!! $*" >&2; }
 fail(){ echo "XXX $*" >&2; return 1; }
 
-VELOX_VER=""; PEER_VER=""
+VELOX_VER=""; PEER_VER=""; DD_VER=""; ORB_VER=""
 versions(){
   [ -n "$VELOX_VER" ] && return 0
   VELOX_VER=$(defaults read /Applications/Velox.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo unknown)
-  case "$LBL_B" in
-    dd)       PEER_VER=$(jq -r '.appVersion' /Applications/Docker.app/Contents/Resources/componentsVersion.json 2>/dev/null || echo unknown) ;;
-    orbstack) PEER_VER=$(defaults read /Applications/OrbStack.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo unknown) ;;
-  esac
+  case " $PEERS " in *" dd "*)
+    DD_VER=$(jq -r '.appVersion' /Applications/Docker.app/Contents/Resources/componentsVersion.json 2>/dev/null || echo unknown) ;; esac
+  case " $PEERS " in *" orbstack "*)
+    ORB_VER=$(defaults read /Applications/OrbStack.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null || echo unknown) ;; esac
+  # The `peer_ver` column: a peer's row carries that peer's version; a Velox row, every peer's.
+  PEER_VER="$( [ -n "$DD_VER" ] && printf 'dd=%s;' "$DD_VER"; [ -n "$ORB_VER" ] && printf 'orbstack=%s;' "$ORB_VER")"
+  PEER_VER="${PEER_VER%;}"
 }
+peer_ver_of(){ case "$1" in dd) echo "$DD_VER" ;; orbstack) echo "$ORB_VER" ;; *) echo "$PEER_VER" ;; esac; }
 
 # eng,suite,test,metric,unit,value + provenance. Provenance exists because results.csv
 # used to be an undated pile in which a June baseline and an August re-run were
 # indistinguishable, and the published scorecard silently mixed them.
 # ROUND_TAG marks rows written after a resume, so a resumed round can never share a key with a
 # discarded attempt of the same round (report.py drops discarded attempts by engine+run+round).
-rec(){ versions; echo "$1,$2,$3,$4,$5,$6,$(now),$RUN_ID,$ROUND${ROUND_TAG:-},$VELOX_VER,$PEER_VER" >> "$CSV"; }
+rec(){ versions; echo "$1,$2,$3,$4,$5,$6,$(now),$RUN_ID,$ROUND${ROUND_TAG:-},$VELOX_VER,$(peer_ver_of "$1")" >> "$CSV"; }
 
 # ONE client toolchain for both engines. Each app installs its own docker CLI and re-links
 # ~/.docker/cli-plugins to its own compose/buildx (OrbStack did exactly that on install), so
@@ -131,7 +161,7 @@ setup_client(){
   [ -f "$DOCKER_CONFIG/config.json" ] || echo '{}' > "$DOCKER_CONFIG/config.json"
   ln -sf "$VELOX_BIN/docker-compose" "$VELOX_BIN/docker-buildx" "$DOCKER_CONFIG/cli-plugins/"
   local c s
-  for c in "$CTX_A" "$CTX_B"; do
+  for c in $(for e in $ENGINES; do ctx_of "$e"; done); do
     case "$c" in
       velox)         s="$HOME/.velox/docker.sock" ;;
       orbstack)      s="$HOME/.orbstack/run/docker.sock" ;;
@@ -344,15 +374,17 @@ capture_env(){                       # one snapshot per campaign, for the report
   { sw_vers; echo; sysctl -n hw.model hw.ncpu hw.memsize; echo; uname -v; } > "$RUNDIR/host.txt" 2>&1
   cp "$HOME/.velox/config.json" "$RUNDIR/velox-config.json" 2>/dev/null
   cp "$HOME/.velox/workspaces.json" "$RUNDIR/velox-workspaces.json" 2>/dev/null
-  case "$LBL_B" in
+  local p
+  for p in $PEERS; do case "$p" in
     dd)
+      # TCC blocks reading DD's Group Container on macOS 27; the in-guest check is the gate.
       cp "$HOME/Library/Group Containers/group.com.docker/settings-store.json" "$RUNDIR/dd-settings-store.json" 2>/dev/null
       cp /Applications/Docker.app/Contents/Resources/componentsVersion.json "$RUNDIR/dd-components.json" 2>/dev/null ;;
     orbstack)
       cp "$HOME/.orbstack/vmconfig.json" "$RUNDIR/orbstack-vmconfig.json" 2>/dev/null
       cp "$HOME/.orbstack/config/docker.json" "$RUNDIR/orbstack-docker.json" 2>/dev/null
       "$HOME/.orbstack/bin/orb" config show > "$RUNDIR/orbstack-config.txt" 2>&1 ;;
-  esac
+  esac; done
   cp "$HERE/../../versions.env" "$RUNDIR/velox-versions.env" 2>/dev/null
   { echo "PATH docker: $(command -v docker)"; docker version --format 'client {{.Client.Version}}' 2>/dev/null
     docker compose version; docker buildx version; echo "DOCKER_CONFIG=$DOCKER_CONFIG"
@@ -365,14 +397,21 @@ capture_env(){                       # one snapshot per campaign, for the report
 config_parity(){
   local cpu="${EXPECT_CPU:-8}" mib="${EXPECT_MEM_MIB:-8192}" vc vm bc bm bad=0
   vc=$(jq -r '.cpuCount' "$HOME/.velox/config.json" 2>/dev/null); vm=$(jq -r '.memoryGiB*1024' "$HOME/.velox/config.json" 2>/dev/null)
-  case "$LBL_B" in
-    dd)       bc=$(jq -r '.Cpus // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null)
-              bm=$(jq -r '.MemoryMiB // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null) ;;
-    orbstack) bc=$(jq -r '.cpu' "$HOME/.orbstack/vmconfig.json" 2>/dev/null); bm=$(jq -r '.memory_mib' "$HOME/.orbstack/vmconfig.json" 2>/dev/null) ;;
-  esac
-  log "configured: velox ${vc} vCPU/${vm} MiB, $LBL_B ${bc:-?} vCPU/${bm:-?} MiB (expected $cpu/$mib)"
+  log "configured: velox ${vc} vCPU/${vm} MiB (expected $cpu/$mib)"
   [ "$vc" = "$cpu" ] && [ "$vm" = "$mib" ] || { warn "velox configuration is not ${cpu} vCPU / ${mib} MiB"; bad=1; }
-  [ "${bc:-$cpu}" = "$cpu" ] && [ "${bm:-$mib}" = "$mib" ] || { warn "$LBL_B configuration is not ${cpu} vCPU / ${mib} MiB"; bad=1; }
+  local p
+  for p in $PEERS; do
+    bc=""; bm=""
+    case "$p" in
+      # Unreadable under macOS 27's TCC (Group Containers) — then "?" here, and capture_info's
+      # in-guest nproc/RAM check, which refuses to measure a mismatch, is the gate.
+      dd)       bc=$(jq -r '.Cpus // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null)
+                bm=$(jq -r '.MemoryMiB // empty' "$HOME/Library/Group Containers/group.com.docker/settings-store.json" 2>/dev/null) ;;
+      orbstack) bc=$(jq -r '.cpu' "$HOME/.orbstack/vmconfig.json" 2>/dev/null); bm=$(jq -r '.memory_mib' "$HOME/.orbstack/vmconfig.json" 2>/dev/null) ;;
+    esac
+    log "configured: $p ${bc:-?} vCPU/${bm:-?} MiB"
+    [ "${bc:-$cpu}" = "$cpu" ] && [ "${bm:-$mib}" = "$mib" ] || { warn "$p configuration is not ${cpu} vCPU / ${mib} MiB"; bad=1; }
+  done
   return "$bad"
 }
 
@@ -420,26 +459,29 @@ stop_engine(){                       # $1 label
 }
 # Symmetric "start": launch the application and let it bring its engine up, which is what a
 # user does and what the restart_to_ready metric is supposed to represent on both sides.
-start_engine(){ if [ "$1" = "$LBL_A" ]; then open -a "$APP_A"; else open -a "$APP_B"; fi; }
+start_engine(){ open -a "$(app_of "$1")"; }
 
 engine(){                            # $1 velox|<peer> — leave exactly this engine resident
-  local want="$1" ctx other_lbl other_ctx
-  if [ "$want" = "$LBL_A" ]; then ctx="$CTX_A"; other_lbl="$LBL_B"; other_ctx="$CTX_B"
-  else ctx="$CTX_B"; other_lbl="$LBL_A"; other_ctx="$CTX_A"; fi
+  local want="$1" ctx other_lbl other_ctx others=""
+  ctx="$(ctx_of "$want")"
+  for other_lbl in $ENGINES; do [ "$other_lbl" != "$want" ] && others="$others $other_lbl"; done
 
-  log "engine switch → $want (stopping $other_lbl)"
-  stop_engine "$other_lbl"
+  log "engine switch → $want (stopping$others)"
   local i
-  for i in $(seq 1 120); do api_up "$other_ctx" || break; sleep 1; done
-  # The API can be down while the VM is still flushing; wait for the process tree too.
-  for i in $(seq 1 60); do [ -z "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && break; sleep 1; done
-  # Two VMs resident at once is not a measurement — fatal, not a warning.
-  [ -n "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && { fail "$other_lbl processes still alive after stop"; return 1; }
+  for other_lbl in $others; do
+    other_ctx="$(ctx_of "$other_lbl")"
+    stop_engine "$other_lbl"
+    for i in $(seq 1 120); do api_up "$other_ctx" || break; sleep 1; done
+    # The API can be down while the VM is still flushing; wait for the process tree too.
+    for i in $(seq 1 60); do [ -z "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && break; sleep 1; done
+    # Two VMs resident at once is not a measurement — fatal, not a warning.
+    [ -n "$(engine_live_pids "$other_lbl" | tr -d ' ')" ] && { fail "$other_lbl processes still alive after stop"; return 1; }
+  done
 
   if api_up "$ctx"; then log "[$want] already up"; else
     # The other engine just released its VM: let the host return to baseline before booting
     # this one, then take the no-engine memory baseline for the sysmem cross-check.
-    host_quiet "${COOLDOWN_S:-30}" "after stopping $other_lbl"
+    host_quiet "${COOLDOWN_S:-30}" "after stopping$others"
     sysmem_mb > "$RUNDIR/sysmem-baseline"
     log "[$want] starting $want"; start_engine "$want"
     for i in $(seq 1 240); do api_up "$ctx" && break; sleep 0.5; done
@@ -485,7 +527,8 @@ footprint(){
   # And the honest total: everything the engine occupies on disk at rest.
   rec "$LBL_A" disk atrest_footprint size MB "$(addmb "$va" "$vk" "$vr" "$vd")"
   log "velox: app=${va} kernel=${vk} rootfs=${vr} data=${vd}"
-  case "$LBL_B" in
+  local p
+  for p in $PEERS; do case "$p" in
     dd)
       local da dr dg
       da=$(dum /Applications/Docker.app)
@@ -504,7 +547,7 @@ footprint(){
       rec orbstack disk installed_footprint size MB "$(addmb "$oa" "$oh")"
       rec orbstack disk atrest_footprint size MB "$(addmb "$oa" "$oh" "$od" "$os")"
       log "orbstack: app=${oa} home=${oh} data=${od} swap=${os}" ;;
-  esac
+  esac; done
 }
 
 # ---- the timed suite ---------------------------------------------------------
@@ -855,13 +898,33 @@ loadram(){          # $1 ctx $2 label
 }
 
 # ---- disk reclaim ------------------------------------------------------------
+# The reclaim trigger: a real stop + start, then a wait long enough for every engine's own
+# reclaim (Velox trims at boot+60 s and seconds after a delete; the peers on their own schedule).
+# Calling engine() here was once a silent no-op ("already up"), which scored a fabricated
+# "0 MB reclaimed" — this must stay a real restart.
+reclaim_settle(){   # $1 ctx $2 label
+  log "[$2] restart + 150 s for the engine's own reclaim"
+  stop_engine "$2"
+  local i; for i in $(seq 1 120); do api_up "$1" || break; sleep 1; done
+  for i in $(seq 1 60); do [ -z "$(engine_live_pids "$2" | tr -d ' ')" ] && break; sleep 1; done
+  start_engine "$2"
+  for i in $(seq 1 240); do api_up "$1" && break; sleep 0.5; done
+  sleep 150
+}
+
 reclaim(){          # $1 ctx $2 label — measure growth, then whether it comes back
   local CTX="$1" ENG="$2" IMG a0 a1 a2
   ensure_csv
   D(){ docker --context "$CTX" "$@"; }
   IMG="$(disk_image "$ENG")"
+  # Quiesce FIRST, with the very restart + wait the measurement uses below. The baseline used to
+  # be taken cold, while each disk still held space from data the suites had already deleted;
+  # the measuring restart then freed that too, so every engine "returned" more than the test
+  # wrote (2026-10-11: returned 4.7–6.1 GB of a 4.1–4.5 GB write). A settled baseline makes
+  # returned_mb mean "of what this test wrote".
+  reclaim_settle "$CTX" "$ENG"
   a0=$(dum "$IMG")
-  log "[$ENG] disk reclaim: baseline ${a0}MB allocated"
+  log "[$ENG] disk reclaim: baseline ${a0}MB allocated (settled)"
   D volume rm rvol >/dev/null 2>&1; D volume create rvol >/dev/null 2>&1
   D run --rm -v rvol:/m "$IMG_ALPINE" sh -c 'dd if=/dev/zero of=/m/f bs=1M count=4096 2>/dev/null; sync' >/dev/null 2>&1
   D load -i "$HERE/loadimage.tar" >/dev/null 2>&1
@@ -869,19 +932,7 @@ reclaim(){          # $1 ctx $2 label — measure growth, then whether it comes 
   a1=$(dum "$IMG")
   log "[$ENG] after 4GiB volume + image load: ${a1}MB"
   D volume rm rvol >/dev/null 2>&1; D rmi "$IMG_LOAD" >/dev/null 2>&1
-  # Restart is the reclaim trigger: Velox runs its fstrim pass 60 s after boot. Whether the
-  # peer returns anything is exactly what this measures — do not assume it can't.
-  #
-  # This MUST be a real stop+start. Calling engine() here was a silent no-op ("already up"),
-  # so no boot happened, no trim pass ran, and Velox scored a fabricated "0 MB reclaimed"
-  # against a Docker Desktop that trims on its own schedule.
-  log "[$ENG] restarting to trigger the trim pass"
-  stop_engine "$ENG"
-  local i; for i in $(seq 1 120); do api_up "$CTX" || break; sleep 1; done
-  for i in $(seq 1 60); do [ -z "$(engine_live_pids "$ENG" | tr -d ' ')" ] && break; sleep 1; done
-  start_engine "$ENG"
-  for i in $(seq 1 240); do api_up "$CTX" && break; sleep 0.5; done
-  sleep 150                       # Velox trims at boot+60 s; leave margin on both engines
+  reclaim_settle "$CTX" "$ENG"
   a2=$(dum "$IMG")
   rec "$ENG" disk reclaim grew_mb MB "$(submb "$a1" "$a0")"
   rec "$ENG" disk reclaim returned_mb MB "$(submb "$a1" "$a2")"
@@ -1021,12 +1072,19 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
     # Quit BOTH engines first. This used to stop only the engine being timed, so after the
     # first round the other one was always resident during every startup measurement — the
     # one-engine-at-a-time rule silently did not hold for this metric (2026-10-09 run).
-    [ "$ENG" = "$LBL_A" ] && OTHER="$LBL_B" || OTHER="$LBL_A"
     SOCK=$(engine_sock "$CTX" "$ENG")
-    log "[$ENG] stopping (and $OTHER)"; stop_engine "$OTHER"; stop_engine "$ENG"
+    log "[$ENG] stopping (and every other engine)"
+    for OTHER in $ENGINES; do stop_engine "$OTHER"; done
     local i; for i in $(seq 1 120); do api_up "$CTX" || break; sleep 0.5; done
-    for i in $(seq 1 60); do [ -z "$(engine_live_pids "$ENG")$(engine_live_pids "$OTHER")" ] && break; sleep 1; done
-    [ -n "$(engine_live_pids "$OTHER" | tr -d ' ')" ] && { fail "$OTHER still alive before timing $ENG"; return 1; }
+    local live
+    for i in $(seq 1 60); do
+      live=""; for OTHER in $ENGINES; do live="$live$(engine_live_pids "$OTHER" | tr -d ' ')"; done
+      [ -z "$live" ] && break; sleep 1
+    done
+    for OTHER in $ENGINES; do
+      [ "$OTHER" != "$ENG" ] && [ -n "$(engine_live_pids "$OTHER" | tr -d ' ')" ] \
+        && { fail "$OTHER still alive before timing $ENG"; return 1; }
+    done
     host_quiet "${COOLDOWN_S:-30}" "before timing $ENG startup"
     # Readiness = the first "OK" from /_ping on the engine's socket, polled every ~25 ms.
     # This used to be `docker version` every 0.5 s: the 0.5 s quantization (plus a docker CLI
@@ -1066,9 +1124,8 @@ startup(){          # bounces both apps; measures launch -> API-ready (warm disk
     warn "[$ENG] DID NOT become ready in 120s"; }
   # Order alternates with the round so neither engine always gets the warm host. ROUND may
   # carry a non-numeric tag (step's retry appends "r"), so use its leading digits only.
-  local rnum="${ROUND%%[!0-9]*}"
-  if [ $(( ${rnum:-0} % 2 )) = 1 ]; then _one "$CTX_A" "$LBL_A"; _one "$CTX_B" "$LBL_B"
-  else _one "$CTX_B" "$LBL_B"; _one "$CTX_A" "$LBL_A"; fi
+  local rnum="${ROUND%%[!0-9]*}" e
+  for e in $(order_for "${rnum:-1}"); do _one "$(ctx_of "$e")" "$e"; done
 }
 
 # ---- campaign driver (resumable) ---------------------------------------------
@@ -1094,66 +1151,61 @@ step(){             # $1 key, rest: command — skip if already recorded
 
 campaign(){
   ensure_csv; STATE="$RUNDIR/campaign.state"; touch "$STATE"
-  log "campaign run_id=$RUN_ID peer=$LBL_B (resumable; state=$STATE; csv=$CSV)"
+  log "campaign run_id=$RUN_ID engines=$ENGINES (resumable; state=$STATE; csv=$CSV)"
   step env:capture capture_env
   step env:parity  config_parity
+  local e r
 
-  # Phase 1 — parity verification on each engine.
-  step p1:velox:engine    engine "$LBL_A"
-  step p1:velox:pre       preflight "$CTX_A"
-  step p1:velox:info      capture_info "$CTX_A" "$LBL_A"
-  step p1:velox:foot      footprint
-  step "p1:$LBL_B:engine" engine "$LBL_B"
-  step "p1:$LBL_B:pre"    preflight "$CTX_B"
-  step "p1:$LBL_B:info"   capture_info "$CTX_B" "$LBL_B"
+  # Phase 1 — parity verification on each engine (refuses to measure a mismatch).
+  for e in $(order_for 1); do
+    step "p1:$e:engine" engine "$e"
+    step "p1:$e:pre"    preflight "$(ctx_of "$e")"
+    step "p1:$e:info"   capture_info "$(ctx_of "$e")" "$e"
+  done
+  step p1:footprint footprint
 
-  # Phase 2 — idle + resource saver (Velox first; Phase 5/6 run the peer first).
-  step p2:velox:engine    engine "$LBL_A"
-  step p2:velox:idle      idle "$CTX_A" "$LBL_A"
-  step "p2:$LBL_B:engine" engine "$LBL_B"
-  step "p2:$LBL_B:idle"   idle "$CTX_B" "$LBL_B"
+  # Phase 2 — idle + resource saver, one engine after another (order rotated vs Phase 5/6).
+  for e in $(order_for 2); do
+    step "p2:$e:engine" engine "$e"
+    step "p2:$e:idle"   idle "$(ctx_of "$e")" "$e"
+  done
 
-  # Phase 3 — startup, n=6, alternating order: each engine goes first exactly 3 times
-  # (n=5 gave Velox the first slot 3 times and the peer 2).
-  local r
+  # Phase 3 — startup, n=6, every order: each engine is timed first, middle and last equally.
   for r in 1 2 3 4 5 6; do ROUND=$r; step "p3:startup:r$r" startup; done
 
-  # Phase 4 — the timed suite, order-balanced, n=6. Heavy sets in rounds 1–4 (2 each way).
+  # Phase 4 — the timed suite, n=6, order-rotated. Heavy sets in a balanced subset of rounds:
+  # 1–4 for two engines (2 each way), 1–3 for three (a Latin square: each engine once per slot).
+  local heavy=4; [ "$(echo $ENGINES | wc -w)" -eq 3 ] && heavy=3
   for r in 1 2 3 4 5 6; do
     ROUND=$r
-    local sets="core"; [ "$r" -le 4 ] && sets="core,build,compose,rosetta"
-    local first second fctx sctx
-    if [ $((r % 2)) = 1 ]; then first="$LBL_A"; fctx="$CTX_A"; second="$LBL_B"; sctx="$CTX_B"
-    else first="$LBL_B"; fctx="$CTX_B"; second="$LBL_A"; sctx="$CTX_A"; fi
-    step "p4:r$r:$first:engine" engine "$first"
-    step "p4:r$r:$first:pre"    preflight "$fctx"
-    BENCH_SETS="$sets" step "p4:r$r:$first:suite" suite "$fctx" "$first"
-    step "p4:r$r:$second:engine" engine "$second"
-    step "p4:r$r:$second:pre"    preflight "$sctx"
-    BENCH_SETS="$sets" step "p4:r$r:$second:suite" suite "$sctx" "$second"
+    local sets="core"; [ "$r" -le "$heavy" ] && sets="core,build,compose,rosetta"
+    for e in $(order_for "$r"); do
+      step "p4:r$r:$e:engine" engine "$e"
+      step "p4:r$r:$e:pre"    preflight "$(ctx_of "$e")"
+      BENCH_SETS="$sets" step "p4:r$r:$e:suite" suite "$(ctx_of "$e")" "$e"
+    done
   done
   ROUND=0
 
-  # Phase 5 — one-offs (low n, labeled as such in the report). Peer first.
-  step "p5:$LBL_B:engine"  engine "$LBL_B"
-  step "p5:$LBL_B:loadram" loadram "$CTX_B" "$LBL_B"
-  step "p5:$LBL_B:reclaim" reclaim "$CTX_B" "$LBL_B"
-  step p5:velox:engine     engine "$LBL_A"
-  step p5:velox:loadram    loadram "$CTX_A" "$LBL_A"
-  step p5:velox:reclaim    reclaim "$CTX_A" "$LBL_A"
+  # Phase 5 — one-offs (low n, labeled as such in the report).
+  for e in $(order_for 3); do
+    step "p5:$e:engine"  engine "$e"
+    step "p5:$e:loadram" loadram "$(ctx_of "$e")" "$e"
+    step "p5:$e:reclaim" reclaim "$(ctx_of "$e")" "$e"
+  done
 
-  # Phase 6 — functional matrix (untimed, network allowed). Peer first.
-  step "p6:$LBL_B:engine" engine "$LBL_B"
-  step "p6:$LBL_B:matrix" matrix "$CTX_B" "$LBL_B"
-  step p6:velox:engine    engine "$LBL_A"
-  step p6:velox:matrix    matrix "$CTX_A" "$LBL_A"
+  # Phase 6 — functional matrix (untimed, network allowed).
+  for e in $(order_for 4); do
+    step "p6:$e:engine" engine "$e"
+    step "p6:$e:matrix" matrix "$(ctx_of "$e")" "$e"
+  done
 
   step p7:footprint footprint
   log "campaign complete — $CSV"
   python3 "$HERE/report.py" --csv "$CSV"
 }
 
-USAGE="usage: [BENCH_PEER=dd|orbstack] $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|parity|report]"
+USAGE="usage: [BENCH_PEER=dd|orbstack|all] $0 [all|campaign|preflight|engine <e>|suite <ctx> <lbl>|idle|loadram|reclaim|matrix|footprint|startup|parity|report]"
 case "${1:-help}" in report|help|-h|--help) ;; *) setup_client ;; esac
 # No default subcommand on purpose: the two cadences differ by 12 minutes vs ~4 hours
 # and the long one bounces both apps, so it must be asked for by name.
@@ -1161,12 +1213,12 @@ case "${1:-help}" in
   campaign)  campaign ;;
   preflight) preflight "${2:-}" ;;
   parity)    config_parity ;;
-  engine)    engine "${2:?usage: engine <velox|$LBL_B>}" ;;
+  engine)    engine "${2:?usage: engine <velox|${PEERS// /|}>}" ;;
   # The quick check writes to its own scratch CSV: it used to truncate results.csv — the
   # committed evidence behind the published scorecard — on every run.
   all)       [ -z "${BENCH_CSV:-}" ] && CSV="$RUNDIR/quick.csv"
              mkdir -p "$RUNDIR"; echo "$CSV_HEADER" > "$CSV"
-             footprint; suite "$CTX_A" "$LBL_A"; suite "$CTX_B" "$LBL_B"
+             footprint; for e in $ENGINES; do suite "$(ctx_of "$e")" "$e"; done
              python3 "$HERE/report.py" --csv "$CSV" ;;
   footprint) footprint ;;
   suite)     suite "${2:?ctx}" "${3:?label}" ;;

@@ -22,10 +22,11 @@
 
 Velox runs a real Docker Engine in a minimal Linux VM on Apple's
 `Virtualization.framework` — and gets out of the way: a self-contained app that
-installs in 357 MB, restarts to a ready Docker API in about 1.2 seconds, and
-settles to well under half a gigabyte once its resource saver kicks in. Numbers
-below, with the methodology, the raw values and a runnable harness in
-[docs/bench/REPORT-2026-08-25.md](docs/bench/REPORT-2026-08-25.md).
+installs in 327 MB, restarts to a ready Docker API in 0.59 seconds, and drops to
+133 MB of host memory once its resource saver stops the idle engine. Numbers below,
+measured against Docker Desktop and OrbStack in one campaign, with the methodology,
+the raw values and a runnable harness in
+[docs/bench/REPORT-2026-10-11-3way.md](docs/bench/REPORT-2026-10-11-3way.md).
 
 ## Highlights
 
@@ -193,82 +194,81 @@ warning.
 
 ## Performance
 
-Measured against Docker Desktop 4.88.0 on the same Mac, on the same day, the same
-way — and the comparison is a close one to make fairly, because **both engines run
-the identical Docker Engine 29.7.2**, the same containerd image store, the same
-`docker` CLI and the same compose plugin, at a verified 8 vCPU / ~8 GB each, with
-only one engine resident at a time. What differs is the host around the engine.
+Measured on 2026-10-11 against Docker Desktop 4.94.0 and OrbStack 2.2.3 in **one campaign**:
+the same Mac and the same night, one engine resident at a time, each at a verified 8 vCPU / 8 GB.
+All three were emptied first and driven by the same `docker` CLI and compose plugin. Six rounds
+ran the engines in all six orders, so each went first, middle and last twice. Medians, n=6
+(n=3 for builds and compose, n=1 for the memory phases). Every raw value, the method and the
+caveats are in [docs/bench/REPORT-2026-10-11-3way.md](docs/bench/REPORT-2026-10-11-3way.md).
+`compose down` and disk reclaim (†) were re-measured the same morning, after Velox adopted a 3 s
+stop default and the reclaim test was fixed.
 
-Medians over five order-balanced rounds (three for build/compose). Full
-methodology, every raw value, and the cases where Docker Desktop wins are in
-[docs/bench/REPORT-2026-08-25.md](docs/bench/REPORT-2026-08-25.md).
-
-| Metric | Velox | Docker Desktop | vs Docker Desktop |
+| Metric | Velox | Docker Desktop | OrbStack |
 | --- | --- | --- | --- |
-| Install footprint | 357 MB | 2,193 MB | 6× smaller |
-| Idle RAM (host RSS, whole engine) | 734 MB | 1,771 MB | 2.4× less |
-| Idle RAM after the resource saver | 373 MB | 847 MB | 2.3× less |
-| Idle CPU (4 min, whole engine) | 0.76 % | 3.52 % | 4.6× less |
-| RAM with 21 containers running | 1,949 MB | 2,991 MB | 1.5× less |
-| Startup (restart → API-ready, warm; other engine still resident¹) | 1.23 s | 1.99 s | 1.6× faster |
-| Container launch (`run --rm alpine true`) | 0.11 s | 0.13 s | 1.2× faster |
-| Published port — host → container (4 streams) | 59.8 Gbit/s | 25.3 Gbit/s | 2.4× faster |
-| `docker cp` out / in (1 GiB) | 540 / 373 MB/s | 225 / 154 MB/s | ~2.4× faster |
-| Disk handed back after deleting ~5 GB | 5,295 MB | 3,594 MB | 1.5× more returned |
-| Named-volume write (`dd` 1 GiB) | 2,115 MB/s | 1,840 MB/s | on par |
-| Image extraction (`docker load`) | 6.70 s | 6.38 s | on par |
-| Incremental `docker build` | 1.52 s | 1.56 s | on par |
-| Postgres `pgbench` TPS (8 clients, 30 s) | 13,796 | 12,372 | on par |
-| Small-file extract (4,000 files → bind) | 3.21 s | 2.56 s | **25% slower** |
-| `compose down` (SIGTERM-ignoring services) | 10.4 s | 3.5 s | **3× slower** |
+| Install footprint | **327 MB** | 2,198 MB | 696 MB |
+| Startup (quit → API-ready) | **0.59 s** | 1.79 s | 1.35 s |
+| Idle RAM (host RSS, whole engine) | 667 MB | 2,306 MB | 767 MB |
+| Idle RAM after the resource saver | **133 MB** | 989 MB | 753 MB |
+| Idle CPU (idle state, after the 5-min saver timer¹) | **0.00 %** | 0.51 % | 0.15 % |
+| RAM with 21 containers running | 1,543 MB | 3,098 MB | 1,563 MB |
+| RAM 3 min after removing them | 1,566 MB | 3,052 MB | **1,149 MB** |
+| Container launch (`run --rm alpine true`) | **0.09 s** | 0.13 s | 0.21 s |
+| Network: container → container | **165 Gbit/s** | 92 Gbit/s | 91 Gbit/s |
+| Published port, 1 stream | 47.9 Gbit/s | 12.5 Gbit/s | 49.3 Gbit/s |
+| Published port, 4 streams | 20.2 Gbit/s | 25.7 Gbit/s | **30.3 Gbit/s** |
+| `docker cp` out / in (1 GiB) | 715 / **932** MB/s | 220 / 148 MB/s | 694 / 546 MB/s |
+| Small-file extract (4,000 files → bind mount) | 2.06 s | 2.35 s | **1.15 s** |
+| Named-volume write | **2,303 MB/s** | 1,771 MB/s | 1,050 MB/s |
+| Incremental `docker build` | 1.35 s | 1.48 s | 2.06 s |
+| Postgres `pgbench` TPS (8 clients) | 15,750 | 14,693 | 6,550 |
+| `compose down` (SIGTERM-ignoring services) † | 3.31 s | 3.50 s | 10.6 s |
+| Disk still held 150 s after deleting ~5 GB † | 0 MB | 1,120 MB | 0 MB |
 
-¹ The harness only quit the engine being timed, which left the other one running. The fix landed
-in 2026-10; the Docker Desktop startup row has not been re-measured since.
+¹ Each product in its idle state: Velox and Docker Desktop after their 5-minute resource-saver
+timeout, OrbStack — which has no saver — as it idles. In the first 4 minutes, with every VM still
+running, it was 0.28 % / 1.51 % / 0.22 %.
 
-Two honest trails. `compose down` is the one users feel: for a container that
-ignores `SIGTERM` — most containers running a bare command as PID 1 — Velox waits
-Docker's documented 10-second grace period before `SIGKILL`, while Docker Desktop
-escalates at about 3 s. Given an explicit `docker stop -t`, the two are
-indistinguishable. Small-file extraction over VirtioFS is the other, and it is the
-only filesystem metric Velox loses; bulk reads, named-volume and overlay writes are
-par or better.
+Bold marks a clear winner: at least 15% ahead of both others, with spreads that don't
+overlap. Rows without bold are par between the best two.
 
-Functionally the two engines came out level on every probe that was run — bind
-mounts, `host.docker.internal`, TCP/UDP/IPv6 publishing, privileged ports, BuildKit
-with attestations, and `linux/amd64`, `linux/arm/v7` and `linux/386` emulation
-(where the emulation tax is the same on both, 4.9× vs 4.8× over native). Velox adds
-`<name>.velox.local`. Per-container host-IP publishing (`-p <LAN-IP>:…`), which Docker
-Desktop had and Velox lacked in that run, is now supported too (IPv4; an address the Mac
-doesn't have starts the container but logs that the port is not published, where Docker
-would refuse the `docker run`). Docker Desktop also ships Kubernetes, Scout, Extensions and
-its AI tooling — none of which Velox has, and which account for much of the size
-difference above.
+**Against Docker Desktop**, Velox is ahead nearly everywhere and trails once: published ports
+with 4 streams. `compose down` used to be a second trail. For a container that ignores `SIGTERM`
+it measures the stop grace period, not engine speed: Docker Desktop ships its dockerd with
+`"default-stop-timeout": 3` instead of Docker's 10 s. Velox now ships the same 3 s default (3.31 s
+vs 3.50 s; it was 10.3 s in the campaign). OrbStack keeps 10 s.
 
-**Against OrbStack** the picture is mixed. This was measured on 2026-10-09 with the same
-harness at 8 vCPU / 8 GiB each, against OrbStack 2.2.3
-([full report](docs/bench/REPORT-2026-10-09-orbstack.md)).
+**Against OrbStack** it's a split decision. Velox is faster at:
+- container launch, about 2.3×;
+- startup;
+- container networking;
+- volume and overlay writes, about 2×;
+- builds;
+- Postgres, about 2.4×;
+- `compose down` with SIGTERM-ignoring services (OrbStack keeps the 10 s grace period).
 
-Velox is clearly faster at container work:
-- container launch, about 2×;
-- builds, 1.4–1.9×;
-- Postgres, 2.5× the TPS;
-- container networking, 1.4–1.6×.
+OrbStack is ahead on:
+- small-file bind-mount I/O, 1.8×;
+- published ports with 4 streams;
+- giving memory back in the first minutes after a workload.
 
-Idle RAM is a tie.
+Velox returns memory by stopping the idle engine after 5 minutes, because macOS 27's memory
+balloon frees nothing.
 
-OrbStack is clearly ahead on host integration:
-- small-file bind-mount I/O, 2.3× faster;
-- startup, 0.88 s vs 1.21 s;
-- `docker cp`, 1.3–1.4× faster;
-- idle CPU;
-- giving memory and disk space back after a workload.
+The 4-stream published-port number fell from a steady 60 Gbit/s on macOS 26.6 to 20–60 Gbit/s
+on macOS 27. The cause is Apple's NAT, not Velox: the 1.7.0 build shows the same swing today, and
+the Mac→VM direction of Apple's NAT measures ~14 Gbit/s with no Velox code in the path at all.
+One stream is steady at 48 Gbit/s.
 
-Velox does not beat OrbStack across the board.
+All three passed every functional probe: bind mounts, `host.docker.internal`, TCP/UDP/IPv6
+publishing, per-container host IPs, privileged ports, BuildKit with attestations, and
+`linux/amd64`, `linux/arm/v7` and `linux/386` emulation. Velox and OrbStack add direct
+`<name>.local` container access. Docker Desktop also ships Kubernetes, Scout, Extensions and its
+AI tooling, none of which Velox has; they account for much of its size.
 
 The data disk is durable by default: a raw image attached with
 `synchronizationMode: .fsync` and guest barriers on, so every committed write
-survives a crash, a power-off and in-place updates. Periodic `fstrim` returns freed
-space to macOS — measured above at 96% of a 5 GB delete handed back.
+survives a crash, a power-off and in-place updates. Freed space goes back to macOS by
+`fstrim`, run a few seconds after Docker deletes something.
 
 ## How it's built
 

@@ -1,45 +1,52 @@
-# Benchmarks — Velox vs Docker Desktop
+# Benchmarks — Velox vs alternatives
 
-A reproducible head-to-head of Velox against **Docker Desktop** on the same Mac, the same
-way, with **both engines configured identically**. The harness lives in
+A reproducible comparison of Velox against **Docker Desktop** and **OrbStack** on the same Mac,
+the same way, with **every engine configured identically**. The harness lives in
 [`docs/bench/`](bench/); this page is the method, the fairness rules, and the recorded
 results.
 
 > **North star:** be as lean, efficient, and fast as possible with the smallest footprint —
-> beating Docker Desktop where possible, on par where not. These tests are how we keep that
+> beating Docker Desktop and OrbStack where possible, on par where not. These tests are how we keep that
 > claim honest, including where Velox currently **trails**.
 
 ## TL;DR
 
-| | Velox vs Docker Desktop 4.88.0 |
-| --- | --- |
-| 🟢 **Wins** | install 6× smaller, idle RAM 2.4× less, idle CPU 4.6× less, startup 1.6× faster, container launch 1.2×, published ports 2.4–3.4×, `docker cp` ~2.4×, container→container net 1.4×, 1.5× more disk handed back after a delete |
-| ⚪ **Par** | VirtioFS bind read, named-volume write, overlay write, `docker load`, cold/incremental build, compose up, emulation tax, pgbench |
-| 🔴 **Trails** | `compose down` on SIGTERM-ignoring services (3× slower), small-file extract over VirtioFS (25% slower), no per-container host-IP publishing (supported since) |
+**2026-10-11 — Velox vs Docker Desktop 4.94.0 vs OrbStack 2.2.3, one campaign**
+([full report](bench/REPORT-2026-10-11-3way.md)). All three ran on the same night, one at a
+time, each at a verified 8 vCPU / 8 GB, in all six orders, with n=6 for the suite. `compose down`
+and disk reclaim were re-measured the same morning (compose n=3, reclaim n=1), after Velox
+adopted a 3 s stop default and the reclaim test was fixed.
 
-**Against OrbStack 2.2.3** (2026-10-09, [full report](bench/REPORT-2026-10-09-orbstack.md)):
-OrbStack is the harder opponent and Velox does **not** beat it across the board.
+| | vs Docker Desktop 4.94.0 | vs OrbStack 2.2.3 |
+| --- | --- | --- |
+| 🟢 **Wins** | install 6.7× smaller, startup 3.1× faster (0.59 s), idle RAM 3.5× / after saver 7.4× less, idle CPU 0 % vs 0.51 % (after saver), RAM under load and after teardown 2×, launch 1.3–1.4×, container→host 4×, container↔container 1.8×, published port (1 stream) 3.9×, `docker cp` 3.3× out / 6.3× in, bind read/write 1.2×, named-volume write 1.3×, build-context transfer 2.4×, disk handed back after a 5 GB delete (all of it vs 1.1 GB still held 150 s later, n=1) | install 2.1× smaller, startup 2.3× faster, idle RAM after saver 5.7× less, idle CPU 0 % vs 0.15 % (idle state; OrbStack has no saver), launch/churn 2.2–2.3×, container→host 1.7×, container↔container 1.8×, named-volume and overlay writes 2×, `docker cp` in 1.7×, builds 1.5–2×, amd64 emulation 1.2×, pgbench 2.4× TPS, `compose down` 3.2× (OrbStack keeps the 10 s stop grace period) |
+| ⚪ **Par** | small-file extract, overlay write, `docker load`, builds, compose up, emulation, pgbench, `compose down` (3.3 vs 3.5 s, both with a 3 s stop default) | idle RAM (RSS), RAM under load, published port (1 stream), bind write, `docker cp` out, `docker load`, compose up, disk handed back after a delete (both returned all of it) |
+| 🔴 **Trails** | published port with 4 streams (0.79×) | small-file extract (1.8× slower), published port with 4 streams (0.67×), RAM in the first minutes after a teardown (1.3×) |
 
-| | Velox 1.7.0 vs OrbStack 2.2.3 |
-| --- | --- |
-| 🟢 **Wins** | container launch/churn 2×, builds 1.4–1.9×, pgbench 2.5× TPS, container→host 1.6×, container↔container 1.4×, overlay write 1.9×, amd64 emulation 1.2×, install 2× smaller |
-| ⚪ **Par** | idle RAM, published port (1 stream), bind write, `docker load`, compose up/down, disk returned after a delete |
-| 🔴 **Trails** | small-file VirtioFS 2.3× slower, startup 1.21 s vs 0.88 s, `docker cp` 1.3–1.4× slower, idle CPU 2–3× higher, RAM under load 1.3× and after teardown 1.7× higher, deleted space held until the next trim, no per-container host-IP publishing (supported since) |
-| ❔ **No verdict** | published port, 4 streams: Velox swings between 19 and 60 Gbit/s on the same boot (OrbStack a steady 28) |
+The 4-stream published-port number is not a Velox regression. Apple's NAT swings on macOS 27:
+the 1.7.0 build shows the same 20–60 Gbit/s spread today, and the Mac→VM direction measures
+~14 Gbit/s with no Velox code in the path. It was a steady 60 on macOS 26.6. One stream is a
+steady 48. Details are in the report. Earlier
+head-to-heads are kept below as history.
 
-Full numbers and raw values: **[REPORT-2026-08-25.md](bench/REPORT-2026-08-25.md)**. The data
+Previous Docker Desktop campaign (Velox 1.x vs Docker Desktop 4.88.0): **[REPORT-2026-08-25.md](bench/REPORT-2026-08-25.md)**. The data
 disk is raw + durable `.fsync` ([Disk](#disk-raw-image--durable-fsync-2026-06-09)); published
 ports ride a VZNAT conduit pool; launch is `HZ_1000` + expedited RCU
 ([Launch](#launch-expedited-rcu-2026-06-09)).
 
 ## Test environment (recorded run)
 
-- **Host:** Apple M4 Pro (8 performance + 4 efficiency cores), 24 GB RAM, macOS 26.6.2
-- **Velox:** 1.2.0 — guest kernel 7.2, dockerd 29.7.2
-- **Docker Desktop:** 4.88.0 — dockerd 29.7.2, `Virtualization.framework` backend
-- **Both engines:** **8 vCPU / ~8 GB** (verified in-guest), 0 containers, same containerd
-  image store, same `docker` CLI and compose plugin, one engine resident at a time
-- **Date:** 2026-08-25 (`./run.sh campaign`, run id `2026-08-24`)
+- **Host:** Apple M4 Pro (8 performance + 4 efficiency cores), 24 GB RAM, macOS 27.0.1
+- **Velox:** 1.7.1 (main @ 508ff8b) — guest kernel 7.2.9, dockerd 29.8.2
+- **Docker Desktop:** 4.94.0 — dockerd 29.8.2, `Virtualization.framework` backend
+- **OrbStack:** 2.2.3 — dockerd 29.4.0, its own VMM
+- **All three:** **8 vCPU / ~8 GB** (verified in-guest), emptied first (no images, volumes or
+  build cache), same `docker` CLI and compose plugin, one engine resident at a time
+- **Date:** 2026-10-11 (`BENCH_PEER=all ./run.sh campaign`, run id `2026-10-11-3way`)
+
+The Results section below and the method sections after it are from the original Docker Desktop
+campaign (2026-08-25) and kept as history; the current numbers are the TL;DR above and its
+report.
 
 Set Docker Desktop's allocation in **Settings → Resources** and Velox's in **Settings →
 Resources** so the two match before running.
@@ -54,16 +61,24 @@ cd docs/bench
 ./run.sh campaign         # the full publishable comparison (~4 h, see below)
 ./run.sh report           # re-print the scorecard from results.csv
 BENCH_PEER=orbstack ./run.sh campaign   # same, against OrbStack → results-orbstack.csv
+BENCH_PEER=all ./run.sh campaign        # all three in ONE campaign (~6 h) → results-3way.csv
 ./run.sh startup          # restart-to-ready timing — NOTE: this quits & relaunches both apps
 ./run.sh suite velox velox            # run the active suite against one engine only
 ```
 
 The engine under test is selected purely by its **Docker context** (`velox` /
 `desktop-linux` / `orbstack`) — no daemon swap, no `DOCKER_HOST` juggling. `BENCH_PEER`
-(`dd`, the default, or `orbstack`) picks the peer. Both engines are driven by **Velox's bundled
+(`dd`, the default, `orbstack`, or `all`) picks the peer. `all` measures Velox, Docker Desktop
+and OrbStack in one campaign, so all three share a day and a host state: every round runs the
+engines in a different order — over six rounds each engine goes first, second and last
+exactly twice — and the scorecard shows one column per engine plus Velox's verdict against
+each. Both engines are driven by **Velox's bundled
 `docker` CLI, compose and buildx** from a private `DOCKER_CONFIG`, so neither app's own CLI or
 plugin re-linking can make the two sides differ. Results append to `docs/bench/results.csv`
-(Docker Desktop) or `results-orbstack.csv`; `report.py --csv <file>` renders the scorecard.
+(Docker Desktop), `results-orbstack.csv` or `results-3way.csv`; `report.py --csv <file>` renders
+the scorecard. A same-day re-measurement after a fix goes into the same CSV under its own
+`RUN_ID` and is applied with `--supersede <run id>`: its rows replace the campaign's for those
+metrics (marked †) instead of being averaged with the build or test they correct.
 
 ## Fairness controls
 
@@ -98,7 +113,7 @@ These are what make the numbers comparable rather than anecdotal:
 | realworld | `pgbench_init` | bulk DB load (sequential writes + checkpoint) |
 | realworld | `pgbench_tps` | TPC-B-like txns — dominated by per-commit **fsync latency** |
 
-## Results
+## Results (2026-08-25, Velox 1.2.0 vs Docker Desktop 4.88.0 — history)
 
 Medians over five order-balanced rounds (three for build/compose); `±` is the inter-quartile
 spread. Metrics whose spread was too wide to call are published without a verdict in the
@@ -199,15 +214,17 @@ Inbound `localhost:PORT → container` used to route over a single `VZVirtioSock
 (VSOCK), which serialized and capped at ~1–6 Gbit/s — the old big trail. It now rides a
 **pre-warmed VZNAT conduit pool**: the guest keeps idle TCP conduits dialed to the host over
 the fast VZNAT path, and the host hands each published connection an idle conduit (assignment
-over VSOCK, *data* over VZNAT), so throughput jumps to **38–60 Gbit/s — 2.9–3.3× Docker
-Desktop** (it falls back to the VSOCK relay if the pool is momentarily empty).
+over VSOCK, *data* over VZNAT), so throughput jumped to **38–60 Gbit/s — 2.9–3.3× Docker
+Desktop** in the August run (it falls back to the VSOCK relay if the pool is momentarily
+empty). In the 2026-10-11 campaign the 4-stream case measured mostly 20 Gbit/s and trailed both peers.
+That turned out to be Apple's NAT varying on macOS 27, not a Velox change (see the report); one
+stream still ran at 47.9 Gbit/s.
 
 ## Velox vs OrbStack — method
 
 The North Star names OrbStack as well as Docker Desktop, so the campaign takes it as a peer:
-`BENCH_PEER=orbstack`. These rules were fixed before the first number existed. The first run
-under them (2026-10-09) is in
-[REPORT-2026-10-09-orbstack.md](bench/REPORT-2026-10-09-orbstack.md), and is summarised in the
+`BENCH_PEER=orbstack`, or all three at once with `BENCH_PEER=all`. These rules were fixed before
+the first number existed; the current three-way campaign ran under them and is summarised in the
 TL;DR above.
 
 - **Forced equal:** 8 vCPU / 8 GiB on both (OrbStack `~/.orbstack/vmconfig.json`, Velox
@@ -235,9 +252,9 @@ TL;DR above.
   non-overlapping IQRs, UNRELIABLE above 25% spread. Every row is published, losses included;
   any re-run covers both engines and keeps every row.
 
-Output: `results-orbstack.csv` and a hand-written `bench/REPORT-<date>-orbstack.md`. The
-OrbStack numbers are not merged into the Docker Desktop table above (different day, different
-Velox version).
+Output: `results-orbstack.csv` and a hand-written `bench/REPORT-<date>-orbstack.md`
+(`results-3way.csv` and `REPORT-<date>-3way.md` for `BENCH_PEER=all`). These numbers are not
+merged into the August Docker Desktop table above (different day, different Velox version).
 
 ## Filesystem: two harness bugs, and a read-ahead fix (2026-08-14)
 

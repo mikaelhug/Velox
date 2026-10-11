@@ -2110,6 +2110,12 @@ fn spawn_dockerd_with_gateway(gw: u32) -> i32 {
         // iptables/ip6tables binaries are dropped from the rootfs. Requires the nft
         // `fib` expression (kernel fragment) and ip_forward preset (below).
         "--firewall-backend=nftables".into(),
+        // 3 s between SIGTERM and SIGKILL when a stop doesn't ask for its own timeout — Docker
+        // Desktop ships the same (`default-stop-timeout: 3`). Docker's default is 10 s, which a
+        // container ignoring SIGTERM (a bare command as PID 1: `sleep`, Python) always waits out,
+        // so `compose down` sat on it for 10 s. A stop that passes `-t`/`stop_grace_period` is
+        // unaffected; a service that needs longer than 3 s to shut down should set one.
+        "--default-stop-timeout=3".into(),
     ];
     // host.docker.internal → the vmnet gateway (the Mac), so containers can reach
     // host services. Containers add it via `--add-host host.docker.internal:host-gateway`

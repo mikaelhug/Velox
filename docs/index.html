@@ -117,20 +117,20 @@
       <section class="section" style="padding-top: clamp(48px, 7vw, 84px)">
         <div class="metric-band" aria-label="Velox performance summary">
           <div class="metric">
-            <span class="metric-value">357 MB</span>
+            <span class="metric-value">327 MB</span>
             <span class="metric-label">self-contained app</span>
           </div>
           <div class="metric">
-            <span class="metric-value">1.23 s</span>
-            <span class="metric-label">warm restart to API-ready</span>
+            <span class="metric-value">0.59 s</span>
+            <span class="metric-label">quit to API-ready</span>
           </div>
           <div class="metric">
-            <span class="metric-value">373 MB</span>
-            <span class="metric-label">idle host footprint, resource saver on</span>
+            <span class="metric-value">133 MB</span>
+            <span class="metric-label">idle host memory, resource saver on</span>
           </div>
           <div class="metric">
-            <span class="metric-value">59.8 Gbit/s</span>
-            <span class="metric-label">published-port throughput</span>
+            <span class="metric-value">165 Gbit/s</span>
+            <span class="metric-label">container-to-container network</span>
           </div>
         </div>
       </section>
@@ -281,40 +281,40 @@ curl http://web.velox.local
 
       <section class="section" id="benchmarks">
         <div class="section-heading">
-          <p class="eyebrow">Measured against Docker Desktop</p>
+          <p class="eyebrow">Measured against Docker Desktop and OrbStack</p>
           <h2>Reproducible numbers, including where Velox trails</h2>
         </div>
         <div class="comparison">
           <div class="comparison-row">
-            <span>Install footprint</span>
-            <strong>6x smaller</strong>
+            <span>Startup, quit to API-ready</span>
+            <strong>3.1x faster than Docker Desktop, 2.3x than OrbStack</strong>
           </div>
           <div class="comparison-row">
-            <span>Idle RAM, whole engine</span>
-            <strong>2.4x less</strong>
+            <span>Container launch</span>
+            <strong>1.4x faster than Docker Desktop, 2.3x than OrbStack</strong>
           </div>
           <div class="comparison-row">
-            <span>Idle CPU</span>
-            <strong>4.6x less</strong>
+            <span>Idle RAM, after the resource saver</span>
+            <strong>7.4x less than Docker Desktop, 5.7x than OrbStack</strong>
           </div>
           <div class="comparison-row">
-            <span>Published port throughput</span>
-            <strong>2.4x faster</strong>
+            <span>Container-to-container network</span>
+            <strong>1.8x faster than both</strong>
           </div>
           <div class="comparison-row">
             <span>Small-file extract over VirtioFS</span>
-            <strong>25% slower</strong>
+            <strong>on par with Docker Desktop, 1.8x slower than OrbStack</strong>
           </div>
           <div class="comparison-row">
-            <span>compose down, SIGTERM-ignoring services</span>
-            <strong>3x slower</strong>
+            <span>Published ports, 4 streams</span>
+            <strong>1.3x slower than Docker Desktop, 1.5x than OrbStack</strong>
           </div>
         </div>
         <p class="note">
-          Measured against Docker Desktop 4.88.0 on one Mac, on one day, with both
-          engines running the identical Docker Engine 29.7.2 at matched CPU and
-          memory. Full methodology, every raw value, and the places Docker Desktop
-          wins are on the <a href="benchmarks.html">benchmark page</a>.
+          Measured against Docker Desktop 4.94.0 and OrbStack 2.2.3 in one campaign on
+          one Mac, one engine at a time, each at a verified 8 vCPU / 8 GB. Full
+          methodology, every raw value, and every place Velox trails are on the
+          <a href="benchmarks.html">benchmark page</a>.
         </p>
       </section>
 

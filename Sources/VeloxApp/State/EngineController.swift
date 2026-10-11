@@ -295,7 +295,7 @@ final class EngineController {
             // real suspension, which is the VM-start continuation — so the guest begins booting
             // during app init instead of after SwiftUI has launched and drawn the dashboard.
             // A plain `Task` queued behind that work: launch→VM process measured 0.38–0.41 s in
-            // the GUI vs 0.10 s in the CLI, the whole startup gap to OrbStack (REPORT-2026-10-09).
+            // the GUI vs 0.10 s in the CLI, the whole startup gap to OrbStack (2026-10-09 OrbStack run).
             if #available(macOS 26.0, *) {
                 Task.immediate { await self.start() }
             } else {
