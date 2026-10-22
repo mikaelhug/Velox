@@ -64,6 +64,7 @@ struct OverviewView: View {
     let remoteHost: RemoteHost?
     let remoteState: SSHTunnel.State?
     @Environment(EngineController.self) private var engine
+    @Environment(\.engineIdle) private var engineIdle
     @State private var model: OverviewModel
     @State private var showReclaim = false
     // The /system/df snapshot lives in the STORE (not view state): it survives pane
@@ -114,7 +115,8 @@ struct OverviewView: View {
         .sheet(isPresented: $showReclaim) {
             ReclaimSpaceSheet(docker: docker, seed: model.store.diskUsage,
                               isPresented: $showReclaim,
-                              remoteHostName: remoteHost?.name) {
+                              remoteHostName: remoteHost?.name,
+                              refreshOnOpen: !engineIdle) {
                 model.refreshDiskUsage()
                 Task { await model.store.refreshDiskUsage() }
             }
@@ -439,11 +441,16 @@ private struct ReclaimSpaceSheet: View {
     /// sheet opens with sizes already in place (no pop-in); a fresh fetch on open —
     /// and after a run — updates them.
     @State private var usage: DiskUsage?
+    /// False while the engine is idle: opening the sheet is looking, and a fetch would resume
+    /// the engine. It shows the last snapshot; Reclaim itself resumes it.
+    private let refreshOnOpen: Bool
 
     init(docker: any DockerClientProtocol, seed: DiskUsage?, isPresented: Binding<Bool>,
-         remoteHostName: String? = nil, onReclaimed: @escaping () -> Void = {}) {
+         remoteHostName: String? = nil, refreshOnOpen: Bool = true,
+         onReclaimed: @escaping () -> Void = {}) {
         self.docker = docker
         self.remoteHostName = remoteHostName
+        self.refreshOnOpen = refreshOnOpen
         self.onReclaimed = onReclaimed
         _isPresented = isPresented
         _usage = State(initialValue: seed)
@@ -498,7 +505,7 @@ private struct ReclaimSpaceSheet: View {
             .padding(12)
         }
         .frame(width: 400, height: 380)
-        .task { usage = try? await docker.systemDiskUsage() }
+        .task { if refreshOnOpen { usage = try? await docker.systemDiskUsage() } }
     }
 
     /// Toggle label with the category's reclaimable size beside it ("— 1.2 GB").

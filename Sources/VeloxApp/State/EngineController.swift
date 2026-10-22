@@ -153,29 +153,54 @@ final class EngineController {
     /// this, not to an edited-but-unapplied value in `config`.
     private var bootedMemoryBytes: UInt64 = 0
 
-    /// The Docker API client, valid only while the engine is running. Dashboards
-    /// read this; it rides an in-process VSOCK connection to the guest.
-    private(set) var docker: DockerClient?
+    /// This boot's Docker API client — an in-process VSOCK connection to the guest, valid only
+    /// while the engine is running. Private on purpose: it dies with the boot, and a view that
+    /// captured it kept dialing a VM Resource Saver had stopped ("virtual machine is not
+    /// running"). Views get `actionDocker` / `followingDocker`, which follow the engine instead.
+    private var docker: DockerClient?
 
-    /// The dashboards' client while the engine is idle: their frozen lists stay on screen, and a
-    /// user action resumes the engine before it runs (`ResumingDockerClient`). Nil otherwise.
-    private(set) var idleDocker: EngineDockerClient?
+    /// The client for user actions (start, stop, remove, prune, …): the live client while running,
+    /// and while the engine is idle it resumes it first, so an action never fails for idleness.
+    /// Stateless — any instance stays valid across idle stops and resumes, so a pane may keep one
+    /// for its whole life.
+    var actionDocker: EngineDockerClient {
+        EngineDockerClient { [weak self] in await self?.resumeForAction() }
+    }
 
-    /// A client for windows that outlive the pane that opened them (container logs): it follows
-    /// the engine across idle stops and resumes — waiting while it is idle, never resuming it.
+    /// A client that follows the engine across idle stops and resumes — waiting while it is idle,
+    /// never resuming it. For the informers and for windows that outlive the pane that opened
+    /// them (container logs): looking must not keep the engine awake.
     var followingDocker: EngineDockerClient {
         EngineDockerClient { [weak self] in await self?.liveClientWaiting() }
     }
+
+    /// The dashboards' client, or nil while there is nothing to show. Running or idle: the panes
+    /// show the lists (frozen while idle) and act through `actionDocker`. Starting: only on a
+    /// resume, whose lists are already loaded — a cold boot shows the engine-down pane.
+    var dashboardDocker: EngineDockerClient? {
+        guard resources != nil, stats != nil else { return nil }
+        switch state {
+        case .running, .napping: return actionDocker
+        case .starting:          return isResuming ? actionDocker : nil
+        default:                 return nil
+        }
+    }
+
+    /// True while `wake()` boots a napping engine (`dashboardDocker` keeps the panes up).
+    private(set) var isResuming = false
 
     /// Persistent, shared store of the dashboard resource lists (containers/images/
     /// volumes/networks). Owned here, above the navigation, so it survives pane
     /// switches — dashboards read already-loaded data instead of re-fetching on every
     /// switch. One events-driven informer feeds all of them (no per-view streams).
+    /// One store per engine session (start → stop): an idle stop freezes it and the resume
+    /// thaws the SAME store, so panes — and an action in flight across the resume — keep it.
     private(set) var resources: DockerResourceStore?
 
     /// Shared owner of live container CPU/memory stats (one stream per running
     /// container, shared by the Containers table and the Overview; streams only while a
-    /// stats view is on screen). Created with the engine, torn down on stop.
+    /// stats view is on screen). Created with the engine, torn down on stop — like
+    /// `resources`, it lives across idle stops, so the panes holding it stay valid.
     private(set) var stats: StatsStore?
 
     /// Per-pane UI state (search/selection/expansion), lifted here so it survives
@@ -570,17 +595,26 @@ final class EngineController {
             pendingHandoff = nil
             self.runtime = runtime
             self.docker = runtime.docker
-            // Start the shared resource informer immediately so the dashboards have
-            // data loaded before the user navigates to them (no per-pane re-fetch).
-            let resourceStore = DockerResourceStore(docker: runtime.docker)
             crashNotifier.enabled = config.notifyOnCrash
-            resourceStore.onContainerDied = { [crashNotifier] name, code in
-                crashNotifier.containerDied(name: name, exitCode: code)
+            if let store = self.resources, stats != nil {
+                // A resume: the idle stop froze this engine's stores in place. Thawing the same
+                // ones keeps every pane — and an action that resumed the engine, with its
+                // "Starting…" badge and any error it raises — instead of rebuilding them.
+                store.thaw()
+                store.start()
+            } else {
+                // Start the shared resource informer immediately so the dashboards have data
+                // loaded before the user navigates to them (no per-pane re-fetch). Through
+                // `followingDocker`, not this boot's client, so they survive idle stops: their
+                // first requests park until dockerd answers, then follow every resume.
+                let resourceStore = DockerResourceStore(docker: followingDocker)
+                resourceStore.onContainerDied = { [crashNotifier] name, code in
+                    crashNotifier.containerDied(name: name, exitCode: code)
+                }
+                resourceStore.start()
+                self.resources = resourceStore
+                self.stats = StatsStore(docker: followingDocker, resources: resourceStore)
             }
-            resourceStore.start()
-            self.resources = resourceStore
-            self.stats = StatsStore(docker: runtime.docker, resources: resourceStore)
-            idleDocker = nil   // live lists from here on
             appliedSignature = config.bootSignature(diskGiB: workspace.diskGiB)
             bootedMemoryBytes = resources.memoryBytes
             startResourceSaver()
@@ -802,13 +836,14 @@ final class EngineController {
         startGeneration &+= 1
         let gen = startGeneration
         state = .napping
-        // The GUI's informers stop now — they would otherwise reconnect to a VM that isn't there,
-        // every second, for the whole idle stretch — but the lists stay on screen, frozen, and the
-        // dashboards act through a client that resumes the engine first.
+        // The resource informer freezes now — its lists stay on screen, read-only, and a resume
+        // thaws the same store. The panes keep acting through `actionDocker`, which resumes the
+        // engine first. The stats store is left as it is: a nap needs nothing running, so it has
+        // no streams, and its `followingDocker` would only park, never dial the stopped VM.
+        // (Stopping it would also drop the retains of the stats views still on screen, which a
+        // resume no longer rebuilds.)
         resources?.freeze()
-        stats?.stop()
         docker = nil
-        idleDocker = EngineDockerClient { [weak self] in await self?.resumeForAction() }
         resourceSaver?.stop(); resourceSaver = nil
         isResourceSaving = false
         portIssues.clear()
@@ -855,6 +890,7 @@ final class EngineController {
     /// already in flight (another action, a `docker` command, the Resume button). Nil if the engine
     /// can't be resumed — it is stopping, failed, or busy with a workspace operation.
     func resumeForAction() async -> (any DockerClientProtocol)? {
+        await settleNap()
         if state == .napping { await wake() }
         while state == .starting || (state == .napping && wakeRequested) {
             await nextStateChange()
@@ -865,8 +901,18 @@ final class EngineController {
     /// The live client once the engine is running — waiting, without resuming it, while it is idle
     /// or starting. Nil when it is stopped or failed.
     func liveClientWaiting() async -> (any DockerClientProtocol)? {
+        await settleNap()
         while state == .napping || state == .starting { await nextStateChange() }
         return state == .running ? docker : nil
+    }
+
+    /// Let an idle stop in flight finish first. From the socket's release until `.napping`, the
+    /// state still reads `.running` while the VM is being powered off: a request handed the live
+    /// client then would be cut off by the stop. After it, the engine is running (the stop was
+    /// declined) or napping, and the callers resume or wait as usual. `napTask` never awaits
+    /// these resolvers, so this cannot deadlock.
+    private func settleNap() async {
+        if let napTask { await napTask.value }
     }
 
     private func nextStateChange() async {
@@ -883,6 +929,8 @@ final class EngineController {
             return
         }
         engineLog.mark("resuming")
+        isResuming = true
+        defer { isResuming = false }
         await performStart(handoff: gate.handOff())
     }
 
@@ -1248,7 +1296,6 @@ final class EngineController {
         startedAt = nil
         napGateBox.withLock { $0?.close(); $0 = nil }
         wakeRequested = false
-        idleDocker = nil
         if let engineActivity {
             ProcessInfo.processInfo.endActivity(engineActivity)
             self.engineActivity = nil

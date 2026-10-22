@@ -92,7 +92,7 @@ struct MenuBarContentView: View {
 
     /// Stop one or many containers concurrently (a project header stops its members).
     private func stop(_ containers: [ContainerSummary]) {
-        guard let docker = engine.docker else { return }
+        let docker = engine.actionDocker
         Task {
             await withTaskGroup(of: Void.self) { group in
                 for c in containers {

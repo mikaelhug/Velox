@@ -653,6 +653,11 @@ private struct ContainerInspector: View {
     }
     @State private var shown: Snapshot?
 
+    private struct InspectKey: Hashable {
+        let container: ContainerSummary?
+        let idle: Bool
+    }
+
     var body: some View {
         Group {
             // Until the first snapshot lands, render the bare summary — its list
@@ -664,7 +669,9 @@ private struct ContainerInspector: View {
                                        description: Text("Select a container to inspect."))
             }
         }
-        .task(id: container) {
+        // Keyed on idleness too: a resume no longer rebuilds the pane, so the inspect the idle
+        // engine skipped must run once it is back.
+        .task(id: InspectKey(container: container, idle: engineIdle)) {
             guard let c = container else { shown = nil; return }
             // Idle: show the list's summary, don't inspect — selecting a row (or reopening a pane
             // with a remembered selection) must not resume the engine.

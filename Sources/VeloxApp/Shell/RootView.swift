@@ -101,11 +101,10 @@ struct RootView: View {
     private var dashboard: Dashboard? {
         switch remotes.selection {
         case .local:
-            // Idle (or resuming from idle): the frozen lists, acting through the resuming client —
-            // looking at Velox never resumes the engine; doing something does.
-            let docker: (any DockerClientProtocol)? = engine.state.isRunning ? engine.docker
-                : (engine.state == .napping || engine.state == .starting) ? engine.idleDocker : nil
-            guard let docker, let store = engine.resources, let stats = engine.stats else { return nil }
+            // Running or idle, one client that follows the engine: idle shows the frozen lists, and
+            // looking at Velox never resumes the engine — doing something does.
+            guard let docker = engine.dashboardDocker, let store = engine.resources,
+                  let stats = engine.stats else { return nil }
             return Dashboard(docker: docker, store: store, stats: stats,
                              ui: engine.paneUI, issues: engine.portIssues, target: .local,
                              dataDiskURL: engine.activeWorkspace?.dataDiskURL
@@ -139,8 +138,9 @@ struct RootView: View {
     private var paneIdentity: String {
         switch remotes.selection {
         // The store is part of the identity: every pane captures its store and client once, into
-        // `@State`, so when a resume swaps the frozen store for a live one the panes must be rebuilt
-        // — or they keep showing (and refreshing) the frozen copy.
+        // `@State`, so a new engine session (a Stop → Start) must rebuild them. An idle stop and its
+        // resume keep the same store and client on purpose — panes, and an action in flight across
+        // the resume, carry on untouched.
         case .local:
             let store = engine.resources.map { "\(ObjectIdentifier($0).hashValue)" } ?? "-"
             return "local:\(engine.workspaces?.activeID ?? ""):\(store)"

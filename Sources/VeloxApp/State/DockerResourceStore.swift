@@ -75,13 +75,19 @@ final class DockerResourceStore {
 
     /// The engine went idle (Resource Saver): stop, and keep the last lists on screen, read-only.
     /// Every refresh is a no-op from here on — the Overview re-reads disk usage on appear, and
-    /// that read must not resume an engine the user only looked at. The engine replaces a frozen
-    /// store with a live one when it resumes.
+    /// that read must not keep an engine the user only looked at busy. The engine thaws this same
+    /// store when it resumes, so panes holding it carry on with live data.
     func freeze() {
         stop()
         isFrozen = true
     }
     private(set) var isFrozen = false
+
+    /// The engine resumed: refreshes run again. `start()` the informer afterwards — its first
+    /// reconcile replaces the frozen lists.
+    func thaw() {
+        isFrozen = false
+    }
 
     /// Container lifecycle actions that change a network's attached-container list.
     /// (Membership also arrives as `network` connect/disconnect events; this is the
@@ -157,7 +163,9 @@ final class DockerResourceStore {
     /// is recorded only *after* that first successful load: a pre-ready failure while
     /// dockerd is still coming up (e.g. ECONNRESET / "Connection reset by peer") is
     /// expected and stays silent, so the Overview never flashes it on launch. A genuine
-    /// mid-session failure — after the list has loaded once — still surfaces.
+    /// mid-session failure — after the list has loaded once — still surfaces. A failure that
+    /// lands after the store froze is dropped too: a request cut off by the engine's idle stop is
+    /// not an error worth painting over the frozen lists.
     func refresh(_ resource: Resource) async {
         guard !isFrozen else { return }
         switch resource {
@@ -171,16 +179,16 @@ final class DockerResourceStore {
                 if !Task.isCancelled { onReachable?() }
                 await refreshAnchors()
             }
-            catch { if containersLoaded { containersError = "\(error)" } }
+            catch { if containersLoaded, !isFrozen { containersError = "\(error)" } }
         case .images:
             do { images = try await docker.images(); imagesError = nil; imagesLoaded = true }
-            catch { if imagesLoaded { imagesError = "\(error)" } }
+            catch { if imagesLoaded, !isFrozen { imagesError = "\(error)" } }
         case .volumes:
             do { volumes = try await docker.volumes(); volumesError = nil; volumesLoaded = true }
-            catch { if volumesLoaded { volumesError = "\(error)" } }
+            catch { if volumesLoaded, !isFrozen { volumesError = "\(error)" } }
         case .networks:
             do { networks = try await docker.networks(); networksError = nil; networksLoaded = true }
-            catch { if networksLoaded { networksError = "\(error)" } }
+            catch { if networksLoaded, !isFrozen { networksError = "\(error)" } }
         }
     }
 
@@ -218,9 +226,9 @@ final class DockerResourceStore {
         do {
             diskUsage = try await docker.systemDiskUsage()
             diskUsageError = nil
-        } catch {
+        } catch where !isFrozen {
             diskUsageError = DockerClient.diskUsageMessage(for: "\(error)")
-        }
+        } catch {}
     }
 
     // MARK: - Lifecycle anchors (native uptime, no polling)

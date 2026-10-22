@@ -308,8 +308,12 @@ connections stall and serialize on the VM queue.
   every boot is the same DHCP client. Not VZ save/restore: that was built and removed (2026-08):
   restore measured 1.8–3.1 s vs a then-1.5 s cold boot, wrote the touched guest RAM to disk per
   sleep, and failed intermittently cross-process (VZErrorDomain 12, never root-caused). The
-  instance lock is kept while idle, the GUI's informers are torn down (they would reconnect to
-  nothing every second), and a stopped container dockerd would restart on boot (`always`,
+  instance lock is kept while idle, the GUI's informers are frozen (they would reconnect to
+  nothing every second) and thawed in place on resume. In the GUI, **looking never resumes the
+  engine; any user action does**: no view may hold a boot's raw `DockerClient` — panes act
+  through `EngineController.actionDocker` (resumes first) and the stores read through
+  `followingDocker` (waits, never resumes), both `EngineDockerClient`s that outlive every nap.
+  And a stopped container dockerd would restart on boot (`always`,
   `on-failure` with a non-zero exit) vetoes the stop rather than being resurrected by it.
 - The **informer rule:** the event is only the *trigger*; a full reconcile (the
   `containers()` list) is the source of truth, re-run on every (re)connect — so a
