@@ -1495,21 +1495,39 @@ do {
 
 section("Workspace.diskGiB clamping")
 do {
-    let now = Date()
-    equal(Workspace.clampDiskGiB(4), 8, "below the range clamps up")
-    equal(Workspace.clampDiskGiB(512), 256, "above the range clamps down")
-    equal(Workspace.clampDiskGiB(64), 64, "inside the range is untouched")
-    // A hand-edited or older manifest must not be able to put the Settings slider outside
-    // its bounds, which is undefined behaviour for a SwiftUI Slider.
+    equal(Workspace.clampDiskGiB(4), 8, "below the minimum clamps up")
+    equal(Workspace.clampDiskGiB(64), 64, "inside the bounds is untouched")
+    equal(Workspace.clampDiskGiB(512), 512, "no arbitrary 256 GB ceiling")
+    equal(Workspace.clampDiskGiB(Int.max), Workspace.maxDiskGiB,
+          "above vinit's 32-bit ext4 block-count read clamps down")
+    // A size set from the CLI or a hand-edited manifest survives decoding; the Settings
+    // slider widens its own upper bound to include it.
     let json = Data("""
     {"id":"z","name":"Huge","diskGiB":4096,"created":"2026-01-01T00:00:00Z",
      "lastUsed":"2026-01-01T00:00:00Z"}
     """.utf8)
     let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
     if let decoded = try? d.decode(Workspace.self, from: json) {
-        equal(decoded.diskGiB, 256, "decoding clamps an out-of-range size")
+        equal(decoded.diskGiB, 4096, "decoding keeps a large in-bounds size")
     } else { check(false, "decode failed") }
-    _ = now
+}
+
+section("Storage.maxDataDiskGiB")
+do {
+    let fm = FileManager.default
+    let base = fm.temporaryDirectory.appendingPathComponent("velox-diskmax-\(getpid())")
+    try? fm.createDirectory(at: base, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: base) }
+    let disk = base.appendingPathComponent("data.img")
+    // Not created yet, inside a folder that doesn't exist either: measured on the volume.
+    let missing = Storage.maxDataDiskGiB(at: base.appendingPathComponent("x/y/data.img"))
+    check((Workspace.minDiskGiB...Workspace.maxDiskGiB).contains(missing),
+          "a not-yet-created disk gets an in-bounds ceiling")
+    try? Storage.ensureDataDisk(at: disk, sizeGiB: 8)
+    let fits = Storage.maxDataDiskGiB(at: disk)
+    check((Workspace.minDiskGiB...Workspace.maxDiskGiB).contains(fits), "in bounds")
+    // A sparse 8 GiB image occupies ~nothing, so it must not count its nominal size.
+    check(abs(fits - missing) <= 1, "a sparse image counts what it occupies, not its size")
 }
 
 section("WorkspaceCapabilities")

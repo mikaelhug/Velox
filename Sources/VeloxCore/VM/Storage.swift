@@ -93,6 +93,30 @@ public enum Storage {
         return !hasExt4Superblock(at: url)
     }
 
+    /// The largest data-disk size, in GiB, the volume holding `url` could physically back:
+    /// what the image already occupies plus the volume's free space. The image is sparse, so
+    /// a larger nominal size is *allowed* — but past this the guest would hit I/O errors when
+    /// the host volume fills. Clamped to `Workspace`'s technical bounds.
+    ///
+    /// One-shot read (callers probe on appear, never on a timer). A disk not created yet is
+    /// measured against its folder's volume; an unreadable volume reports the minimum.
+    public static func maxDataDiskGiB(at url: URL) -> Int {
+        let allocated = (try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+            .totalFileAllocatedSize ?? 0
+        // Nearest existing ancestor: a relocated workspace's folder may not exist until its
+        // first boot creates it.
+        var dir = url.deletingLastPathComponent()
+        while !FileManager.default.fileExists(atPath: dir.path), dir.path != "/" {
+            dir = dir.deletingLastPathComponent()
+        }
+        let vals = try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey,
+                                                     .volumeAvailableCapacityKey])
+        let free = vals?.volumeAvailableCapacityForImportantUsage
+            ?? vals?.volumeAvailableCapacity.map(Int64.init) ?? 0
+        let gib = (Int64(allocated) + max(0, free)) >> 30
+        return Workspace.clampDiskGiB(Int(clamping: gib))
+    }
+
     // MARK: - Filesystem probes
     //
     // Host-side reads of the guest's ext4 superblock. These mirror `is_ext4` and

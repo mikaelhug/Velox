@@ -20,14 +20,19 @@ public struct Workspace: Codable, Sendable, Equatable, Identifiable {
     public static let defaultID = "default"
     public static let defaultName = "Default"
 
-    /// Allowed data-disk sizes, in GiB. Defined once here because both front ends must agree:
-    /// the Settings slider is bound to this range, and a SwiftUI `Slider` whose value sits
-    /// outside its bounds is undefined — so a workspace created with `velox workspace new
-    /// --size 512` would otherwise put the GUI in an invalid state. Every write clamps.
-    public static let diskGiBRange = 8...256
+    /// Technical bounds on a data-disk size, in GiB — not a policy. Create, set and decode all
+    /// clamp to them, so every stored size is one the guest can actually apply.
+    ///
+    /// The ceiling is vinit's `ext4_geometry`, which reads only the 32-bit
+    /// `s_blocks_count_lo`: at 4 KiB blocks a filesystem of 16 TiB or more would be misread.
+    /// What a *volume* can hold is a separate, per-workspace question answered by
+    /// `Storage.maxDataDiskGiB(at:)`; the Settings slider derives its upper bound from that
+    /// (and from the stored size, so the `Slider` never sits outside its bounds).
+    public static let minDiskGiB = 8
+    public static let maxDiskGiB = 16 * 1024 - 1
 
     public static func clampDiskGiB(_ gib: Int) -> Int {
-        min(max(gib, diskGiBRange.lowerBound), diskGiBRange.upperBound)
+        min(max(gib, minDiskGiB), maxDiskGiB)
     }
 
     /// Stable identity. A UUID for everything created after migration, so a user-supplied

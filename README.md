@@ -120,6 +120,7 @@ velox workspace ls                    # * marks the active one
 velox workspace new client-a          # an empty workspace
 velox workspace clone client-a demo   # instant, no extra disk until they diverge
 velox workspace use client-a          # takes effect on the next start
+velox workspace resize client-a 1024  # max disk size in GB (sparse: costs only what's used)
 ```
 
 In the app, workspaces live in the sidebar: **+** creates one, clicking one

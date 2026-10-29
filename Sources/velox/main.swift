@@ -34,6 +34,7 @@ func printUsage() {
       velox workspace clone <name> <new>     Duplicate one (instant on APFS, no extra space)
       velox workspace use <name>             Make it active (takes effect on next start)
       velox workspace rename <old> <new>     Rename one
+      velox workspace resize <name> <N>      Set its maximum disk size (N in GB)
       velox workspace rm <name>              Delete one and its data, permanently
     Everything except container data is shared: the docker socket path never changes,
     so `docker` follows the active workspace with no reconfiguration.
@@ -204,6 +205,20 @@ func workspaceNamed(_ name: String, in manifest: WorkspaceManifest) throws -> Wo
     return w
 }
 
+/// Parse a disk size in whole GB, clamped to `Workspace`'s technical bounds, and warn when
+/// it exceeds what the disk's volume can hold. Allowed anyway: the image is sparse, so the
+/// size is a ceiling, not an allocation — but the guest sees I/O errors if the volume fills.
+func parseDiskGiB(_ text: String, for disk: URL) throws -> Int {
+    guard let n = Int(text) else {
+        throw VeloxError.workspace("The size must be a whole number of GB (e.g. 64).")
+    }
+    let size = Workspace.clampDiskGiB(n)
+    if size != n { print("Size clamped to \(size) GB (allowed: \(Workspace.minDiskGiB)–\(Workspace.maxDiskGiB)).") }
+    let fits = Storage.maxDataDiskGiB(at: disk)
+    if size > fits { print("warning: \(size) GB exceeds the ~\(fits) GB its volume can hold.") }
+    return size
+}
+
 func runWorkspace(_ args: [String]) -> Never {
     do {
         let manifest = try WorkspaceStore.load()
@@ -213,12 +228,12 @@ func runWorkspace(_ args: [String]) -> Never {
             // shares its blocks, so this is what the workspace actually occupies today.
             let width = max(4, manifest.workspaces.map(\.name.count).max() ?? 4)
             print("  \("NAME".padding(toLength: width, withPad: " ", startingAt: 0))  "
-                  + "\("SIZE".padding(toLength: 9, withPad: " ", startingAt: 0))  MAX   LOCATION")
+                  + "\("SIZE".padding(toLength: 9, withPad: " ", startingAt: 0))  MAX    LOCATION")
             for w in manifest.workspaces.sorted(by: { $0.created < $1.created }) {
                 let marker = w.id == manifest.activeID ? "*" : " "
                 let name = w.name.padding(toLength: width, withPad: " ", startingAt: 0)
                 let size = w.allocatedDescription.padding(toLength: 9, withPad: " ", startingAt: 0)
-                let max = "\(w.diskGiB)G".padding(toLength: 5, withPad: " ", startingAt: 0)
+                let max = "\(w.diskGiB)G".padding(toLength: 6, withPad: " ", startingAt: 0)
                 let dir = (w.dataDiskURL.deletingLastPathComponent().path as NSString)
                     .abbreviatingWithTildeInPath
                 print("\(marker) \(name)  \(size)  \(max) \(dir)")
@@ -242,13 +257,11 @@ func runWorkspace(_ args: [String]) -> Never {
             try requireStoppedEngine("create a workspace")
             var size = manifest.active.diskGiB
             if let i = args.firstIndex(of: "--size") {
-                guard i + 1 < args.count, let n = Int(args[i + 1]) else {
-                    throw VeloxError.workspace(
-                        "--size needs a whole number of GB (e.g. --size 64).")
+                guard i + 1 < args.count else {
+                    throw VeloxError.workspace("--size needs a whole number of GB (e.g. --size 64).")
                 }
-                // Clamped to the same range the Settings slider offers, so the two front
-                // ends can't disagree about what a legal size is.
-                size = Workspace.clampDiskGiB(n)
+                // New workspaces get the standard slot under ~/.velox, so that's the volume.
+                size = try parseDiskGiB(args[i + 1], for: Paths.workspaces.appendingPathComponent("data.img"))
             }
             let created = try WorkspaceStore.create(name: args[1], diskGiB: size)
             print("Created workspace “\(created.name)” (\(size) GB max) at "
@@ -275,6 +288,16 @@ func runWorkspace(_ args: [String]) -> Never {
             let target = try workspaceNamed(args[1], in: manifest)
             try WorkspaceStore.rename(id: target.id, to: args[2])
             print("Renamed “\(target.name)” → “\(args[2])”")
+
+        case "resize":
+            guard args.count > 2 else { throw VeloxError.workspace("Usage: velox workspace resize <name> <N>") }
+            try requireStoppedEngine("resize a workspace")
+            let target = try workspaceNamed(args[1], in: manifest)
+            let size = try parseDiskGiB(args[2], for: target.dataDiskURL)
+            try WorkspaceStore.setDiskGiB(id: target.id, size)
+            // Applied by the next boot: the host grows the sparse image, vinit resizes the
+            // ext4 (online grow, or offline shrink when the used data allows it).
+            print("“\(target.name)” is now \(size) GB max. Takes effect on next start.")
 
         case "rm", "remove", "delete":
             guard args.count > 1 else { throw VeloxError.workspace("Usage: velox workspace rm <name>") }

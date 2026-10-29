@@ -230,7 +230,8 @@ private struct ResourcesPane: View {
                 Text("Disk-backed swap for memory-heavy builds.")
             }
             Section {
-                IntSlider(value: activeDiskGiB, range: Workspace.diskGiBRange, step: 8, unit: "GB")
+                IntSlider(value: activeDiskGiB, range: Workspace.minDiskGiB...diskUpperGiB,
+                          step: diskUpperGiB > 512 ? 64 : 8, unit: "GB")
                 if let workspace = engine.activeWorkspace {
                     DiskUsageRow(allocatedGiB: workspace.diskGiB,
                                  dataDiskURL: workspace.dataDiskURL)
@@ -241,7 +242,14 @@ private struct ResourcesPane: View {
                 // Size and location are per-workspace, so this section describes the active
                 // one. Location lives on the workspace itself (right-click it in the
                 // sidebar) rather than here, where it would read as a global setting.
-                Text("Maximum size of \(activeName)'s data. Right-click the workspace to move it.")
+                Text("Maximum size of \(activeName)'s data"
+                     + (volumeMaxGiB.map { " (its volume fits \($0) GB)" } ?? "")
+                     + ". Right-click the workspace to move it.")
+            }
+            // Probed once per workspace (a relocated one lives on another volume), not polled.
+            .task(id: engine.activeWorkspace?.dataDiskURL) {
+                guard let url = engine.activeWorkspace?.dataDiskURL else { return }
+                volumeMaxGiB = await Task.detached { Storage.maxDataDiskGiB(at: url) }.value
             }
             ResourceSaverSection(config: $config)
             NestedVirtualizationSection(config: $config)
@@ -271,6 +279,16 @@ private struct ResourcesPane: View {
     }
 
     private var activeName: String { engine.activeWorkspace?.name ?? "the workspace" }
+
+    /// What the active workspace's volume can physically hold; `nil` until probed.
+    @State private var volumeMaxGiB: Int?
+
+    /// The slider's upper bound: the volume's capacity, but never below the stored size — a
+    /// SwiftUI `Slider` whose value sits outside its bounds is undefined, and a size set from
+    /// the CLI (or before the volume filled up) may exceed it.
+    private var diskUpperGiB: Int {
+        max(volumeMaxGiB ?? 256, activeDiskGiB.wrappedValue)
+    }
 }
 
 /// Shows the data disk's **actual** on-disk footprint (the raw image is sparse, so
@@ -372,9 +390,12 @@ private struct IntSlider: View {
 
     var body: some View {
         HStack {
+            // `Slider(step:)` counts from the lower bound (a 64 GB step over 8… lands on 72,
+            // 136, 200), so the setter also snaps to whole multiples of `step`.
             Slider(value: Binding(
                 get: { Double(value) },
-                set: { value = Int($0.rounded()) }),
+                set: { value = min(range.upperBound, max(range.lowerBound,
+                                                         Int(($0 / Double(step)).rounded()) * step)) }),
                 in: Double(range.lowerBound)...Double(range.upperBound),
                 step: Double(step))
             Text("\(value) \(unit)")

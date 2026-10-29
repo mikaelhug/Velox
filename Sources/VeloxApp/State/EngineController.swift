@@ -1154,7 +1154,8 @@ final class EngineController {
     /// Dragging the Settings slider fires on every integer tick, and each manifest write is a
     /// JSON encode plus an fsync of the directory. This rides the SAME debounce the config
     /// write already uses rather than adding a second timer — the trailing fire persists both.
-    func setActiveWorkspaceDiskGiB(_ gib: Int) {
+    func setActiveWorkspaceDiskGiB(_ requested: Int) {
+        let gib = Workspace.clampDiskGiB(requested)
         guard let active = activeWorkspace, active.diskGiB != gib else { return }
         // Update the in-memory copy immediately so the slider tracks the drag…
         if var manifest = workspaces,
